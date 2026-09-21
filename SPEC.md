@@ -95,6 +95,23 @@ Adjutant is not a hierarchy management tool with a scouting skin. It is a sovere
 └─────────────────────────────────────────────────────┘
                       │
                       ▼
+
+│                                                     │
+│  ┌───────────────────────────────────────────────┐  │
+│  │                   SDK                         │  │
+│  │  adjutant-sdk crate — the contract            │  │
+│  │  • Plugin trait definitions                   │  │
+│  │  • PluginContext, RouteDefinition, etc.       │  │
+│  │  • CLI scaffolding (adjutant new-plugin)      │  │
+│  │  • Plugin test harness                        │  │
+│  │  • Versioned with the core                    │  │
+│  │                                               │  │
+│  │  The SDK is how we build Adjutant itself.     │  │
+│  │  First-party plugins use the same API as      │  │
+│  │  third-party plugins. Dogfooding is the       │  │
+│  │  validation.                                  │  │
+│  └───────────────────────────────────────────────┘  │
+
 ┌─────────────────────────────────────────────────────┐
 │                  POSTGRESQL                         │
 │                                                     │
@@ -126,6 +143,7 @@ Adjutant is not a hierarchy management tool with a scouting skin. It is a sovere
 | Payments | Plugin (Stripe) | Industry standard, PCI compliant |
 | MCP Server | Plugin (permissions-aware) | AI agent integration with scoped access |
 | Storage | S3-compatible (plugin) | MinIO self-hosted or Cloudflare R2 |
+| SDK | adjutant-sdk (Rust crate) | Plugin API contract, CLI scaffolding, test harness — we build our own plugins with this |
 | Hosting | Docker Compose or bare metal | One command deployment |
 | CI/CD | GitHub Actions | Automated testing, building, publishing |
 
@@ -239,6 +257,38 @@ pub struct PluginContext {
     pub permissions: PermissionService, // Check user permissions
     pub audit: AuditService,     // Write to audit log
 }
+```
+
+
+### 5.2a The SDK (adjutant-sdk)
+
+The SDK is the contract between the core and every plugin. It is the primary development interface for Adjutant — first-party and third-party plugins alike.
+
+**Principle:** We eat our own dogfood. The auth, membership, and missions plugins are built using the exact same SDK API that third-party developers will use. If the SDK is awkward for us, it's awkward for everyone.
+
+**What the SDK provides:**
+
+| Component | Purpose |
+|---|---|
+| `AdjutantPlugin` trait | The core interface every plugin implements |
+| `PluginContext` struct | Runtime services (DB, events, permissions, audit) |
+| `RouteDefinition` | Type-safe Axum route registration |
+| `EventSubscription` | Subscribe to event bus topics |
+| `Migration` | Database migration declarations |
+| `Permission` | Permission declaration and checking |
+| `adjutant new-plugin` | CLI scaffolding — generates a plugin project with manifest, routes, models, migrations |
+| `adjutant test-plugin` | Test harness — spins up a test server with the plugin loaded, mock permissions, test database |
+| `adjutant validate-plugin` | Checks manifest, permissions, schema, routes against the core API |
+
+**SDK versioning:** The SDK version is pinned to the core version. Breaking changes to the SDK require a major version bump. The SDK changelog is the contract changelog.
+
+**SDK development order:** The SDK is built incrementally, not up front. The core defines the traits it needs; the SDK wraps them into a developer-facing API. Each plugin built with the SDK is a validation pass — if a plugin can't be built cleanly, the SDK needs revision before we write more plugins.
+
+```
+SDK v0.1  → core traits + PluginContext + scaffolding CLI
+SDK v0.2  → route helpers, event helpers, test harness (after auth plugin validates it)
+SDK v0.3  → permission macros, migration helpers (after membership plugin validates it)
+SDK v1.0  → stable, documented, ready for third-party plugins
 ```
 
 **Schema isolation:** Each plugin gets its own PostgreSQL schema (`missions.*`, `governance.*`, etc.). The plugin's database handle is scoped to its own schema — it cannot read or write to other plugins' schemas unless the core explicitly grants cross-schema access.
@@ -905,27 +955,239 @@ adjutant/
 
 ---
 
-## 13. Open Questions
+## 13. Resolved Decisions
 
-1. **Axum commitment** — Final validation of Axum as the server framework before implementation begins
-2. **License** — MIT vs. Apache 2.0 (both are permissive, different patent clauses)
-3. **Hosting** — Primary deployment target: VPS, self-hosted, or both?
-4. **OSG API** — Does OSG have a programmatic API? If not, CSV import is the baseline
-5. **Plugin WASM** — Should all plugins support WASM mode, or only third-party plugins?
-6. **Mobile app distribution** — Google Play, F-Droid, APK direct, or all three?
-7. **Web push notifications** — Web Push API requires a push service (Firebase, web-push-protocol)
-8. **Multi-tenancy** — Single troop per instance, or support multiple troops on one server?
-9. **Versioning** — SemVer for the core? Separate versioning for plugins?
-10. **Contributing guidelines** — CONTRIBUTING.md, code of conduct, PR process
+The following were open questions in earlier versions of this spec. They are resolved.
+
+1. **Axum** — Confirmed. Axum is the server framework. Tokio ecosystem, proven at scale, good WASM integration via wasmtime.
+2. **License** — MIT. Permissive, simple, maximally forkable. No patent clause complexity.
+3. **Hosting** — Docker Compose primary, bare metal supported. One `docker compose up` to deploy.
+4. **OSG API** — Assume none. CSV import is the baseline. If OSG provides an API later, the membership plugin adapts.
+5. **Plugin WASM** — WASM is optional mode for third-party/untrusted plugins. First-party plugins compile natively.
+6. **Mobile distribution** — APK direct + F-Droid. Google Play deferred until post-MVP.
+7. **Web push** — Firebase Cloud Messaging for web push. Self-hosted alternative via ntfy (plugin).
+8. **Multi-tenancy** — Single troop per instance. Multi-tenancy is a future community plugin, not core.
+9. **Versioning** — SemVer for core and SDK. Plugins version independently, pinned to minimum core version.
+10. **Contributing** — CONTRIBUTING.md, code of conduct, PR process — created at Milestone 6.
 
 ---
 
-## 14. Next Steps
+## 14. Risk Register
 
-1. Validate Axum with a small proof-of-concept (plugin loading, route dispatch, WASM execution)
-2. Set up the Flutter project structure
-3. Implement the core (plugin registry, WASM runtime, database, HTTP server)
-4. Implement the auth plugin (OIDC integration)
-5. Implement the membership plugin (OSG sync)
-6. Ship the MCP server plugin (Hermes integration)
-7. Iterate on feature plugins with troop feedback
+| # | Risk | Severity | Likelihood | Mitigation |
+|---|---|---|---|---|
+| R1 | **WASM plugin host API is an unsolved design problem.** Plugins need to register routes, query DB, publish events, check permissions — all through a WASM host API. This is the hardest technical piece. | HIGH | HIGH | Prototype WASM plugin loading + host API in Milestone 1. If it doesn't work cleanly, fall back to native-only plugins (WASM becomes optional, not required). The SDK trait API stays the same either way. |
+| R2 | **SDK ergonomics.** If writing a plugin with the SDK is painful, the ecosystem dies. The SDK is the product; everything else is infrastructure. | HIGH | MEDIUM | Build the SDK incrementally. Auth and membership plugins are dogfooding — if they can't be built cleanly, redesign the SDK before writing more plugins. CLI scaffolding (`adjutant new-plugin`) enforces good patterns. |
+| R3 | **Offline sync protocol.** The client must work without connectivity. Conflict resolution, delta sync, and queue management are non-trivial. | HIGH | MEDIUM | Design the sync protocol before Phase 3 (client). Use CRDTs for simple conflict resolution (last-write-wins for most fields, merge for lists). Prototype the sync layer as a standalone library. |
+| R4 | **Scope creep.** AI makes it easy to add "just one more feature." A large codebase that nobody fully understands is a liability. | MEDIUM | HIGH | Ship the MVP (Milestone 5), get it in front of scouts, iterate based on real feedback. The milestone structure enforces hard gates — don't start the next milestone until the current one's exit criteria are met. |
+| R5 | **Concurrent AI agents.** Multiple agents working the same codebase simultaneously produce conflicting code. | MEDIUM | MEDIUM | One agent at a time per worktree. Lock the worktree before starting. Small commits, clear interfaces, human review at every phase boundary. |
+| R6 | **App store submission.** Google Play and Apple App Store have review processes, developer accounts, and compliance requirements. | LOW | HIGH | Defer to Milestone 6. APK direct + F-Droid for initial distribution. App store submission is a separate workstream with its own timeline. |
+| R7 | **Axum doesn't deliver.** The framework has gaps we haven't found yet (middleware limitations, WASM integration issues, ecosystem holes). | LOW | LOW | Mitigated by the Milestone 1 prototype. If Axum fails, alternatives (Actix-web, Warp) are drop-in replacements at the trait level — the SDK insulates plugins from the framework choice. |
+
+---
+
+## 15. Development Milestones
+
+Milestones are ordered by dependency. Each milestone has hard exit criteria — don't start the next one until the current one passes. Time estimates are deliberately absent; the milestones define *what* is done, not *when*.
+
+### Milestone 1: Prototype Validation
+
+**Goal:** Prove the core architectural bets are sound before writing application code.
+
+**Exit criteria:**
+- [ ] Axum server compiles and responds to HTTP requests
+- [ ] A plugin can register routes and handle requests through the core router
+- [ ] A plugin can query PostgreSQL through the core's connection pool
+- [ ] A plugin can publish and subscribe to events through the event bus
+- [ ] Permissions can be declared by a plugin and enforced by the core middleware
+- [ ] Database migrations run automatically when a plugin loads
+- [ ] The WASM plugin path works (or the fallback: native-only) — one of these must be proven
+- [ ] A "hello world" plugin compiles, loads, and responds
+
+**Deliverable:** A working prototype that validates every core subsystem. If any subsystem fails, redesign before proceeding.
+
+---
+
+### Milestone 2: Core Server
+
+**Goal:** Build the production core using the SDK.
+
+**Exit criteria:**
+- [ ] Plugin registry: load, enable, disable, uninstall, hot-reload
+- [ ] Database connection pool with per-plugin schema isolation
+- [ ] Axum server with full middleware stack (request ID, logging, CORS, rate limiting, auth, authorization, plugin routing)
+- [ ] Event bus with pub/sub, persistence, and replay
+- [ ] Configuration management (file, environment, CLI)
+- [ ] Structured logging with tracing
+- [ ] Audit log (append-only, tamper-evident)
+- [ ] All core traits compiled as the `adjutant-sdk` crate
+- [ ] Core compiles, all tests pass, `cargo clippy` clean
+
+**Deliverable:** A production-ready core server that plugins can target. The SDK is built alongside — the core defines the traits it needs.
+
+---
+
+### Milestone 3: SDK v0.1 + First Plugins
+
+**Goal:** Build the SDK to v0.1 and validate it by building the auth and membership plugins with it.
+
+**Exit criteria:**
+- [ ] `adjutant-sdk` crate published (v0.1)
+- [ ] `adjutant new-plugin` CLI scaffolds a plugin project with manifest, routes, models, migrations
+- [ ] `adjutant test-plugin` runs a test server with mock permissions and test database
+- [ ] Auth plugin: OIDC login, session management, role enforcement — all built with the SDK
+- [ ] Membership plugin: member roster, OSG CSV import, proficiency tracking — all built with the SDK
+- [ ] Both plugins can be loaded, enabled, disabled, and uninstalled through the core
+- [ ] Both plugins' routes respond correctly with proper permission checks
+- [ ] Both plugins' database schemas are isolated and migrations run cleanly
+- [ ] The SDK API feels good. If building auth or membership is painful, redesign the SDK before proceeding.
+
+**Deliverable:** SDK v0.1 with two validated plugins. The SDK is the product — this milestone proves it works.
+
+---
+
+### Milestone 4: Missions + Governance + SDK v0.2
+
+**Goal:** Expand the SDK and build the core mission/governance plugins.
+
+**Exit criteria:**
+- [ ] Missions plugin: full 6-stage lifecycle, mentor matching, Lodge Commander approval
+- [ ] Governance plugin: motion lifecycle, voting, amendments, Accords versioning
+- [ ] SDK v0.2: route helpers, event helpers, test harness improvements
+- [ ] Event bus integration: missions publish `mission.completed`, governance publishes `motion.passed`
+- [ ] Both plugins built with the SDK, validating the API
+
+**Deliverable:** Four plugins (auth, membership, missions, governance) all built with the SDK.
+
+---
+
+### Milestone 5: MCP Server + Flutter Client MVP
+
+**Goal:** Ship the permissions-aware MCP server and a working Flutter client.
+
+**Exit criteria:**
+- [ ] MCP server plugin: tools exposed, permissions filtered, invocations logged
+- [ ] Hermes agent can connect and interact through the MCP server
+- [ ] Flutter client: login screen, mission list, membership roster, basic navigation
+- [ ] Flutter client works on Android, iOS, and Web (PWA)
+- [ ] Offline mode: client caches data locally, syncs when online
+- [ ] Basic UI/UX review — is the navigation intuitive? Are the screens useful?
+- [ ] Deployed to The House for real use by the 161st
+
+**Deliverable:** A working MVP that scouts can actually use. This is the first release to real users.
+
+---
+
+### Milestone 6: Finance + Equipment + Calendar
+
+**Goal:** Build the operational plugins that scouts use daily.
+
+**Exit criteria:**
+- [ ] Finance plugin: fund tracking, transaction recording, budget vs. actuals, sliding scale dues
+- [ ] Equipment plugin: inventory, checkout/checkin, maintenance schedules
+- [ ] Calendar plugin: events, RSVPs, recurring events, quorum tracking
+- [ ] SDK v0.3: permission macros, migration helpers
+- [ ] All plugins built with the SDK, validating the API
+
+**Deliverable:** Seven plugins covering the full operational scope of a scout troop.
+
+---
+
+### Milestone 7: Production Hardening
+
+**Goal:** Make Adjutant production-ready for self-hosting.
+
+**Exit criteria:**
+- [ ] Docker Compose deployment (one command)
+- [ ] HTTPS/TLS configuration
+- [ ] Backup and restore procedures
+- [ ] Performance testing (100+ concurrent users)
+- [ ] Security audit (OWASP Top 10, dependency scanning)
+- [ ] Documentation: admin guide, user guide, API reference
+- [ ] CONTRIBUTING.md, code of conduct, PR process
+- [ ] CI/CD pipeline (GitHub Actions)
+
+**Deliverable:** Production-ready deployment with documentation.
+
+---
+
+### Milestone 8: v1.0 Release
+
+**Goal:** Stable, documented, ready for community adoption.
+
+**Exit criteria:**
+- [ ] All 7 core plugins stable and tested
+- [ ] SDK v1.0 published with stable API
+- [ ] Documentation site live
+- [ ] F-Droid listing
+- [ ] Community plugin guide published
+- [ ] 3+ troops using Adjutant in production
+- [ ] 1+ community plugin contributed by someone outside The House
+
+**Deliverable:** Adjutant v1.0. The project is real.
+
+---
+
+## 16. AI-Assisted Development Workflow
+
+Adjutant is built by humans and AI agents working together. The human makes design decisions. The AI generates code. The SPEC is the contract between them.
+
+### 16.1 What the AI Agent Does
+
+| Task | AI Suitability | Notes |
+|---|---|---|
+| Core server boilerplate | HIGH | Plugin registry, DB pool, HTTP routes, event bus — standard Rust patterns |
+| Database migrations | HIGH | Schema is defined in the SPEC; AI writes the DDL |
+| Plugin implementations | HIGH | Once SDK traits are defined, plugins follow predictable patterns |
+| Test generation | HIGH | Unit tests, integration tests, API tests — AI generates from the spec |
+| Documentation | HIGH | API docs, admin guides, user guides — AI generates from code and spec |
+| CI/CD setup | HIGH | GitHub Actions workflows, Docker builds — standard patterns |
+| SDK scaffolding | HIGH | CLI tools, project templates — mechanical generation |
+| Bug fixes | MEDIUM | AI can diagnose and fix if the bug is well-defined |
+| Performance optimization | MEDIUM | AI can identify hot paths but needs human judgment on tradeoffs |
+
+### 16.2 What the Human Does
+
+| Task | Why Human | Notes |
+|---|---|---|
+| SDK API design | Ergonomics are subjective | The SDK must feel good to use. This is a design decision, not a code generation task. |
+| UX decisions | Scouts are the users | Layout, navigation, what goes where — AI can suggest, humans decide |
+| Phase boundary review | Quality gate | Before starting the next milestone, review what was built. Does it work? Does it feel right? |
+| Error handling strategy | UX and safety implications | How errors surface to users, how failures propagate — human judgment |
+| Naming and API surface | Long-term maintainability | Names stick. Humans choose them. |
+| Scope enforcement | AI says yes, humans say no | The milestone structure is the scope gate. Don't add features outside the current milestone. |
+
+### 16.3 The Contract
+
+The SPEC is the contract. AI generates code that satisfies the SPEC. Humans validate the SPEC and the output.
+
+```
+Human writes/validates SPEC
+        ↓
+AI generates code from SPEC
+        ↓
+Human reviews output, course-corrects
+        ↓
+If output fails: redesign SPEC, then regenerate
+        ↓
+If output passes: commit, move to next milestone
+```
+
+**Phase boundaries are hard stops.** At the end of each milestone, the human reviews:
+1. Does the code compile and pass tests?
+2. Does the SDK API feel right for building plugins?
+3. Are there any design decisions the AI made that need human input?
+4. Is the scope still under control?
+
+Only after all four are satisfied does the next milestone begin.
+
+### 16.4 Agent Constraints
+
+- **One agent at a time.** Don't run concurrent agents on the same worktree. Lock the worktree before starting.
+- **Small commits.** Each commit should be reviewable in isolation. No mega-commits.
+- **Tests first.** AI generates tests from the SPEC before generating implementation. The SPEC defines expected behavior; tests verify it.
+- **No scope creep.** If the AI suggests "while I'm here, I could also add X" — reject it. X goes in the next milestone, not this one.
+- **Human review at every milestone boundary.** The AI does not self-certify. Humans review and approve.
+
+---
+
