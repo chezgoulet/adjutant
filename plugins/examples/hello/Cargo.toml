@@ -1,0 +1,16 @@
+[package]
+name = "adjutant-hello"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Hello-world plugin: the Milestone 1 prototype plugin proving the SDK contract end to end."
+
+[lib]
+# cdylib so the core can load it dynamically; rlib so it also links as a test fixture
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+adjutant-sdk.workspace = true
+serde.workspace = true
+serde_json.workspace = true
