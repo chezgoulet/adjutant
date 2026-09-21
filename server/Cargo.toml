@@ -1,0 +1,32 @@
+[package]
+name = "adjutant-server"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Adjutant core server: plugin registry, HTTP dispatch, events, permissions, audit."
+
+[lib]
+name = "adjutant_server"
+path = "src/lib.rs"
+
+[[bin]]
+name = "adjutant"
+path = "src/main.rs"
+
+[dependencies]
+adjutant-sdk.workspace = true
+axum.workspace = true
+tokio.workspace = true
+sqlx.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+async-trait.workspace = true
+chrono.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+libloading = "0.8"
+
+[dev-dependencies]
+reqwest = { version = "0.12", default-features = false, features = ["json"] }

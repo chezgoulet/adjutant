@@ -1,0 +1,8 @@
+/target
+/local
+*.so
+*.dylib
+*.dll
+Cargo.lock.bak
+.idea/
+.vscode/

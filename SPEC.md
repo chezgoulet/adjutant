@@ -266,6 +266,14 @@ The SDK is the contract between the core and every plugin. It is the primary dev
 
 **Principle:** We eat our own dogfood. The auth, membership, and missions plugins are built using the exact same SDK API that third-party developers will use. If the SDK is awkward for us, it's awkward for everyone.
 
+**Constraint (proven in Milestone 1):** a plugin is a `cdylib` with its own copy
+of every dependency, so it cannot call `sqlx`/`tokio` directly — plugin-side DB
+calls resolve the plugin's *own* runtime thread-local, panic, and abort the
+process (`Rust cannot catch foreign exceptions`). All database, event,
+permission, and audit access therefore crosses the boundary as `Arc<dyn Host…>`
+trait objects implemented in the core. **The SDK links neither `sqlx` nor
+`tokio`.** This host API is the shape the future WASM host API must mirror.
+
 **What the SDK provides:**
 
 | Component | Purpose |
@@ -710,15 +718,17 @@ CREATE TABLE core.role_permissions (
     PRIMARY KEY (role_id, permission_id)
 );
 
--- User → Role mapping (scoped to troop or Lodge)
-CREATE TABLE core.user_roles (
+-- User → Role mapping (scoped to troop or Lodge).
+-- scope_id is NOT NULL DEFAULT zero-UUID rather than NULL + COALESCE-in-PK:
+-- PostgreSQL forbids expressions in PRIMARY KEY column lists.
+CREATE TABLE IF NOT EXISTS core.user_roles (
     user_id         UUID NOT NULL REFERENCES core.users(id) ON DELETE CASCADE,
     role_id         TEXT NOT NULL REFERENCES core.roles(id) ON DELETE CASCADE,
-    scope_type      TEXT DEFAULT 'troop',
-    scope_id        UUID,
-    granted_at      TIMESTAMPTZ DEFAULT now(),
+    scope_type      TEXT NOT NULL DEFAULT 'troop',
+    scope_id        UUID NOT NULL DEFAULT '00000000-0000-0000-0000-000000000000',
+    granted_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
     granted_by      UUID REFERENCES core.users(id),
-    PRIMARY KEY (user_id, role_id, COALESCE(scope_id, '00000000-0000-0000-0000-000000000000'::UUID))
+    PRIMARY KEY (user_id, role_id, scope_id)
 );
 
 -- Event bus
@@ -994,15 +1004,20 @@ Milestones are ordered by dependency. Each milestone has hard exit criteria — 
 
 **Goal:** Prove the core architectural bets are sound before writing application code.
 
+**Status: PASSED (2026-09-21).** Evidence: `docs/milestones/M1-prototype-validation.md`
+(10/10 live probes, 18 unit tests). Three findings reshaped the design — see that
+document: host-mediated I/O, plugin libraries must outlive the router, and a
+SPEC §8.1 DDL error (COALESCE in PRIMARY KEY).
+
 **Exit criteria:**
-- [ ] Axum server compiles and responds to HTTP requests
-- [ ] A plugin can register routes and handle requests through the core router
-- [ ] A plugin can query PostgreSQL through the core's connection pool
-- [ ] A plugin can publish and subscribe to events through the event bus
-- [ ] Permissions can be declared by a plugin and enforced by the core middleware
-- [ ] Database migrations run automatically when a plugin loads
-- [ ] The WASM plugin path works (or the fallback: native-only) — one of these must be proven
-- [ ] A "hello world" plugin compiles, loads, and responds
+- [x] Axum server compiles and responds to HTTP requests
+- [x] A plugin can register routes and handle requests through the core router
+- [x] A plugin can query PostgreSQL through the core's connection pool *(via host API — plugin links no sqlx)*
+- [x] A plugin can publish and subscribe to events through the event bus
+- [x] Permissions can be declared by a plugin and enforced by the core middleware
+- [x] Database migrations run automatically when a plugin loads
+- [x] The WASM plugin path works (or the fallback: native-only) — one of these must be proven *(native-only; `.so` has 0 tokio/sqlx symbols)*
+- [x] A "hello world" plugin compiles, loads, and responds
 
 **Deliverable:** A working prototype that validates every core subsystem. If any subsystem fails, redesign before proceeding.
 

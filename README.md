@@ -1,50 +1,76 @@
-# Adjutant
+# Adjutant — Development
 
-**Sovereignty-first administration software for democratic scout troops**
+Sovereignty-first administration for democratic scout troops.
+See [`SPEC.md`](SPEC.md) for the full specification.
 
-[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
+## Stack
 
-Adjutant is an open-source, self-hosted administration platform for scout troops that govern themselves. Built on the principles of the Catamount Accords — authority flows from the ground up, transparency is the default, and the system serves the scouts.
+- **Server:** Rust + Axum, single binary, PostgreSQL
+- **Plugins:** Rust `cdylib`s built against `adjutant-sdk`, loaded at boot
+- **Client:** Flutter (all platforms) — not yet started (Milestone 5)
 
-## What It Does
+## Repository layout
 
-- **Mission Engine** — Six-stage lifecycle from proposal to impact reporting
-- **Governance Ledger** — Motions, votes, amendments, and Accords versioning
-- **Membership** — OSG sync, proficiency tracking, lodge and patrol management
-- **Finance** — Fund tracking, budgets, sliding scale dues
-- **Equipment** — Gear inventory and checkout management
-- **Calendar** — Events, RSVPs, seasonal awareness
-- **Conflict Resolution** — Structured pathway tracking
-- **Impact Reporting** — Community service, conservation, and educational outcomes
-- **Hermes MCP** — Permissions-aware AI agent integration
-- **Meshcore** — LoRa mesh networking for backcountry operations
-- **ATAK** — Tactical mapping integration
-
-## Architecture
-
-- **Server:** Rust + Axum (single binary, WASM plugin runtime)
-- **Client:** Flutter (Android, iOS, Web, Desktop — one codebase)
-- **Database:** PostgreSQL
-- **Plugins:** Core + plugin architecture. Everything is a plugin.
-
-## Quick Start
-
-```bash
-# Docker (recommended)
-docker compose up
-
-# Or bare metal
-cargo build --release
-./target/release/adjutant-server
+```
+server/                 Core server (binary: `adjutant`)
+plugins/sdk/            adjutant-sdk — the plugin contract
+plugins/examples/hello/ Prototype plugin proving the SDK end to end
+docs/                   Architecture, plugin development, API reference
 ```
 
-## Documentation
+## Prerequisites
 
-- [Master Specification](SPEC.md) — Full architecture and design
-- [Plugin Development](docs/plugin-development.md) — How to build plugins
-- [Deployment](docs/deployment.md) — Installation and configuration
-- [API Reference](docs/api-reference.md) — REST and MCP API docs
+- Rust 1.75+ (workspace edition 2021)
+- PostgreSQL 14+ (dev default: `postgres://adjutant@127.0.0.1:5433/adjutant_dev`)
 
-## License
+## Build & test
 
-MIT — use it, fork it, build on it. The code is given freely.
+```bash
+cargo build --workspace          # core + sdk + plugins
+cargo test  --workspace
+```
+
+## Run the prototype
+
+```bash
+# 1. build everything (plugins land as .so in target/debug)
+cargo build --workspace
+
+# 2. stage plugins into the plugin dir the server scans
+mkdir -p plugins-built
+cp target/debug/libadjutant_hello.so plugins-built/
+
+# 3. start (env overrides: ADJUTANT_BIND, ADJUTANT_DATABASE_URL, ADJUTANT_PLUGIN_DIR, ADJUTANT_LOG)
+ADJUTANT_PLUGIN_DIR=plugins-built cargo run -p adjutant-server
+```
+
+Smoke test (dev identity stub — `x-dev-user`/`x-dev-role`, replaced by the
+auth plugin in Milestone 2):
+
+```bash
+curl -s localhost:8787/                                # health
+curl -s localhost:8787/api/plugins                     # loaded plugins
+curl -s localhost:8787/api/hello                       # open route
+curl -s localhost:8787/api/hello/greetings             # 401 — needs hello:read
+curl -s -H 'x-dev-user: christopher' -H 'x-dev-role: chief' \
+     localhost:8787/api/hello/greetings                # 200 — chief has all
+curl -s -H 'x-dev-user: christopher' -H 'x-dev-role: chief' \
+     -H 'content-type: application/json' \
+     -d '{"message":"first greeting"}' \
+     localhost:8787/api/hello/greet                    # 201, publishes hello.greeted
+curl -s -H 'x-dev-user: christopher' -H 'x-dev-role: chief' \
+     localhost:8787/api/events/recent                  # persisted event visible
+```
+
+## Development milestones
+
+Tracked in [`SPEC.md` §15](SPEC.md). Milestone 1 = prototype validation
+(core server compiles, plugin loads, routes dispatch, permissions enforce,
+migrations run, events flow — all verified by tests).
+
+## Git flow
+
+House standard ([chezgoulet-git-flow]): `testing` = integration target,
+`main` = releases, `feature/*` branches from `testing`, PRs target `testing`.
+
+[chezgoulet-git-flow]: https://github.com/chezgoulet/library
