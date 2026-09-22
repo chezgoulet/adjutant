@@ -1054,15 +1054,22 @@ calling `Executor::execute` directly. Also found: a `libloading::Symbol` or a
 **Goal:** Build the SDK to v0.1 and validate it by building the auth and membership plugins with it.
 
 **Exit criteria:**
-- [ ] `adjutant-sdk` crate published (v0.1)
-- [ ] `adjutant new-plugin` CLI scaffolds a plugin project with manifest, routes, models, migrations
-- [ ] `adjutant test-plugin` runs a test server with mock permissions and test database
-- [ ] Auth plugin: OIDC login, session management, role enforcement — all built with the SDK
-- [ ] Membership plugin: member roster, OSG CSV import, proficiency tracking — all built with the SDK
-- [ ] Both plugins can be loaded, enabled, disabled, and uninstalled through the core
-- [ ] Both plugins' routes respond correctly with proper permission checks
-- [ ] Both plugins' database schemas are isolated and migrations run cleanly
-- [ ] The SDK API feels good. If building auth or membership is painful, redesign the SDK before proceeding.
+- [ ] `adjutant-sdk` crate published (v0.1) — *versioned 0.1.0 in-workspace; crates.io publication pending a registry token decision*
+- [x] `adjutant new-plugin` CLI scaffolds a plugin project with manifest, routes, models, migrations
+- [x] `adjutant test-plugin` runs a test server with mock permissions and test database
+- [x] Auth plugin: OIDC login, session management, role enforcement — all built with the SDK
+- [x] Membership plugin: member roster, OSG CSV import, proficiency tracking — all built with the SDK
+- [x] Both plugins can be loaded, enabled, disabled, and uninstalled through the core
+- [x] Both plugins' routes respond correctly with proper permission checks
+- [x] Both plugins' database schemas are isolated and migrations run cleanly
+- [x] The SDK API feels good. If building auth or membership is painful, redesign the SDK before proceeding.
+
+**Evidence:** `docs/milestones/M3-sdk-and-plugins.md` — build/test/clippy gates, 37/37
+`test-plugin` probes, and 38/38 live end-to-end probes with `ADJUTANT_DEV_HEADERS=false`
+(every identity from a real session; OIDC exercised against a mock IdP).
+SDK verdict: API held up; no redesign needed. Ten bugs found and fixed, including a
+systemic one — the documented per-plugin `search_path` contract was never applied at
+runtime, which had silently hidden every unqualified plugin table.
 
 **Deliverable:** SDK v0.1 with two validated plugins. The SDK is the product — this milestone proves it works.
 

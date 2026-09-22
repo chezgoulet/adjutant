@@ -26,7 +26,7 @@ use serde_json::json;
 use tokio::sync::RwLock;
 use tower_http::cors::{Any, CorsLayer};
 
-use adjutant_sdk::{AuditService, PermissionService, PluginRequest};
+use adjutant_sdk::{AuditService, PermissionService, PluginRequest, SdkError};
 
 use crate::config::Config;
 use crate::db;
@@ -47,13 +47,29 @@ pub struct AppState {
     pub registry: RwLock<PluginRegistry>,
     pub bus: Arc<EventBus>,
     pub config: Arc<Config>,
+    /// Plugin-registered identity providers (auth plugin replaces the dev stub).
+    pub identity: Arc<crate::identity::IdentityHub>,
+    /// Core-mediated HTTP shared by all plugin contexts.
+    pub http: Arc<crate::host::CoreHttp>,
 }
 
 impl AppState {
     /// Admin gate: `core:admin` permission. Returns a ready 401/403 response
     /// when the caller isn't allowed, `None` when allowed.
+    ///
+    /// Uses the SAME identity resolution as `dispatch` — plugin providers
+    /// first (auth sessions via cookie/Bearer), dev headers only as the gated
+    /// fallback. Reading dev headers alone here meant every admin route
+    /// 401'd for real sessions once `allow_dev_headers=false`.
     async fn require_admin(&self, headers: &axum::http::HeaderMap) -> Option<Response> {
-        let identity = extract_identity(headers);
+        let map: HashMap<String, String> = headers
+            .iter()
+            .filter_map(|(k, v)| Some((k.as_str().to_string(), v.to_str().ok()?.to_string())))
+            .collect();
+        let mut identity = self.identity.identify(&map).await;
+        if identity.is_none() && self.config.allow_dev_headers {
+            identity = extract_identity(headers);
+        }
         match authorize(identity.as_ref(), &self.permissions, "core:admin").await {
             Ok(()) => None,
             Err(status) => {
@@ -75,12 +91,16 @@ impl AppState {
 pub async fn build_app(cfg: &Config) -> Result<(Router, Arc<AppState>), BuildError> {
     let pool = db::connect_and_migrate(cfg).await.map_err(BuildError::Db)?;
     let bus = EventBus::new();
+    let identity = crate::identity::IdentityHub::new();
+    let http = crate::host::CoreHttp::new();
 
     let registry = load_all(
         &cfg.plugin_dir,
         pool.clone(),
         bus.sender(),
         serde_json::Value::Object(Default::default()),
+        identity.clone(),
+        http.clone(),
     )
     .await
     .map_err(BuildError::Plugin)?;
@@ -116,6 +136,8 @@ pub async fn build_app(cfg: &Config) -> Result<(Router, Arc<AppState>), BuildErr
         registry: RwLock::new(registry),
         bus,
         config: Arc::new(cfg.clone()),
+        identity,
+        http,
     });
 
     let cors = cfg.cors_origins.first().map(|_| {
@@ -224,8 +246,18 @@ async fn dispatch(
         .await
         .unwrap_or_default();
 
-    // 1. Identity from dev headers (auth plugin replaces this later).
-    let identity = extract_identity(&parts.headers);
+    // 1. Identity: plugin providers first (the auth plugin owns real
+    // sessions), dev headers only as a gated fallback (SPEC §7.1 — spoofable,
+    // off in production via auth.allow_dev_headers).
+    let headers: HashMap<String, String> = parts
+        .headers
+        .iter()
+        .filter_map(|(k, v)| Some((k.as_str().to_string(), v.to_str().ok()?.to_string())))
+        .collect();
+    let mut identity = state.identity.identify(&headers).await;
+    if identity.is_none() && state.config.allow_dev_headers {
+        identity = extract_identity(&parts.headers);
+    }
 
     // 2. Permission gate — enforced by core, never by the plugin (SPEC §9).
     if let Some(perm) = &required {
@@ -254,12 +286,6 @@ async fn dispatch(
         })
         .unwrap_or_default();
 
-    let headers: HashMap<String, String> = parts
-        .headers
-        .iter()
-        .filter_map(|(k, v)| Some((k.as_str().to_string(), v.to_str().ok()?.to_string())))
-        .collect();
-
     let preq = PluginRequest {
         method: parts.method.to_string(),
         path: parts.uri.path().to_string(),
@@ -287,11 +313,13 @@ async fn dispatch(
         }
         Err(e) => {
             tracing::warn!(plugin = %plugin_id, error = %e, "plugin handler error");
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(json!({ "error": e.to_string() })),
-            )
-                .into_response()
+            // BadRequest is the plugin saying the *client* is at fault (bad
+            // credentials, malformed body) → 400, not a server error.
+            let status = match &e {
+                SdkError::BadRequest(_) => StatusCode::BAD_REQUEST,
+                SdkError::Db(_) | SdkError::Internal(_) => StatusCode::INTERNAL_SERVER_ERROR,
+            };
+            (status, Json(json!({ "error": e.to_string() }))).into_response()
         }
     }
 }
@@ -422,6 +450,7 @@ async fn enable_plugin(
     if !changed {
         return (StatusCode::NOT_FOUND, Json(json!({ "error": "plugin not loaded" }))).into_response();
     }
+    state.identity.set_enabled(&name, true);
     let dbres = sqlx::query(
         "UPDATE core.plugins SET enabled = true, updated_at = now() WHERE id = $1",
     )
@@ -455,6 +484,7 @@ async fn disable_plugin(
     if !changed {
         return (StatusCode::NOT_FOUND, Json(json!({ "error": "plugin not loaded" }))).into_response();
     }
+    state.identity.set_enabled(&name, false);
     let dbres = sqlx::query(
         "UPDATE core.plugins SET enabled = false, updated_at = now() WHERE id = $1",
     )
@@ -504,6 +534,7 @@ async fn uninstall_plugin(
             .into_response();
     }
     state.bus.clear_plugin(&name);
+    state.identity.remove(&name);
     let _ = state
         .audit
         .log(identity.as_ref(), "plugin.uninstall", "plugin", &name, json!({}))
@@ -530,6 +561,8 @@ async fn reload_plugins(State(state): State<Arc<AppState>>, req: Request) -> Res
         state.pool.clone(),
         state.bus.sender(),
         serde_json::Value::Object(Default::default()),
+        state.identity.clone(),
+        state.http.clone(),
     )
     .await
     {
@@ -555,6 +588,14 @@ async fn reload_plugins(State(state): State<Arc<AppState>>, req: Request) -> Res
     {
         let mut reg = state.registry.write().await;
         reg.replace_all(fresh);
+    }
+    // Providers from retired plugins stop answering; live ones re-registered
+    // themselves during load_all's init (same owner key → replaced in place).
+    {
+        let reg = state.registry.read().await;
+        let live: std::collections::HashSet<String> =
+            reg.plugins.iter().map(|p| p.info.id.clone()).collect();
+        state.identity.retain(&live);
     }
     for old_id in state.bus.subscriber_ids() {
         state.bus.clear_plugin(&old_id);

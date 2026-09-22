@@ -20,6 +20,7 @@
 
 use std::collections::HashMap;
 use std::path::Path;
+use std::sync::Mutex;
 
 use sqlx::PgPool;
 use std::sync::Arc;
@@ -30,6 +31,22 @@ use adjutant_sdk::{
 };
 
 use crate::db::run_migration;
+
+/// Every opened plugin library, kept mapped for the process lifetime.
+///
+/// The registry holds live plugins and `retired` holds uninstalled/superseded
+/// ones — but a *load error* would drop the only `Arc<Library>` while the core
+/// may still own trait objects into that code (an identity provider registered
+/// during `init`, for example). Dropping those then calls vtables in unmapped
+/// memory: SIGSEGV on the error path (seen while bringing up auth). Parking
+/// every library here makes "never unload" unconditional instead of
+/// dependent on which locals happen to still be alive.
+static PARKED: std::sync::LazyLock<Mutex<Vec<Arc<libloading::Library>>>> =
+    std::sync::LazyLock::new(|| Mutex::new(Vec::new()));
+
+fn park(lib: Arc<libloading::Library>) {
+    PARKED.lock().expect("parking lot poisoned").push(lib);
+}
 
 /// Core-owned route namespaces plugins may never claim.
 const RESERVED_IDS: &[&str] = &["plugins", "events", "audit", "core"];
@@ -56,6 +73,16 @@ pub struct PluginInfo {
     pub enabled: bool,
     pub routes: usize,
     pub permissions: Vec<String>,
+    /// Full route table — lets `adjutant test-plugin` probe every route
+    /// without hardcoding plugin knowledge.
+    pub route_list: Vec<RouteInfo>,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct RouteInfo {
+    pub method: String,
+    pub path: String,
+    pub permission: Option<String>,
 }
 
 /// Result of resolving a request path against the registry.
@@ -158,6 +185,8 @@ pub async fn load_all(
     pool: Arc<PgPool>,
     event_tx: tokio::sync::broadcast::Sender<adjutant_sdk::Event>,
     config: serde_json::Value,
+    identity: std::sync::Arc<crate::identity::IdentityHub>,
+    http: std::sync::Arc<crate::host::CoreHttp>,
 ) -> Result<PluginRegistry, PluginRuntimeError> {
     let mut plugins: Vec<LoadedPlugin> = Vec::new();
     let mut seen_ids: HashMap<String, ()> = HashMap::new();
@@ -182,6 +211,7 @@ pub async fn load_all(
             PluginRuntimeError::Load(path.display().to_string(), e.to_string())
         })?;
         let lib = Arc::new(lib);
+        park(lib.clone()); // mapped until process exit, whatever happens below
 
         // Scope the libloading `Symbol` (a raw-pointer borrow) to this block
         // so it cannot be live across any await below — a Symbol in the
@@ -233,18 +263,50 @@ pub async fn load_all(
         .await
         .map_err(|e| PluginRuntimeError::Migration(id.clone(), e.to_string()))?;
 
+        // --- per-plugin config (DB row) + enabled state ---------------------
+        // Read BEFORE ctx construction: init() needs ctx.config (OIDC settings
+        // etc. are per-plugin and admin-editable via the config column).
+        let existing: Option<(bool, serde_json::Value)> = sqlx::query_as(
+            "SELECT enabled, config FROM core.plugins WHERE id = $1",
+        )
+        .bind(&id)
+        .fetch_optional(pool.as_ref())
+        .await
+        .map_err(|e| PluginRuntimeError::Migration(id.clone(), e.to_string()))?;
+        let (enabled, row_config) = existing.unwrap_or((true, serde_json::Value::Null));
+        sqlx::query(
+            "INSERT INTO core.plugins (id, version, enabled) VALUES ($1, $2, $3) \
+             ON CONFLICT (id) DO UPDATE SET version = EXCLUDED.version, updated_at = now()",
+        )
+        .bind(&id)
+        .bind(plugin.version())
+        .bind(enabled)
+        .execute(pool.as_ref())
+        .await
+        .map_err(|e| PluginRuntimeError::Migration(id.clone(), e.to_string()))?;
+        // A non-empty row config wins over the global default from the caller.
+        let plugin_config = match &row_config {
+            v if v.as_object().map(|o| !o.is_empty()).unwrap_or(false) => v.clone(),
+            _ => config.clone(),
+        };
+
         let ctx = PluginContext {
             plugin_id: id.clone(),
             // Host-mediated: these Arc<dyn Host…> impls live in the core, so no
             // sqlx/tokio is ever linked into the plugin (see SDK host-I/O note).
-            db: adjutant_sdk::DbHandle::new(core_db.clone(), id.clone()),
-            config: config.clone(),
+            db: adjutant_sdk::DbHandle::new(
+                crate::host::CoreDb::for_plugin(pool.clone(), id.clone()),
+                id.clone(),
+            ),
+            config: plugin_config.clone(),
             events: EventBusHandle::new(
                 crate::host::CoreEvents::new(pool.clone(), event_tx.clone(), id.clone()),
                 id.clone(),
             ),
             permissions: PermissionService::new(core_db.clone()),
             audit: adjutant_sdk::AuditService::new(core_db.clone(), id.clone()),
+            identity: identity.clone(),
+            http: http.clone(),
         };
 
         plugin
@@ -318,18 +380,7 @@ pub async fn load_all(
             seen_routes.insert(key, ());
         }
 
-        // --- enabled state ---------------------------------------------------
-        let enabled: bool = sqlx::query_scalar(
-            "INSERT INTO core.plugins (id, version) VALUES ($1, $2) \
-             ON CONFLICT (id) DO UPDATE SET version = EXCLUDED.version, updated_at = now() \
-             RETURNING enabled",
-        )
-        .bind(&id)
-        .bind(plugin.version())
-        .fetch_one(pool.as_ref())
-        .await
-        .map_err(|e| PluginRuntimeError::Migration(id.clone(), e.to_string()))?;
-
+        // --- enabled state (row created above; version tracked at upsert) ---
         tracing::info!(
             id,
             version = plugin.version(),
@@ -346,6 +397,14 @@ pub async fn load_all(
             enabled,
             routes: routes.len(),
             permissions: granted.iter().map(|p| p.id.clone()).collect(),
+            route_list: routes
+                .iter()
+                .map(|r| RouteInfo {
+                    method: r.method.as_str().to_string(),
+                    path: r.path.clone(),
+                    permission: r.required_permission.clone(),
+                })
+                .collect(),
         };
         seen_ids.insert(id, ());
 

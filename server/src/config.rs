@@ -50,6 +50,10 @@ pub struct Config {
     pub rate: RateConfig,
     /// Empty = no CORS layer (same-origin only). `["*"]` allows everyone.
     pub cors_origins: Vec<String>,
+    /// Dev identity headers (`x-dev-user`/`x-dev-role`). Trivially spoofable —
+    /// MUST be false in production; only consulted when no plugin identity
+    /// provider answered (SPEC §7.1).
+    pub allow_dev_headers: bool,
 }
 
 impl Default for Config {
@@ -63,6 +67,7 @@ impl Default for Config {
             log_format: LogFormat::Pretty,
             rate: RateConfig::default(),
             cors_origins: Vec::new(),
+            allow_dev_headers: true,
         }
     }
 }
@@ -79,6 +84,7 @@ struct FileConfig {
     log_format: Option<String>,
     rates: Option<FileRates>,
     cors: Option<FileCors>,
+    auth: Option<FileAuth>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -90,6 +96,11 @@ struct FileRates {
 #[derive(Debug, Default, Deserialize)]
 struct FileCors {
     origins: Option<Vec<String>>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct FileAuth {
+    allow_dev_headers: Option<bool>,
 }
 
 // --- CLI --------------------------------------------------------------------
@@ -109,9 +120,13 @@ pub const USAGE: &str = "\
 adjutant — sovereignty-first troop administration server
 
 USAGE:
-    adjutant [OPTIONS]
+    adjutant [serve] [OPTIONS]     start the server (default command)
+    adjutant new-plugin <name>     scaffold plugins/<name> (compiling stub)
+    adjutant test-plugin [OPTIONS] boot against a pristine test DB and probe
+                                   every plugin route with mock permissions
+    adjutant --help                print this help
 
-OPTIONS:
+SERVE OPTIONS:
     --config <PATH>        TOML config file (default: ./adjutant.toml if present)
     --bind <ADDR>          listen address, e.g. 127.0.0.1:8787
     --database-url <URL>   PostgreSQL connection string
@@ -205,6 +220,9 @@ pub fn load(cli: &CliArgs) -> Result<Config, String> {
     if let Ok(v) = std::env::var("ADJUTANT_MAX_BODY") {
         cfg.max_body_bytes = v.parse().map_err(|e| format!("ADJUTANT_MAX_BODY: {e}"))?;
     }
+    if let Ok(v) = std::env::var("ADJUTANT_DEV_HEADERS") {
+        cfg.allow_dev_headers = matches!(v.as_str(), "1" | "true" | "yes");
+    }
 
     // 3. CLI (highest precedence)
     if let Some(v) = &cli.bind {
@@ -265,6 +283,11 @@ fn merge_file(cfg: &mut Config, path: &Path) -> Result<(), String> {
     if let Some(c) = f.cors {
         if let Some(v) = c.origins {
             cfg.cors_origins = v;
+        }
+    }
+    if let Some(a) = f.auth {
+        if let Some(v) = a.allow_dev_headers {
+            cfg.allow_dev_headers = v;
         }
     }
     Ok(())

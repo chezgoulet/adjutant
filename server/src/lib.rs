@@ -2,9 +2,11 @@
 //! integration tests.
 
 pub mod config;
+pub mod cli;
 pub mod db;
 pub mod events;
 pub mod host;
+pub mod identity;
 pub mod middleware;
 pub mod permissions;
 pub mod plugin_runtime;

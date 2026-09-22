@@ -76,6 +76,61 @@ pub enum SdkError {
     Internal(String),
 }
 
+/// HTTP, mediated by the core. The M1 host-I/O rule extends here: a plugin
+/// that linked its own `reqwest` would resolve *its* tokio reactor
+/// thread-local — unset on the core's runtime — and panic exactly like
+/// plugin-side `sqlx` did. OIDC discovery/token exchange etc. go through this.
+#[async_trait]
+pub trait HostHttp: Send + Sync + 'static {
+    /// `method` is "GET"/"POST"/…; `body` is (content-type, bytes).
+    async fn request(
+        &self,
+        method: String,
+        url: String,
+        headers: Vec<(String, String)>,
+        body: Option<(String, Vec<u8>)>,
+    ) -> Result<HttpResponse, SdkError>;
+}
+
+/// Framework-neutral HTTP response handed back across the boundary.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct HttpResponse {
+    pub status: u16,
+    pub headers: HashMap<String, String>,
+    pub body: Vec<u8>,
+}
+
+impl HttpResponse {
+    pub fn json<T: serde::de::DeserializeOwned>(&self) -> Result<T, SdkError> {
+        serde_json::from_slice(&self.body)
+            .map_err(|e| SdkError::Internal(format!("response decode failed: {e}")))
+    }
+
+    /// Case-insensitive header lookup (HTTP/2 lowercases, HTTP/1.1 may not).
+    pub fn header(&self, name: &str) -> Option<&str> {
+        self.headers
+            .iter()
+            .find(|(k, _)| k.eq_ignore_ascii_case(name))
+            .map(|(_, v)| v.as_str())
+    }
+}
+
+/// A plugin's identity provider, registered during `init` so the core asks
+/// *the plugin* "who is this request?" instead of reading dev headers.
+/// Replaces the `x-dev-user`/`x-dev-role` stub (SPEC §7.1).
+#[async_trait]
+pub trait IdentityProvider: Send + Sync + 'static {
+    /// `Ok(Some(identity))` = authenticated; `Ok(None)` = no credentials this
+    /// provider recognizes (core may fall back); `Err` = invalid credentials
+    /// (treated as anonymous — never fall back to spoofable headers).
+    async fn identify(&self, headers: &HashMap<String, String>) -> Result<Option<Identity>, SdkError>;
+}
+
+/// How a plugin registers its provider with the core (via `PluginContext`).
+pub trait IdentityRegistrar: Send + Sync + 'static {
+    fn register(&self, owner: &str, provider: Arc<dyn IdentityProvider>);
+}
+
 // ---------------------------------------------------------------------------
 // Host services — implemented by the core, never by the plugin
 // ---------------------------------------------------------------------------
@@ -104,6 +159,24 @@ impl From<&str> for SqlValue {
 impl From<String> for SqlValue {
     fn from(s: String) -> Self {
         SqlValue::Text(s)
+    }
+}
+impl From<Option<String>> for SqlValue {
+    /// `None` binds as SQL NULL, `Some` as text — the pattern every plugin
+    /// needs for optional form fields (found while dogfooding membership).
+    fn from(v: Option<String>) -> Self {
+        match v {
+            Some(s) => SqlValue::Text(s),
+            None => SqlValue::Null,
+        }
+    }
+}
+impl From<Option<i64>> for SqlValue {
+    fn from(v: Option<i64>) -> Self {
+        match v {
+            Some(n) => SqlValue::Int(n),
+            None => SqlValue::Null,
+        }
     }
 }
 impl From<i64> for SqlValue {
@@ -567,6 +640,10 @@ pub struct PluginContext {
     pub events: EventBusHandle,
     pub permissions: PermissionService,
     pub audit: AuditService,
+    /// Register this plugin as the request identity provider (auth plugin).
+    pub identity: Arc<dyn IdentityRegistrar>,
+    /// Core-mediated HTTP (OIDC discovery, token exchange, …).
+    pub http: Arc<dyn HostHttp>,
 }
 
 /// The plugin contract. Object-safe so the core can hold `Box<dyn AdjutantPlugin>`.
@@ -649,9 +726,10 @@ macro_rules! export_plugin {
 pub mod prelude {
     pub use crate::{
         async_trait, export_plugin, event_handler, route_handler, AdjutantPlugin, AuditService,
-        DbHandle, EventBusHandle, Event, EventSubscription, HostDb, HostEvents, Identity, Method,
-        Migration, Permission, PermissionService, PluginContext, PluginRequest, PluginResponse,
-        RouteDefinition, SdkError, SqlValue,
+        DbHandle, EventBusHandle, Event, EventSubscription, HostDb, HostEvents, HostHttp,
+        HttpResponse, Identity, IdentityProvider, IdentityRegistrar, Method, Migration, Permission,
+        PermissionService, PluginContext, PluginRequest, PluginResponse, RouteDefinition, SdkError,
+        SqlValue,
     };
 }
 

@@ -7,7 +7,7 @@
 
 use std::sync::Arc;
 
-use adjutant_sdk::{Event, HostDb, HostEvents, SdkError, SqlValue};
+use adjutant_sdk::{Event, HostDb, HostEvents, HostHttp, HttpResponse, SdkError, SqlValue};
 use async_trait::async_trait;
 use serde_json::Value;
 use sqlx::postgres::PgRow;
@@ -17,11 +17,23 @@ use tokio::sync::broadcast;
 /// Core-backed database access shared by every plugin.
 pub struct CoreDb {
     pool: Arc<sqlx::PgPool>,
+    /// When set, every call runs with `search_path` pointed at this schema so
+    /// plugin queries can use bare table names (the SDK's documented contract:
+    /// "search_path pre-set by the core"). Core-owned tables stay reachable —
+    /// plugin queries qualify them as `core.*`.
+    schema: Option<String>,
 }
 
 impl CoreDb {
+    /// No schema → default search_path (core services: permissions, audit —
+    /// all of their queries are `core.*`-qualified).
     pub fn new(pool: Arc<sqlx::PgPool>) -> Arc<Self> {
-        Arc::new(Self { pool })
+        Arc::new(Self { pool, schema: None })
+    }
+
+    /// Handle for one plugin: bare table names resolve in its schema.
+    pub fn for_plugin(pool: Arc<sqlx::PgPool>, schema: String) -> Arc<Self> {
+        Arc::new(Self { pool, schema: Some(schema) })
     }
 }
 
@@ -40,6 +52,12 @@ fn decode_value(row: &PgRow, idx: usize) -> Value {
     }
     if let Ok(v) = row.try_get::<f64, _>(idx) {
         return Value::from(v);
+    }
+    // text[] — needed for any array column (e.g. core.user_roles roles).
+    // Without this, TEXTA[] matched none of the above and fell to Null,
+    // which silently emptied role lists and broke permission checks.
+    if let Ok(v) = row.try_get::<Vec<String>, _>(idx) {
+        return Value::Array(v.into_iter().map(Value::String).collect());
     }
     if let Ok(v) = row.try_get::<String, _>(idx) {
         return Value::String(v);
@@ -65,19 +83,47 @@ fn bind_params<'q>(
     q
 }
 
+impl CoreDb {
+    /// A transaction with the plugin's schema on `search_path` (SDK contract:
+    /// "search_path pre-set by the core"). Per acquire, never cached: pool
+    /// connections go back to the shared pool, and `SET` inside the
+    /// transaction rolls back if the call fails, so a poisoned search_path
+    /// can never poison a later plugin's queries.
+    async fn txn(&self) -> Result<sqlx::postgres::PgTransaction<'_>, SdkError> {
+        let mut txn = self
+            .pool
+            .begin()
+            .await
+            .map_err(|e| SdkError::Db(format!("begin failed: {e}")))?;
+        if let Some(schema) = &self.schema {
+            // Schema names are core-validated ([a-z][a-z0-9_]{0,30}).
+            sqlx::query(&format!("SET search_path TO \"{}\", public", schema))
+                .execute(&mut *txn)
+                .await
+                .map_err(|e| SdkError::Db(format!("search_path failed: {e}")))?;
+        }
+        Ok(txn)
+    }
+}
+
 #[async_trait]
 impl HostDb for CoreDb {
     async fn execute(&self, sql: String, params: Vec<SqlValue>) -> Result<u64, SdkError> {
+        let mut txn = self.txn().await?;
         let res = bind_params(sqlx::query(&sql), params)
-            .execute(self.pool.as_ref())
+            .execute(&mut *txn)
             .await
             .map_err(|e| SdkError::Db(format!("{e} (sql: {sql})")))?;
+        txn.commit()
+            .await
+            .map_err(|e| SdkError::Db(format!("commit failed: {e}")))?;
         Ok(res.rows_affected())
     }
 
     async fn query(&self, sql: String, params: Vec<SqlValue>) -> Result<Vec<Value>, SdkError> {
+        let mut txn = self.txn().await?;
         let rows = bind_params(sqlx::query(&sql), params)
-            .fetch_all(self.pool.as_ref())
+            .fetch_all(&mut *txn)
             .await
             .map_err(|e| SdkError::Db(format!("{e} (sql: {sql})")))?;
 
@@ -90,7 +136,72 @@ impl HostDb for CoreDb {
             }
             out.push(Value::Object(obj));
         }
+        // Commit — plugins run `INSERT … RETURNING` through query(); dropping
+        // the txn would roll the write back and silently lose the row.
+        txn.commit()
+            .await
+            .map_err(|e| SdkError::Db(format!("commit failed: {e}")))?;
         Ok(out)
+    }
+}
+
+/// Core-backed HTTP for plugins (SPEC: host-mediated I/O — see SDK docs).
+/// One shared `reqwest::Client` (connection pooling, 15s timeout, no
+/// redirect-following surprises for OIDC endpoints).
+pub struct CoreHttp {
+    client: reqwest::Client,
+}
+
+impl CoreHttp {
+    pub fn new() -> std::sync::Arc<Self> {
+        std::sync::Arc::new(Self {
+            client: reqwest::Client::builder()
+                .timeout(std::time::Duration::from_secs(15))
+                .redirect(reqwest::redirect::Policy::none())
+                .build()
+                .expect("reqwest client"),
+        })
+    }
+}
+
+#[async_trait]
+impl HostHttp for CoreHttp {
+    async fn request(
+        &self,
+        method: String,
+        url: String,
+        headers: Vec<(String, String)>,
+        body: Option<(String, Vec<u8>)>,
+    ) -> Result<HttpResponse, SdkError> {
+        let m = reqwest::Method::from_bytes(method.as_bytes())
+            .map_err(|e| SdkError::BadRequest(format!("bad method {method}: {e}")))?;
+        let mut req = self.client.request(m, &url);
+        for (k, v) in &headers {
+            req = req.header(k.as_str(), v.as_str());
+        }
+        req = match body {
+            Some((ct, bytes)) => req.header("content-type", ct).body(bytes),
+            None => req,
+        };
+        let resp = req
+            .send()
+            .await
+            .map_err(|e| SdkError::Internal(format!("http {method} {url} failed: {e}")))?;
+        let status = resp.status().as_u16();
+        let hdrs: std::collections::HashMap<String, String> = resp
+            .headers()
+            .iter()
+            .filter_map(|(k, v)| Some((k.as_str().to_string(), v.to_str().ok()?.to_string())))
+            .collect();
+        let bytes = resp
+            .bytes()
+            .await
+            .map_err(|e| SdkError::Internal(format!("http body read failed: {e}")))?;
+        Ok(HttpResponse {
+            status,
+            headers: hdrs,
+            body: bytes.to_vec(),
+        })
     }
 }
 

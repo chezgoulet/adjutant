@@ -1,0 +1,595 @@
+//! `adjutant` subcommands: `new-plugin` (scaffold) and `test-plugin`
+//! (SPEC §15 M3 exit criteria).
+//!
+//! Design note: SPEC §5.2's `manifest.json` is folded into the trait
+//! implementation — `id()`/`version()`/`permissions_granted()` *are* the
+//! manifest, declared in code the compiler checks. The scaffold emits that
+//! shape so a new plugin starts valid.
+
+use std::path::{Path, PathBuf};
+
+use crate::config::Config;
+
+// ---------------------------------------------------------------------------
+// new-plugin
+// ---------------------------------------------------------------------------
+
+const RESERVED: &[&str] = &["plugins", "events", "audit", "core", "sdk", "auth", "membership"];
+
+/// Validate a plugin id: `[a-z][a-z0-9_]{0,30}`, not reserved.
+pub fn validate_plugin_name(name: &str) -> Result<(), String> {
+    let ok = !name.is_empty()
+        && name.len() <= 31
+        && name.chars().next().is_some_and(|c| c.is_ascii_lowercase())
+        && name.chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_');
+    if !ok {
+        return Err(format!(
+            "invalid plugin name {name:?}: expected [a-z][a-z0-9_]{{0,30}} (lowercase, underscore)"
+        ));
+    }
+    if RESERVED.contains(&name) {
+        return Err(format!("{name:?} is reserved by the core or an existing plugin"));
+    }
+    Ok(())
+}
+
+/// Scaffold `plugins/<name>/` with a compiling plugin and register it in the
+/// workspace. Returns the created directory.
+pub fn scaffold_plugin(repo_root: &Path, name: &str) -> Result<PathBuf, String> {
+    validate_plugin_name(name)?;
+    let dir = repo_root.join("plugins").join(name);
+    if dir.exists() {
+        return Err(format!("{} already exists", dir.display()));
+    }
+
+    let crate_name = format!("adjutant-{name}");
+    let cargo = format!(
+        r#"[package]
+name = "{crate_name}"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "TODO: one-line description of the {name} plugin."
+
+[lib]
+# cdylib: loaded dynamically by the core; rlink: usable as a test fixture.
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+adjutant-sdk.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+"#
+    );
+
+    // The trait impl IS the manifest (SPEC §5.2 manifest.json folded in).
+    // Placeholders, not format!: a code template is full of literal braces
+    // and escaping them all is how scaffolding bugs get shipped.
+    let lib = r#"//! __NAME__ — TODO: what this plugin owns (SPEC section reference).
+//!
+//! Scaffolded by `adjutant new-plugin __NAME__`. The trait implementation below
+//! is the plugin's manifest: id/version/permissions/routes/migrations are
+//! declared in code the compiler checks, not a JSON file.
+
+use std::sync::OnceLock;
+
+use adjutant_sdk::prelude::*;
+
+pub struct __STRUCT__ {
+    ctx: OnceLock<PluginContext>,
+}
+
+impl __STRUCT__ {
+    pub fn new() -> Self {
+        Self { ctx: OnceLock::new() }
+    }
+
+    fn ctx(&self) -> &PluginContext {
+        self.ctx.get().expect("core must call init() before routes()")
+    }
+}
+
+impl Default for __STRUCT__ {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+#[async_trait]
+impl AdjutantPlugin for __STRUCT__ {
+    fn id(&self) -> &str {
+        "__NAME__"
+    }
+
+    fn name(&self) -> &str {
+        "__TITLE__"
+    }
+
+    fn version(&self) -> &str {
+        env!("CARGO_PKG_VERSION")
+    }
+
+    async fn init(&mut self, ctx: PluginContext) -> Result<(), SdkError> {
+        let _ = self.ctx.set(ctx);
+        Ok(())
+    }
+
+    /// Permissions this plugin defines. A route may only require a permission
+    /// the plugin itself grants — the core rejects anything else at load time.
+    fn permissions_granted(&self) -> Vec<Permission> {
+        vec![
+            Permission::new("__NAME__:read", "Read __TITLE__ data"),
+            Permission::new("__NAME__:manage", "Modify __TITLE__ data"),
+        ]
+    }
+
+    /// Runs once, in order, inside this plugin's own PostgreSQL schema
+    /// (search_path pre-set by the core). Recorded in core.schema_migrations.
+    fn migrations(&self) -> Vec<Migration> {
+        vec![Migration::new(
+            1,
+            "initial_schema",
+            "CREATE TABLE IF NOT EXISTS items (\
+                 id BIGSERIAL PRIMARY KEY, \
+                 name TEXT NOT NULL, \
+                 created_at TIMESTAMPTZ NOT NULL DEFAULT now()\
+             );",
+        )]
+    }
+
+    /// Routes must live under /api/__NAME__/ — the core rejects namespace
+    /// escapes at load. Gate them with the *_protected constructors.
+    fn routes(&self) -> Vec<RouteDefinition> {
+        let c = self.ctx().clone();
+        let open = RouteDefinition::get(
+            "/api/__NAME__/health",
+            route_handler(|_req| async {
+                PluginResponse::json(200, &serde_json::json!({"plugin": "__NAME__", "ok": true}))
+            }),
+        );
+
+        let c2 = c.clone();
+        let list = RouteDefinition::get_protected(
+            "/api/__NAME__/items",
+            "__NAME__:read",
+            route_handler(move |_req| {
+                let c = c2.clone();
+                async move {
+                    let rows = c
+                        .db
+                        .query(
+                            &format!(
+                                "SELECT id, name FROM {} ORDER BY id",
+                                c.db.table("items")
+                            ),
+                            vec![],
+                        )
+                        .await?;
+                    PluginResponse::json(200, &serde_json::json!({"items": rows}))
+                }
+            }),
+        );
+
+        let _ = c;
+        vec![open, list]
+    }
+}
+
+export_plugin!(__STRUCT__);
+"#;
+    let lib = lib
+        .replace("__NAME__", name)
+        .replace("__STRUCT__", &struct_name_for(name))
+        .replace("__TITLE__", &title_for(name));
+
+    std::fs::create_dir_all(dir.join("src")).map_err(|e| e.to_string())?;
+    std::fs::write(dir.join("Cargo.toml"), cargo).map_err(|e| e.to_string())?;
+    std::fs::write(dir.join("src").join("lib.rs"), lib).map_err(|e| e.to_string())?;
+
+    // Register in the workspace members list (idempotent).
+    let ws_path = repo_root.join("Cargo.toml");
+    let ws = std::fs::read_to_string(&ws_path).map_err(|e| e.to_string())?;
+    let member = format!("\"plugins/{name}\",");
+    if !ws.contains(&member) {
+        let anchor = "\"plugins/sdk\",";
+        if !ws.contains(anchor) {
+            return Err("workspace Cargo.toml has no plugins/sdk member to anchor on".into());
+        }
+        let ws = ws.replacen(anchor, &format!("{anchor}\n    {member}"), 1);
+        std::fs::write(&ws_path, ws).map_err(|e| e.to_string())?;
+    }
+
+    Ok(dir)
+}
+
+/// `my_plugin` → `MyPlugin` (Rust type name).
+fn struct_name_for(name: &str) -> String {
+    name.split('_')
+        .filter(|p| !p.is_empty())
+        .map(|p| {
+            let mut c = p.chars();
+            match c.next() {
+                Some(f) => f.to_uppercase().collect::<String>() + c.as_str(),
+                None => String::new(),
+            }
+        })
+        .collect()
+}
+
+/// `my_plugin` → `My Plugin` (display title).
+fn title_for(name: &str) -> String {
+    name.replace('_', " ")
+}
+
+// ---------------------------------------------------------------------------
+// test-plugin
+// ---------------------------------------------------------------------------
+
+/// Derive a fresh test database URL from the configured one:
+/// `…/adjutant_dev` → `…/adjutant_test`. `ADJUTANT_TEST_DATABASE_URL`
+/// overrides entirely.
+pub fn test_database_url(cfg: &Config) -> String {
+    if let Ok(u) = std::env::var("ADJUTANT_TEST_DATABASE_URL") {
+        return u;
+    }
+    let base = &cfg.database_url;
+    match base.rsplit_once('/') {
+        Some((prefix, rest)) => {
+            let (db, query) = match rest.split_once('?') {
+                Some((d, q)) => (d, format!("?{q}")),
+                None => (rest, String::new()),
+            };
+            let stem = db.strip_suffix("_test").unwrap_or(db);
+            format!("{prefix}/{stem}_test{query}")
+        }
+        None => base.clone(),
+    }
+}
+
+/// URL of the maintenance database (`/postgres`) for drop/create.
+fn maintenance_url(url: &str) -> String {
+    match url.rsplit_once('/') {
+        Some((prefix, _)) => format!("{prefix}/postgres"),
+        None => url.to_string(),
+    }
+}
+
+/// Drop + recreate the test database so every run starts pristine.
+pub async fn reset_database(test_url: &str) -> Result<(), String> {
+    let maint = maintenance_url(test_url);
+    let dbname = test_url
+        .rsplit_once('/')
+        .map(|(_, d)| d.split('?').next().unwrap_or(d).to_string())
+        .ok_or_else(|| format!("cannot parse db name from {test_url}"))?;
+
+    let pool = sqlx::postgres::PgPoolOptions::new()
+        .max_connections(2)
+        .connect(&maint)
+        .await
+        .map_err(|e| format!("connect {maint}: {e}"))?;
+
+    // Terminate stragglers, then recreate. Identifiers are quoted, and the
+    // name only ever comes from our own config URL.
+    let kill = format!(
+        "SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE datname = '{dbname}' AND pid <> pg_backend_pid()"
+    );
+    sqlx::query(&kill).execute(&pool).await.map_err(|e| e.to_string())?;
+    sqlx::query(&format!("DROP DATABASE IF EXISTS \"{dbname}\""))
+        .execute(&pool)
+        .await
+        .map_err(|e| e.to_string())?;
+    sqlx::query(&format!("CREATE DATABASE \"{dbname}\""))
+        .execute(&pool)
+        .await
+        .map_err(|e| e.to_string())?;
+    pool.close().await;
+    Ok(())
+}
+
+/// One probe result for the report table.
+pub struct Probe {
+    pub name: String,
+    pub status: u16,
+    pub expect: String,
+    pub ok: bool,
+    pub detail: String,
+}
+
+/// Boot the core against a pristine test database, then probe every registered
+/// plugin route with mock permissions (dev headers = the mock identity layer):
+///
+/// * permission-gated route, anonymous → expect 401/403 (the gate fires)
+/// * open GET route, anonymous → expect <500 and not 404 (handler runs)
+/// * open GET route, as `chief` → expect <500 and not 404 (identity attaches)
+/// * mutating open routes → listed as skipped (no side effects in a probe)
+pub async fn run_test_plugin(cfg: &Config) -> Result<Vec<Probe>, String> {
+    let test_url = test_database_url(cfg);
+    if test_url == cfg.database_url {
+        return Err(format!(
+            "refusing to wipe the live database ({test_url}); set ADJUTANT_TEST_DATABASE_URL"
+        ));
+    }
+    reset_database(&test_url).await?;
+
+    let mut cfg = cfg.clone();
+    cfg.database_url = test_url.clone();
+    cfg.bind = "127.0.0.1:0".parse().expect("ephemeral");
+    cfg.rate.max_requests = 0; // probes would trip the limiter otherwise
+    cfg.allow_dev_headers = true; // mock permissions
+    cfg.log_filter = "warn".into();
+
+    let (app, _state) = crate::build_app(&cfg)
+        .await
+        .map_err(|e| format!("build_app failed: {e}"))?;
+
+    let listener = tokio::net::TcpListener::bind(cfg.bind)
+        .await
+        .map_err(|e| format!("bind: {e}"))?;
+    let addr = listener.local_addr().map_err(|e| e.to_string())?;
+    let base = format!("http://{addr}");
+
+    let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
+    let server = tokio::spawn(async move {
+        axum::serve(listener, app)
+            .with_graceful_shutdown(async {
+                let _ = shutdown_rx.await;
+            })
+            .await
+    });
+
+    // Give the listener a beat, then read the live route table.
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(10))
+        .build()
+        .map_err(|e| e.to_string())?;
+
+    let mut probes = Vec::new();
+
+    let health = client.get(format!("{base}/")).send().await.map_err(|e| e.to_string())?;
+    probes.push(Probe {
+        name: "core health".into(),
+        status: health.status().as_u16(),
+        expect: "200".into(),
+        ok: health.status().as_u16() == 200,
+        detail: "GET /".into(),
+    });
+
+    let list = client
+        .get(format!("{base}/api/plugins"))
+        .send()
+        .await
+        .map_err(|e| e.to_string())?;
+    let list_status = list.status().as_u16();
+    let body: serde_json::Value = list.json().await.unwrap_or_default();
+    let plugins = body["plugins"].as_array().cloned().unwrap_or_default();
+    probes.push(Probe {
+        name: "plugin registry".into(),
+        status: list_status,
+        expect: ">=1 plugin".into(),
+        ok: list_status == 200 && !plugins.is_empty(),
+        detail: format!("{} plugin(s) loaded", plugins.len()),
+    });
+
+    // Flatten every registered route from the live registry (M2 route_list).
+    let mut routes: Vec<(String, String, String, Option<String>)> = Vec::new();
+    for p in &plugins {
+        let pid = p["id"].as_str().unwrap_or_default().to_string();
+        for r in p["route_list"].as_array().into_iter().flatten() {
+            routes.push((
+                pid.clone(),
+                r["method"].as_str().unwrap_or("GET").to_string(),
+                r["path"].as_str().unwrap_or_default().to_string(),
+                r["permission"].as_str().map(String::from),
+            ));
+        }
+    }
+
+    for (pid, method, path, perm) in routes {
+        let url = format!("{base}{path}");
+
+        // --- anonymous pass -------------------------------------------------
+        if method == "GET" {
+            match client.get(&url).send().await {
+                Ok(resp) => {
+                    let s = resp.status().as_u16();
+                    let (ok, expect) = match &perm {
+                        Some(_) => (s == 401 || s == 403, "401|403 (gate)"),
+                        // !404 = route resolves; !500 = handler didn't crash.
+                        // 501 is a designed response (e.g. OIDC unconfigured).
+                        None => (s != 404 && s != 500, "!404 !500"),
+                    };
+                    probes.push(Probe {
+                        name: format!("{pid} GET {path} anonymous"),
+                        status: s,
+                        expect: expect.into(),
+                        ok,
+                        detail: perm
+                            .clone()
+                            .map(|p| format!("requires {p}"))
+                            .unwrap_or_else(|| "open".into()),
+                    });
+                }
+                Err(e) => probes.push(Probe {
+                    name: format!("{pid} GET {path} anonymous"),
+                    status: 0,
+                    expect: "any".into(),
+                    ok: false,
+                    detail: format!("transport: {e}"),
+                }),
+            }
+
+            // --- chief pass (mock identity) --------------------------------
+            match client
+                .get(&url)
+                .header("x-dev-user", "chief-user")
+                .header("x-dev-role", "chief")
+                .send()
+                .await
+            {
+                Ok(resp) => {
+                    let s = resp.status().as_u16();
+                    let ok = s != 404 && s != 500;
+                    probes.push(Probe {
+                        name: format!("{pid} GET {path} as chief"),
+                        status: s,
+                        expect: "!404 !500".into(),
+                        ok,
+                        detail: perm
+                            .clone()
+                            .map(|p| format!("requires {p}"))
+                            .unwrap_or_else(|| "open".into()),
+                    });
+                }
+                Err(e) => probes.push(Probe {
+                    name: format!("{pid} GET {path} as chief"),
+                    status: 0,
+                    expect: "any".into(),
+                    ok: false,
+                    detail: format!("transport: {e}"),
+                }),
+            }
+        } else if perm.is_some() {
+            // Protected mutating route: anonymous must be rejected by the gate
+            // BEFORE the handler runs — safe, provably side-effect free.
+            let send = match method.as_str() {
+                "POST" => client.post(&url),
+                "PUT" => client.put(&url),
+                "DELETE" => client.delete(&url),
+                other => {
+                    probes.push(Probe {
+                        name: format!("{pid} {method} {path} anonymous"),
+                        status: 0,
+                        expect: "401|403".into(),
+                        ok: false,
+                        detail: format!("unsupported method {other}"),
+                    });
+                    continue;
+                }
+            };
+            match send.send().await {
+                Ok(resp) => {
+                    let s = resp.status().as_u16();
+                    probes.push(Probe {
+                        name: format!("{pid} {method} {path} anonymous"),
+                        status: s,
+                        expect: "401|403 (gate)".into(),
+                        ok: s == 401 || s == 403,
+                        detail: format!("requires {}", perm.unwrap_or_default()),
+                    });
+                }
+                Err(e) => probes.push(Probe {
+                    name: format!("{pid} {method} {path} anonymous"),
+                    status: 0,
+                    expect: "any".into(),
+                    ok: false,
+                    detail: format!("transport: {e}"),
+                }),
+            }
+        } else {
+            // Open mutating route: probing it would cause side effects.
+            probes.push(Probe {
+                name: format!("{pid} {method} {path} anonymous"),
+                status: 0,
+                expect: "skipped".into(),
+                ok: true,
+                detail: "open mutating route — not probed (side effects)".into(),
+            });
+        }
+    }
+
+    // reqwest pools keep-alive connections; axum's graceful shutdown waits for
+    // them to close — a test harness has no reason to drain, so abort instead.
+    drop(client);
+    let _ = shutdown_tx;
+    server.abort();
+    let _ = server.await;
+
+    Ok(probes)
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn plugin_name_validation() {
+        assert!(validate_plugin_name("scouting").is_ok());
+        assert!(validate_plugin_name("gear_locker").is_ok());
+        assert!(validate_plugin_name("").is_err());
+        assert!(validate_plugin_name("Camel").is_err());
+        assert!(validate_plugin_name("9lives").is_err());
+        assert!(validate_plugin_name("drop table").is_err());
+        assert!(validate_plugin_name("auth").is_err(), "reserved names rejected");
+        assert!(validate_plugin_name("plugins").is_err());
+        assert!(validate_plugin_name(&"x".repeat(40)).is_err());
+    }
+
+    #[test]
+    fn struct_names_camel_case() {
+        assert_eq!(struct_name_for("gear_locker"), "GearLocker");
+        assert_eq!(struct_name_for("scouting"), "Scouting");
+        assert_eq!(struct_name_for("a_b_c"), "ABC");
+    }
+
+    #[test]
+    fn scaffold_creates_compiling_layout() {
+        let tmp = std::env::temp_dir().join(format!("adjutant-scaffold-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        std::fs::create_dir_all(&tmp).unwrap();
+        // minimal workspace anchor
+        std::fs::write(
+            tmp.join("Cargo.toml"),
+            "[workspace]\nmembers = [\n    \"plugins/sdk\",\n]\n",
+        )
+        .unwrap();
+
+        let dir = scaffold_plugin(&tmp, "gear_locker").unwrap();
+        assert!(dir.join("Cargo.toml").exists());
+        let lib = std::fs::read_to_string(dir.join("src/lib.rs")).unwrap();
+        assert!(lib.contains("impl AdjutantPlugin for GearLocker"));
+        assert!(lib.contains("export_plugin!(GearLocker)"));
+        assert!(lib.contains("\"gear_locker:read\""));
+        assert!(lib.contains("Migration::new"));
+
+        let ws = std::fs::read_to_string(tmp.join("Cargo.toml")).unwrap();
+        assert!(ws.contains("\"plugins/gear_locker\","));
+        assert_eq!(ws.matches("\"plugins/gear_locker\",").count(), 1, "idempotent");
+
+        // duplicate refused; reserved refused
+        assert!(scaffold_plugin(&tmp, "gear_locker").is_err());
+        assert!(scaffold_plugin(&tmp, "auth").is_err());
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[tokio::test]
+    async fn test_database_url_derivation_and_safety() {
+        let mut cfg = Config {
+            database_url: "postgres://adjutant@127.0.0.1:5433/adjutant_dev".into(),
+            ..Config::default()
+        };
+        assert_eq!(
+            test_database_url(&cfg),
+            "postgres://adjutant@127.0.0.1:5433/adjutant_dev_test",
+            "live DB gets _test appended"
+        );
+        // already _test → stays _test (no _test_test)
+        cfg.database_url = "postgres://adjutant@127.0.0.1:5433/adjutant_test".into();
+        assert_eq!(
+            test_database_url(&cfg),
+            "postgres://adjutant@127.0.0.1:5433/adjutant_test"
+        );
+        assert_eq!(
+            maintenance_url("postgres://h:5433/adjutant_test"),
+            "postgres://h:5433/postgres"
+        );
+        // suffix preserved through query strings
+        cfg.database_url = "postgres://h/dbname?sslmode=disable".into();
+        assert_eq!(test_database_url(&cfg), "postgres://h/dbname_test?sslmode=disable");
+    }
+}
