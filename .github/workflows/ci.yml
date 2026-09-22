@@ -2,7 +2,8 @@ name: CI
 
 on:
   push:
-    branches: [testing, master, "feature/*", "fix/*"]
+    # House git flow: testing = integration target, main = releases.
+    branches: [testing, main, "feature/*", "fix/*"]
   pull_request:
 
 jobs:
