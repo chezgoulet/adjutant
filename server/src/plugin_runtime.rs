@@ -91,10 +91,65 @@ pub enum RouteLookup {
         plugin_id: String,
         required_permission: Option<String>,
         handler: RouteHandler,
+        /// Captures from a templated route (`/api/missions/{id}`).
+        params: HashMap<String, String>,
     },
     /// Route exists but its plugin is disabled (SPEC: disable = stop serving).
     Disabled { plugin_id: String },
     NotFound,
+}
+
+/// Match a route template against a request path.
+///
+/// A `{name}` segment captures exactly one non-empty path segment, so a capture
+/// can never span a `/`. Different segment counts never match. Returns the
+/// captures (empty for a literal route) or `None`.
+fn match_path(template: &str, path: &str) -> Option<HashMap<String, String>> {
+    let t: Vec<&str> = template.split('/').collect();
+    let p: Vec<&str> = path.split('/').collect();
+    if t.len() != p.len() {
+        return None;
+    }
+    let mut params = HashMap::new();
+    for (ts, ps) in t.iter().zip(p.iter()) {
+        if let Some(name) = ts.strip_prefix('{').and_then(|s| s.strip_suffix('}')) {
+            if ps.is_empty() {
+                return None;
+            }
+            params.insert(name.to_string(), (*ps).to_string());
+        } else if ts != ps {
+            return None;
+        }
+    }
+    Some(params)
+}
+
+/// Validate `{name}` captures in a route path: a capture must be a whole
+/// segment with a non-empty `[a-z0-9_]` name, unique within the path.
+fn validate_route_path(path: &str) -> Result<(), String> {
+    let mut seen: Vec<&str> = Vec::new();
+    for seg in path.split('/') {
+        if !seg.contains('{') && !seg.contains('}') {
+            continue;
+        }
+        let Some(name) = seg.strip_prefix('{').and_then(|s| s.strip_suffix('}')) else {
+            return Err(format!("route {path}: capture must occupy a whole segment (`{{name}}`)"));
+        };
+        if name.is_empty()
+            || !name
+                .chars()
+                .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_')
+        {
+            return Err(format!(
+                "route {path}: capture name {name:?} must be [a-z0-9_]+"
+            ));
+        }
+        if seen.contains(&name) {
+            return Err(format!("route {path}: duplicate capture {name:?}"));
+        }
+        seen.push(name);
+    }
+    Ok(())
 }
 
 pub struct PluginRegistry {
@@ -119,23 +174,43 @@ impl PluginRegistry {
     }
 
     /// Resolve `METHOD path` against live plugin routes.
+    ///
+    /// Literal routes win over templated ones, so a specific path is never
+    /// shadowed by a capture. Captures are delivered to the handler.
     pub fn find(&self, method: &str, path: &str) -> RouteLookup {
+        let mut templated: Option<(&LoadedPlugin, &RouteDefinition, HashMap<String, String>)> = None;
         for p in &self.plugins {
             for r in &p.routes {
-                if r.method.as_str() == method && r.path == path {
-                    return if p.enabled {
-                        RouteLookup::Found {
-                            plugin_id: p.info.id.clone(),
-                            required_permission: r.required_permission.clone(),
-                            handler: r.handler.clone(),
-                        }
-                    } else {
-                        RouteLookup::Disabled { plugin_id: p.info.id.clone() }
-                    };
+                if r.method.as_str() != method {
+                    continue;
+                }
+                if r.path == path {
+                    return Self::resolve(p, r, HashMap::new());
+                }
+                if templated.is_none() {
+                    if let Some(params) = match_path(&r.path, path) {
+                        templated = Some((p, r, params));
+                    }
                 }
             }
         }
-        RouteLookup::NotFound
+        match templated {
+            Some((p, r, params)) => Self::resolve(p, r, params),
+            None => RouteLookup::NotFound,
+        }
+    }
+
+    fn resolve(p: &LoadedPlugin, r: &RouteDefinition, params: HashMap<String, String>) -> RouteLookup {
+        if p.enabled {
+            RouteLookup::Found {
+                plugin_id: p.info.id.clone(),
+                required_permission: r.required_permission.clone(),
+                handler: r.handler.clone(),
+                params,
+            }
+        } else {
+            RouteLookup::Disabled { plugin_id: p.info.id.clone() }
+        }
     }
 
     /// Flip `enabled` in memory. Returns false when the plugin isn't live
@@ -353,6 +428,8 @@ pub async fn load_all(
                     format!("route {} escapes plugin namespace (must start with {prefix})", r.path),
                 ));
             }
+            validate_route_path(&r.path)
+                .map_err(|e| PluginRuntimeError::Invalid(id.clone(), e))?;
             if let Some(required) = &r.required_permission {
                 if !granted.iter().any(|p| &p.id == required) {
                     return Err(PluginRuntimeError::Invalid(
@@ -577,6 +654,56 @@ mod tests {
         assert!(matches!(reg.find("GET", "/api/nope"), RouteLookup::NotFound));
         // Method mismatch is NotFound, not a silent match.
         assert!(matches!(reg.find("POST", "/api/alpha/thing"), RouteLookup::NotFound));
+    }
+
+    #[test]
+    fn templated_routes_capture_one_segment() {
+        let reg = PluginRegistry::new(vec![loaded(
+            "missions",
+            true,
+            "GET",
+            "/api/missions/{id}",
+            Some("missions:read"),
+        )]);
+        match reg.find("GET", "/api/missions/42") {
+            RouteLookup::Found { params, plugin_id, .. } => {
+                assert_eq!(plugin_id, "missions");
+                assert_eq!(params.get("id").map(String::as_str), Some("42"));
+            }
+            _ => panic!("template must match a one-segment path"),
+        }
+        // A capture is exactly one segment — never a prefix match across slashes.
+        assert!(matches!(reg.find("GET", "/api/missions/42/approve"), RouteLookup::NotFound));
+        assert!(matches!(reg.find("GET", "/api/missions"), RouteLookup::NotFound));
+        // An empty segment is not a capture.
+        assert!(matches!(reg.find("GET", "/api/missions/"), RouteLookup::NotFound));
+    }
+
+    #[test]
+    fn literal_routes_win_over_templates() {
+        let reg = PluginRegistry::new(vec![
+            loaded("missions", true, "GET", "/api/missions/{id}", None),
+            loaded("missions", true, "GET", "/api/missions/current", Some("missions:read")),
+        ]);
+        match reg.find("GET", "/api/missions/current") {
+            RouteLookup::Found { required_permission, params, .. } => {
+                assert_eq!(required_permission.as_deref(), Some("missions:read"));
+                assert!(params.is_empty(), "literal match has no captures");
+            }
+            _ => panic!("literal route must win"),
+        }
+    }
+
+    #[test]
+    fn route_path_validation_rejects_malformed_captures() {
+        assert!(validate_route_path("/api/missions/{id}").is_ok());
+        assert!(validate_route_path("/api/missions/{mission_id}/approve").is_ok());
+        assert!(validate_route_path("/api/missions/plain").is_ok());
+        assert!(validate_route_path("/api/missions/{id").is_err(), "unclosed");
+        assert!(validate_route_path("/api/missions/x{id}").is_err(), "partial segment");
+        assert!(validate_route_path("/api/missions/{}").is_err(), "empty name");
+        assert!(validate_route_path("/api/missions/{ID}").is_err(), "uppercase name");
+        assert!(validate_route_path("/api/missions/{id}/{id}").is_err(), "duplicate name");
     }
 
     #[test]

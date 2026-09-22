@@ -293,6 +293,7 @@ trait objects implemented in the core. **The SDK links neither `sqlx` nor
 | `Permission` | Permission declaration and checking |
 | `adjutant new-plugin` | CLI scaffolding — generates a plugin project with manifest, routes, models, migrations |
 | `adjutant test-plugin` | Test harness — spins up a test server with the plugin loaded, mock permissions, test database |
+| Path captures | `{name}` segments in `RouteDefinition::path` (`/api/missions/{id}`); captures arrive in `PluginRequest::params`, literal routes are matched first (landed ahead of SDK v0.2 because M4 needs it) |
 | `adjutant validate-plugin` | **Planned, not implemented.** Validation happens at load time (id/route-namespace/duplicate/permission-parity checks in `plugin_runtime.rs`), which fails the boot loudly rather than validating offline |
 
 **SDK versioning:** The SDK version is pinned to the core version. Breaking changes to the SDK require a major version bump. The SDK changelog is the contract changelog.
@@ -348,7 +349,9 @@ For most plugins, native Rust compilation is fine. WASM mode is for third-party 
 /api/events/recent          — Event replay, ?since=&limit= (core:admin)
 /api/audit/verify           — Hash-chain verification (core:admin)
 /api/mcp/{messages,sse}     — MCP endpoint: planned (M5), no code yet
-/api/{plugin}/*             — Plugin-specific routes
+/api/{plugin}/*             — Plugin-specific routes. A segment may be a
+                              capture: `/api/missions/{id}` delivers
+                              `PluginRequest::params["id"]`
 ```
 
 ### 5.4 Event Bus
@@ -1057,7 +1060,7 @@ SPEC §8.1 DDL error (COALESCE in PRIMARY KEY).
 **Goal:** Build the production core using the SDK.
 
 **Status: PASSED (2026-09-22).** Evidence: `docs/milestones/M2-core-server.md`
-(**59/59** live probes via the committed `scripts/probes.py`, transcript in
+(**63/63** live probes via the committed `scripts/probes.py`, transcript in
 `docs/evidence/m2_probes.json`; 28 unit tests at commit `0cb6fff`; clippy 0
 warnings). *Correction (audit, 2026-09-22): this line previously claimed "52/52
 live probes" from four gitignored JSON transcripts that in fact recorded 50 passes
@@ -1101,12 +1104,13 @@ calling `Executor::execute` directly. Also found: a `libloading::Symbol` or a
 - [x] The SDK API feels good. If building auth or membership is painful, redesign the SDK before proceeding.
 
 **Evidence:** `docs/milestones/M3-sdk-and-plugins.md` — build/test/clippy gates,
-**34/34 + 3 skipped** `test-plugin` probes, and **49/49** live end-to-end probes
+**36/36 + 3 skipped** `test-plugin` probes, and **49/49** live end-to-end probes
 with `ADJUTANT_DEV_HEADERS=false` (the harness now asserts that flag rather than
 assuming it; every identity comes from a real session; OIDC exercised against a mock
-IdP). SDK verdict: API held up; no redesign needed. Nine of the ten listed bugs are
-verified fixed in the code; the tenth (a claimed 409 for duplicate usernames) does
-not exist anywhere in the codebase and is recorded as an open defect. The systemic
+IdP). SDK verdict: API held up; no redesign needed. All ten listed bugs are now verified
+fixed in the code — the tenth (a claimed 409 for duplicate usernames) described
+behaviour that did not exist when written and has since been implemented
+(`auth/src/lib.rs`, unique violation → 409). The systemic
 one — the documented per-plugin `search_path` contract was never applied at runtime,
 which had silently hidden every unqualified plugin table — is fixed and now has a
 regression test. The audit pass also fixed the harness's `elif` body-assertion bug,

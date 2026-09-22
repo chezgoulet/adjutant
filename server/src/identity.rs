@@ -73,6 +73,19 @@ impl IdentityHub {
         d.retain(|owner| live.contains(owner));
     }
 
+    /// True when `owner` is the *only* enabled provider and at least one exists.
+    ///
+    /// Used to refuse lifecycle actions that would leave the process with no way
+    /// to authenticate anybody: with the dev-header stub off, the last provider
+    /// going away makes every authenticated route (including the admin route
+    /// that would undo the change) unreachable until a restart.
+    pub fn is_sole_enabled_provider(&self, owner: &str) -> bool {
+        let p = self.providers.try_read().expect("identity hub locked");
+        let d = self.disabled.try_read().expect("identity hub locked");
+        let mut enabled = p.keys().filter(|k| !d.contains(*k));
+        matches!((enabled.next(), enabled.next()), (Some(first), None) if first == owner)
+    }
+
     pub fn owners(&self) -> Vec<String> {
         self.providers
             .try_read()
@@ -184,6 +197,28 @@ mod tests {
         let live: HashSet<String> = ["alive".to_string()].into_iter().collect();
         hub.retain(&live);
         assert_eq!(hub.owners(), vec!["alive".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn sole_provider_detection() {
+        let hub = IdentityHub::new();
+        assert!(!hub.is_sole_enabled_provider("auth"), "no providers: nothing is sole");
+
+        hub.register("auth", Arc::new(HeaderStub));
+        assert!(hub.is_sole_enabled_provider("auth"));
+        assert!(!hub.is_sole_enabled_provider("other"), "unknown owner is never sole");
+
+        // A second provider removes the lockout risk.
+        hub.register("backup", Arc::new(HeaderStub));
+        assert!(!hub.is_sole_enabled_provider("auth"));
+
+        // Disabling the other one restores it.
+        hub.set_enabled("backup", false);
+        assert!(hub.is_sole_enabled_provider("auth"));
+
+        // And a disabled provider is not a provider at all.
+        hub.set_enabled("auth", false);
+        assert!(!hub.is_sole_enabled_provider("auth"));
     }
 
     #[tokio::test]

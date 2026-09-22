@@ -3,7 +3,8 @@
 //! Proves every SDK surface end to end (SPEC §15, Milestone 1 exit criteria):
 //!
 //! - **routes**: `GET /api/hello` (open), `GET /api/hello/greetings`
-//!   (`hello:read`), `POST /api/hello/greet` (`hello:write`)
+//!   (`hello:read`), `GET /api/hello/greetings/{id}` (`hello:read`, path
+//!   capture), `POST /api/hello/greet` (`hello:write`)
 //! - **migrations**: creates `hello.greetings` + `hello.events_received`
 //! - **permissions**: declares `hello:read` / `hello:write`
 //! - **database**: reads/writes through the core-provided pool
@@ -164,7 +165,38 @@ impl AdjutantPlugin for HelloPlugin {
             }),
         );
 
-        vec![hello, list, greet]
+        // 4. Templated path — proves capture dispatch (`/api/hello/greetings/{id}`),
+        //    which the missions/governance plugins need for per-resource routes.
+        let c = ctx.clone();
+        let get_one = RouteDefinition::get_protected(
+            "/api/hello/greetings/{id}",
+            "hello:read",
+            route_handler(move |req| {
+                let c = c.clone();
+                async move {
+                    let raw = req.param("id").unwrap_or_default();
+                    let id: i64 = raw.parse().map_err(|_| {
+                        SdkError::BadRequest(format!("greeting id must be a number, got {raw:?}"))
+                    })?;
+                    let rows = c
+                        .db
+                        .query(
+                            format!(
+                                "SELECT id, message, created_at::text AS created_at FROM {} WHERE id = $1",
+                                c.db.table("greetings")
+                            ),
+                            vec![SqlValue::Int(id)],
+                        )
+                        .await?;
+                    match rows.into_iter().next() {
+                        Some(row) => PluginResponse::json(200, &serde_json::json!({ "greeting": row })),
+                        None => PluginResponse::error(404, "no such greeting"),
+                    }
+                }
+            }),
+        );
+
+        vec![hello, list, greet, get_one]
     }
 
     fn subscriptions(&self) -> Vec<EventSubscription> {

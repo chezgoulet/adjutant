@@ -496,6 +496,9 @@ impl Method {
 pub struct PluginRequest {
     pub method: String,
     pub path: String,
+    /// Path captures from a templated route (`/api/missions/{id}` → `id`).
+    /// Empty for literal routes.
+    pub params: HashMap<String, String>,
     pub query: Vec<(String, String)>,
     pub headers: HashMap<String, String>,
     pub body: Vec<u8>,
@@ -503,6 +506,11 @@ pub struct PluginRequest {
 }
 
 impl PluginRequest {
+    /// One captured path segment (see `params`).
+    pub fn param(&self, key: &str) -> Option<&str> {
+        self.params.get(key).map(String::as_str)
+    }
+
     pub fn query_param(&self, key: &str) -> Option<&str> {
         self.query.iter().find(|(k, _)| k == key).map(|(_, v)| v.as_str())
     }
@@ -566,6 +574,11 @@ where
 /// A route a plugin registers with the core. `path` MUST live under
 /// `/api/{plugin_id}/…` — the core validates this and rejects namespace
 /// escapes at load time.
+///
+/// A segment may be a capture: `/api/missions/{id}` matches
+/// `/api/missions/42` and delivers `id = "42"` in `PluginRequest::params`.
+/// A capture occupies a whole segment (one path component, never a slash), and
+/// literal routes are matched before templated ones.
 pub struct RouteDefinition {
     pub method: Method,
     pub path: String,

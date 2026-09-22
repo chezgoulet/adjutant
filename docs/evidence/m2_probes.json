@@ -8,8 +8,8 @@
   "middleware2",
   "tamper"
  ],
- "passed": 59,
- "total": 59,
+ "passed": 63,
+ "total": 63,
  "results": [
   {
    "batch": "m1_regression",
@@ -33,7 +33,7 @@
    "batch": "m1_regression",
    "probe": "2c registry metadata",
    "result": "PASS",
-   "detail": "{\"id\": \"hello\", \"version\": \"0.1.0\", \"routes\": 3, \"permissions\": [\"hello:read\", \"hello:write\"]}"
+   "detail": "{\"id\": \"hello\", \"version\": \"0.1.0\", \"routes\": 4, \"permissions\": [\"hello:read\", \"hello:write\"]}"
   },
   {
    "batch": "m1_regression",
@@ -69,7 +69,7 @@
    "batch": "m1_regression",
    "probe": "8 event persisted",
    "result": "PASS",
-   "detail": "200 | {\"cursor\":1,\"events\":[{\"created_at\":\"2026-09-22 22:56:20.46564+00\",\"event_type\":\"hello.greeted\",\"id\":1,\"payloa"
+   "detail": "200 | {\"cursor\":1,\"events\":[{\"created_at\":\"2026-09-22 23:04:31.001523+00\",\"event_type\":\"hello.greeted\",\"id\":1,\"paylo"
   },
   {
    "batch": "m1_regression",
@@ -81,7 +81,31 @@
    "batch": "m1_regression",
    "probe": "9 greeting readable",
    "result": "PASS",
-   "detail": "200 | {\"greetings\":[{\"created_at\":\"2026-09-22 22:56:20.461849+00\",\"id\":1,\"message\":\"first greeting\"}]}"
+   "detail": "200 | {\"greetings\":[{\"created_at\":\"2026-09-22 23:04:30.996401+00\",\"id\":1,\"message\":\"first greeting\"}]}"
+  },
+  {
+   "batch": "m1_regression",
+   "probe": "9b path capture read",
+   "result": "PASS",
+   "detail": "200 | {\"greeting\":{\"created_at\":\"2026-09-22 23:04:30.996401+00\",\"id\":1,\"message\":\"first greeting\"}}"
+  },
+  {
+   "batch": "m1_regression",
+   "probe": "9c path capture prefers literal",
+   "result": "PASS",
+   "detail": "200 | {\"greetings\":[{\"created_at\":\"2026-09-22 23:04:30.996401+00\",\"id\":1,\"message\":\"first greeting\"}]}"
+  },
+  {
+   "batch": "m1_regression",
+   "probe": "9d non-numeric capture is a 400",
+   "result": "PASS",
+   "detail": "400 | {\"error\":\"bad request: greeting id must be a number, got \\\"abc\\\"\"}"
+  },
+  {
+   "batch": "m1_regression",
+   "probe": "9e extra segment is 404",
+   "result": "PASS",
+   "detail": "404 | {\"error\":\"route not found\"}"
   },
   {
    "batch": "m1_regression",
@@ -99,7 +123,7 @@
    "batch": "middleware",
    "probe": "M1 x-request-id present",
    "result": "PASS",
-   "detail": "rid=001a0cb559c58-00000a"
+   "detail": "rid=001a0cb5d187c-00000e"
   },
   {
    "batch": "middleware",
@@ -111,13 +135,13 @@
    "batch": "middleware",
    "probe": "M4 replay since=0",
    "result": "PASS",
-   "detail": "200 | {\"cursor\":1,\"events\":[{\"created_at\":\"2026-09-22 22:56:20.46564+00\",\"event_type\":\"hello.greeted\",\"id\":1,\"payloa"
+   "detail": "200 | {\"cursor\":1,\"events\":[{\"created_at\":\"2026-09-22 23:04:31.001523+00\",\"event_type\":\"hello.greeted\",\"id\":1,\"paylo"
   },
   {
    "batch": "middleware",
    "probe": "M4b cursor equals last id",
    "result": "PASS",
-   "detail": "{\"cursor\": 1, \"events\": [{\"created_at\": \"2026-09-22 22:56:20.46564+00\", \"event_type\": \"hello.greeted\", \"id\": 1, \"payload\": {\"by\": \"christoph"
+   "detail": "{\"cursor\": 1, \"events\": [{\"created_at\": \"2026-09-22 23:04:31.001523+00\", \"event_type\": \"hello.greeted\", \"id\": 1, \"payload\": {\"by\": \"christop"
   },
   {
    "batch": "middleware",
@@ -243,7 +267,7 @@
    "batch": "lifecycle",
    "probe": "L16 reload reinstalls",
    "result": "PASS",
-   "detail": "200 | {\"reloaded\":[\"hello\"],\"routes\":3,\"versions\":{\"hello\":\"0.1.0\"}}"
+   "detail": "200 | {\"reloaded\":[\"hello\"],\"routes\":4,\"versions\":{\"hello\":\"0.1.0\"}}"
   },
   {
    "batch": "lifecycle",
@@ -357,13 +381,13 @@
    "batch": "middleware2",
    "probe": "M3d request-id on 429",
    "result": "PASS",
-   "detail": "rid=001a0cb559fef-000009"
+   "detail": "rid=001a0cb5d1c06-000009"
   },
   {
    "batch": "middleware2",
    "probe": "M4 JSON log line",
    "result": "PASS",
-   "detail": "{\"timestamp\":\"2026-09-22T22:56:21.487317Z\",\"level\":\"INFO\",\"fields\":{\"message\":\"request\",\"request_id\":\"001a0cb559fef-000009\",\"method\":\"GET\",\""
+   "detail": "{\"timestamp\":\"2026-09-22T23:04:32.007021Z\",\"level\":\"INFO\",\"fields\":{\"message\":\"request\",\"request_id\":\"001a0cb5d1c06-000009\",\"method\":\"GET\",\""
   }
  ]
 }

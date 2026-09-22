@@ -85,11 +85,12 @@ Precedence is defaults < TOML file (./adjutant.toml or `--config`) < environment
 - **Dev headers default to on.** With `ADJUTANT_DEV_HEADERS=true`, anyone who can
   reach the port can claim any role by setting two headers. Set it to `false` and
   rely on the auth plugin's sessions. The milestone harnesses assert this for you.
-- **Disabling the auth plugin locks you out.** With dev headers off, the auth
-  plugin is the only source of identity — so `POST /api/plugins/auth/disable`
-  removes the only way to authenticate to the admin routes that would re-enable
-  it. Recovery is a process restart (or a direct `core.plugins` update). The M3
-  harness deliberately does not exercise auth disable for this reason.
+- **Disabling the last identity provider is refused.** With dev headers off the
+  auth plugin is the only source of identity, so disabling or uninstalling it
+  would make every authenticated route — including the admin route that would
+  undo it — unreachable until a restart. The core now answers `409` with a hint
+  instead of allowing the lockout; recovery from a manual `core.plugins` edit is
+  still a restart, so register a second provider before removing the first.
 
 ## Smoke test
 
@@ -125,7 +126,8 @@ ADJUTANT_TEST_DATABASE_URL=postgres://adjutant@127.0.0.1:5433/adjutant_dev_test 
 
 Two live harnesses prove the integration claims. Both drive a real server and a
 real database, and both are committed because the earlier, uncommitted probe
-transcripts could not be reproduced by anyone else.
+transcripts could not be reproduced by anyone else. CI runs all of them
+(`.github/workflows/ci.yml`) on every push and pull request.
 
 ```bash
 # M1 + M2: resets adjutant_dev, stages the hello plugin, boots its own server,

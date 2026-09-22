@@ -5,8 +5,8 @@
 Environment: Rust 1.96.1, clippy 0.1.96, PostgreSQL 18.6 (`adjutant_dev`,
 reset to empty before the run so migration 2 executed on a fresh database).
 Gates: `cargo clippy --workspace --all-targets` → **0 warnings**,
-`cargo test --workspace` → **28 passed / 0 failed at commit `0cb6fff`** (52 today),
-live probes → **59/59**, four batches (m1_regression, middleware, lifecycle,
+`cargo test --workspace` → **28 passed / 0 failed at commit `0cb6fff`** (56 today),
+live probes → **63/63**, four batches (m1_regression, middleware, lifecycle,
 tamper), reproducible and committed:
 
 ```

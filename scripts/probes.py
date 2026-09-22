@@ -158,7 +158,13 @@ def batch_m1_regression():
     _, raw = probe(b, "2b registry as chief", "GET", "/api/plugins", status=200, contains='"hello"', headers=CHIEF)
     try:
         info = json.loads(raw)["plugins"][0]
-        ok = info["routes"] == 3 and sorted(info["permissions"]) == ["hello:read", "hello:write"] and info["version"] == "0.1.0"
+        # Relational, not literal: the route count must agree with the route table
+        # the registry reports, so adding a route cannot silently break the probe.
+        ok = (
+            info["routes"] == len(info["route_list"])
+            and sorted(info["permissions"]) == ["hello:read", "hello:write"]
+            and info["version"] == "0.1.0"
+        )
         check(b, "2c registry metadata", ok, json.dumps({k: info[k] for k in ("id", "version", "routes", "permissions")}))
     except Exception as e:  # noqa: BLE001
         check(b, "2c registry metadata", False, f"parse: {e}")
@@ -178,6 +184,15 @@ def batch_m1_regression():
         check(b, "8b cursor present", False, f"parse: {e}")
     probe(b, "9 greeting readable", "GET", "/api/hello/greetings", status=200,
           contains="first greeting", headers=CHIEF)
+    # Path capture, end to end: template match -> param -> handler -> DB.
+    probe(b, "9b path capture read", "GET", "/api/hello/greetings/1", status=200,
+          contains="first greeting", headers=CHIEF)
+    probe(b, "9c path capture prefers literal", "GET", "/api/hello/greetings", status=200,
+          contains="greetings", headers=CHIEF)
+    probe(b, "9d non-numeric capture is a 400", "GET", "/api/hello/greetings/abc", status=400,
+          contains="must be a number", headers=CHIEF)
+    probe(b, "9e extra segment is 404", "GET", "/api/hello/greetings/1/extra", status=404,
+          contains="route not found", headers=CHIEF)
     probe_sql(b, "10 event delivered to subscriber", "SELECT count(*) FROM hello.events_received WHERE event_type='hello.greeted'", "1")
     probe_sql(b, "audit logged the write", "SELECT count(*) FROM core.audit_log WHERE action='greet'", "1")
 

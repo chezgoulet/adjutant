@@ -220,7 +220,8 @@ async fn dynamic_dispatch(State(state): State<Arc<AppState>>, req: Request) -> R
                 required_permission,
                 handler,
                 plugin_id,
-            } => Ok((plugin_id, required_permission, handler)),
+                params,
+            } => Ok((plugin_id, required_permission, handler, params)),
             RouteLookup::Disabled { plugin_id } => Err((
                 StatusCode::NOT_FOUND,
                 format!("plugin {plugin_id} is disabled"),
@@ -229,14 +230,14 @@ async fn dynamic_dispatch(State(state): State<Arc<AppState>>, req: Request) -> R
         }
     };
 
-    let (plugin_id, required, handler) = match lookup {
+    let (plugin_id, required, handler, params) = match lookup {
         Ok(x) => x,
         Err((status, msg)) => {
             return (status, Json(json!({ "error": msg }))).into_response();
         }
     };
 
-    dispatch(state, plugin_id, required, handler, req).await
+    dispatch(state, plugin_id, required, handler, params, req).await
 }
 
 /// Permission gate → build SDK request → call handler.
@@ -245,6 +246,7 @@ async fn dispatch(
     plugin_id: String,
     required: Option<String>,
     handler: adjutant_sdk::RouteHandler,
+    params: HashMap<String, String>,
     req: Request,
 ) -> Response {
     let (parts, body) = req.into_parts();
@@ -292,6 +294,7 @@ async fn dispatch(
     let preq = PluginRequest {
         method: parts.method.to_string(),
         path: parts.uri.path().to_string(),
+        params,
         query,
         headers,
         body: body_bytes.to_vec(),
@@ -511,6 +514,20 @@ async fn disable_plugin(
     if let Some(resp) = state.require_admin(req.headers()).await {
         return resp;
     }
+    // With the dev-header stub off, the identity providers ARE the only way to
+    // authenticate. Removing the last one makes every authenticated route —
+    // including the admin route that would undo this — unreachable until the
+    // process restarts. Refuse, and say how to proceed.
+    if !state.config.allow_dev_headers && state.identity.is_sole_enabled_provider(&name) {
+        return (
+            StatusCode::CONFLICT,
+            Json(json!({
+                "error": "refusing to remove the only identity provider while dev headers are off",
+                "hint": "register/enable another identity provider, or set ADJUTANT_DEV_HEADERS=true for a dev instance",
+            })),
+        )
+            .into_response();
+    }
     let identity = state.resolve_identity(req.headers()).await;
     let changed = {
         let mut reg = state.registry.write().await;
@@ -548,6 +565,20 @@ async fn uninstall_plugin(
 ) -> Response {
     if let Some(resp) = state.require_admin(req.headers()).await {
         return resp;
+    }
+    // With the dev-header stub off, the identity providers ARE the only way to
+    // authenticate. Removing the last one makes every authenticated route —
+    // including the admin route that would undo this — unreachable until the
+    // process restarts. Refuse, and say how to proceed.
+    if !state.config.allow_dev_headers && state.identity.is_sole_enabled_provider(&name) {
+        return (
+            StatusCode::CONFLICT,
+            Json(json!({
+                "error": "refusing to remove the only identity provider while dev headers are off",
+                "hint": "register/enable another identity provider, or set ADJUTANT_DEV_HEADERS=true for a dev instance",
+            })),
+        )
+            .into_response();
     }
     let identity = state.resolve_identity(req.headers()).await;
     let removed = {

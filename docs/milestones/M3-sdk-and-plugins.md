@@ -8,11 +8,11 @@
 | Gate | Result |
 |---|---|
 | `cargo build --workspace` | 0 errors |
-| `cargo test --workspace` | **52/52 passed** (2 are DB-backed and print SKIPPED without `ADJUTANT_TEST_DATABASE_URL`) |
+| `cargo test --workspace` | **56/56 passed** (2 are DB-backed and print SKIPPED without `ADJUTANT_TEST_DATABASE_URL`) |
 | `cargo clippy --workspace --all-targets` | **0 warnings** (independently re-verified on a from-scratch build) |
-| `adjutant test-plugin` | **34/34 probes passed, 3 skipped** (skips are open mutating routes — never executed, and no longer counted as passes) against a fresh test DB |
+| `adjutant test-plugin` | **36/36 probes passed, 3 skipped** (skips are open mutating routes — never executed, and no longer counted as passes) against a fresh test DB |
 | `docs/e2e_m3.py` (live, dev headers OFF) | **49/49 probes**, repeatable (run twice back to back, exit 0) |
-| `scripts/probes.py` (M1+M2 batches) | **59/59 probes**, committed transcript |
+| `scripts/probes.py` (M1+M2 batches) | **63/63 probes**, committed transcript |
 
 Counts changed in the 2026-09-22 audit pass because the harnesses were made
 honest, not because the software moved: `docs/e2e_m3.py`'s `probe()` used an
@@ -91,15 +91,13 @@ pass" was misleading.
 5. **Two statements in one prepared statement** (`INSERT … ON CONFLICT; DELETE
    …`) — sqlx refuses; split. Same trap as the M2 SEED bug.
 6. **`make_interval(hours => $3)`** with a bigint bind — PostgreSQL wants `int`;
-   cast added (`$3::int`, `auth/src/lib.rs:193`). **Open defect:** an earlier
-   draft of this entry also claimed register "now answers 409
-   'already registered — log in instead'". No 409 status and no such string
-   exist anywhere in the codebase; a duplicate username on
-   `POST /api/auth/users` still raises a unique violation that the core maps to
-   500 (`server/src/server.rs`, `SdkError::Db → INTERNAL_SERVER_ERROR`), and
-   `POST /api/auth/register` cannot reach the path because it is closed once any
-   user exists. Either implement the 409 or drop the claim — tracked as an open
-   defect.
+   cast added (`$3::int`, `auth/src/lib.rs:193`). The same entry originally
+   claimed register "now answers 409 'already registered — log in instead'",
+   which was **not true of the code at the time** — no 409 and no such string
+   existed, so a duplicate username surfaced as a 500. The claim is now true: a
+   unique violation (`23505`) is mapped to 409 with that message on
+   `POST /api/auth/register`, and to `409 username "x" is already taken` on the
+   admin `POST /api/auth/users` route.
 7. **Membership SQL typos**: `EXCLUDED.patrols_lodge` (no such column),
    `COALESCE($8, true)` where `$8` binds as text-null (needs `::boolean`), and
    `WHERE m.id = $1` binding a bigint id as text.
@@ -131,9 +129,23 @@ pass" was misleading.
       publication pending**: it needs a registry token/account decision from
       Christopher, so it is not claimed as done
 - [x] `adjutant new-plugin` scaffolds a plugin project (manifest, routes,
-      models, migrations) — proven live with a throwaway fixture, then removed
+      models, migrations) — verified live: the scaffold was generated into a
+      scratch copy of the repo, compiled (`cargo build -p adjutant-gear_locker`),
+      loaded by the real server, and exercised end to end:
+
+      ```
+      GET  /api/gear_locker/health   -> 200 {"ok":true,"plugin":"gear_locker"}
+      GET  /api/gear_locker/items    -> 401 anonymous, 200 {"items":[]} as chief
+      registry                       -> 2 routes, [gear_locker:read, gear_locker:manage]
+      core.schema_migrations         -> gear_locker:0:create_schema, gear_locker:1:initial_schema
+      SELECT count(*) FROM gear_locker.items -> 0   (bare name resolved via search_path)
+      ```
+
+      The scaffold-compiles step now runs in CI so the criterion cannot regress.
+      (The old evidence for this line was a unit test asserting the generated
+      strings, which never compiled anything.)
 - [x] `adjutant test-plugin` runs a test server with mock permissions and a
-      test database (34/34 probed, 3 open mutating routes reported as skipped)
+      test database (36/36 probed, 3 open mutating routes reported as skipped)
 - [x] Auth plugin: OIDC login, session management, role enforcement — all via
       the SDK (proved end-to-end against a mock IdP)
 - [x] Membership plugin: roster, OSG CSV import, proficiency tracking — via the SDK
@@ -186,6 +198,20 @@ these fixes (all verified by the gates above):
 11. **Reinstall actually reinstalls**: uninstall no longer clears `enabled`, so
     clearing `uninstalled` + reload brings the plugin back serving (this was
     broken and the old probes recorded the failure without explaining it).
+12. **The auth-disable lockout is now prevented, not just documented**: with dev
+    headers off, disabling/uninstalling the only enabled identity provider is
+    refused with `409` and a hint, because it would make every authenticated
+    route — including the admin route that would undo it — unreachable until a
+    restart.
+13. **Path captures landed** (`/api/missions/{id}` → `PluginRequest::params`),
+    with literal-before-template matching, load-time validation of malformed
+    captures, unit tests, and a live probe through the hello plugin's new
+    `GET /api/hello/greetings/{id}` route. This is the routing shape M4's
+    missions/governance plugins need; it arrived ahead of the SDK v0.2 bucket
+    because it is a prerequisite, not a nicety.
+14. **CI now enforces the gates** (`.github/workflows/ci.yml`): build, clippy
+    with `-D warnings`, unit + DB-backed tests, the M1/M2 probe ladder,
+    `test-plugin`, and the end-to-end harness against a PostgreSQL service.
 
 ## Next
 

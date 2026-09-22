@@ -157,6 +157,12 @@ async fn session_identity(db: &DbHandle, token: &str) -> Result<Option<SessionUs
     }))
 }
 
+/// PostgreSQL unique-violation detection. sqlx surfaces the driver message
+/// (SQLSTATE 23505) as text across the host boundary, so match both forms.
+fn is_duplicate_key(err: &str) -> bool {
+    err.contains("duplicate key") || err.contains("23505")
+}
+
 /// Local username for an IdP-created user: lowercase, `[a-z0-9._-]`, capped at
 /// 32 chars. Falls back to a deterministic subject-derived handle when the
 /// IdP handle sanitizes to nothing usable.
@@ -456,7 +462,7 @@ impl AdjutantPlugin for AuthPlugin {
                         return PluginResponse::error(400, "password must be at least 8 characters");
                     }
                     let pw = hash_password(&body.password)?;
-                    let rows = c
+                    let rows = match c
                         .db
                         .query(
                             "INSERT INTO core.users (username, email, display_name, password_hash) \
@@ -469,7 +475,19 @@ impl AdjutantPlugin for AuthPlugin {
                                 SqlValue::Text(pw),
                             ],
                         )
-                        .await?;
+                        .await
+                    {
+                        Ok(rows) => rows,
+                        // A unique violation is the caller's problem, not a server
+                        // error: report it as such (the earlier 500 was a defect).
+                        Err(SdkError::Db(e)) if is_duplicate_key(&e) => {
+                            return PluginResponse::error(
+                                409,
+                                "already registered — log in instead",
+                            )
+                        }
+                        Err(e) => return Err(e),
+                    };
                     let uid = rows
                         .first()
                         .and_then(|r| r["id"].as_str())
@@ -520,7 +538,7 @@ impl AdjutantPlugin for AuthPlugin {
                         return PluginResponse::error(400, "password must be at least 8 characters");
                     }
                     let pw = hash_password(&body.password)?;
-                    let rows = c
+                    let rows = match c
                         .db
                         .query(
                             "INSERT INTO core.users (username, email, display_name, password_hash) \
@@ -533,7 +551,17 @@ impl AdjutantPlugin for AuthPlugin {
                                 SqlValue::Text(pw),
                             ],
                         )
-                        .await?;
+                        .await
+                    {
+                        Ok(rows) => rows,
+                        Err(SdkError::Db(e)) if is_duplicate_key(&e) => {
+                            return PluginResponse::error(
+                                409,
+                                format!("username {:?} is already taken", body.username),
+                            )
+                        }
+                        Err(e) => return Err(e),
+                    };
                     let uid = rows
                         .first()
                         .and_then(|r| r["id"].as_str())
@@ -850,7 +878,7 @@ impl AuthPlugin {
                             Ok(rows) => rows,
                             // Username taken by another account (or a local
                             // user) — disambiguate deterministically.
-                            Err(SdkError::Db(e)) if e.contains("duplicate key") => {
+                            Err(SdkError::Db(e)) if is_duplicate_key(&e) => {
                                 insert(format!("{username}-{}", &token_hash(&subject)[..8])).await?
                             }
                             Err(e) => return Err(e),
