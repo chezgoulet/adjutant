@@ -1,9 +1,12 @@
 //! Event bus: broadcast dispatch (SPEC §5.4).
 //!
-//! The broadcast channel is in-process and ephemeral; durability lives in
-//! `core.events`, written by `host::CoreEvents` *before* the send — so this
-//! module owns only fan-out, not persistence. Subscriptions are registered by
-//! the plugin runtime, which spawns one task per subscription.
+//! Fan-out only — durability lives in `core.events`, written by
+//! `host::CoreEvents` *before* the send. Subscriptions are tracked **per
+//! plugin** so a hot-reload can abort a plugin's old tasks before rebinding
+//! the new instance (otherwise both generations would handle the same event).
+
+use std::collections::HashMap;
+use std::sync::Mutex;
 
 use tokio::sync::broadcast;
 
@@ -16,67 +19,92 @@ const BUS_CAPACITY: usize = 1024;
 
 pub struct EventBus {
     tx: broadcast::Sender<Event>,
-    handles: Vec<tokio::task::JoinHandle<()>>,
+    /// plugin_id → subscription tasks. Mutex (not RwLock): never held across
+    /// an await — spawn/abort are synchronous.
+    subs: Mutex<HashMap<String, Vec<tokio::task::JoinHandle<()>>>>,
 }
 
 impl EventBus {
-    pub fn new() -> Self {
+    pub fn new() -> std::sync::Arc<Self> {
         let (tx, _) = broadcast::channel(BUS_CAPACITY);
-        Self { tx, handles: Vec::new() }
+        std::sync::Arc::new(Self { tx, subs: Mutex::new(HashMap::new()) })
     }
 
     pub fn sender(&self) -> broadcast::Sender<Event> {
         self.tx.clone()
     }
 
-    /// Register a plugin subscription: one task, prefix-filtered dispatch.
-    pub fn subscribe(&mut self, plugin_id: &str, sub: EventSubscription) {
-        let plugin_id = plugin_id.to_string();
+    /// Bind one subscription task for `plugin_id`, replacing nothing (call
+    /// [`Self::clear_plugin`] first when rebinding an existing plugin).
+    pub fn subscribe(&self, plugin_id: &str, sub: EventSubscription) {
         let mut rx = self.tx.subscribe();
-        let filter = sub.filter.clone();
-        let dispatch_filter = filter.clone();
+        let filter_for_log = sub.filter.clone(); // stays for the log line below
+        let filter = sub.filter; // moved into the dispatch task
         let handler = sub.handler;
-        let handle = tokio::spawn({
-            let plugin_id = plugin_id.clone();
-            async move {
-                loop {
-                    match rx.recv().await {
-                        Ok(ev) => {
-                            let matched =
-                                dispatch_filter == "*" || ev.event_type.starts_with(&dispatch_filter);
-                            if !matched {
-                                continue;
-                            }
-                            if let Err(e) = handler(ev).await {
-                                tracing::warn!(
-                                    plugin = %plugin_id,
-                                    error = %e,
-                                    "event handler failed"
-                                );
-                            }
+        let owner = plugin_id.to_string();
+        let log_id = plugin_id.to_string();
+
+        let handle = tokio::spawn(async move {
+            loop {
+                match rx.recv().await {
+                    Ok(ev) => {
+                        if !(filter == "*" || ev.event_type.starts_with(&filter)) {
+                            continue;
                         }
-                        Err(broadcast::error::RecvError::Lagged(n)) => {
-                            tracing::warn!(plugin = %plugin_id, dropped = n, "event subscriber lagged");
+                        if let Err(e) = handler(ev).await {
+                            tracing::warn!(plugin = %log_id, error = %e, "event handler failed");
                         }
-                        Err(broadcast::error::RecvError::Closed) => break,
                     }
+                    Err(broadcast::error::RecvError::Lagged(n)) => {
+                        tracing::warn!(plugin = %log_id, dropped = n, "event subscriber lagged");
+                    }
+                    Err(broadcast::error::RecvError::Closed) => break,
                 }
             }
         });
-        self.handles.push(handle);
-        tracing::debug!(plugin = %plugin_id, filter, "event subscription registered");
+
+        let mut map = self.subs.lock().expect("event bus poisoned");
+        map.entry(owner).or_default().push(handle);
+        tracing::debug!(plugin = plugin_id, filter = %filter_for_log, "event subscription registered");
     }
 
-    /// Abort all subscription tasks (graceful shutdown).
-    pub fn shutdown(&mut self) {
-        for h in self.handles.drain(..) {
-            h.abort();
+    /// Abort every subscription task owned by `plugin_id` (disable/uninstall/
+    /// reload rebinding). Missing id is a no-op.
+    pub fn clear_plugin(&self, plugin_id: &str) {
+        let mut map = self.subs.lock().expect("event bus poisoned");
+        if let Some(handles) = map.remove(plugin_id) {
+            for h in handles {
+                h.abort();
+            }
+            tracing::debug!(plugin = plugin_id, "event subscriptions cleared");
         }
+    }
+
+    /// Currently-bound plugin ids.
+    pub fn subscriber_ids(&self) -> Vec<String> {
+        self.subs
+            .lock()
+            .expect("event bus poisoned")
+            .keys()
+            .cloned()
+            .collect()
+    }
+
+    /// Abort everything (graceful shutdown).
+    pub fn shutdown(&self) {
+        let mut map = self.subs.lock().expect("event bus poisoned");
+        for handles in map.values_mut() {
+            for h in handles.drain(..) {
+                h.abort();
+            }
+        }
+        map.clear();
     }
 }
 
-impl Drop for EventBus {
-    fn drop(&mut self) {
-        self.shutdown();
+impl Default for EventBus {
+    fn default() -> Self {
+        let (tx, _) = broadcast::channel(BUS_CAPACITY);
+        Self { tx, subs: Mutex::new(HashMap::new()) }
     }
 }

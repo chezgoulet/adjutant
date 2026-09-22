@@ -1027,16 +1027,23 @@ SPEC §8.1 DDL error (COALESCE in PRIMARY KEY).
 
 **Goal:** Build the production core using the SDK.
 
+**Status: PASSED (2026-09-22).** Evidence: `docs/milestones/M2-core-server.md`
+(52/52 live probes, 28 unit tests, clippy 0 warnings). One bug dominated the
+milestone — `sqlx::raw_sql`'s `async fn` wrapper is unprovable as `Send`, which
+made every handler awaiting migrations fail axum's `Handler` bound; fixed by
+calling `Executor::execute` directly. Also found: a `libloading::Symbol` or a
+`slice::Iter` left alive across an await poisons the generator's `Send` proof.
+
 **Exit criteria:**
-- [ ] Plugin registry: load, enable, disable, uninstall, hot-reload
-- [ ] Database connection pool with per-plugin schema isolation
-- [ ] Axum server with full middleware stack (request ID, logging, CORS, rate limiting, auth, authorization, plugin routing)
-- [ ] Event bus with pub/sub, persistence, and replay
-- [ ] Configuration management (file, environment, CLI)
-- [ ] Structured logging with tracing
-- [ ] Audit log (append-only, tamper-evident)
-- [ ] All core traits compiled as the `adjutant-sdk` crate
-- [ ] Core compiles, all tests pass, `cargo clippy` clean
+- [x] Plugin registry: load, enable, disable, uninstall, hot-reload
+- [x] Database connection pool with per-plugin schema isolation
+- [x] Axum server with full middleware stack (request ID, logging, CORS, rate limiting, auth, authorization, plugin routing)
+- [x] Event bus with pub/sub, persistence, and replay
+- [x] Configuration management (file, environment, CLI)
+- [x] Structured logging with tracing *(pretty + json)*
+- [x] Audit log (append-only, tamper-evident) *(SHA-256 chain + append-only trigger; superuser bypass detected by verifier)*
+- [x] All core traits compiled as the `adjutant-sdk` crate
+- [x] Core compiles, all tests pass, `cargo clippy` clean *(0 warnings, 28/28)*
 
 **Deliverable:** A production-ready core server that plugins can target. The SDK is built alongside — the core defines the traits it needs.
 

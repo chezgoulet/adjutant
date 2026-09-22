@@ -111,24 +111,54 @@ impl CoreEvents {
 #[async_trait]
 impl HostEvents for CoreEvents {
     async fn publish(&self, event_type: String, payload: Value) -> Result<(), SdkError> {
-        let ev = Event {
+        let mut ev = Event {
+            id: 0,
             event_type,
             payload: payload.clone(),
             source: self.source.clone(),
             timestamp: chrono::Utc::now(),
         };
-        sqlx::query(
-            "INSERT INTO core.events (event_type, payload, source_plugin) VALUES ($1, $2::jsonb, $3)",
+        let json = serde_json::to_string(&ev.payload).unwrap_or_else(|_| "{}".into());
+        // Persist first, capture the row id, then broadcast with the real id
+        // (SPEC §5.4: core.events is the durable record; subscribers see ids).
+        let id: i64 = sqlx::query_scalar(
+            "INSERT INTO core.events (event_type, payload, source_plugin)              VALUES ($1, $2::jsonb, $3) RETURNING id",
         )
         .bind(&ev.event_type)
-        .bind(serde_json::to_string(&ev.payload).unwrap_or_else(|_| "{}".into()))
+        .bind(&json)
         .bind(&ev.source)
-        .execute(self.pool.as_ref())
+        .fetch_one(self.pool.as_ref())
         .await
         .map_err(|e| SdkError::Db(e.to_string()))?;
+        ev.id = id;
 
         let _ = self.tx.send(ev); // no subscribers is fine
         Ok(())
+    }
+
+    async fn replay(&self, since_id: i64, limit: i64) -> Result<Vec<Event>, SdkError> {
+        let rows = sqlx::query_as::<
+            _,
+            (i64, String, Value, String, chrono::DateTime<chrono::Utc>),
+        >(
+            "SELECT id, event_type, payload, source_plugin, created_at              FROM core.events WHERE id > $1 ORDER BY id ASC LIMIT $2",
+        )
+        .bind(since_id)
+        .bind(limit.clamp(1, 500))
+        .fetch_all(self.pool.as_ref())
+        .await
+        .map_err(|e| SdkError::Db(e.to_string()))?;
+
+        Ok(rows
+            .into_iter()
+            .map(|(id, event_type, payload, source, created_at)| Event {
+                id,
+                event_type,
+                payload,
+                source,
+                timestamp: created_at,
+            })
+            .collect())
     }
 }
 

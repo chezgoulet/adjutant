@@ -1,5 +1,7 @@
 /target
 /local
+/plugins-built
+m2_probes_*.json
 *.so
 *.dylib
 *.dll

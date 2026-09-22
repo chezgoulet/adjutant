@@ -28,6 +28,12 @@ impl HelloPlugin {
     }
 }
 
+impl Default for HelloPlugin {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 #[async_trait]
 impl AdjutantPlugin for HelloPlugin {
     fn id(&self) -> &str {

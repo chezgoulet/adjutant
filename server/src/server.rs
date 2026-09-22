@@ -1,62 +1,80 @@
-//! HTTP server: Axum router assembly + plugin route dispatch (SPEC §5.3).
+//! HTTP server: Axum router assembly, dynamic plugin dispatch, admin lifecycle
+//! (SPEC §5.3, §15 M2).
 //!
-//! Middleware stack (bottom → top):
-//! 1. Request ID — assigned per request, logged
-//! 2. Logging — structured request/response via tracing
-//! 3. Identity — `x-dev-user`/`x-dev-role` stub → request extensions
-//! 4. Permission gate — per-route, inside the dispatch wrapper
-//! 5. Plugin routing — dispatch to the owning plugin's handler
+//! Middleware stack (outer → inner):
+//! 1. CORS — tower-http, config-driven (`cors.origins`)
+//! 2. Request ID + structured access log — `x-request-id` in, one line out
+//! 3. Rate limiting — fixed window per client IP (`rates.*`)
+//! 4. Identity (`x-dev-user`/`x-dev-role` stub) + permission gate + dispatch
 //!
-//! CORS and rate limiting are Milestone 2 (auth plugin brings real sessions;
-//! tower-http adds CORS). The prototype validates the hard part — dispatch +
-//! permission enforcement through plugin-registered routes.
+//! **Plugin routes are NOT registered statically.** Enable/disable/reload must
+//! take effect without rebuilding the router, so every non-core request falls
+//! through to `dynamic_dispatch`, which resolves `METHOD path` against the live
+//! registry under a read lock (the lock is released before the handler runs —
+//! a slow plugin must never block a reload).
 
 use std::collections::HashMap;
 use std::sync::Arc;
 
 use axum::body::to_bytes;
-use axum::extract::{Request, State};
+use axum::extract::{Path, Request, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
-use axum::routing::{get, post};
+use axum::routing::{delete, get, post};
 use axum::{Json, Router};
 use serde_json::json;
+use tokio::sync::RwLock;
+use tower_http::cors::{Any, CorsLayer};
 
-use adjutant_sdk::{Method, PermissionService, PluginRequest, RouteHandler};
+use adjutant_sdk::{AuditService, PermissionService, PluginRequest};
 
 use crate::config::Config;
 use crate::db;
 use crate::events::EventBus;
+use crate::middleware::{request_log, RateLimiter};
 use crate::permissions::{authorize, extract_identity};
-use crate::plugin_runtime::{load_all, PluginInfo, PluginRegistry};
+use crate::plugin_runtime::{load_all, PluginRegistry, RouteLookup};
 
-/// Shared app state.
-///
-/// Holds the plugin registry: the `Library` handles pin the plugin `.so`s in
-/// memory for the process lifetime. Dropping them while the router still holds
-/// handler `Arc`s into that code = SIGSEGV on first dispatch (seen in Milestone
-/// 1 bring-up). AppState lives inside every dispatch closure, so the libraries
-/// outlive the router by construction.
+/// Shared app state. The registry lives behind a lock: admin lifecycle ops
+/// (enable/disable/uninstall/reload) mutate it while requests dispatch through
+/// it. `LoadedPlugin` keeps every `Library` mapped — retired plugins too (see
+/// plugin_runtime's library lifetime rule), so handlers cloned out of a read
+/// lock stay valid even if a reload races them.
 pub struct AppState {
     pub pool: Arc<sqlx::PgPool>,
     pub permissions: PermissionService,
-    pub plugins: Vec<PluginInfo>,
-    pub registry: PluginRegistry,
+    pub audit: AuditService,
+    pub registry: RwLock<PluginRegistry>,
+    pub bus: Arc<EventBus>,
+    pub config: Arc<Config>,
 }
 
-/// One registered plugin route: method, path, permission gate, handler.
-struct RouteEntry {
-    method: Method,
-    path: String,
-    required_permission: Option<String>,
-    handler: RouteHandler,
+impl AppState {
+    /// Admin gate: `core:admin` permission. Returns a ready 401/403 response
+    /// when the caller isn't allowed, `None` when allowed.
+    async fn require_admin(&self, headers: &axum::http::HeaderMap) -> Option<Response> {
+        let identity = extract_identity(headers);
+        match authorize(identity.as_ref(), &self.permissions, "core:admin").await {
+            Ok(()) => None,
+            Err(status) => {
+                let msg = if status == 401 {
+                    "authentication required"
+                } else {
+                    "insufficient permissions"
+                };
+                Some(
+                    (StatusCode::from_u16(status).unwrap(), Json(json!({ "error": msg })))
+                        .into_response(),
+                )
+            }
+        }
+    }
 }
 
 /// Build the full application: connect DB, load plugins, assemble router.
-/// Returns the router (ready to serve) and the event bus (kept alive by caller).
-pub async fn build_app(cfg: &Config) -> Result<(Router, EventBus), BuildError> {
+pub async fn build_app(cfg: &Config) -> Result<(Router, Arc<AppState>), BuildError> {
     let pool = db::connect_and_migrate(cfg).await.map_err(BuildError::Db)?;
-    let mut bus = EventBus::new();
+    let bus = EventBus::new();
 
     let registry = load_all(
         &cfg.plugin_dir,
@@ -67,18 +85,18 @@ pub async fn build_app(cfg: &Config) -> Result<(Router, EventBus), BuildError> {
     .await
     .map_err(BuildError::Plugin)?;
 
-    // Register event subscriptions before any traffic flows.
+    // Bind event subscriptions before any traffic flows.
     for lp in &registry.plugins {
-        let subs = lp.plugin.subscriptions();
-        for sub in subs {
+        for sub in lp.plugin.subscriptions() {
             bus.subscribe(lp.plugin.id(), sub);
         }
     }
+    let route_count: usize = registry.plugins.iter().map(|p| p.routes.len()).sum();
 
     // Bootstrap role grants: plugins registered their permissions during load;
     // now grant them. SPEC §9 — Chief holds full troop authority, so `chief`
     // gets every permission that exists after load. Placeholder until the auth
-    // plugin (Milestone 2) replaces static roles with real role management.
+    // plugin replaces static roles.
     sqlx::query(
         "INSERT INTO core.role_permissions (role_id, permission_id) \
          SELECT 'chief', id FROM core.permissions \
@@ -89,76 +107,127 @@ pub async fn build_app(cfg: &Config) -> Result<(Router, EventBus), BuildError> {
     .map_err(BuildError::Db)?;
 
     let permissions = PermissionService::new(crate::host::CoreDb::new(pool.clone()));
-    let mut routes: Vec<RouteEntry> = Vec::new();
-    for lp in &registry.plugins {
-        for r in &lp.routes {
-            routes.push(RouteEntry {
-                method: r.method,
-                path: r.path.clone(),
-                required_permission: r.required_permission.clone(),
-                handler: r.handler.clone(),
-            });
-        }
-    }
-    let routes_len = routes.len();
+    let audit = AuditService::new(crate::host::CoreDb::new(pool.clone()), "core".into());
 
-    // Registry moves INTO the state — see AppState doc: this is what keeps the
-    // plugin libraries mapped for as long as the router can dispatch into them.
     let state = Arc::new(AppState {
         pool: pool.clone(),
-        permissions: permissions.clone(),
-        plugins: registry.infos.clone(),
-        registry,
+        permissions,
+        audit,
+        registry: RwLock::new(registry),
+        bus,
+        config: Arc::new(cfg.clone()),
     });
 
-    let mut app = Router::new()
+    let cors = cfg.cors_origins.first().map(|_| {
+        let layer = CorsLayer::new();
+        if cfg.cors_origins.iter().any(|o| o == "*") {
+            layer.allow_origin(Any).allow_methods(Any).allow_headers(Any)
+        } else {
+            let origins: Vec<_> = cfg
+                .cors_origins
+                .iter()
+                .filter_map(|o| o.parse().ok())
+                .collect();
+            layer
+                .allow_origin(origins)
+                .allow_methods(Any)
+                .allow_headers(Any)
+        }
+    });
+
+    let app = Router::new()
         .route("/", get(health))
         .route("/api/plugins", get(list_plugins))
+        .route("/api/plugins/{name}/enable", post(enable_plugin))
+        .route("/api/plugins/{name}/disable", post(disable_plugin))
+        .route("/api/plugins/{name}", delete(uninstall_plugin))
+        .route("/api/plugins/reload", post(reload_plugins))
         .route("/api/events/recent", get(recent_events))
+        .route("/api/audit/verify", get(audit_verify))
+        // Every other METHOD path resolves against the live plugin registry.
+        .fallback(dynamic_dispatch)
         .with_state(state.clone());
 
-    // Register each plugin route on the router with its own dispatch wrapper.
-    for entry in routes {
-        let st = state.clone();
-        let required = entry.required_permission.clone();
-        let handler = entry.handler.clone();
-        let path = entry.path.clone();
+    // Layer order: later call = outermost. CORS outermost (headers on 429s and
+    // errors), then access log (sees every response incl. rate-limited), then
+    // the limiter (cheap rejection before any handler work).
+    let limiter = RateLimiter::new(cfg.rate.clone());
+    let app = app.layer(axum::middleware::from_fn_with_state(
+        limiter,
+        rate_limit_layer,
+    ));
+    let app = app.layer(axum::middleware::from_fn(request_log));
+    let app = match cors {
+        Some(c) => app.layer(c),
+        None => app,
+    };
 
-        let wrapper = move |req: Request| {
-            let st = st.clone();
-            let required = required.clone();
-            let handler = handler.clone();
-            async move { dispatch(st, required, handler, path, req).await }
-        };
-
-        app = match entry.method {
-            Method::Get => app.route(&entry.path, get(wrapper)),
-            Method::Post => app.route(&entry.path, post(wrapper)),
-            Method::Put => app.route(&entry.path, axum::routing::put(wrapper)),
-            Method::Delete => app.route(&entry.path, axum::routing::delete(wrapper)),
-        };
-    }
-
-    let route_count = 3 + routes_len;
-    tracing::info!(routes = route_count, "router assembled");
-    Ok((app, bus))
+    tracing::info!(routes = route_count, "router assembled (dynamic plugin dispatch)");
+    Ok((app, state))
 }
 
-/// Plugin route dispatch: permission gate → build SDK request → call handler.
+/// from_fn wrapper over the testable `rate_limit_inner`.
+async fn rate_limit_layer(
+    State(limiter): State<RateLimiter>,
+    request: Request,
+    next: axum::middleware::Next,
+) -> Response {
+    crate::middleware::rate_limit_inner(limiter, request, next).await
+}
+
+// ---------------------------------------------------------------------------
+// Dynamic plugin dispatch
+// ---------------------------------------------------------------------------
+
+async fn dynamic_dispatch(State(state): State<Arc<AppState>>, req: Request) -> Response {
+    let method = req.method().to_string();
+    let path = req.uri().path().to_string();
+
+    // Resolve under the read lock, clone what we need, release BEFORE awaiting
+    // the handler (a slow plugin must not block reload/uninstall writers).
+    let lookup = {
+        let reg = state.registry.read().await;
+        match reg.find(&method, &path) {
+            RouteLookup::Found {
+                required_permission,
+                handler,
+                plugin_id,
+            } => Ok((plugin_id, required_permission, handler)),
+            RouteLookup::Disabled { plugin_id } => Err((
+                StatusCode::NOT_FOUND,
+                format!("plugin {plugin_id} is disabled"),
+            )),
+            RouteLookup::NotFound => Err((StatusCode::NOT_FOUND, "route not found".to_string())),
+        }
+    };
+
+    let (plugin_id, required, handler) = match lookup {
+        Ok(x) => x,
+        Err((status, msg)) => {
+            return (status, Json(json!({ "error": msg }))).into_response();
+        }
+    };
+
+    dispatch(state, plugin_id, required, handler, req).await
+}
+
+/// Permission gate → build SDK request → call handler.
 async fn dispatch(
     state: Arc<AppState>,
+    plugin_id: String,
     required: Option<String>,
-    handler: RouteHandler,
-    path: String,
+    handler: adjutant_sdk::RouteHandler,
     req: Request,
 ) -> Response {
     let (parts, body) = req.into_parts();
-    let body_bytes = to_bytes(body, 1024 * 1024).await.unwrap_or_default();
+    let body_bytes = to_bytes(body, state.config.max_body_bytes)
+        .await
+        .unwrap_or_default();
 
-    // 1. Identity from dev headers (Milestone 1 stub; auth plugin replaces).
+    // 1. Identity from dev headers (auth plugin replaces this later).
     let identity = extract_identity(&parts.headers);
 
-    // 2. Permission gate (SPEC §9 — enforced by core, not by the plugin).
+    // 2. Permission gate — enforced by core, never by the plugin (SPEC §9).
     if let Some(perm) = &required {
         if let Err(status) = authorize(identity.as_ref(), &state.permissions, perm).await {
             let msg = if status == 401 {
@@ -166,12 +235,12 @@ async fn dispatch(
             } else {
                 "insufficient permissions"
             };
-            return (StatusCode::from_u16(status).unwrap(), Json(json!({ "error": msg }))).into_response();
+            return (StatusCode::from_u16(status).unwrap(), Json(json!({ "error": msg })))
+                .into_response();
         }
     }
 
     // 3. Convert Axum request → SDK request.
-
     let query = parts
         .uri
         .query()
@@ -203,7 +272,8 @@ async fn dispatch(
     // 4. Call the plugin.
     match handler(preq).await {
         Ok(resp) => {
-            let status = StatusCode::from_u16(resp.status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
+            let status =
+                StatusCode::from_u16(resp.status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
             let mut response = (status, resp.body).into_response();
             for (k, v) in resp.headers {
                 if let (Ok(name), Ok(val)) = (
@@ -216,14 +286,17 @@ async fn dispatch(
             response
         }
         Err(e) => {
-            tracing::warn!(path, error = %e, "plugin handler error");
-            (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({ "error": e.to_string() }))).into_response()
+            tracing::warn!(plugin = %plugin_id, error = %e, "plugin handler error");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({ "error": e.to_string() })),
+            )
+                .into_response()
         }
     }
 }
 
 fn decode(s: &str) -> String {
-    // Minimal percent-decoding for query params (no external dep).
     let bytes = s.as_bytes();
     let mut out = Vec::with_capacity(bytes.len());
     let mut i = 0;
@@ -252,26 +325,49 @@ fn decode(s: &str) -> String {
     String::from_utf8_lossy(&out).into_owned()
 }
 
-// --- core routes ------------------------------------------------------------
+// ---------------------------------------------------------------------------
+// Core routes
+// ---------------------------------------------------------------------------
 
 async fn health() -> Json<serde_json::Value> {
     Json(json!({ "status": "ok", "service": "adjutant" }))
 }
 
 async fn list_plugins(State(state): State<Arc<AppState>>) -> Json<serde_json::Value> {
-    Json(json!({ "plugins": state.plugins }))
+    let reg = state.registry.read().await;
+    Json(json!({
+        "plugins": reg.infos(),
+        "retired_libraries": reg.retired_count(),
+    }))
 }
 
-/// Last 50 events — proves event persistence without plugin involvement.
-async fn recent_events(State(state): State<Arc<AppState>>) -> Json<serde_json::Value> {
+/// Last N events with cursor replay: `?since=<id>&limit=<1..500>`
+/// (SPEC §15 M2: event bus persistence + replay).
+async fn recent_events(
+    State(state): State<Arc<AppState>>,
+    axum::extract::Query(params): axum::extract::Query<HashMap<String, String>>,
+) -> Json<serde_json::Value> {
+    let since: i64 = params
+        .get("since")
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(0);
+    let limit: i64 = params
+        .get("limit")
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(50)
+        .clamp(1, 500);
+
     let rows: Vec<(i64, String, serde_json::Value, String, String)> = sqlx::query_as(
         "SELECT id, event_type, payload, source_plugin, created_at::text \
-         FROM core.events ORDER BY id DESC LIMIT 50",
+         FROM core.events WHERE id > $1 ORDER BY id ASC LIMIT $2",
     )
+    .bind(since)
+    .bind(limit)
     .fetch_all(state.pool.as_ref())
     .await
     .unwrap_or_default();
 
+    let last = rows.last().map(|r| r.0).unwrap_or(since);
     let events: Vec<serde_json::Value> = rows
         .into_iter()
         .map(|(id, event_type, payload, source, created_at)| {
@@ -282,7 +378,213 @@ async fn recent_events(State(state): State<Arc<AppState>>) -> Json<serde_json::V
         })
         .collect();
 
-    Json(json!({ "events": events }))
+    Json(json!({ "events": events, "cursor": last }))
+}
+
+/// Recompute the audit hash chain (SPEC §15 M2: tamper-evident audit log).
+async fn audit_verify(State(state): State<Arc<AppState>>, req: Request) -> Response {
+    if let Some(resp) = state.require_admin(req.headers()).await {
+        return resp;
+    }
+    let row: Option<(Option<i64>, i64)> =
+        sqlx::query_as("SELECT first_bad, rows_checked FROM core.audit_verify()")
+            .fetch_one(state.pool.as_ref())
+            .await
+            .map_err(|e| e.to_string())
+            .ok()
+            .map(|(f, n): (Option<i64>, i64)| (f, n));
+    let (first_bad, rows) = row.unwrap_or((None, 0));
+    Json(json!({
+        "ok": first_bad.is_none(),
+        "first_bad": first_bad,
+        "rows_checked": rows,
+    }))
+    .into_response()
+}
+
+// ---------------------------------------------------------------------------
+// Admin lifecycle (all require core:admin; every action is audit-logged)
+// ---------------------------------------------------------------------------
+
+async fn enable_plugin(
+    State(state): State<Arc<AppState>>,
+    Path(name): Path<String>,
+    req: Request,
+) -> Response {
+    if let Some(resp) = state.require_admin(req.headers()).await {
+        return resp;
+    }
+    let identity = extract_identity(req.headers());
+    let changed = {
+        let mut reg = state.registry.write().await;
+        reg.set_enabled(&name, true)
+    };
+    if !changed {
+        return (StatusCode::NOT_FOUND, Json(json!({ "error": "plugin not loaded" }))).into_response();
+    }
+    let dbres = sqlx::query(
+        "UPDATE core.plugins SET enabled = true, updated_at = now() WHERE id = $1",
+    )
+    .bind(&name)
+    .execute(state.pool.as_ref())
+    .await;
+    if let Err(e) = dbres {
+        return (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({ "error": e.to_string() })))
+            .into_response();
+    }
+    let _ = state
+        .audit
+        .log(identity.as_ref(), "plugin.enable", "plugin", &name, json!({}))
+        .await;
+    Json(json!({ "plugin": name, "enabled": true })).into_response()
+}
+
+async fn disable_plugin(
+    State(state): State<Arc<AppState>>,
+    Path(name): Path<String>,
+    req: Request,
+) -> Response {
+    if let Some(resp) = state.require_admin(req.headers()).await {
+        return resp;
+    }
+    let identity = extract_identity(req.headers());
+    let changed = {
+        let mut reg = state.registry.write().await;
+        reg.set_enabled(&name, false)
+    };
+    if !changed {
+        return (StatusCode::NOT_FOUND, Json(json!({ "error": "plugin not loaded" }))).into_response();
+    }
+    let dbres = sqlx::query(
+        "UPDATE core.plugins SET enabled = false, updated_at = now() WHERE id = $1",
+    )
+    .bind(&name)
+    .execute(state.pool.as_ref())
+    .await;
+    if let Err(e) = dbres {
+        return (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({ "error": e.to_string() })))
+            .into_response();
+    }
+    let _ = state
+        .audit
+        .log(identity.as_ref(), "plugin.disable", "plugin", &name, json!({}))
+        .await;
+    Json(json!({ "plugin": name, "enabled": false })).into_response()
+}
+
+/// Uninstall: routes stop resolving immediately, the library is retired (kept
+/// mapped), and the plugin's event subscriptions are aborted. **Data is
+/// archived, never dropped** (SPEC §5.2) — the schema and `core.plugins` row
+/// stay; only `uninstalled` flips, so a later boot/reload skips it.
+async fn uninstall_plugin(
+    State(state): State<Arc<AppState>>,
+    Path(name): Path<String>,
+    req: Request,
+) -> Response {
+    if let Some(resp) = state.require_admin(req.headers()).await {
+        return resp;
+    }
+    let identity = extract_identity(req.headers());
+    let removed = {
+        let mut reg = state.registry.write().await;
+        reg.uninstall(&name)
+    };
+    if !removed {
+        return (StatusCode::NOT_FOUND, Json(json!({ "error": "plugin not loaded" }))).into_response();
+    }
+    let dbres = sqlx::query(
+        "UPDATE core.plugins SET uninstalled = true, enabled = false, updated_at = now() \
+         WHERE id = $1",
+    )
+    .bind(&name)
+    .execute(state.pool.as_ref())
+    .await;
+    if let Err(e) = dbres {
+        return (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({ "error": e.to_string() })))
+            .into_response();
+    }
+    state.bus.clear_plugin(&name);
+    let _ = state
+        .audit
+        .log(identity.as_ref(), "plugin.uninstall", "plugin", &name, json!({}))
+        .await;
+    Json(json!({
+        "plugin": name,
+        "uninstalled": true,
+        "data": "archived (schema and rows preserved)",
+    }))
+    .into_response()
+}
+
+/// Hot-reload: rescan `plugin_dir`, load the new set OUTSIDE the lock (old
+/// registry keeps serving meanwhile), then swap and rebind subscriptions.
+/// On failure the old registry stays live — reload is all-or-nothing.
+async fn reload_plugins(State(state): State<Arc<AppState>>, req: Request) -> Response {
+    if let Some(resp) = state.require_admin(req.headers()).await {
+        return resp;
+    }
+    let identity = extract_identity(req.headers());
+
+    let fresh = match load_all(
+        &state.config.plugin_dir,
+        state.pool.clone(),
+        state.bus.sender(),
+        serde_json::Value::Object(Default::default()),
+    )
+    .await
+    {
+        Ok(r) => r,
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({ "error": format!("reload failed, old registry kept: {e}") })),
+            )
+                .into_response();
+        }
+    };
+    let route_count: usize = fresh.plugins.iter().map(|p| p.routes.len()).sum();
+    let ids: Vec<String> = fresh.plugins.iter().map(|p| p.info.id.clone()).collect();
+    let versions: HashMap<String, String> = fresh
+        .plugins
+        .iter()
+        .map(|p| (p.info.id.clone(), p.info.version.clone()))
+        .collect();
+
+    // Swap, then rebind subscriptions: abort every old task first so no
+    // event is handled by both the old and the new instance.
+    {
+        let mut reg = state.registry.write().await;
+        reg.replace_all(fresh);
+    }
+    for old_id in state.bus.subscriber_ids() {
+        state.bus.clear_plugin(&old_id);
+    }
+    {
+        let reg = state.registry.read().await;
+        for lp in &reg.plugins {
+            for sub in lp.plugin.subscriptions() {
+                state.bus.subscribe(lp.plugin.id(), sub);
+            }
+        }
+    }
+
+    let _ = state
+        .audit
+        .log(
+            identity.as_ref(),
+            "plugin.reload",
+            "plugin",
+            "*",
+            json!({ "reloaded": ids, "routes": route_count }),
+        )
+        .await;
+    tracing::info!(routes = route_count, "registry hot-reloaded");
+    Json(json!({
+        "reloaded": ids,
+        "versions": versions,
+        "routes": route_count,
+    }))
+    .into_response()
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -292,3 +594,4 @@ pub enum BuildError {
     #[error("plugin runtime: {0}")]
     Plugin(#[from] crate::plugin_runtime::PluginRuntimeError),
 }
+

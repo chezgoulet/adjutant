@@ -5,6 +5,7 @@ pub mod config;
 pub mod db;
 pub mod events;
 pub mod host;
+pub mod middleware;
 pub mod permissions;
 pub mod plugin_runtime;
 pub mod server;
