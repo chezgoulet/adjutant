@@ -20,6 +20,7 @@
 
 use std::collections::HashMap;
 use std::path::Path;
+use std::sync::Mutex;
 
 use sqlx::PgPool;
 use std::sync::Arc;
@@ -30,6 +31,22 @@ use adjutant_sdk::{
 };
 
 use crate::db::run_migration;
+
+/// Every opened plugin library, kept mapped for the process lifetime.
+///
+/// The registry holds live plugins and `retired` holds uninstalled/superseded
+/// ones — but a *load error* would drop the only `Arc<Library>` while the core
+/// may still own trait objects into that code (an identity provider registered
+/// during `init`, for example). Dropping those then calls vtables in unmapped
+/// memory: SIGSEGV on the error path (seen while bringing up auth). Parking
+/// every library here makes "never unload" unconditional instead of
+/// dependent on which locals happen to still be alive.
+static PARKED: std::sync::LazyLock<Mutex<Vec<Arc<libloading::Library>>>> =
+    std::sync::LazyLock::new(|| Mutex::new(Vec::new()));
+
+fn park(lib: Arc<libloading::Library>) {
+    PARKED.lock().expect("parking lot poisoned").push(lib);
+}
 
 /// Core-owned route namespaces plugins may never claim.
 const RESERVED_IDS: &[&str] = &["plugins", "events", "audit", "core"];
@@ -56,6 +73,16 @@ pub struct PluginInfo {
     pub enabled: bool,
     pub routes: usize,
     pub permissions: Vec<String>,
+    /// Full route table — lets `adjutant test-plugin` probe every route
+    /// without hardcoding plugin knowledge.
+    pub route_list: Vec<RouteInfo>,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct RouteInfo {
+    pub method: String,
+    pub path: String,
+    pub permission: Option<String>,
 }
 
 /// Result of resolving a request path against the registry.
@@ -64,10 +91,65 @@ pub enum RouteLookup {
         plugin_id: String,
         required_permission: Option<String>,
         handler: RouteHandler,
+        /// Captures from a templated route (`/api/missions/{id}`).
+        params: HashMap<String, String>,
     },
     /// Route exists but its plugin is disabled (SPEC: disable = stop serving).
     Disabled { plugin_id: String },
     NotFound,
+}
+
+/// Match a route template against a request path.
+///
+/// A `{name}` segment captures exactly one non-empty path segment, so a capture
+/// can never span a `/`. Different segment counts never match. Returns the
+/// captures (empty for a literal route) or `None`.
+fn match_path(template: &str, path: &str) -> Option<HashMap<String, String>> {
+    let t: Vec<&str> = template.split('/').collect();
+    let p: Vec<&str> = path.split('/').collect();
+    if t.len() != p.len() {
+        return None;
+    }
+    let mut params = HashMap::new();
+    for (ts, ps) in t.iter().zip(p.iter()) {
+        if let Some(name) = ts.strip_prefix('{').and_then(|s| s.strip_suffix('}')) {
+            if ps.is_empty() {
+                return None;
+            }
+            params.insert(name.to_string(), (*ps).to_string());
+        } else if ts != ps {
+            return None;
+        }
+    }
+    Some(params)
+}
+
+/// Validate `{name}` captures in a route path: a capture must be a whole
+/// segment with a non-empty `[a-z0-9_]` name, unique within the path.
+fn validate_route_path(path: &str) -> Result<(), String> {
+    let mut seen: Vec<&str> = Vec::new();
+    for seg in path.split('/') {
+        if !seg.contains('{') && !seg.contains('}') {
+            continue;
+        }
+        let Some(name) = seg.strip_prefix('{').and_then(|s| s.strip_suffix('}')) else {
+            return Err(format!("route {path}: capture must occupy a whole segment (`{{name}}`)"));
+        };
+        if name.is_empty()
+            || !name
+                .chars()
+                .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_')
+        {
+            return Err(format!(
+                "route {path}: capture name {name:?} must be [a-z0-9_]+"
+            ));
+        }
+        if seen.contains(&name) {
+            return Err(format!("route {path}: duplicate capture {name:?}"));
+        }
+        seen.push(name);
+    }
+    Ok(())
 }
 
 pub struct PluginRegistry {
@@ -92,23 +174,43 @@ impl PluginRegistry {
     }
 
     /// Resolve `METHOD path` against live plugin routes.
+    ///
+    /// Literal routes win over templated ones, so a specific path is never
+    /// shadowed by a capture. Captures are delivered to the handler.
     pub fn find(&self, method: &str, path: &str) -> RouteLookup {
+        let mut templated: Option<(&LoadedPlugin, &RouteDefinition, HashMap<String, String>)> = None;
         for p in &self.plugins {
             for r in &p.routes {
-                if r.method.as_str() == method && r.path == path {
-                    return if p.enabled {
-                        RouteLookup::Found {
-                            plugin_id: p.info.id.clone(),
-                            required_permission: r.required_permission.clone(),
-                            handler: r.handler.clone(),
-                        }
-                    } else {
-                        RouteLookup::Disabled { plugin_id: p.info.id.clone() }
-                    };
+                if r.method.as_str() != method {
+                    continue;
+                }
+                if r.path == path {
+                    return Self::resolve(p, r, HashMap::new());
+                }
+                if templated.is_none() {
+                    if let Some(params) = match_path(&r.path, path) {
+                        templated = Some((p, r, params));
+                    }
                 }
             }
         }
-        RouteLookup::NotFound
+        match templated {
+            Some((p, r, params)) => Self::resolve(p, r, params),
+            None => RouteLookup::NotFound,
+        }
+    }
+
+    fn resolve(p: &LoadedPlugin, r: &RouteDefinition, params: HashMap<String, String>) -> RouteLookup {
+        if p.enabled {
+            RouteLookup::Found {
+                plugin_id: p.info.id.clone(),
+                required_permission: r.required_permission.clone(),
+                handler: r.handler.clone(),
+                params,
+            }
+        } else {
+            RouteLookup::Disabled { plugin_id: p.info.id.clone() }
+        }
     }
 
     /// Flip `enabled` in memory. Returns false when the plugin isn't live
@@ -158,6 +260,8 @@ pub async fn load_all(
     pool: Arc<PgPool>,
     event_tx: tokio::sync::broadcast::Sender<adjutant_sdk::Event>,
     config: serde_json::Value,
+    identity: std::sync::Arc<crate::identity::IdentityHub>,
+    http: std::sync::Arc<crate::host::CoreHttp>,
 ) -> Result<PluginRegistry, PluginRuntimeError> {
     let mut plugins: Vec<LoadedPlugin> = Vec::new();
     let mut seen_ids: HashMap<String, ()> = HashMap::new();
@@ -182,6 +286,7 @@ pub async fn load_all(
             PluginRuntimeError::Load(path.display().to_string(), e.to_string())
         })?;
         let lib = Arc::new(lib);
+        park(lib.clone()); // mapped until process exit, whatever happens below
 
         // Scope the libloading `Symbol` (a raw-pointer borrow) to this block
         // so it cannot be live across any await below — a Symbol in the
@@ -197,13 +302,7 @@ pub async fn load_all(
         let id = plugin.id().to_string();
 
         // --- validation -----------------------------------------------------
-        validate_id(&id).map_err(|e| PluginRuntimeError::Invalid(id.clone(), e))?;
-        if RESERVED_IDS.contains(&id.as_str()) {
-            return Err(PluginRuntimeError::Invalid(
-                id,
-                "id is reserved by the core".into(),
-            ));
-        }
+        validate_plugin_id(&id).map_err(|e| PluginRuntimeError::Invalid(id.clone(), e))?;
         if seen_ids.contains_key(&id) {
             return Err(PluginRuntimeError::Invalid(id, "duplicate plugin id".into()));
         }
@@ -233,18 +332,50 @@ pub async fn load_all(
         .await
         .map_err(|e| PluginRuntimeError::Migration(id.clone(), e.to_string()))?;
 
+        // --- per-plugin config (DB row) + enabled state ---------------------
+        // Read BEFORE ctx construction: init() needs ctx.config (OIDC settings
+        // etc. are per-plugin and admin-editable via the config column).
+        let existing: Option<(bool, serde_json::Value)> = sqlx::query_as(
+            "SELECT enabled, config FROM core.plugins WHERE id = $1",
+        )
+        .bind(&id)
+        .fetch_optional(pool.as_ref())
+        .await
+        .map_err(|e| PluginRuntimeError::Migration(id.clone(), e.to_string()))?;
+        let (enabled, row_config) = existing.unwrap_or((true, serde_json::Value::Null));
+        sqlx::query(
+            "INSERT INTO core.plugins (id, version, enabled) VALUES ($1, $2, $3) \
+             ON CONFLICT (id) DO UPDATE SET version = EXCLUDED.version, updated_at = now()",
+        )
+        .bind(&id)
+        .bind(plugin.version())
+        .bind(enabled)
+        .execute(pool.as_ref())
+        .await
+        .map_err(|e| PluginRuntimeError::Migration(id.clone(), e.to_string()))?;
+        // A non-empty row config wins over the global default from the caller.
+        let plugin_config = match &row_config {
+            v if v.as_object().map(|o| !o.is_empty()).unwrap_or(false) => v.clone(),
+            _ => config.clone(),
+        };
+
         let ctx = PluginContext {
             plugin_id: id.clone(),
             // Host-mediated: these Arc<dyn Host…> impls live in the core, so no
             // sqlx/tokio is ever linked into the plugin (see SDK host-I/O note).
-            db: adjutant_sdk::DbHandle::new(core_db.clone(), id.clone()),
-            config: config.clone(),
+            db: adjutant_sdk::DbHandle::new(
+                crate::host::CoreDb::for_plugin(pool.clone(), id.clone()),
+                id.clone(),
+            ),
+            config: plugin_config.clone(),
             events: EventBusHandle::new(
                 crate::host::CoreEvents::new(pool.clone(), event_tx.clone(), id.clone()),
                 id.clone(),
             ),
             permissions: PermissionService::new(core_db.clone()),
             audit: adjutant_sdk::AuditService::new(core_db.clone(), id.clone()),
+            identity: identity.clone(),
+            http: http.clone(),
         };
 
         plugin
@@ -297,6 +428,8 @@ pub async fn load_all(
                     format!("route {} escapes plugin namespace (must start with {prefix})", r.path),
                 ));
             }
+            validate_route_path(&r.path)
+                .map_err(|e| PluginRuntimeError::Invalid(id.clone(), e))?;
             if let Some(required) = &r.required_permission {
                 if !granted.iter().any(|p| &p.id == required) {
                     return Err(PluginRuntimeError::Invalid(
@@ -318,18 +451,7 @@ pub async fn load_all(
             seen_routes.insert(key, ());
         }
 
-        // --- enabled state ---------------------------------------------------
-        let enabled: bool = sqlx::query_scalar(
-            "INSERT INTO core.plugins (id, version) VALUES ($1, $2) \
-             ON CONFLICT (id) DO UPDATE SET version = EXCLUDED.version, updated_at = now() \
-             RETURNING enabled",
-        )
-        .bind(&id)
-        .bind(plugin.version())
-        .fetch_one(pool.as_ref())
-        .await
-        .map_err(|e| PluginRuntimeError::Migration(id.clone(), e.to_string()))?;
-
+        // --- enabled state (row created above; version tracked at upsert) ---
         tracing::info!(
             id,
             version = plugin.version(),
@@ -346,6 +468,14 @@ pub async fn load_all(
             enabled,
             routes: routes.len(),
             permissions: granted.iter().map(|p| p.id.clone()).collect(),
+            route_list: routes
+                .iter()
+                .map(|r| RouteInfo {
+                    method: r.method.as_str().to_string(),
+                    path: r.path.clone(),
+                    permission: r.required_permission.clone(),
+                })
+                .collect(),
         };
         seen_ids.insert(id, ());
 
@@ -359,6 +489,15 @@ pub async fn load_all(
     }
 
     Ok(PluginRegistry::new(plugins))
+}
+
+/// Full load-time id check: shape rule plus the core-reserved names.
+fn validate_plugin_id(id: &str) -> Result<(), String> {
+    validate_id(id)?;
+    if RESERVED_IDS.contains(&id) {
+        return Err(format!("id {id:?} is reserved by the core"));
+    }
+    Ok(())
 }
 
 /// Plugin ids: same rule as schema names (they ARE the schema).
@@ -448,36 +587,158 @@ mod tests {
         }
     }
 
-    /// Registry without a real .so: fake the library field with a dummy Arc.
-    /// (A `Library` can't be fabricated, so registry tests build `plugins`
-    /// through a helper that leaks a never-unloaded handle via transmute-free
-    /// path: we only exercise `find`/`set_enabled`/`uninstall` bookkeeping, so
-    /// an empty retired list is fine and the library field is only moved.)
-    fn make_registry(enabled: bool) -> PluginRegistry {
-        // SAFETY-FREE approach: build LoadedPlugin via load path is heavy for a
-        // unit test; instead test the pure registry logic with a stub plugin
-        // and a library handle we obtain from the real SDK-linked test binary.
-        // We can't construct libloading::Library in a unit test, so these tests
-        // use `PluginRegistry` fields directly with a placeholder: see
-        // `registry_logic` tests below which operate on an empty-armed struct.
-        let _ = enabled;
-        PluginRegistry { plugins: Vec::new(), retired: Vec::new() }
+    /// A real `Library` handle for the lifetime field. The field is never read
+    /// (it exists so plugin code outlives its handlers), so any valid mapping
+    /// does — the test binary itself, with libc as a portable fallback. That is
+    /// enough to exercise the registry logic for real instead of against the
+    /// empty placeholder this fixture used to be.
+    fn test_library() -> Arc<libloading::Library> {
+        let exe = std::env::current_exe().expect("current_exe");
+        let lib = unsafe { libloading::Library::new(&exe) }
+            .or_else(|_| unsafe { libloading::Library::new("libc.so.6") })
+            .expect("a Library handle for registry tests");
+        Arc::new(lib)
     }
 
-    /// Compile-time proofs for the M2 hot-reload requirement: the registry
-    /// (which owns `Arc<Library>`) must cross await points inside axum
-    /// handlers, so every type it contains must be Send + Sync.
+    /// A real `LoadedPlugin` fixture.
+    fn loaded(id: &str, enabled: bool, method: &str, path: &str, perm: Option<&str>) -> LoadedPlugin {
+        let lib = test_library();
+        let handler = route_handler(|_: PluginRequest| async {
+            PluginResponse::json(200, &serde_json::json!({"ok": true}))
+        });
+        let route = match perm {
+            Some(p) => RouteDefinition::get_protected(path, p, handler),
+            None => RouteDefinition::get(path, handler),
+        };
+        let info = PluginInfo {
+            id: id.into(),
+            name: id.into(),
+            version: "0.0.1".into(),
+            enabled,
+            routes: 1,
+            permissions: perm.map(|p| vec![p.to_string()]).unwrap_or_default(),
+            route_list: vec![RouteInfo {
+                method: method.into(),
+                path: path.into(),
+                permission: perm.map(String::from),
+            }],
+        };
+        LoadedPlugin {
+            plugin: Box::new(TestPlugin::new()),
+            library: lib,
+            routes: vec![route],
+            enabled,
+            info,
+        }
+    }
+
     #[test]
-    fn registry_and_library_are_send_sync() {
-        fn assert_send<T: Send>() {}
-        fn assert_sync<T: Sync>() {}
-        assert_send::<libloading::Library>();
-        assert_sync::<libloading::Library>();
-        assert_send::<Arc<libloading::Library>>();
-        assert_send::<PluginRegistry>();
-        assert_sync::<PluginRegistry>();
-        assert_send::<LoadedPlugin>();
-        assert_send::<RouteDefinition>();
+    fn find_reports_enabled_disabled_and_unknown() {
+        let reg = PluginRegistry::new(vec![
+            loaded("alpha", true, "GET", "/api/alpha/thing", Some("alpha:read")),
+            loaded("beta", false, "GET", "/api/beta/thing", None),
+        ]);
+
+        match reg.find("GET", "/api/alpha/thing") {
+            RouteLookup::Found { plugin_id, required_permission, .. } => {
+                assert_eq!(plugin_id, "alpha");
+                assert_eq!(required_permission.as_deref(), Some("alpha:read"));
+            }
+            _ => panic!("enabled route must resolve"),
+        }
+        // Disabled plugin: the route exists but must not serve (SPEC lifecycle).
+        match reg.find("GET", "/api/beta/thing") {
+            RouteLookup::Disabled { plugin_id } => assert_eq!(plugin_id, "beta"),
+            _ => panic!("disabled plugin must report Disabled, not Found/NotFound"),
+        }
+        assert!(matches!(reg.find("GET", "/api/nope"), RouteLookup::NotFound));
+        // Method mismatch is NotFound, not a silent match.
+        assert!(matches!(reg.find("POST", "/api/alpha/thing"), RouteLookup::NotFound));
+    }
+
+    #[test]
+    fn templated_routes_capture_one_segment() {
+        let reg = PluginRegistry::new(vec![loaded(
+            "missions",
+            true,
+            "GET",
+            "/api/missions/{id}",
+            Some("missions:read"),
+        )]);
+        match reg.find("GET", "/api/missions/42") {
+            RouteLookup::Found { params, plugin_id, .. } => {
+                assert_eq!(plugin_id, "missions");
+                assert_eq!(params.get("id").map(String::as_str), Some("42"));
+            }
+            _ => panic!("template must match a one-segment path"),
+        }
+        // A capture is exactly one segment — never a prefix match across slashes.
+        assert!(matches!(reg.find("GET", "/api/missions/42/approve"), RouteLookup::NotFound));
+        assert!(matches!(reg.find("GET", "/api/missions"), RouteLookup::NotFound));
+        // An empty segment is not a capture.
+        assert!(matches!(reg.find("GET", "/api/missions/"), RouteLookup::NotFound));
+    }
+
+    #[test]
+    fn literal_routes_win_over_templates() {
+        let reg = PluginRegistry::new(vec![
+            loaded("missions", true, "GET", "/api/missions/{id}", None),
+            loaded("missions", true, "GET", "/api/missions/current", Some("missions:read")),
+        ]);
+        match reg.find("GET", "/api/missions/current") {
+            RouteLookup::Found { required_permission, params, .. } => {
+                assert_eq!(required_permission.as_deref(), Some("missions:read"));
+                assert!(params.is_empty(), "literal match has no captures");
+            }
+            _ => panic!("literal route must win"),
+        }
+    }
+
+    #[test]
+    fn route_path_validation_rejects_malformed_captures() {
+        assert!(validate_route_path("/api/missions/{id}").is_ok());
+        assert!(validate_route_path("/api/missions/{mission_id}/approve").is_ok());
+        assert!(validate_route_path("/api/missions/plain").is_ok());
+        assert!(validate_route_path("/api/missions/{id").is_err(), "unclosed");
+        assert!(validate_route_path("/api/missions/x{id}").is_err(), "partial segment");
+        assert!(validate_route_path("/api/missions/{}").is_err(), "empty name");
+        assert!(validate_route_path("/api/missions/{ID}").is_err(), "uppercase name");
+        assert!(validate_route_path("/api/missions/{id}/{id}").is_err(), "duplicate name");
+    }
+
+    #[test]
+    fn set_enabled_and_uninstall_update_serving() {
+        let mut reg = PluginRegistry::new(vec![loaded("alpha", true, "GET", "/api/alpha/thing", None)]);
+        assert!(reg.set_enabled("alpha", false));
+        assert!(matches!(reg.find("GET", "/api/alpha/thing"), RouteLookup::Disabled { .. }));
+        assert!(reg.set_enabled("alpha", true));
+        assert!(matches!(reg.find("GET", "/api/alpha/thing"), RouteLookup::Found { .. }));
+        assert!(!reg.set_enabled("ghost", false), "unknown plugin must report false");
+
+        assert!(reg.uninstall("alpha"));
+        assert!(matches!(reg.find("GET", "/api/alpha/thing"), RouteLookup::NotFound));
+        assert_eq!(reg.retired_count(), 1, "library must be retired, never dropped");
+        assert!(reg.is_empty());
+        assert!(!reg.uninstall("ghost"));
+    }
+
+    #[test]
+    fn replace_all_retires_previous_generation() {
+        let mut reg = PluginRegistry::new(vec![loaded("alpha", true, "GET", "/api/alpha/thing", None)]);
+        reg.replace_all(PluginRegistry::new(vec![loaded(
+            "alpha",
+            true,
+            "GET",
+            "/api/alpha/thing",
+            Some("alpha:read"),
+        )]));
+        assert_eq!(reg.retired_count(), 1);
+        match reg.find("GET", "/api/alpha/thing") {
+            RouteLookup::Found { required_permission, .. } => {
+                assert_eq!(required_permission.as_deref(), Some("alpha:read"));
+            }
+            _ => panic!("fresh generation must serve"),
+        }
     }
 
     #[test]
@@ -491,35 +752,16 @@ mod tests {
     }
 
     #[test]
-    fn reserved_ids_rejected_in_helper() {
+    fn validate_plugin_id_rejects_reserved_and_malformed() {
         for r in RESERVED_IDS {
-            assert!(!r.is_empty());
-            assert!(validate_id(r).is_ok(), "{r} is a valid-looking id, so the RESERVED check must catch it");
+            // Each reserved name is shape-valid, so only the reserved check can
+            // reject it — which is exactly what the old test failed to assert.
+            assert!(validate_id(r).is_ok(), "{r} must be shape-valid for the reserved rule to matter");
+            assert!(validate_plugin_id(r).is_err(), "reserved id {r} must be rejected at load");
         }
-        let reserved: std::collections::HashSet<&str> =
-            RESERVED_IDS.iter().copied().collect();
-        assert!(reserved.contains("plugins") && reserved.contains("events"));
+        assert!(validate_plugin_id("hello").is_ok());
+        assert!(validate_plugin_id("Hello").is_err());
+        assert!(validate_plugin_id("drop table").is_err());
     }
 
-    #[test]
-    fn empty_registry_lookup_is_not_found() {
-        let reg = make_registry(true);
-        assert!(matches!(reg.find("GET", "/api/nope"), RouteLookup::NotFound));
-        assert!(reg.is_empty());
-        assert_eq!(reg.infos().len(), 0);
-        assert_eq!(reg.retired_count(), 0);
-    }
-
-    #[test]
-    fn test_plugin_route_namespacing_is_valid() {
-        // guards the TestPlugin fixture itself: namespace + permission pairing
-        let p = TestPlugin::new();
-        let prefix = format!("/api/{}", p.id());
-        for r in p.routes() {
-            assert!(r.path.starts_with(&prefix), "{} must live under {prefix}", r.path);
-            if let Some(perm) = &r.required_permission {
-                assert!(p.permissions_granted().iter().any(|g| &g.id == perm));
-            }
-        }
-    }
 }

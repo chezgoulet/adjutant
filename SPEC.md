@@ -136,8 +136,8 @@ Adjutant is not a hierarchy management tool with a scouting skin. It is a sovere
 | Layer | Technology | Rationale |
 |---|---|---|
 | Server | Rust + Axum | Safety, performance, WASM plugins, single binary, edge deployment |
-| Database | PostgreSQL 16+ | JSONB, PostGIS, full-text search, proven reliability |
-| Plugin runtime | wasmtime (WASM) | Sandboxed execution, server-side and client-side |
+| Database | PostgreSQL 14+ (18.6 in development) | JSONB, full-text search, proven reliability; `pgcrypto` for the audit hash chain |
+| Plugin runtime | native `cdylib` today; wasmtime (WASM) **planned** | Sandboxed execution for untrusted/third-party plugins. Milestone 1 proved the native host-API path and deferred WASM (§14-R1); the SDK trait API is the same either way |
 | Client (all platforms) | Flutter (Dart) | Single codebase, native performance, offline-first, PWA support |
 | Auth | Plugin (OIDC) | Delegate to upstream identity providers |
 | Payments | Plugin (Stripe) | Industry standard, PCI compliant |
@@ -163,7 +163,8 @@ Adjutant is not a hierarchy management tool with a scouting skin. It is a sovere
 The core is the minimum viable server. It owns:
 
 - **Plugin registry and lifecycle** — load, enable, disable, uninstall plugins
-- **WASM runtime** — wasmtime for sandboxed plugin execution
+- **Plugin runtime** — native `cdylib` + `libloading` today; the WASM host API
+  (wasmtime) is planned and mirrors the same `Arc<dyn Host…>` boundary (§14-R1)
 - **Database connection and schema management** — connection pooling, migrations, schema isolation per plugin
 - **HTTP server and route dispatching** — Axum router, middleware stack, request handling
 - **Configuration** — server config, plugin config, environment variables
@@ -178,7 +179,13 @@ The core does NOT contain:
 
 ### 5.2 Plugin System
 
-**Architecture:** Interface-based registration with WASM sandboxing.
+**Architecture:** Interface-based registration. On the native path the
+`manifest.json` described below is **folded into the trait implementation** —
+`id()`/`version()`/`permissions_granted()` are the manifest, in code the compiler
+checks (`server/src/cli.rs:4-7`). The JSON form is retained here as the shape a
+future WASM/out-of-tree plugin loader would consume; nothing reads a
+`manifest.json` today, and plugin discovery is a scan for `*.so`
+(`server/src/plugin_runtime.rs:201-213`).
 
 Each plugin is a directory containing:
 
@@ -286,7 +293,8 @@ trait objects implemented in the core. **The SDK links neither `sqlx` nor
 | `Permission` | Permission declaration and checking |
 | `adjutant new-plugin` | CLI scaffolding — generates a plugin project with manifest, routes, models, migrations |
 | `adjutant test-plugin` | Test harness — spins up a test server with the plugin loaded, mock permissions, test database |
-| `adjutant validate-plugin` | Checks manifest, permissions, schema, routes against the core API |
+| Path captures | `{name}` segments in `RouteDefinition::path` (`/api/missions/{id}`); captures arrive in `PluginRequest::params`, literal routes are matched first (landed ahead of SDK v0.2 because M4 needs it) |
+| `adjutant validate-plugin` | **Planned, not implemented.** Validation happens at load time (id/route-namespace/duplicate/permission-parity checks in `plugin_runtime.rs`), which fails the boot loudly rather than validating offline |
 
 **SDK versioning:** The SDK version is pinned to the core version. Breaking changes to the SDK require a major version bump. The SDK changelog is the contract changelog.
 
@@ -316,22 +324,34 @@ For most plugins, native Rust compilation is fine. WASM mode is for third-party 
 
 **Middleware stack (bottom to top):**
 
-1. **Request ID** — Assign unique ID to every request
-2. **Logging** — Structured request/response logging
-3. **CORS** — Cross-origin resource sharing for web clients
-4. **Rate limiting** — Per-user, per-endpoint rate limits
-5. **Authentication** — Validate session token, load user identity (delegated to auth plugin)
-6. **Authorization** — Check permissions against the route's required permission (core enforcement)
-7. **Plugin routing** — Dispatch to the appropriate plugin's route handler
+1. **Request ID + logging** — one layer: assigns `x-request-id` and emits one
+   structured line per request (`middleware.rs:32-62`)
+2. **CORS** — tower-http layer, outermost so its headers survive 429s and errors
+3. **Rate limiting** — fixed window **per client IP** (`middleware.rs:98-176`).
+   `x-forwarded-for` is honoured only when the direct peer is listed in
+   `ADJUTANT_TRUSTED_PROXIES` (empty by default) — the header is client-controlled
+4. **Authentication** — plugin identity providers first (auth sessions via cookie
+   or Bearer); the `x-dev-user`/`x-dev-role` stub only as a gated fallback
+   (`server/src/server.rs:63-87`). The core owns this resolution so the permission
+   gate, the admin gate and audit attribution cannot drift apart
+5. **Authorization** — permission checked by the core against
+   `core.role_permissions` (never by the plugin)
+6. **Plugin routing** — resolve `METHOD path` against the live registry and
+   dispatch, releasing the registry lock before the handler runs
 
 **Route structure:**
 
 ```
 /                           — Health check
-/api/plugins                — Plugin management (admin)
-/api/mcp/messages           — MCP server endpoint (Hermes)
-/api/mcp/sse                — MCP server SSE stream
-/api/{plugin}/*             — Plugin-specific routes
+/api/plugins                — Plugin registry + route table (core:admin)
+/api/plugins/{name}         — DELETE = uninstall, data archived (core:admin)
+/api/plugins/reload         — Hot reload (core:admin)
+/api/events/recent          — Event replay, ?since=&limit= (core:admin)
+/api/audit/verify           — Hash-chain verification (core:admin)
+/api/mcp/{messages,sse}     — MCP endpoint: planned (M5), no code yet
+/api/{plugin}/*             — Plugin-specific routes. A segment may be a
+                              capture: `/api/missions/{id}` delivers
+                              `PluginRequest::params["id"]`
 ```
 
 ### 5.4 Event Bus
@@ -829,7 +849,11 @@ Permissions are scoped to a level:
 - **Patrol** — Patrol Captains, scoped to their Patrol
 - **Personal** — Regular scouts, scoped to their own data
 
-The enforcement layer checks both the permission AND the scope before allowing an action.
+**Status: designed, not implemented.** The schema carries
+`core.user_roles.scope_id` (`server/src/db.rs:66-76`) but enforcement checks the
+permission only (`server/src/permissions.rs:34-46`); nothing reads `scope_id`.
+Scope checks are a Milestone 4+ item — until then, treat every granted permission
+as troop-wide.
 
 ---
 
@@ -854,11 +878,15 @@ The membership plugin pulls OSG data, displays it in Adjutant's compliance dashb
 
 ### 11.1 Docker Compose
 
+# NOTE (planned, not yet implemented - M7): no Redis. SPEC 2.6 says one
+# server, one database, one binary; nothing in the code uses a cache layer.
+# NOTE (planned, not yet implemented - M7): no Redis. SPEC 2.6 says one
+# server, one database, one binary; nothing in the code uses a cache layer.
 ```yaml
 services:
   adjutant:
     build: .
-    ports: ["3000:3000"]
+    ports: ["8787:8787"]
     environment:
       DATABASE_URL: postgresql://adjutant:secret@postgres:5432/adjutant
       REDIS_URL: redis://redis:6379
@@ -872,9 +900,7 @@ services:
       POSTGRES_PASSWORD: secret
     volumes: ["pgdata:/var/lib/postgresql/data"]
   
-  redis:
-    image: redis:7-alpine
-  
+
   minio:
     image: minio/minio
     command: server /data --console-address ":9001"
@@ -892,11 +918,17 @@ volumes:
 # Build
 cargo build --release
 
-# Run
-./target/release/adjutant-server --config /etc/adjutant/config.toml
+# Run (binary name is `adjutant`; env vars are ADJUTANT_*-prefixed)
+ADJUTANT_DATABASE_URL=postgres://adjutant@127.0.0.1:5432/adjutant \
+ADJUTANT_PLUGIN_DIR=/etc/adjutant/plugins \
+ADJUTANT_DEV_HEADERS=false \
+ADJUTANT_TRUSTED_PROXIES=127.0.0.1 \
+  ./target/release/adjutant --config /etc/adjutant/config.toml
 ```
 
-Single binary. No runtime dependencies. `scp` to a server and run.
+Single binary plus PostgreSQL. Plugin `cdylibs` live in the plugin directory, so
+the deployment unit is the binary plus its `.so` files. Release builds still need
+`pgcrypto` available in PostgreSQL (created by core migration 2).
 
 ### 11.3 Minimum Requirements
 
@@ -904,7 +936,7 @@ Single binary. No runtime dependencies. `scp` to a server and run.
 - **RAM:** 256MB minimum (512MB+ recommended)
 - **Disk:** 1GB (scales with data)
 - **OS:** Linux, macOS, Windows
-- **PostgreSQL:** 14+
+- **PostgreSQL:** 14+ (`pgcrypto` extension available)
 
 Runs on a Raspberry Pi, a cheap VPS, or a production server.
 
@@ -986,7 +1018,7 @@ The following were open questions in earlier versions of this spec. They are res
 
 | # | Risk | Severity | Likelihood | Mitigation |
 |---|---|---|---|---|
-| R1 | **WASM plugin host API is an unsolved design problem.** Plugins need to register routes, query DB, publish events, check permissions — all through a WASM host API. This is the hardest technical piece. | HIGH | HIGH | Prototype WASM plugin loading + host API in Milestone 1. If it doesn't work cleanly, fall back to native-only plugins (WASM becomes optional, not required). The SDK trait API stays the same either way. |
+| R1 | **WASM plugin host API is an unsolved design problem.** Plugins need to register routes, query DB, publish events, check permissions — all through a WASM host API. This is the hardest technical piece. | HIGH | HIGH | **Resolved for now: native-only.** Milestone 1 proved the host-mediated I/O boundary (`Arc<dyn Host…>`, the SDK links no sqlx/tokio) and deferred WASM; first-party plugins are native `cdylibs`. That host API is the shape a WASM host must mirror; sandboxing third-party plugins remains open. |
 | R2 | **SDK ergonomics.** If writing a plugin with the SDK is painful, the ecosystem dies. The SDK is the product; everything else is infrastructure. | HIGH | MEDIUM | Build the SDK incrementally. Auth and membership plugins are dogfooding — if they can't be built cleanly, redesign the SDK before writing more plugins. CLI scaffolding (`adjutant new-plugin`) enforces good patterns. |
 | R3 | **Offline sync protocol.** The client must work without connectivity. Conflict resolution, delta sync, and queue management are non-trivial. | HIGH | MEDIUM | Design the sync protocol before Phase 3 (client). Use CRDTs for simple conflict resolution (last-write-wins for most fields, merge for lists). Prototype the sync layer as a standalone library. |
 | R4 | **Scope creep.** AI makes it easy to add "just one more feature." A large codebase that nobody fully understands is a liability. | MEDIUM | HIGH | Ship the MVP (Milestone 5), get it in front of scouts, iterate based on real feedback. The milestone structure enforces hard gates — don't start the next milestone until the current one's exit criteria are met. |
@@ -1028,7 +1060,14 @@ SPEC §8.1 DDL error (COALESCE in PRIMARY KEY).
 **Goal:** Build the production core using the SDK.
 
 **Status: PASSED (2026-09-22).** Evidence: `docs/milestones/M2-core-server.md`
-(52/52 live probes, 28 unit tests, clippy 0 warnings). One bug dominated the
+(**63/63** live probes via the committed `scripts/probes.py`, transcript in
+`docs/evidence/m2_probes.json`; 28 unit tests at commit `0cb6fff`; clippy 0
+warnings). *Correction (audit, 2026-09-22): this line previously claimed "52/52
+live probes" from four gitignored JSON transcripts that in fact recorded 50 passes
+and 7 failures. The probes were re-run through a committed harness; the defects
+behind those failures (broken reinstall, anonymous plugin inventory, fail-open
+audit verifier, actorless lifecycle audit rows, unconditional XFF trust) are fixed
+and listed in the milestone document.* One bug dominated the
 milestone — `sqlx::raw_sql`'s `async fn` wrapper is unprovable as `Send`, which
 made every handler awaiting migrations fail axum's `Handler` bound; fixed by
 calling `Executor::execute` directly. Also found: a `libloading::Symbol` or a
@@ -1054,15 +1093,29 @@ calling `Executor::execute` directly. Also found: a `libloading::Symbol` or a
 **Goal:** Build the SDK to v0.1 and validate it by building the auth and membership plugins with it.
 
 **Exit criteria:**
-- [ ] `adjutant-sdk` crate published (v0.1)
-- [ ] `adjutant new-plugin` CLI scaffolds a plugin project with manifest, routes, models, migrations
-- [ ] `adjutant test-plugin` runs a test server with mock permissions and test database
-- [ ] Auth plugin: OIDC login, session management, role enforcement — all built with the SDK
-- [ ] Membership plugin: member roster, OSG CSV import, proficiency tracking — all built with the SDK
-- [ ] Both plugins can be loaded, enabled, disabled, and uninstalled through the core
-- [ ] Both plugins' routes respond correctly with proper permission checks
-- [ ] Both plugins' database schemas are isolated and migrations run cleanly
-- [ ] The SDK API feels good. If building auth or membership is painful, redesign the SDK before proceeding.
+- [ ] `adjutant-sdk` crate published (v0.1) — *versioned 0.1.0 in-workspace; crates.io publication pending a registry token decision*
+- [x] `adjutant new-plugin` CLI scaffolds a plugin project with manifest, routes, models, migrations
+- [x] `adjutant test-plugin` runs a test server with mock permissions and test database
+- [x] Auth plugin: OIDC login, session management, role enforcement — all built with the SDK
+- [x] Membership plugin: member roster, OSG CSV import, proficiency tracking — all built with the SDK
+- [x] Both plugins can be loaded, enabled, disabled, and uninstalled through the core
+- [x] Both plugins' routes respond correctly with proper permission checks
+- [x] Both plugins' database schemas are isolated and migrations run cleanly
+- [x] The SDK API feels good. If building auth or membership is painful, redesign the SDK before proceeding.
+
+**Evidence:** `docs/milestones/M3-sdk-and-plugins.md` — build/test/clippy gates,
+**36/36 + 3 skipped** `test-plugin` probes, and **49/49** live end-to-end probes
+with `ADJUTANT_DEV_HEADERS=false` (the harness now asserts that flag rather than
+assuming it; every identity comes from a real session; OIDC exercised against a mock
+IdP). SDK verdict: API held up; no redesign needed. All ten listed bugs are now verified
+fixed in the code — the tenth (a claimed 409 for duplicate usernames) described
+behaviour that did not exist when written and has since been implemented
+(`auth/src/lib.rs`, unique violation → 409). The systemic
+one — the documented per-plugin `search_path` contract was never applied at runtime,
+which had silently hidden every unqualified plugin table — is fixed and now has a
+regression test. The audit pass also fixed the harness's `elif` body-assertion bug,
+an unverifiable re-import assertion, missing lifecycle probes, an anonymous
+`/api/plugins`, a fail-open audit verifier, and four unit tests that could not fail.
 
 **Deliverable:** SDK v0.1 with two validated plugins. The SDK is the product — this milestone proves it works.
 

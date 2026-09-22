@@ -26,7 +26,7 @@ use serde_json::json;
 use tokio::sync::RwLock;
 use tower_http::cors::{Any, CorsLayer};
 
-use adjutant_sdk::{AuditService, PermissionService, PluginRequest};
+use adjutant_sdk::{AuditService, PermissionService, PluginRequest, SdkError};
 
 use crate::config::Config;
 use crate::db;
@@ -47,13 +47,35 @@ pub struct AppState {
     pub registry: RwLock<PluginRegistry>,
     pub bus: Arc<EventBus>,
     pub config: Arc<Config>,
+    /// Plugin-registered identity providers (auth plugin replaces the dev stub).
+    pub identity: Arc<crate::identity::IdentityHub>,
+    /// Core-mediated HTTP shared by all plugin contexts.
+    pub http: Arc<crate::host::CoreHttp>,
 }
 
 impl AppState {
+    /// Resolve the caller's identity the SAME way `dispatch` does: plugin
+    /// providers first (auth sessions via cookie/Bearer), dev headers only as
+    /// the gated fallback. Every consumer (permission gate, audit attribution)
+    /// must use this — reading dev headers directly meant admin routes 401'd
+    /// for real sessions once `allow_dev_headers=false`, and audit rows lost
+    /// their actor entirely.
+    async fn resolve_identity(&self, headers: &axum::http::HeaderMap) -> Option<adjutant_sdk::Identity> {
+        let map: HashMap<String, String> = headers
+            .iter()
+            .filter_map(|(k, v)| Some((k.as_str().to_string(), v.to_str().ok()?.to_string())))
+            .collect();
+        let mut identity = self.identity.identify(&map).await;
+        if identity.is_none() && self.config.allow_dev_headers {
+            identity = extract_identity(headers);
+        }
+        identity
+    }
+
     /// Admin gate: `core:admin` permission. Returns a ready 401/403 response
     /// when the caller isn't allowed, `None` when allowed.
     async fn require_admin(&self, headers: &axum::http::HeaderMap) -> Option<Response> {
-        let identity = extract_identity(headers);
+        let identity = self.resolve_identity(headers).await;
         match authorize(identity.as_ref(), &self.permissions, "core:admin").await {
             Ok(()) => None,
             Err(status) => {
@@ -75,12 +97,16 @@ impl AppState {
 pub async fn build_app(cfg: &Config) -> Result<(Router, Arc<AppState>), BuildError> {
     let pool = db::connect_and_migrate(cfg).await.map_err(BuildError::Db)?;
     let bus = EventBus::new();
+    let identity = crate::identity::IdentityHub::new();
+    let http = crate::host::CoreHttp::new();
 
     let registry = load_all(
         &cfg.plugin_dir,
         pool.clone(),
         bus.sender(),
         serde_json::Value::Object(Default::default()),
+        identity.clone(),
+        http.clone(),
     )
     .await
     .map_err(BuildError::Plugin)?;
@@ -116,6 +142,8 @@ pub async fn build_app(cfg: &Config) -> Result<(Router, Arc<AppState>), BuildErr
         registry: RwLock::new(registry),
         bus,
         config: Arc::new(cfg.clone()),
+        identity,
+        http,
     });
 
     let cors = cfg.cors_origins.first().map(|_| {
@@ -151,7 +179,7 @@ pub async fn build_app(cfg: &Config) -> Result<(Router, Arc<AppState>), BuildErr
     // Layer order: later call = outermost. CORS outermost (headers on 429s and
     // errors), then access log (sees every response incl. rate-limited), then
     // the limiter (cheap rejection before any handler work).
-    let limiter = RateLimiter::new(cfg.rate.clone());
+    let limiter = RateLimiter::new(cfg.rate.clone(), cfg.trusted_proxies.clone());
     let app = app.layer(axum::middleware::from_fn_with_state(
         limiter,
         rate_limit_layer,
@@ -192,7 +220,8 @@ async fn dynamic_dispatch(State(state): State<Arc<AppState>>, req: Request) -> R
                 required_permission,
                 handler,
                 plugin_id,
-            } => Ok((plugin_id, required_permission, handler)),
+                params,
+            } => Ok((plugin_id, required_permission, handler, params)),
             RouteLookup::Disabled { plugin_id } => Err((
                 StatusCode::NOT_FOUND,
                 format!("plugin {plugin_id} is disabled"),
@@ -201,14 +230,14 @@ async fn dynamic_dispatch(State(state): State<Arc<AppState>>, req: Request) -> R
         }
     };
 
-    let (plugin_id, required, handler) = match lookup {
+    let (plugin_id, required, handler, params) = match lookup {
         Ok(x) => x,
         Err((status, msg)) => {
             return (status, Json(json!({ "error": msg }))).into_response();
         }
     };
 
-    dispatch(state, plugin_id, required, handler, req).await
+    dispatch(state, plugin_id, required, handler, params, req).await
 }
 
 /// Permission gate → build SDK request → call handler.
@@ -217,6 +246,7 @@ async fn dispatch(
     plugin_id: String,
     required: Option<String>,
     handler: adjutant_sdk::RouteHandler,
+    params: HashMap<String, String>,
     req: Request,
 ) -> Response {
     let (parts, body) = req.into_parts();
@@ -224,8 +254,15 @@ async fn dispatch(
         .await
         .unwrap_or_default();
 
-    // 1. Identity from dev headers (auth plugin replaces this later).
-    let identity = extract_identity(&parts.headers);
+    // 1. Identity: plugin providers first (the auth plugin owns real
+    // sessions), dev headers only as a gated fallback (SPEC §7.1 — spoofable,
+    // off in production via auth.allow_dev_headers).
+    let headers: HashMap<String, String> = parts
+        .headers
+        .iter()
+        .filter_map(|(k, v)| Some((k.as_str().to_string(), v.to_str().ok()?.to_string())))
+        .collect();
+    let identity = state.resolve_identity(&parts.headers).await;
 
     // 2. Permission gate — enforced by core, never by the plugin (SPEC §9).
     if let Some(perm) = &required {
@@ -254,15 +291,10 @@ async fn dispatch(
         })
         .unwrap_or_default();
 
-    let headers: HashMap<String, String> = parts
-        .headers
-        .iter()
-        .filter_map(|(k, v)| Some((k.as_str().to_string(), v.to_str().ok()?.to_string())))
-        .collect();
-
     let preq = PluginRequest {
         method: parts.method.to_string(),
         path: parts.uri.path().to_string(),
+        params,
         query,
         headers,
         body: body_bytes.to_vec(),
@@ -287,11 +319,13 @@ async fn dispatch(
         }
         Err(e) => {
             tracing::warn!(plugin = %plugin_id, error = %e, "plugin handler error");
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(json!({ "error": e.to_string() })),
-            )
-                .into_response()
+            // BadRequest is the plugin saying the *client* is at fault (bad
+            // credentials, malformed body) → 400, not a server error.
+            let status = match &e {
+                SdkError::BadRequest(_) => StatusCode::BAD_REQUEST,
+                SdkError::Db(_) | SdkError::Internal(_) => StatusCode::INTERNAL_SERVER_ERROR,
+            };
+            (status, Json(json!({ "error": e.to_string() }))).into_response()
         }
     }
 }
@@ -333,20 +367,43 @@ async fn health() -> Json<serde_json::Value> {
     Json(json!({ "status": "ok", "service": "adjutant" }))
 }
 
-async fn list_plugins(State(state): State<Arc<AppState>>) -> Json<serde_json::Value> {
+/// Plugin registry + route/permission inventory (SPEC §5.3: admin surface).
+/// Anonymous callers previously got the whole route table; now the same
+/// `core:admin` gate as every other admin route applies.
+async fn list_plugins(State(state): State<Arc<AppState>>, req: Request) -> Response {
+    if let Some(resp) = state.require_admin(req.headers()).await {
+        return resp;
+    }
     let reg = state.registry.read().await;
     Json(json!({
         "plugins": reg.infos(),
         "retired_libraries": reg.retired_count(),
     }))
+    .into_response()
 }
 
 /// Last N events with cursor replay: `?since=<id>&limit=<1..500>`
-/// (SPEC §15 M2: event bus persistence + replay).
+/// (SPEC §15 M2: event bus persistence + replay). Admin-gated: event payloads
+/// carry plugin data (member ids, messages) and the route is not public API.
 async fn recent_events(
     State(state): State<Arc<AppState>>,
-    axum::extract::Query(params): axum::extract::Query<HashMap<String, String>>,
-) -> Json<serde_json::Value> {
+    req: Request,
+) -> Response {
+    if let Some(resp) = state.require_admin(req.headers()).await {
+        return resp;
+    }
+    let params: HashMap<String, String> = req
+        .uri()
+        .query()
+        .map(|q| {
+            q.split('&')
+                .filter_map(|pair| {
+                    let mut it = pair.splitn(2, '=');
+                    Some((decode(it.next()?), decode(it.next().unwrap_or(""))))
+                })
+                .collect()
+        })
+        .unwrap_or_default();
     let since: i64 = params
         .get("since")
         .and_then(|v| v.parse().ok())
@@ -378,28 +435,37 @@ async fn recent_events(
         })
         .collect();
 
-    Json(json!({ "events": events, "cursor": last }))
+    Json(json!({ "events": events, "cursor": last })).into_response()
 }
 
 /// Recompute the audit hash chain (SPEC §15 M2: tamper-evident audit log).
+/// FAILS CLOSED: if the verification query itself errors, the endpoint answers
+/// 500 — never `{"ok":true,"rows_checked":0}`, which is what the old
+/// `unwrap_or((None, 0))` produced and would have masked a broken verifier.
 async fn audit_verify(State(state): State<Arc<AppState>>, req: Request) -> Response {
     if let Some(resp) = state.require_admin(req.headers()).await {
         return resp;
     }
-    let row: Option<(Option<i64>, i64)> =
+    let row: Result<(Option<i64>, i64), sqlx::Error> =
         sqlx::query_as("SELECT first_bad, rows_checked FROM core.audit_verify()")
             .fetch_one(state.pool.as_ref())
-            .await
-            .map_err(|e| e.to_string())
-            .ok()
-            .map(|(f, n): (Option<i64>, i64)| (f, n));
-    let (first_bad, rows) = row.unwrap_or((None, 0));
-    Json(json!({
-        "ok": first_bad.is_none(),
-        "first_bad": first_bad,
-        "rows_checked": rows,
-    }))
-    .into_response()
+            .await;
+    match row {
+        Ok((first_bad, rows)) => Json(json!({
+            "ok": first_bad.is_none(),
+            "first_bad": first_bad,
+            "rows_checked": rows,
+        }))
+        .into_response(),
+        Err(e) => {
+            tracing::error!(error = %e, "audit verification query failed");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({ "error": format!("audit verification unavailable: {e}") })),
+            )
+                .into_response()
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -414,7 +480,7 @@ async fn enable_plugin(
     if let Some(resp) = state.require_admin(req.headers()).await {
         return resp;
     }
-    let identity = extract_identity(req.headers());
+    let identity = state.resolve_identity(req.headers()).await;
     let changed = {
         let mut reg = state.registry.write().await;
         reg.set_enabled(&name, true)
@@ -422,6 +488,7 @@ async fn enable_plugin(
     if !changed {
         return (StatusCode::NOT_FOUND, Json(json!({ "error": "plugin not loaded" }))).into_response();
     }
+    state.identity.set_enabled(&name, true);
     let dbres = sqlx::query(
         "UPDATE core.plugins SET enabled = true, updated_at = now() WHERE id = $1",
     )
@@ -447,7 +514,21 @@ async fn disable_plugin(
     if let Some(resp) = state.require_admin(req.headers()).await {
         return resp;
     }
-    let identity = extract_identity(req.headers());
+    // With the dev-header stub off, the identity providers ARE the only way to
+    // authenticate. Removing the last one makes every authenticated route —
+    // including the admin route that would undo this — unreachable until the
+    // process restarts. Refuse, and say how to proceed.
+    if !state.config.allow_dev_headers && state.identity.is_sole_enabled_provider(&name) {
+        return (
+            StatusCode::CONFLICT,
+            Json(json!({
+                "error": "refusing to remove the only identity provider while dev headers are off",
+                "hint": "register/enable another identity provider, or set ADJUTANT_DEV_HEADERS=true for a dev instance",
+            })),
+        )
+            .into_response();
+    }
+    let identity = state.resolve_identity(req.headers()).await;
     let changed = {
         let mut reg = state.registry.write().await;
         reg.set_enabled(&name, false)
@@ -455,6 +536,7 @@ async fn disable_plugin(
     if !changed {
         return (StatusCode::NOT_FOUND, Json(json!({ "error": "plugin not loaded" }))).into_response();
     }
+    state.identity.set_enabled(&name, false);
     let dbres = sqlx::query(
         "UPDATE core.plugins SET enabled = false, updated_at = now() WHERE id = $1",
     )
@@ -484,7 +566,21 @@ async fn uninstall_plugin(
     if let Some(resp) = state.require_admin(req.headers()).await {
         return resp;
     }
-    let identity = extract_identity(req.headers());
+    // With the dev-header stub off, the identity providers ARE the only way to
+    // authenticate. Removing the last one makes every authenticated route —
+    // including the admin route that would undo this — unreachable until the
+    // process restarts. Refuse, and say how to proceed.
+    if !state.config.allow_dev_headers && state.identity.is_sole_enabled_provider(&name) {
+        return (
+            StatusCode::CONFLICT,
+            Json(json!({
+                "error": "refusing to remove the only identity provider while dev headers are off",
+                "hint": "register/enable another identity provider, or set ADJUTANT_DEV_HEADERS=true for a dev instance",
+            })),
+        )
+            .into_response();
+    }
+    let identity = state.resolve_identity(req.headers()).await;
     let removed = {
         let mut reg = state.registry.write().await;
         reg.uninstall(&name)
@@ -492,8 +588,13 @@ async fn uninstall_plugin(
     if !removed {
         return (StatusCode::NOT_FOUND, Json(json!({ "error": "plugin not loaded" }))).into_response();
     }
+    // NOTE: `enabled` is deliberately NOT flipped here. Uninstall means
+    // "not installed"; a later reinstall (clear the flag + reload) must come
+    // back serving, which is only true if the previous enabled state survives.
+    // The old `enabled = false` made the documented reinstall path load the
+    // plugin into a disabled state (routes 404) with nothing in the docs to say so.
     let dbres = sqlx::query(
-        "UPDATE core.plugins SET uninstalled = true, enabled = false, updated_at = now() \
+        "UPDATE core.plugins SET uninstalled = true, updated_at = now() \
          WHERE id = $1",
     )
     .bind(&name)
@@ -504,6 +605,7 @@ async fn uninstall_plugin(
             .into_response();
     }
     state.bus.clear_plugin(&name);
+    state.identity.remove(&name);
     let _ = state
         .audit
         .log(identity.as_ref(), "plugin.uninstall", "plugin", &name, json!({}))
@@ -523,13 +625,15 @@ async fn reload_plugins(State(state): State<Arc<AppState>>, req: Request) -> Res
     if let Some(resp) = state.require_admin(req.headers()).await {
         return resp;
     }
-    let identity = extract_identity(req.headers());
+    let identity = state.resolve_identity(req.headers()).await;
 
     let fresh = match load_all(
         &state.config.plugin_dir,
         state.pool.clone(),
         state.bus.sender(),
         serde_json::Value::Object(Default::default()),
+        state.identity.clone(),
+        state.http.clone(),
     )
     .await
     {
@@ -555,6 +659,14 @@ async fn reload_plugins(State(state): State<Arc<AppState>>, req: Request) -> Res
     {
         let mut reg = state.registry.write().await;
         reg.replace_all(fresh);
+    }
+    // Providers from retired plugins stop answering; live ones re-registered
+    // themselves during load_all's init (same owner key → replaced in place).
+    {
+        let reg = state.registry.read().await;
+        let live: std::collections::HashSet<String> =
+            reg.plugins.iter().map(|p| p.info.id.clone()).collect();
+        state.identity.retain(&live);
     }
     for old_id in state.bus.subscriber_ids() {
         state.bus.clear_plugin(&old_id);

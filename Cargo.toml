@@ -2,6 +2,8 @@
 resolver = "2"
 members = [
     "plugins/sdk",
+    "plugins/auth",
+    "plugins/membership",
     "plugins/examples/hello",
     "server",
 ]

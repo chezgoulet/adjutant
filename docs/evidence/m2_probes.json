@@ -1,0 +1,393 @@
+{
+ "generated_by": "scripts/probes.py",
+ "database": "postgres://adjutant@127.0.0.1:5433/adjutant_dev",
+ "batches": [
+  "lifecycle",
+  "m1_regression",
+  "middleware",
+  "middleware2",
+  "tamper"
+ ],
+ "passed": 63,
+ "total": 63,
+ "results": [
+  {
+   "batch": "m1_regression",
+   "probe": "1 health",
+   "result": "PASS",
+   "detail": "200 | {\"service\":\"adjutant\",\"status\":\"ok\"}"
+  },
+  {
+   "batch": "m1_regression",
+   "probe": "2a registry anonymous refused",
+   "result": "PASS",
+   "detail": "401 | {\"error\":\"authentication required\"}"
+  },
+  {
+   "batch": "m1_regression",
+   "probe": "2b registry as chief",
+   "result": "PASS",
+   "detail": "200 | {\"plugins\":[{\"enabled\":true,\"id\":\"hello\",\"name\":\"Hello World\",\"permissions\":[\"hello:read\",\"hello:write\"],\"rout"
+  },
+  {
+   "batch": "m1_regression",
+   "probe": "2c registry metadata",
+   "result": "PASS",
+   "detail": "{\"id\": \"hello\", \"version\": \"0.1.0\", \"routes\": 4, \"permissions\": [\"hello:read\", \"hello:write\"]}"
+  },
+  {
+   "batch": "m1_regression",
+   "probe": "3 open route",
+   "result": "PASS",
+   "detail": "200 | {\"message\":\"Hello, Adjutant!\",\"service\":\"adjutant\"}"
+  },
+  {
+   "batch": "m1_regression",
+   "probe": "4 protected no identity",
+   "result": "PASS",
+   "detail": "401 | {\"error\":\"authentication required\"}"
+  },
+  {
+   "batch": "m1_regression",
+   "probe": "5 scout lacks permission",
+   "result": "PASS",
+   "detail": "403 | {\"error\":\"insufficient permissions\"}"
+  },
+  {
+   "batch": "m1_regression",
+   "probe": "6 chief reads",
+   "result": "PASS",
+   "detail": "200 | {\"greetings\":[]}"
+  },
+  {
+   "batch": "m1_regression",
+   "probe": "7 chief writes",
+   "result": "PASS",
+   "detail": "201 | {\"message\":\"first greeting\",\"ok\":true}"
+  },
+  {
+   "batch": "m1_regression",
+   "probe": "8 event persisted",
+   "result": "PASS",
+   "detail": "200 | {\"cursor\":1,\"events\":[{\"created_at\":\"2026-09-22 23:04:31.001523+00\",\"event_type\":\"hello.greeted\",\"id\":1,\"paylo"
+  },
+  {
+   "batch": "m1_regression",
+   "probe": "8b cursor present",
+   "result": "PASS",
+   "detail": "cursor=1"
+  },
+  {
+   "batch": "m1_regression",
+   "probe": "9 greeting readable",
+   "result": "PASS",
+   "detail": "200 | {\"greetings\":[{\"created_at\":\"2026-09-22 23:04:30.996401+00\",\"id\":1,\"message\":\"first greeting\"}]}"
+  },
+  {
+   "batch": "m1_regression",
+   "probe": "9b path capture read",
+   "result": "PASS",
+   "detail": "200 | {\"greeting\":{\"created_at\":\"2026-09-22 23:04:30.996401+00\",\"id\":1,\"message\":\"first greeting\"}}"
+  },
+  {
+   "batch": "m1_regression",
+   "probe": "9c path capture prefers literal",
+   "result": "PASS",
+   "detail": "200 | {\"greetings\":[{\"created_at\":\"2026-09-22 23:04:30.996401+00\",\"id\":1,\"message\":\"first greeting\"}]}"
+  },
+  {
+   "batch": "m1_regression",
+   "probe": "9d non-numeric capture is a 400",
+   "result": "PASS",
+   "detail": "400 | {\"error\":\"bad request: greeting id must be a number, got \\\"abc\\\"\"}"
+  },
+  {
+   "batch": "m1_regression",
+   "probe": "9e extra segment is 404",
+   "result": "PASS",
+   "detail": "404 | {\"error\":\"route not found\"}"
+  },
+  {
+   "batch": "m1_regression",
+   "probe": "10 event delivered to subscriber",
+   "result": "PASS",
+   "detail": "rc=0 out='1' err=''"
+  },
+  {
+   "batch": "m1_regression",
+   "probe": "audit logged the write",
+   "result": "PASS",
+   "detail": "rc=0 out='1' err=''"
+  },
+  {
+   "batch": "middleware",
+   "probe": "M1 x-request-id present",
+   "result": "PASS",
+   "detail": "rid=001a0cb5d187c-00000e"
+  },
+  {
+   "batch": "middleware",
+   "probe": "M2 CORS allow-origin on 200",
+   "result": "PASS",
+   "detail": "allow-origin=*"
+  },
+  {
+   "batch": "middleware",
+   "probe": "M4 replay since=0",
+   "result": "PASS",
+   "detail": "200 | {\"cursor\":1,\"events\":[{\"created_at\":\"2026-09-22 23:04:31.001523+00\",\"event_type\":\"hello.greeted\",\"id\":1,\"paylo"
+  },
+  {
+   "batch": "middleware",
+   "probe": "M4b cursor equals last id",
+   "result": "PASS",
+   "detail": "{\"cursor\": 1, \"events\": [{\"created_at\": \"2026-09-22 23:04:31.001523+00\", \"event_type\": \"hello.greeted\", \"id\": 1, \"payload\": {\"by\": \"christop"
+  },
+  {
+   "batch": "middleware",
+   "probe": "M5 replay since=999 empty",
+   "result": "PASS",
+   "detail": "200 | {\"cursor\":999,\"events\":[]}"
+  },
+  {
+   "batch": "middleware",
+   "probe": "M6 scout cannot disable plugins",
+   "result": "PASS",
+   "detail": "403 | {\"error\":\"insufficient permissions\"}"
+  },
+  {
+   "batch": "middleware",
+   "probe": "M7 anonymous cannot disable plugins",
+   "result": "PASS",
+   "detail": "401 | {\"error\":\"authentication required\"}"
+  },
+  {
+   "batch": "lifecycle",
+   "probe": "L1 disable",
+   "result": "PASS",
+   "detail": "200 | {\"enabled\":false,\"plugin\":\"hello\"}"
+  },
+  {
+   "batch": "lifecycle",
+   "probe": "L2 disabled route 404",
+   "result": "PASS",
+   "detail": "404 | {\"error\":\"plugin hello is disabled\"}"
+  },
+  {
+   "batch": "lifecycle",
+   "probe": "L3 core routes unaffected",
+   "result": "PASS",
+   "detail": "200 | {\"service\":\"adjutant\",\"status\":\"ok\"}"
+  },
+  {
+   "batch": "lifecycle",
+   "probe": "L4 db enabled=false",
+   "result": "PASS",
+   "detail": "rc=0 out='f' err=''"
+  },
+  {
+   "batch": "lifecycle",
+   "probe": "L5 enable",
+   "result": "PASS",
+   "detail": "200 | {\"enabled\":true,\"plugin\":\"hello\"}"
+  },
+  {
+   "batch": "lifecycle",
+   "probe": "L6 route works again",
+   "result": "PASS",
+   "detail": "200 | {\"message\":\"Hello, Adjutant!\",\"service\":\"adjutant\"}"
+  },
+  {
+   "batch": "lifecycle",
+   "probe": "L7 data present before uninstall",
+   "result": "PASS",
+   "detail": "rc=0 out='1' err=''"
+  },
+  {
+   "batch": "lifecycle",
+   "probe": "L8 uninstall",
+   "result": "PASS",
+   "detail": "200 | {\"data\":\"archived (schema and rows preserved)\",\"plugin\":\"hello\",\"uninstalled\":true}"
+  },
+  {
+   "batch": "lifecycle",
+   "probe": "L9 uninstalled route 404",
+   "result": "PASS",
+   "detail": "404 | {\"error\":\"route not found\"}"
+  },
+  {
+   "batch": "lifecycle",
+   "probe": "L10 rows archived",
+   "result": "PASS",
+   "detail": "rc=0 out='1' err=''"
+  },
+  {
+   "batch": "lifecycle",
+   "probe": "L11 schema archived",
+   "result": "PASS",
+   "detail": "rc=0 out='1' err=''"
+  },
+  {
+   "batch": "lifecycle",
+   "probe": "L12 db uninstalled=true",
+   "result": "PASS",
+   "detail": "rc=0 out='t' err=''"
+  },
+  {
+   "batch": "lifecycle",
+   "probe": "L13 retired library tracked",
+   "result": "PASS",
+   "detail": "200 | {\"plugins\":[],\"retired_libraries\":1}"
+  },
+  {
+   "batch": "lifecycle",
+   "probe": "L13b hello absent from live registry",
+   "result": "PASS",
+   "detail": "{\"plugins\":[],\"retired_libraries\":1}"
+  },
+  {
+   "batch": "lifecycle",
+   "probe": "L14 reload skips uninstalled",
+   "result": "PASS",
+   "detail": "200 | {\"reloaded\":[],\"routes\":0,\"versions\":{}}"
+  },
+  {
+   "batch": "lifecycle",
+   "probe": "L14b reloaded list empty",
+   "result": "PASS",
+   "detail": "{\"reloaded\":[],\"routes\":0,\"versions\":{}}"
+  },
+  {
+   "batch": "lifecycle",
+   "probe": "L15 clear uninstalled flag",
+   "result": "PASS",
+   "detail": "rc=0 out='UPDATE 1' err=''"
+  },
+  {
+   "batch": "lifecycle",
+   "probe": "L16 reload reinstalls",
+   "result": "PASS",
+   "detail": "200 | {\"reloaded\":[\"hello\"],\"routes\":4,\"versions\":{\"hello\":\"0.1.0\"}}"
+  },
+  {
+   "batch": "lifecycle",
+   "probe": "L17 route works after reinstall",
+   "result": "PASS",
+   "detail": "200 | {\"message\":\"Hello, Adjutant!\",\"service\":\"adjutant\"}"
+  },
+  {
+   "batch": "lifecycle",
+   "probe": "L18 data still archived",
+   "result": "PASS",
+   "detail": "rc=0 out='1' err=''"
+  },
+  {
+   "batch": "lifecycle",
+   "probe": "L19 subscriptions rebound (publish)",
+   "result": "PASS",
+   "detail": "201 | {\"message\":\"post-reload\",\"ok\":true}"
+  },
+  {
+   "batch": "lifecycle",
+   "probe": "L19b subscriber received post-reload event",
+   "result": "PASS",
+   "detail": "1 -> 2"
+  },
+  {
+   "batch": "tamper",
+   "probe": "T1 UPDATE rejected",
+   "result": "PASS",
+   "detail": "ERROR:  core.audit_log is append-only (attempt UPDATE)\nCONTEXT:  PL/pgSQL function core.audit_append_only() line 3 at RA"
+  },
+  {
+   "batch": "tamper",
+   "probe": "T2 DELETE rejected",
+   "result": "PASS",
+   "detail": "ERROR:  core.audit_log is append-only (attempt DELETE)\nCONTEXT:  PL/pgSQL function core.audit_append_only() line 3 at RA"
+  },
+  {
+   "batch": "tamper",
+   "probe": "T3 row untouched",
+   "result": "PASS",
+   "detail": "rc=0 out='greet' err=''"
+  },
+  {
+   "batch": "tamper",
+   "probe": "T4 chain verifies",
+   "result": "PASS",
+   "detail": "200 | {\"first_bad\":null,\"ok\":true,\"rows_checked\":7}"
+  },
+  {
+   "batch": "tamper",
+   "probe": "T4b rows actually checked",
+   "result": "PASS",
+   "detail": "{\"first_bad\":null,\"ok\":true,\"rows_checked\":7}"
+  },
+  {
+   "batch": "tamper",
+   "probe": "T5 superuser bypass lands",
+   "result": "PASS",
+   "detail": "rc=0 err="
+  },
+  {
+   "batch": "tamper",
+   "probe": "T6 verifier DETECTS tamper",
+   "result": "PASS",
+   "detail": "200 | {\"first_bad\":1,\"ok\":false,\"rows_checked\":7}"
+  },
+  {
+   "batch": "tamper",
+   "probe": "T6b first_bad names row 1",
+   "result": "PASS",
+   "detail": "{\"first_bad\":1,\"ok\":false,\"rows_checked\":7}"
+  },
+  {
+   "batch": "tamper",
+   "probe": "T7 restore",
+   "result": "PASS",
+   "detail": "rc=0 out='UPDATE 1' err=''"
+  },
+  {
+   "batch": "tamper",
+   "probe": "T8 chain verifies again",
+   "result": "PASS",
+   "detail": "200 | {\"first_bad\":null,\"ok\":true,\"rows_checked\":7}"
+  },
+  {
+   "batch": "tamper",
+   "probe": "T9 guard re-armed",
+   "result": "PASS",
+   "detail": "ERROR:  core.audit_log is append-only (attempt UPDATE)\nCONTEXT:  PL/pgSQL function core.audit_append_only() line 3 at RA"
+  },
+  {
+   "batch": "middleware2",
+   "probe": "M3 ninth request 429",
+   "result": "PASS",
+   "detail": "codes=[200, 200, 200, 200, 200, 200, 200, 200, 429]"
+  },
+  {
+   "batch": "middleware2",
+   "probe": "M3b retry-after set",
+   "result": "PASS",
+   "detail": "retry-after=60"
+  },
+  {
+   "batch": "middleware2",
+   "probe": "M3c CORS header survives 429",
+   "result": "PASS",
+   "detail": "allow-origin=*"
+  },
+  {
+   "batch": "middleware2",
+   "probe": "M3d request-id on 429",
+   "result": "PASS",
+   "detail": "rid=001a0cb5d1c06-000009"
+  },
+  {
+   "batch": "middleware2",
+   "probe": "M4 JSON log line",
+   "result": "PASS",
+   "detail": "{\"timestamp\":\"2026-09-22T23:04:32.007021Z\",\"level\":\"INFO\",\"fields\":{\"message\":\"request\",\"request_id\":\"001a0cb5d1c06-000009\",\"method\":\"GET\",\""
+  }
+ ]
+}

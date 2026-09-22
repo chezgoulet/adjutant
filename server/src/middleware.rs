@@ -65,12 +65,47 @@ pub async fn request_log(request: Request, next: Next) -> Response {
 #[derive(Clone)]
 pub struct RateLimiter {
     cfg: RateConfig,
+    /// IPs allowed to set `x-forwarded-for` (direct peers of a reverse proxy).
+    trusted_proxies: Arc<Vec<String>>,
     hits: Arc<Mutex<HashMap<String, (Instant, u32)>>>,
 }
 
 impl RateLimiter {
-    pub fn new(cfg: RateConfig) -> Self {
-        Self { cfg, hits: Arc::new(Mutex::new(HashMap::new())) }
+    pub fn new(cfg: RateConfig, trusted_proxies: Vec<String>) -> Self {
+        Self {
+            cfg,
+            trusted_proxies: Arc::new(trusted_proxies),
+            hits: Arc::new(Mutex::new(HashMap::new())),
+        }
+    }
+
+    /// Client key for the window.
+    ///
+    /// `x-forwarded-for` is CLIENT-CONTROLLED. It is honoured only when the
+    /// direct peer is a configured trusted proxy; the list is then walked from
+    /// the right, skipping trusted hops, so entries a client injected on the
+    /// left are never used. With no trusted proxies configured (the default)
+    /// the header is ignored entirely — otherwise any client can reset its own
+    /// budget by rotating a header value.
+    pub fn client_key(&self, peer: &str, xff: Option<&str>) -> String {
+        if self.trusted_proxies.is_empty() || !self.is_trusted(peer) {
+            return peer.to_string();
+        }
+        let hops: Vec<&str> = xff
+            .unwrap_or("")
+            .split(',')
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .collect();
+        hops.iter()
+            .rev()
+            .find(|hop| !self.is_trusted(hop))
+            .map(|hop| (*hop).to_string())
+            .unwrap_or_else(|| peer.to_string())
+    }
+
+    fn is_trusted(&self, ip: &str) -> bool {
+        self.trusted_proxies.iter().any(|t| t == ip)
     }
 
     /// Record a hit for `key`; false when the key exceeded its window budget.
@@ -101,19 +136,19 @@ pub async fn rate_limit_inner(
     next: Next,
 ) -> Response {
     // Prefer the proxy-set IP, else the direct peer (ConnectInfo is layered in
-    // by the server via `into_make_service_with_connect_info`).
+    // by the server via `into_make_service_with_connect_info`). The header is
+    // only meaningful when the peer is a configured trusted proxy — see
+    // `RateLimiter::client_key`.
     let peer = request
         .extensions()
         .get::<ConnectInfo<SocketAddr>>()
         .map(|c| c.0.ip().to_string())
         .unwrap_or_else(|| "unknown".to_string());
-    let key = request
+    let xff = request
         .headers()
         .get("x-forwarded-for")
-        .and_then(|v| v.to_str().ok())
-        .map(|s| s.split(',').next().unwrap_or(s).trim().to_string())
-        .filter(|s| !s.is_empty())
-        .unwrap_or(peer);
+        .and_then(|v| v.to_str().ok());
+    let key = limiter.client_key(&peer, xff);
 
     if limiter.check(&key, Instant::now()) {
         next.run(request).await
@@ -140,7 +175,7 @@ mod tests {
 
     #[test]
     fn rate_limiter_window_budget_and_rollover() {
-        let rl = RateLimiter::new(RateConfig { window_secs: 60, max_requests: 3 });
+        let rl = RateLimiter::new(RateConfig { window_secs: 60, max_requests: 3 }, vec![]);
         let t0 = Instant::now();
         assert!(rl.check("1.1.1.1", t0));
         assert!(rl.check("1.1.1.1", t0 + Duration::from_secs(1)));
@@ -156,11 +191,37 @@ mod tests {
 
     #[test]
     fn rate_limiter_disabled_when_zero() {
-        let rl = RateLimiter::new(RateConfig { window_secs: 60, max_requests: 0 });
+        let rl = RateLimiter::new(RateConfig { window_secs: 60, max_requests: 0 }, vec![]);
         let t = Instant::now();
         for _ in 0..1000 {
             assert!(rl.check("x", t));
         }
+    }
+
+    #[test]
+    fn forwarded_for_is_ignored_without_trusted_proxies() {
+        let rl = RateLimiter::new(RateConfig::default(), vec![]);
+        // Client-supplied header must not change the key: rotating it would
+        // otherwise reset the window.
+        assert_eq!(rl.client_key("203.0.113.7", Some("1.2.3.4")), "203.0.113.7");
+    }
+
+    #[test]
+    fn forwarded_for_used_only_from_a_trusted_peer() {
+        let rl = RateLimiter::new(RateConfig::default(), vec!["10.0.0.5".into()]);
+        // Untrusted peer: header ignored even if present.
+        assert_eq!(rl.client_key("203.0.113.7", Some("1.2.3.4")), "203.0.113.7");
+        // Trusted peer: the rightmost non-trusted hop is the client.
+        assert_eq!(rl.client_key("10.0.0.5", Some("1.2.3.4")), "1.2.3.4");
+        // Injected left-hand entries are never used.
+        assert_eq!(
+            rl.client_key("10.0.0.5", Some("9.9.9.9, 1.2.3.4")),
+            "1.2.3.4"
+        );
+        // All-trusted chain falls back to the peer.
+        assert_eq!(rl.client_key("10.0.0.5", Some("10.0.0.5")), "10.0.0.5");
+        // Malformed/empty header falls back to the peer.
+        assert_eq!(rl.client_key("10.0.0.5", Some("")), "10.0.0.5");
     }
 
     #[test]

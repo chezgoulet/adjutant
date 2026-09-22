@@ -3,7 +3,14 @@
 **Status:** PASSED · 2026-09-21 · All 8 exit criteria verified against a live server.
 
 Environment: Rust 1.96.1, PostgreSQL 18.6 (`adjutant_dev`), `debug` profile.
-Artifacts: `cargo build --workspace`, `cargo test --workspace` (18 tests, 0 failed).
+Artifacts: `cargo build --workspace`, `cargo test --workspace` (18 tests at commit
+`0a8d952`, 0 failed; the workspace suite is larger now — see M3).
+
+**Probe evidence.** The M1 criteria are the `m1_regression` batch of the committed
+harness `scripts/probes.py` (`python3 scripts/probes.py`), whose transcript lands in
+`docs/evidence/m2_probes.json`. The 10-probe transcript below is the original
+hand-run record; it had no committed artefact until the M2 harness above, which is
+why the batch is now reproducible rather than narrated.
 
 ## Exit criteria (SPEC §15, Milestone 1)
 
@@ -89,14 +96,13 @@ permissions (every protected route 403s). Placeholder until the auth plugin
 
 ```bash
 cargo build --workspace && cargo test --workspace
-psql -h 127.0.0.1 -p 5433 -U adjutant -d postgres \
-  -c 'DROP DATABASE IF EXISTS adjutant_dev;' -c 'CREATE DATABASE adjutant_dev;'
-mkdir -p plugins-built && cp target/debug/libadjutant_hello.so plugins-built/
-ADJUTANT_PLUGIN_DIR=plugins-built \
-ADJUTANT_DATABASE_URL=postgres://adjutant@127.0.0.1:5433/adjutant_dev \
-  ./target/debug/adjutant
-# then the 10 probes in README.md
+python3 scripts/probes.py     # resets the DB, stages the .so, boots the server,
+                              # runs m1_regression → middleware → lifecycle → tamper
 ```
+
+`scripts/probes.py` needs PostgreSQL reachable at `$ADJUTANT_DATABASE_URL`
+(default `postgres://adjutant@127.0.0.1:5433/adjutant_dev`), the `adjutant` role
+to own it, and port 8787 free. It writes `docs/evidence/m2_probes.json`.
 
 ## Next
 

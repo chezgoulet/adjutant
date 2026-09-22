@@ -1,0 +1,29 @@
+[package]
+name = "adjutant-auth"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Authentication: local passwords, sessions, OIDC, role assignment (SPEC 7.1). Owns core.users/core.sessions."
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+adjutant-sdk.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+async-trait.workspace = true
+chrono.workspace = true
+# Password hashing + session tokens are pure CPU — no runtime, no I/O — so
+# they are safe to link into a plugin (unlike sqlx/reqwest; see SDK docs).
+argon2 = { version = "0.5", features = ["password-hash"] }
+rand = "0.8"
+sha2 = "0.10"
+hex = "0.4"
+# OIDC id_token verification (HS256 with client_secret, RS256 via JWKS).
+# Pure verification — network goes through ctx.http (host-mediated).
+jsonwebtoken = "9"
+
+[dev-dependencies]
+tokio.workspace = true

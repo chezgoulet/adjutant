@@ -3,7 +3,8 @@
 //! Proves every SDK surface end to end (SPEC §15, Milestone 1 exit criteria):
 //!
 //! - **routes**: `GET /api/hello` (open), `GET /api/hello/greetings`
-//!   (`hello:read`), `POST /api/hello/greet` (`hello:write`)
+//!   (`hello:read`), `GET /api/hello/greetings/{id}` (`hello:read`, path
+//!   capture), `POST /api/hello/greet` (`hello:write`)
 //! - **migrations**: creates `hello.greetings` + `hello.events_received`
 //! - **permissions**: declares `hello:read` / `hello:write`
 //! - **database**: reads/writes through the core-provided pool
@@ -164,7 +165,38 @@ impl AdjutantPlugin for HelloPlugin {
             }),
         );
 
-        vec![hello, list, greet]
+        // 4. Templated path — proves capture dispatch (`/api/hello/greetings/{id}`),
+        //    which the missions/governance plugins need for per-resource routes.
+        let c = ctx.clone();
+        let get_one = RouteDefinition::get_protected(
+            "/api/hello/greetings/{id}",
+            "hello:read",
+            route_handler(move |req| {
+                let c = c.clone();
+                async move {
+                    let raw = req.param("id").unwrap_or_default();
+                    let id: i64 = raw.parse().map_err(|_| {
+                        SdkError::BadRequest(format!("greeting id must be a number, got {raw:?}"))
+                    })?;
+                    let rows = c
+                        .db
+                        .query(
+                            format!(
+                                "SELECT id, message, created_at::text AS created_at FROM {} WHERE id = $1",
+                                c.db.table("greetings")
+                            ),
+                            vec![SqlValue::Int(id)],
+                        )
+                        .await?;
+                    match rows.into_iter().next() {
+                        Some(row) => PluginResponse::json(200, &serde_json::json!({ "greeting": row })),
+                        None => PluginResponse::error(404, "no such greeting"),
+                    }
+                }
+            }),
+        );
+
+        vec![hello, list, greet, get_one]
     }
 
     fn subscriptions(&self) -> Vec<EventSubscription> {
@@ -199,26 +231,23 @@ mod tests {
     use super::*;
 
     #[test]
-    fn plugin_identity_is_stable() {
+    fn declared_manifest_satisfies_the_load_rules() {
+        // These are the invariants the core enforces at load time (SPEC §9
+        // namespacing, loader rejects migration version < 1) — not a restatement
+        // of the literals above. Route dispatch needs a PluginContext, so the
+        // handler path is covered by the live probe ladder instead.
         let p = HelloPlugin::new();
-        assert_eq!(p.id(), "hello");
-        assert_eq!(p.name(), "Hello World");
-    }
-
-    #[test]
-    fn migrations_are_versioned_and_namespaced() {
-        let p = HelloPlugin::new();
-        let m = p.migrations();
-        assert_eq!(m.len(), 1);
-        assert_eq!(m[0].version, 1);
-        assert!(m[0].sql.contains("greetings"));
-    }
-
-    #[test]
-    fn permissions_declare_read_and_write() {
-        let p = HelloPlugin::new();
-        let ids: Vec<String> = p.permissions_granted().iter().map(|x| x.id.clone()).collect();
-        assert_eq!(ids, vec!["hello:read".to_string(), "hello:write".to_string()]);
+        let id = p.id();
+        for perm in p.permissions_granted() {
+            assert!(
+                perm.id.starts_with(&format!("{id}:")),
+                "permission {} must be namespaced by the plugin id",
+                perm.id
+            );
+        }
+        for m in p.migrations() {
+            assert!(m.version >= 1, "migration {} version must be >= 1", m.name);
+        }
     }
 
     #[test]

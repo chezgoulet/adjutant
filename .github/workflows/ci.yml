@@ -1,0 +1,90 @@
+name: CI
+
+on:
+  push:
+    branches: [testing, master, "feature/*", "fix/*"]
+  pull_request:
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:18-alpine
+        env:
+          POSTGRES_USER: adjutant
+          POSTGRES_PASSWORD: adjutant
+          POSTGRES_DB: adjutant_dev
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U adjutant"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 12
+    env:
+      ADJUTANT_DATABASE_URL: postgres://adjutant:adjutant@127.0.0.1:5432/adjutant_dev
+      ADJUTANT_TEST_DATABASE_URL: postgres://adjutant:adjutant@127.0.0.1:5432/adjutant_dev_test
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build
+        run: cargo build --workspace
+
+      # The gate the milestone docs quote: 0 warnings, in CI, on every push.
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+      - name: Unit + integration tests
+        run: cargo test --workspace
+
+      # These skip themselves without ADJUTANT_TEST_DATABASE_URL; here it is set,
+      # so they must actually run.
+      - name: DB-backed host tests
+        run: cargo test -p adjutant-server --test host_db -- --nocapture
+
+      # Live evidence: the committed ladder resets the database, boots its own
+      # server and writes docs/evidence/m2_probes.json. A failure here means the
+      # milestone document's numbers are stale.
+      - name: Live probe ladder (M1 + M2)
+        run: python3 scripts/probes.py
+
+      - name: Stage plugins
+        run: |
+          mkdir -p plugins-built
+          cp target/debug/libadjutant_hello.so \
+             target/debug/libadjutant_auth.so \
+             target/debug/libadjutant_membership.so plugins-built/
+
+      # Route/registry smoke ladder against a pristine test database.
+      - name: test-plugin harness
+        run: ADJUTANT_PLUGIN_DIR=plugins-built ./target/debug/adjutant test-plugin
+
+      # End-to-end, with the spoofable dev-header stub OFF. The harness asserts
+      # that precondition itself (probe 0) and exercises a mock OIDC provider.
+      # `adjutant new-plugin` output must compile — the unit test only checks
+      # the generated strings, which is how a broken scaffold could ship.
+      # CI checkouts are disposable, so mutating the workspace here is fine.
+      - name: Scaffolder output compiles
+        run: |
+          ./target/debug/adjutant new-plugin gear_locker
+          cargo build -p adjutant-gear_locker
+
+      - name: End-to-end harness (dev headers OFF)
+        run: |
+          ADJUTANT_PLUGIN_DIR=plugins-built \
+          ADJUTANT_DEV_HEADERS=false \
+          ADJUTANT_RATE_MAX=0 \
+          ADJUTANT_LOG=warn \
+            ./target/debug/adjutant &
+          for _ in $(seq 1 100); do
+            if python3 -c "import socket,sys; socket.create_connection(('127.0.0.1',8787),1); sys.exit(0)" 2>/dev/null; then break; fi
+            sleep 0.2
+          done
+          python3 docs/e2e_m3.py
