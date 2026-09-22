@@ -24,3 +24,6 @@ hex = "0.4"
 # OIDC id_token verification (HS256 with client_secret, RS256 via JWKS).
 # Pure verification — network goes through ctx.http (host-mediated).
 jsonwebtoken = "9"
+
+[dev-dependencies]
+tokio.workspace = true

@@ -273,35 +273,5 @@ impl HostEvents for CoreEvents {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn decode_prefers_json_then_scalars() {
-        // Unit-level coverage of the fallback chain needs a live row; here we
-        // pin the Null terminal so a fully-undecodable column is explicit.
-        assert_eq!(Value::Null, Value::Null);
-    }
-
-    #[test]
-    fn bind_params_accepts_every_variant() {
-        use sqlx::Execute;
-        // Compile-time proof every SqlValue variant binds into the same query
-        // type; runtime is a no-op (no pool attached).
-        let q = sqlx::query("SELECT 1");
-        let q = bind_params(
-            q,
-            vec![
-                SqlValue::Null,
-                SqlValue::Bool(true),
-                SqlValue::Int(1),
-                SqlValue::Float(1.5),
-                SqlValue::Text("t".into()),
-                SqlValue::TextArray(vec!["a".into()]),
-                SqlValue::Json("{}".into()),
-            ],
-        );
-        assert!(q.sql().contains("SELECT 1"));
-    }
-}
+// Decode-order coverage needs a real PgRow, so it lives in
+// `server/tests/host_db.rs` (skipped unless ADJUTANT_TEST_DATABASE_URL is set).

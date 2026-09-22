@@ -199,26 +199,23 @@ mod tests {
     use super::*;
 
     #[test]
-    fn plugin_identity_is_stable() {
+    fn declared_manifest_satisfies_the_load_rules() {
+        // These are the invariants the core enforces at load time (SPEC §9
+        // namespacing, loader rejects migration version < 1) — not a restatement
+        // of the literals above. Route dispatch needs a PluginContext, so the
+        // handler path is covered by the live probe ladder instead.
         let p = HelloPlugin::new();
-        assert_eq!(p.id(), "hello");
-        assert_eq!(p.name(), "Hello World");
-    }
-
-    #[test]
-    fn migrations_are_versioned_and_namespaced() {
-        let p = HelloPlugin::new();
-        let m = p.migrations();
-        assert_eq!(m.len(), 1);
-        assert_eq!(m[0].version, 1);
-        assert!(m[0].sql.contains("greetings"));
-    }
-
-    #[test]
-    fn permissions_declare_read_and_write() {
-        let p = HelloPlugin::new();
-        let ids: Vec<String> = p.permissions_granted().iter().map(|x| x.id.clone()).collect();
-        assert_eq!(ids, vec!["hello:read".to_string(), "hello:write".to_string()]);
+        let id = p.id();
+        for perm in p.permissions_granted() {
+            assert!(
+                perm.id.starts_with(&format!("{id}:")),
+                "permission {} must be namespaced by the plugin id",
+                perm.id
+            );
+        }
+        for m in p.migrations() {
+            assert!(m.version >= 1, "migration {} version must be >= 1", m.name);
+        }
     }
 
     #[test]

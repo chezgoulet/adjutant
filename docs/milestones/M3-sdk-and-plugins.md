@@ -8,14 +8,28 @@
 | Gate | Result |
 |---|---|
 | `cargo build --workspace` | 0 errors |
-| `cargo test --workspace` | **47/47 passed** |
-| `cargo clippy --workspace --all-targets` | **0 warnings** |
-| `adjutant test-plugin` | **37/37 probes** against a fresh test DB |
-| `docs/e2e_m3.py` (live, dev headers OFF) | **38/38 probes**, repeatable (run twice, exit 0) |
+| `cargo test --workspace` | **52/52 passed** (2 are DB-backed and print SKIPPED without `ADJUTANT_TEST_DATABASE_URL`) |
+| `cargo clippy --workspace --all-targets` | **0 warnings** (independently re-verified on a from-scratch build) |
+| `adjutant test-plugin` | **34/34 probes passed, 3 skipped** (skips are open mutating routes — never executed, and no longer counted as passes) against a fresh test DB |
+| `docs/e2e_m3.py` (live, dev headers OFF) | **49/49 probes**, repeatable (run twice back to back, exit 0) |
+| `scripts/probes.py` (M1+M2 batches) | **59/59 probes**, committed transcript |
 
-The E2E harness is the milestone's real proof: the server runs with
-`ADJUTANT_DEV_HEADERS=false`, so the spoofable `x-dev-user` stub is off and every
-identity in the run comes from a real session issued by the auth plugin.
+Counts changed in the 2026-09-22 audit pass because the harnesses were made
+honest, not because the software moved: `docs/e2e_m3.py`'s `probe()` used an
+`elif`, so every body assertion was skipped whenever the status matched (17
+probes asserted a status code only); `test-plugin` counted three never-executed
+"skipped" entries as passes and asserted only `!404 && !500` for its chief pass.
+
+**The E2E harness now verifies its own premise.** Probe 0 sends dev-stub headers
+and requires a 401/403 — i.e. it proves `ADJUTANT_DEV_HEADERS=false` instead of
+assuming it. (The identity claims were sound by construction even before: the
+harness never sends `x-dev-*` headers, so any identified request got its identity
+from the auth plugin's session provider.)
+
+Run it against a server started with `ADJUTANT_DEV_HEADERS=false` and, for a
+back-to-back run, `ADJUTANT_RATE_MAX=0` — the harness issues ~55 requests per run
+and would otherwise exhaust the 120/min window (it waits out one window and
+retries rather than failing opaquely).
 
 ## What landed
 
@@ -37,6 +51,9 @@ assignment, `login`/`logout`/`me`/`register`/`users`, and OIDC:
 `oidc/login` (state stored server-side, authorize endpoint from discovery) →
 `oidc/callback` (code exchange, id_token verified HS256 or RS256-via-JWKS,
 iss/aud/exp enforced) → session. Registers the core's identity provider.
+`verify_id_token` now has direct unit tests (valid/expired/wrong-iss/wrong-aud,
+plus RS256-through-JWKS with a committed test key) — the old test round-tripped a
+token through `jsonwebtoken` and never called the function that decides trust.
 
 **Membership plugin** — roster, lodges, patrols, proficiencies (+ completion
 sign-off), stewards, member detail with proficiency/position aggregates, and
@@ -74,9 +91,15 @@ pass" was misleading.
 5. **Two statements in one prepared statement** (`INSERT … ON CONFLICT; DELETE
    …`) — sqlx refuses; split. Same trap as the M2 SEED bug.
 6. **`make_interval(hours => $3)`** with a bigint bind — PostgreSQL wants `int`;
-   cast added. The failure was also non-atomic (user row written, session not),
-   so register now answers 409 "already registered — log in instead" for a
-   duplicate username instead of a bare 500.
+   cast added (`$3::int`, `auth/src/lib.rs:193`). **Open defect:** an earlier
+   draft of this entry also claimed register "now answers 409
+   'already registered — log in instead'". No 409 status and no such string
+   exist anywhere in the codebase; a duplicate username on
+   `POST /api/auth/users` still raises a unique violation that the core maps to
+   500 (`server/src/server.rs`, `SdkError::Db → INTERNAL_SERVER_ERROR`), and
+   `POST /api/auth/register` cannot reach the path because it is closed once any
+   user exists. Either implement the 409 or drop the claim — tracked as an open
+   defect.
 7. **Membership SQL typos**: `EXCLUDED.patrols_lodge` (no such column),
    `COALESCE($8, true)` where `$8` binds as text-null (needs `::boolean`), and
    `WHERE m.id = $1` binding a bigint id as text.
@@ -110,20 +133,62 @@ pass" was misleading.
 - [x] `adjutant new-plugin` scaffolds a plugin project (manifest, routes,
       models, migrations) — proven live with a throwaway fixture, then removed
 - [x] `adjutant test-plugin` runs a test server with mock permissions and a
-      test database (37/37)
+      test database (34/34 probed, 3 open mutating routes reported as skipped)
 - [x] Auth plugin: OIDC login, session management, role enforcement — all via
       the SDK (proved end-to-end against a mock IdP)
 - [x] Membership plugin: roster, OSG CSV import, proficiency tracking — via the SDK
-- [x] Both plugins load, enable, disable, and uninstall through the core
+- [x] Both plugins load, enable, disable, and uninstall through the core —
+      evidenced by e2e probes 39–48 for membership (disable → 404, auth keeps
+      serving, enable → 200, uninstall → rows survive, clear flag + reload →
+      route live again). **Auth's lifecycle is not exercised end-to-end on
+      purpose:** with the dev-header stub off, the auth plugin is the only way to
+      authenticate, so disabling it locks the operator out of the admin routes
+      until a restart. That is a real operational hazard, documented in README,
+      not something the harness should paper over.
 - [x] Both plugins' routes enforce permissions correctly (with the stub off)
-- [x] Both plugins' schemas are isolated; migrations run cleanly
+- [x] Both plugins' schemas are separate and migrations run cleanly
+      *(reworded in the audit: nothing enforces isolation beyond a per-call
+      `search_path`, and the shipped plugins deliberately write `core.*`
+      tables — see `server/src/host.rs:92-106`)*
 - [x] **SDK verdict: the API held up.** Building auth and membership through it
       was not painful — the identity seam, `ctx.db`/`ctx.http`, and
       `route_handler` covered everything these two plugins needed, and the one
       real friction point (per-plugin `search_path`) was a core bug, not an SDK
       design flaw. No redesign required before M4.
 
+## Audit pass (2026-09-22) — what else changed
+
+An adversarial review of the milestone docs, harnesses and test suite produced
+these fixes (all verified by the gates above):
+
+1. **`docs/e2e_m3.py` body assertions were dead** whenever the status matched
+   (`elif` in `probe()`). Fixed; ~17 probes now check what their names claim.
+2. **The re-import probe could not detect duplicates** (`updated + created == 3`
+   passes for a duplicating importer). It now asserts row identity.
+3. **The dev-headers precondition is asserted, not assumed** (probe 0).
+4. **Missing lifecycle evidence** for the criterion above (probes 39–48).
+5. **Test-plugin inflated its gate**: three auto-pass "skipped" entries are
+   reported separately; the probe authenticates for the now-admin-gated
+   `GET /api/plugins`.
+6. **Four tests that could not fail** were removed (`assert_eq!(Null, Null)`, a
+   bind test that asserted only the SQL string, two registry tests against an
+   empty placeholder). Replaced by: a DB-backed `decode_value`/`bind_params`
+   regression test that provably catches the `text[]`→`Null` bug (verified by
+   reverting the fix in a scratch copy), and real registry tests covering
+   Found/Disabled/NotFound, enable/disable, uninstall and reload generation swap.
+7. **The OIDC verifier is now tested directly**, including the RS256/JWKS branch
+   that the mock IdP never exercised.
+8. **Audit verify fails closed**; lifecycle audit rows resolve the real actor.
+9. **`GET /api/plugins` and `/api/events/recent` are admin-gated** (they exposed
+   the full route/permission table anonymously).
+10. **`x-forwarded-for` is only trusted from `ADJUTANT_TRUSTED_PROXIES`** —
+    otherwise any client could reset its own rate-limit window.
+11. **Reinstall actually reinstalls**: uninstall no longer clears `enabled`, so
+    clearing `uninstalled` + reload brings the plugin back serving (this was
+    broken and the old probes recorded the failure without explaining it).
+
 ## Next
 
 Milestone 4: missions + governance plugins, and SDK v0.2 (route/event helpers,
-test-harness improvements).
+test-harness improvements — including a public `adjutant_sdk::testing` module so
+plugin authors can unit-test handlers without a live core).

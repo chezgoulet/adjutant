@@ -10,11 +10,34 @@ from http.server import BaseHTTPRequestHandler, HTTPServer
 import threading
 
 BASE = "http://127.0.0.1:8787"
+PSQL = ["-h", "127.0.0.1", "-p", "5433", "-U", "adjutant", "-d", "adjutant_dev"]
+# PRECONDITION: the target server must have rate limiting disabled for this run
+# (ADJUTANT_RATE_MAX=0) or allow the burst below. The harness issues ~55
+# requests back-to-back, so against a default 120/min window two consecutive
+# runs exhaust the budget. If a 429 does arrive, wait out the window once and
+# retry, so a repeat run cannot fail for a reason unrelated to the code.
 IDP_PORT = 9099
 ISSUER = f"http://127.0.0.1:{IDP_PORT}"
 CLIENT_ID = "adjutant-e2e"
 SECRET = "e2e-shared-secret"
 results = []
+
+def _open(req, data=None):
+    """urllib request with one rate-limit wait-and-retry (see precondition)."""
+    for attempt in (1, 2):
+        try:
+            with urllib.request.urlopen(req, data=data, timeout=10) as r:
+                return r.status, r.read().decode(), dict(r.headers)
+        except urllib.error.HTTPError as e:
+            status, raw, hdrs = e.code, e.read().decode(), dict(e.headers)
+            if status == 429 and attempt == 1:
+                wait = int(hdrs.get("retry-after", "60")) + 1
+                print(f"[e2e] rate limited - waiting {wait}s for the window "
+                      f"(start the server with ADJUTANT_RATE_MAX=0 to avoid this)", flush=True)
+                time.sleep(wait)
+                continue
+            return status, raw, hdrs
+
 
 def probe(name, method, path, body=None, headers=None, expect_status=None, expect_in=None, token=None):
     h = dict(headers or {})
@@ -27,19 +50,16 @@ def probe(name, method, path, body=None, headers=None, expect_status=None, expec
     if body is not None:
         data = json.dumps(body).encode()
         req.add_header("content-type", "application/json")
-    try:
-        with urllib.request.urlopen(req, data=data, timeout=10) as r:
-            status, raw = r.status, r.read().decode()
-    except urllib.error.HTTPError as e:
-        status, raw = e.code, e.read().decode()
-    except Exception as e:
-        results.append((name, "FAIL", 0, f"transport: {e}"))
-        return None
-    ok, detail = True, raw[:150]
+    status, raw, _hdrs = _open(req, data=data)
+    # Both assertions are evaluated. The old `elif` skipped the body check
+    # whenever the status matched, so every probe that also passed expect_in
+    # was only ever checking a status code.
+    errs = []
     if expect_status is not None and status != expect_status:
-        ok, detail = False, f"status {status} != {expect_status} | {raw[:120]}"
-    elif expect_in is not None and expect_in not in raw:
-        ok, detail = False, f"missing {expect_in!r} | {raw[:120]}"
+        errs.append(f"status {status} != {expect_status}")
+    if expect_in is not None and expect_in not in raw:
+        errs.append(f"missing {expect_in!r}")
+    ok, detail = (not errs), ("; ".join(errs) + f" | {raw[:120]}" if errs else raw[:150])
     results.append((name, "PASS" if ok else "FAIL", status, detail))
     print(f"{'PASS' if ok else 'FAIL':4} {status:>4}  {name}", flush=True)
     try:
@@ -123,6 +143,20 @@ srv = HTTPServer(("127.0.0.1", IDP_PORT), IdP)
 threading.Thread(target=srv.serve_forever, daemon=True).start()
 print(f"[e2e] mock IdP on {ISSUER}")
 
+# ------------------------------------------------- 0a. precondition: stub OFF
+# The milestone claim is "every identity comes from a real session". Verify the
+# server configuration instead of trusting it: with the stub on, these headers
+# would authenticate the caller.
+def stub_probe():
+    req = urllib.request.Request(BASE + "/api/membership/members")
+    req.add_header("x-dev-user", "e2e-stub-must-not-work")
+    req.add_header("x-dev-role", "chief")
+    status, raw, _hdrs = _open(req)
+    if status == 200:
+        return False, f"dev-header stub is ON (status {status}) - run with ADJUTANT_DEV_HEADERS=false"
+    return status in (401, 403), f"stub refused with {status}"
+probe_raw("0 dev-header stub is OFF", stub_probe)
+
 # ---------------------------------------------------------------- 0. reset
 # The server must stay up (it owns the pool), so reset data instead of
 # dropping the DB. TRUNCATE ... CASCADE clears sessions/user_roles too.
@@ -137,6 +171,11 @@ reset = subprocess.run(
 if reset.returncode != 0:
     print(f"[e2e] reset failed: {reset.stderr.strip()}")
     sys.exit(2)
+# A previous failed run can leave a plugin uninstalled; the boot-time loader
+# would then skip it and every probe below would fail confusingly.
+subprocess.run(["psql", *PSQL, "-c",
+                "UPDATE core.plugins SET uninstalled=false, enabled=true;"],
+               capture_output=True, text=True)
 print("[e2e] data reset — starting from bootstrap state")
 
 # ---------------------------------------------------------------- 1. bootstrap
@@ -230,15 +269,26 @@ def csv_probe():
 probe_raw("26 CSV import (3 created, 1 skipped)", csv_probe)
 probe("27 imported patrol auto-created", "GET", "/api/membership/members",
       token=chief_token, expect_status=200, expect_in="Summit")
+def _member_count():
+    return subprocess.run(["psql", *PSQL, "-tAc", "SELECT count(*) FROM membership.members"],
+                          capture_output=True, text=True).stdout.strip()
+_MEMBERS_AFTER_IMPORT = None
 def csv_reimport():
+    # A duplicate-creating importer would still satisfy the old
+    # `updated + created == 3` check, so assert row identity instead.
+    before = _member_count()
     req = urllib.request.Request(BASE + "/api/membership/import", method="POST",
                                  data=csv.encode())
     req.add_header("Cookie", f"adjutant_session={chief_token}")
     with urllib.request.urlopen(req, timeout=10) as r:
         body = json.loads(r.read().decode())
-        return r.status == 200 and body.get("updated", 0) + body.get("created", 0) == 3, \
-               f"status={r.status} body={json.dumps(body)[:130]}"
-probe_raw("28 re-import updates, not duplicates", csv_reimport)
+    after = _member_count()
+    global _MEMBERS_AFTER_IMPORT
+    _MEMBERS_AFTER_IMPORT = after
+    ok = (r.status == 200 and before == after and int(before) >= 3
+          and body.get("created", 0) == 0 and body.get("updated", 0) == 3)
+    return ok, f"status={r.status} rows {before}->{after} body={json.dumps(body)[:110]}"
+probe_raw("28 re-import updates, no new rows", csv_reimport)
 
 # ---------------------------------------------------------------- 7. OIDC end-to-end
 # Set per-plugin config, then hot-reload (M2 feature) so auth re-inits with it.
@@ -301,6 +351,43 @@ def audit_rows():
     missing = need - set(acts)
     return not missing, f"actions={acts} missing={sorted(missing)}"
 probe_raw("38 audit captured admin actions", audit_rows)
+
+# ------------------------------------------------- 8. plugin lifecycle (M3)
+# Exit criterion: "both plugins load, enable, disable, and uninstall through
+# the core". Auth cannot be disable-probed here: with the dev-header stub off,
+# the auth plugin IS the only way to authenticate, so disabling it locks the
+# operator out of the admin routes until a process restart. README documents
+# that hazard; membership proves the lifecycle without the lockout.
+probe("39 disable membership", "POST", "/api/plugins/membership/disable",
+      token=chief_token, expect_status=200, expect_in='"enabled":false')
+probe("40 disabled plugin route 404", "GET", "/api/membership/members",
+      token=chief_token, expect_status=404, expect_in="plugin membership is disabled")
+probe("41 auth still answers while membership is down", "GET", "/api/auth/me",
+      token=chief_token, expect_status=200, expect_in='"roles":["chief"]')
+probe("42 enable membership", "POST", "/api/plugins/membership/enable",
+      token=chief_token, expect_status=200, expect_in='"enabled":true')
+probe("43 route back after enable", "GET", "/api/membership/members",
+      token=chief_token, expect_status=200, expect_in="Tiguidou")
+probe("44 uninstall membership", "DELETE", "/api/plugins/membership",
+      token=chief_token, expect_status=200, expect_in='"uninstalled":true')
+probe("45 uninstalled route 404", "GET", "/api/membership/members",
+      token=chief_token, expect_status=404)
+def data_survives():
+    out = _member_count()
+    return out == _MEMBERS_AFTER_IMPORT, f"count {_MEMBERS_AFTER_IMPORT} -> {out} after uninstall"
+probe_raw("46 data archived, not dropped", data_survives)
+def reinstall():
+    subprocess.run(["psql", *PSQL, "-c",
+                    "UPDATE core.plugins SET uninstalled=false WHERE id='membership';"],
+                   capture_output=True, text=True)
+    req = urllib.request.Request(BASE + "/api/plugins/reload", method="POST")
+    req.add_header("Cookie", f"adjutant_session={chief_token}")
+    with urllib.request.urlopen(req, timeout=10) as r:
+        body = json.loads(r.read().decode())
+    return r.status == 200 and "membership" in body.get("reloaded", []), f"status={r.status} body={json.dumps(body)[:110]}"
+probe_raw("47 clear flag + reload reinstalls", reinstall)
+probe("48 route live after reinstall", "GET", "/api/membership/members",
+      token=chief_token, expect_status=200, expect_in="Tiguidou")
 
 srv.shutdown()
 print()

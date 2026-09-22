@@ -1142,3 +1142,152 @@ mod tests {
         assert!(serde_json::from_str::<AuthConfig>("{}").is_ok());
     }
 }
+
+#[cfg(test)]
+mod id_token_tests {
+    //! Coverage for `verify_id_token` itself — the decision point that decides
+    //! whether an upstream identity is trusted. The old OIDC unit test only
+    //! round-tripped a token through `jsonwebtoken`, so this function (and the
+    //! RS256/JWKS branch, and exp/iss/aud enforcement) had no test at all.
+    use super::*;
+    use std::collections::HashMap;
+    use std::sync::Arc;
+
+    struct StubHttp {
+        jwks: Option<String>,
+    }
+
+    #[async_trait]
+    impl HostHttp for StubHttp {
+        async fn request(
+            &self,
+            _method: String,
+            url: String,
+            _headers: Vec<(String, String)>,
+            _body: Option<(String, Vec<u8>)>,
+        ) -> Result<HttpResponse, SdkError> {
+            let body = if url.ends_with("/.well-known/openid-configuration") {
+                serde_json::json!({
+                    "issuer": ISSUER,
+                    "authorization_endpoint": format!("{ISSUER}/authorize"),
+                    "token_endpoint": format!("{ISSUER}/token"),
+                    "jwks_uri": format!("{ISSUER}/jwks"),
+                })
+                .to_string()
+                .into_bytes()
+            } else if url.ends_with("/jwks") {
+                match &self.jwks {
+                    Some(j) => j.clone().into_bytes(),
+                    None => return Err(SdkError::Internal("test stub has no JWKS".into())),
+                }
+            } else {
+                return Err(SdkError::Internal(format!("unexpected url {url}")));
+            };
+            Ok(HttpResponse { status: 200, headers: HashMap::new(), body })
+        }
+    }
+
+    const ISSUER: &str = "https://idp.example";
+    const SECRET: &str = "shared-secret";
+    const CLIENT: &str = "adjutant-test";
+    const RSA_PEM: &str = include_str!("../tests/fixtures/rs256-test-key.pem");
+    const JWKS: &str = include_str!("../tests/fixtures/rs256-jwks.json");
+
+    fn oidc() -> OidcCfg {
+        OidcCfg {
+            issuer: ISSUER.into(),
+            client_id: CLIENT.into(),
+            client_secret: SECRET.into(),
+            redirect_uri: "https://app.example/cb".into(),
+        }
+    }
+
+    fn claims(iss: &str, aud: &str, exp_offset: i64) -> serde_json::Value {
+        let now = chrono::Utc::now().timestamp();
+        serde_json::json!({
+            "sub": "idp-user-1",
+            "iss": iss,
+            "aud": aud,
+            "exp": now + exp_offset,
+            "iat": now,
+            "email": "u@example.org",
+        })
+    }
+
+    fn hs256(claims: &serde_json::Value, secret: &[u8]) -> String {
+        jsonwebtoken::encode(
+            &jsonwebtoken::Header::new(jsonwebtoken::Algorithm::HS256),
+            claims,
+            &jsonwebtoken::EncodingKey::from_secret(secret),
+        )
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn hs256_valid_token_is_accepted() {
+        let http: Arc<dyn HostHttp> = Arc::new(StubHttp { jwks: None });
+        let tok = hs256(&claims(ISSUER, CLIENT, 3600), SECRET.as_bytes());
+        let got = verify_id_token(&http, &oidc(), &tok).await.expect("valid token");
+        assert_eq!(got.sub, "idp-user-1");
+        assert_eq!(got.email.as_deref(), Some("u@example.org"));
+    }
+
+    #[tokio::test]
+    async fn expired_token_is_rejected() {
+        let http: Arc<dyn HostHttp> = Arc::new(StubHttp { jwks: None });
+        // An hour past expiry: comfortably outside jsonwebtoken's default 60s
+        // clock-skew leeway (which is why -60 would still be accepted).
+        let tok = hs256(&claims(ISSUER, CLIENT, -3600), SECRET.as_bytes());
+        assert!(verify_id_token(&http, &oidc(), &tok).await.is_err(), "expired token must fail");
+    }
+
+    #[tokio::test]
+    async fn wrong_issuer_audience_and_secret_are_rejected() {
+        let http: Arc<dyn HostHttp> = Arc::new(StubHttp { jwks: None });
+        for tok in [
+            hs256(&claims("https://evil.example", CLIENT, 3600), SECRET.as_bytes()),
+            hs256(&claims(ISSUER, "someone-else", 3600), SECRET.as_bytes()),
+            hs256(&claims(ISSUER, CLIENT, 3600), b"wrong-secret"),
+        ] {
+            assert!(
+                verify_id_token(&http, &oidc(), &tok).await.is_err(),
+                "iss/aud/secret mismatch must fail"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn rs256_token_is_verified_against_jwks() {
+        let http: Arc<dyn HostHttp> = Arc::new(StubHttp { jwks: Some(JWKS.into()) });
+        let header = jsonwebtoken::Header {
+            alg: jsonwebtoken::Algorithm::RS256,
+            kid: Some("test-key-1".into()),
+            ..Default::default()
+        };
+        let tok = jsonwebtoken::encode(
+            &header,
+            &claims(ISSUER, CLIENT, 3600),
+            &jsonwebtoken::EncodingKey::from_rsa_pem(RSA_PEM.as_bytes()).unwrap(),
+        )
+        .unwrap();
+        let got = verify_id_token(&http, &oidc(), &tok).await.expect("RS256 token via JWKS");
+        assert_eq!(got.sub, "idp-user-1");
+    }
+
+    #[tokio::test]
+    async fn rs256_token_with_unknown_kid_is_rejected() {
+        let http: Arc<dyn HostHttp> = Arc::new(StubHttp { jwks: Some(JWKS.into()) });
+        let header = jsonwebtoken::Header {
+            alg: jsonwebtoken::Algorithm::RS256,
+            kid: Some("no-such-key".into()),
+            ..Default::default()
+        };
+        let tok = jsonwebtoken::encode(
+            &header,
+            &claims(ISSUER, CLIENT, 3600),
+            &jsonwebtoken::EncodingKey::from_rsa_pem(RSA_PEM.as_bytes()).unwrap(),
+        )
+        .unwrap();
+        assert!(verify_id_token(&http, &oidc(), &tok).await.is_err());
+    }
+}

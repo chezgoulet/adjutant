@@ -64,8 +64,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             failed += 1;
                         }
                     }
-                    let passed = probes.len() - failed;
-                    println!("\n{passed}/{} probes passed against test database", probes.len());
+                    // Probes that were never executed (open mutating routes)
+                    // are counted separately — they are not evidence.
+                    let skipped = probes.iter().filter(|p| p.expect == "skipped").count();
+                    let passed = probes.len() - failed - skipped;
+                    println!(
+                        "\n{passed}/{} probes passed against test database ({skipped} skipped, not probed)",
+                        probes.len() - skipped
+                    );
                     if failed > 0 {
                         std::process::exit(1);
                     }

@@ -355,8 +355,12 @@ pub async fn run_test_plugin(cfg: &Config) -> Result<Vec<Probe>, String> {
         detail: "GET /".into(),
     });
 
+    // /api/plugins is admin-gated (SPEC §5.3); this harness runs with the dev
+    // identity stub on, so it authenticates as its mock chief.
     let list = client
         .get(format!("{base}/api/plugins"))
+        .header("x-dev-user", "test-plugin")
+        .header("x-dev-role", "chief")
         .send()
         .await
         .map_err(|e| e.to_string())?;

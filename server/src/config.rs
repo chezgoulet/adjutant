@@ -54,6 +54,9 @@ pub struct Config {
     /// MUST be false in production; only consulted when no plugin identity
     /// provider answered (SPEC §7.1).
     pub allow_dev_headers: bool,
+    /// Direct peers whose `x-forwarded-for` header may be trusted for rate
+    /// limiting (reverse-proxy IPs). Empty = ignore the header entirely.
+    pub trusted_proxies: Vec<String>,
 }
 
 impl Default for Config {
@@ -68,6 +71,7 @@ impl Default for Config {
             rate: RateConfig::default(),
             cors_origins: Vec::new(),
             allow_dev_headers: true,
+            trusted_proxies: Vec::new(),
         }
     }
 }
@@ -85,6 +89,7 @@ struct FileConfig {
     rates: Option<FileRates>,
     cors: Option<FileCors>,
     auth: Option<FileAuth>,
+    trusted_proxies: Option<Vec<String>>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -223,6 +228,9 @@ pub fn load(cli: &CliArgs) -> Result<Config, String> {
     if let Ok(v) = std::env::var("ADJUTANT_DEV_HEADERS") {
         cfg.allow_dev_headers = matches!(v.as_str(), "1" | "true" | "yes");
     }
+    if let Ok(v) = std::env::var("ADJUTANT_TRUSTED_PROXIES") {
+        cfg.trusted_proxies = split_origins(&v);
+    }
 
     // 3. CLI (highest precedence)
     if let Some(v) = &cli.bind {
@@ -289,6 +297,9 @@ fn merge_file(cfg: &mut Config, path: &Path) -> Result<(), String> {
         if let Some(v) = a.allow_dev_headers {
             cfg.allow_dev_headers = v;
         }
+    }
+    if let Some(v) = f.trusted_proxies {
+        cfg.trusted_proxies = v;
     }
     Ok(())
 }
