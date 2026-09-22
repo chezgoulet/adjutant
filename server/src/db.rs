@@ -96,16 +96,87 @@ CREATE TABLE IF NOT EXISTS core.audit_log (
     created_at      TIMESTAMPTZ NOT NULL DEFAULT now()
 );
 CREATE INDEX IF NOT EXISTS idx_core_audit_created ON core.audit_log (created_at);
+"),
+(2, "audit_chain_and_uninstall", "
+ALTER TABLE core.plugins ADD COLUMN IF NOT EXISTS uninstalled BOOLEAN NOT NULL DEFAULT false;
+
+CREATE EXTENSION IF NOT EXISTS pgcrypto WITH SCHEMA public;
+
+ALTER TABLE core.audit_log ADD COLUMN IF NOT EXISTS prev_hash TEXT;
+ALTER TABLE core.audit_log ADD COLUMN IF NOT EXISTS entry_hash TEXT;
+
+DO $fn$
+DECLARE r RECORD; prev TEXT := repeat('0', 64); h TEXT;
+BEGIN
+  FOR r IN SELECT id, action, resource_type, resource_id, details, source FROM core.audit_log ORDER BY id LOOP
+    h := encode(public.digest(prev || '|' || r.id::text || '|' || r.action || '|' || r.resource_type || '|' || r.resource_id || '|' || r.details::text || '|' || r.source, 'sha256'), 'hex');
+    UPDATE core.audit_log SET prev_hash = prev, entry_hash = h WHERE id = r.id;
+    prev := h;
+  END LOOP;
+END
+$fn$;
+
+CREATE OR REPLACE FUNCTION core.audit_chain_fill() RETURNS trigger
+LANGUAGE plpgsql AS $fn$
+DECLARE prev TEXT;
+BEGIN
+  PERFORM pg_advisory_xact_lock(918273645);
+  SELECT entry_hash INTO prev FROM core.audit_log ORDER BY id DESC LIMIT 1;
+  NEW.prev_hash := COALESCE(prev, repeat('0', 64));
+  NEW.entry_hash := encode(public.digest(
+    NEW.prev_hash || '|' || NEW.id::text || '|' || NEW.action || '|' ||
+    NEW.resource_type || '|' || NEW.resource_id || '|' ||
+    NEW.details::text || '|' || NEW.source, 'sha256'), 'hex');
+  RETURN NEW;
+END
+$fn$;
+
+DROP TRIGGER IF EXISTS audit_chain_fill ON core.audit_log;
+CREATE TRIGGER audit_chain_fill BEFORE INSERT ON core.audit_log
+  FOR EACH ROW EXECUTE FUNCTION core.audit_chain_fill();
+
+CREATE OR REPLACE FUNCTION core.audit_append_only() RETURNS trigger
+LANGUAGE plpgsql AS $fn$
+BEGIN
+  RAISE EXCEPTION 'core.audit_log is append-only (attempt %)', TG_OP;
+END
+$fn$;
+
+DROP TRIGGER IF EXISTS audit_append_only ON core.audit_log;
+CREATE TRIGGER audit_append_only BEFORE UPDATE OR DELETE ON core.audit_log
+  FOR EACH ROW EXECUTE FUNCTION core.audit_append_only();
+
+CREATE OR REPLACE FUNCTION core.audit_verify()
+RETURNS TABLE(first_bad BIGINT, rows_checked BIGINT)
+LANGUAGE sql STABLE AS $fn$
+SELECT min(id) FILTER (WHERE bad)::BIGINT, count(*)::BIGINT FROM (
+  SELECT a.id,
+    (a.prev_hash IS DISTINCT FROM COALESCE(lag(a.entry_hash, 1) OVER w, repeat('0', 64)))
+    OR (a.entry_hash IS DISTINCT FROM encode(public.digest(
+        COALESCE(lag(a.entry_hash, 1) OVER w, repeat('0', 64)) || '|' || a.id::text || '|' ||
+        a.action || '|' || a.resource_type || '|' || a.resource_id || '|' ||
+        a.details::text || '|' || a.source, 'sha256'), 'hex')) AS bad
+  FROM core.audit_log a WINDOW w AS (ORDER BY a.id)
+) t
+$fn$;
 ")];
 
 /// Bootstrap roles + permissions grants. `chief` gets everything (SPEC §9 —
 /// real role management arrives with the auth plugin in Milestone 2; this is
 /// the seed the prototype enforces against).
-const SEED: &str = "
+// Two statements, two constants: `sqlx::query` prepares a single statement
+// ("cannot insert multiple commands into a prepared statement").
+const SEED_ROLES: &str = "
 INSERT INTO core.roles (id, display_name, description) VALUES
     ('chief', 'Chief', 'Full troop authority (placeholder until auth plugin)'),
     ('scout', 'Scout', 'Standard member (placeholder until auth plugin)')
 ON CONFLICT (id) DO NOTHING;
+";
+
+const SEED_PERMS: &str = "
+INSERT INTO core.permissions (id, description) VALUES
+    ('core:admin', 'Administer plugins, reload, and audit verification')
+ON CONFLICT (id) DO UPDATE SET description = EXCLUDED.description;
 ";
 
 /// Connect, run core migrations, seed bootstrap roles.
@@ -123,7 +194,8 @@ pub async fn connect_and_migrate(cfg: &Config) -> Result<Arc<PgPool>, sqlx::Erro
         run_migration(&pool, "core", *version, name, sql).await?;
     }
 
-    sqlx::query(SEED).execute(&pool).await?;
+    sqlx::query(SEED_ROLES).execute(&pool).await?;
+    sqlx::query(SEED_PERMS).execute(&pool).await?;
     tracing::info!("database ready (core schema migrated, bootstrap roles seeded)");
 
     Ok(Arc::new(pool))
@@ -175,7 +247,16 @@ pub async fn run_migration(
          INSERT INTO core.schema_migrations (schema, version, name) VALUES ('{schema}', {version}, '{name}');\
          COMMIT;"
     );
-    sqlx::raw_sql(&script).execute(&mut *conn).await?;
+    // Call `Executor::execute` directly rather than `RawSql::execute` (an
+    // `async fn` wrapper). The wrapper's future trips rustc's HRTB limit
+    // ("implementation of Executor is not general enough") and can't be proven
+    // Send, which makes every handler that awaits run_migration (hot-reload)
+    // fail axum's Handler bound. The direct call returns a concrete
+    // `BoxFuture` (= `Pin<Box<dyn Future + Send>>`) — provably Send.
+    // Found by bisecting with probe handlers: raw_sql-via-wrapper was the
+    // only !Send piece (2026-09-21, M2).
+    use sqlx::Executor;
+    Executor::execute(&mut *conn, sqlx::raw_sql(&script)).await?;
 
     tracing::info!(schema, version, name, "migration applied");
     Ok(())

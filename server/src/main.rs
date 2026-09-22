@@ -1,28 +1,42 @@
 //! `adjutant` — the core server binary.
 
-use adjutant_server::{build_app, config::Config};
+use adjutant_server::config::{self, CliArgs, LogFormat};
+use adjutant_server::build_app;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let cfg = Config::from_env();
+    // CLI first: --help must work without a database.
+    let cli = CliArgs::parse(std::env::args().skip(1)).unwrap_or_else(|e| {
+        eprintln!("error: {e}\n\n{}", config::USAGE);
+        std::process::exit(2);
+    });
+    if cli.help {
+        print!("{}", config::USAGE);
+        return Ok(());
+    }
+    let cfg = config::load(&cli)?;
 
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| cfg.log_filter.clone().into()),
-        )
-        .init();
+    let filter = tracing_subscriber::EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| cfg.log_filter.clone().into());
+    match cfg.log_format {
+        LogFormat::Pretty => tracing_subscriber::fmt().with_env_filter(filter).init(),
+        LogFormat::Json => tracing_subscriber::fmt().with_env_filter(filter).json().init(),
+    }
 
     tracing::info!(bind = %cfg.bind, plugin_dir = %cfg.plugin_dir.display(), "starting adjutant");
 
-    let (app, _bus) = build_app(&cfg).await?;
+    let (app, _state) = build_app(&cfg).await?;
 
     let listener = tokio::net::TcpListener::bind(cfg.bind).await?;
     tracing::info!(addr = %listener.local_addr()?, "listening");
 
-    axum::serve(listener, app)
-        .with_graceful_shutdown(shutdown_signal())
-        .await?;
+    // ConnectInfo feeds the rate limiter's per-IP key.
+    axum::serve(
+        listener,
+        app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+    )
+    .with_graceful_shutdown(shutdown_signal())
+    .await?;
 
     tracing::info!("adjutant stopped");
     Ok(())

@@ -139,6 +139,11 @@ pub trait HostDb: Send + Sync + 'static {
 #[async_trait]
 pub trait HostEvents: Send + Sync + 'static {
     async fn publish(&self, event_type: String, payload: Value) -> Result<(), SdkError>;
+
+    /// Replay persisted events (SPEC §15 M2: event bus with persistence and
+    /// replay). Returns rows with `id > since_id`, ascending, capped at
+    /// `limit` (the core clamps it).
+    async fn replay(&self, since_id: i64, limit: i64) -> Result<Vec<Event>, SdkError>;
 }
 
 // ---------------------------------------------------------------------------
@@ -222,8 +227,12 @@ fn tracing_warn(msg: &str) {
 // ---------------------------------------------------------------------------
 
 /// An inter-plugin event. Persisted to `core.events` and broadcast in-process.
+/// `id` is the `core.events` row id (0 for events that somehow skipped
+/// persistence); replayed events carry their real ids.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Event {
+    #[serde(default)]
+    pub id: i64,
     pub event_type: String,
     pub payload: Value,
     pub source: String,
@@ -249,6 +258,12 @@ impl EventBusHandle {
 
     pub async fn publish(&self, event_type: &str, payload: Value) -> Result<(), SdkError> {
         self.host.publish(event_type.to_string(), payload).await
+    }
+
+    /// Replay persisted events with `id > since_id` (ascending, clamped).
+    pub async fn replay(&self, since_id: i64, limit: i64) -> Result<Vec<Event>, SdkError> {
+        let limit = limit.clamp(1, 500);
+        self.host.replay(since_id, limit).await
     }
 }
 
@@ -600,6 +615,11 @@ pub trait AdjutantPlugin: Send + Sync {
 }
 
 /// Entry-point signature the core looks up in a loaded `cdylib`.
+///
+/// The trait object is intentionally not FFI-safe by C's definition: core and
+/// plugin are the same crate graph (same toolchain + versions) — documented in
+/// the native-loading caveat above.
+#[allow(improper_ctypes_definitions)]
 pub type PluginFactory = unsafe extern "C" fn() -> *mut dyn AdjutantPlugin;
 
 /// Symbol the core resolves in every plugin library.
@@ -667,6 +687,7 @@ mod tests {
     #[derive(Default)]
     struct StubEvents {
         published: Mutex<Vec<(String, Value)>>,
+        replayed: Mutex<Vec<(i64, i64)>>,
     }
 
     #[async_trait]
@@ -674,6 +695,11 @@ mod tests {
         async fn publish(&self, event_type: String, payload: Value) -> Result<(), SdkError> {
             self.published.lock().unwrap().push((event_type, payload));
             Ok(())
+        }
+
+        async fn replay(&self, since_id: i64, limit: i64) -> Result<Vec<Event>, SdkError> {
+            self.replayed.lock().unwrap().push((since_id, limit));
+            Ok(vec![])
         }
     }
 
