@@ -2,7 +2,8 @@ name: CI
 
 on:
   push:
-    branches: [testing, master, "feature/*", "fix/*"]
+    # House git flow: testing = integration target, main = releases.
+    branches: [testing, main, "feature/*", "fix/*"]
   pull_request:
 
 jobs:
@@ -33,6 +34,11 @@ jobs:
           components: clippy
 
       - uses: Swatinem/rust-cache@v2
+
+      # The DB-backed tests connect to this database and fail loudly if it is
+      # missing (that is how the first CI run after the M3 merge went red).
+      - name: Create the test database
+        run: psql "$ADJUTANT_DATABASE_URL" -c 'CREATE DATABASE adjutant_dev_test'
 
       - name: Build
         run: cargo build --workspace
