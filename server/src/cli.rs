@@ -226,14 +226,14 @@ fn title_for(name: &str) -> String {
 // test-plugin
 // ---------------------------------------------------------------------------
 
-/// Derive a fresh test database URL from the configured one:
-/// `…/adjutant_dev` → `…/adjutant_test`. `ADJUTANT_TEST_DATABASE_URL`
-/// overrides entirely.
-pub fn test_database_url(cfg: &Config) -> String {
-    if let Ok(u) = std::env::var("ADJUTANT_TEST_DATABASE_URL") {
-        return u;
-    }
-    let base = &cfg.database_url;
+/// Pure test-database derivation: `…/adjutant_dev` → `…/adjutant_dev_test`,
+/// preserving any query string and never doubling an existing `_test` suffix.
+///
+/// Split out from the environment lookup so it can be tested without depending
+/// on ambient state (the earlier single-function version made the unit test fail
+/// in any shell or CI job that exports `ADJUTANT_TEST_DATABASE_URL`, which is the
+/// documented workflow for the DB-backed tests).
+pub fn derive_test_database_url(base: &str) -> String {
     match base.rsplit_once('/') {
         Some((prefix, rest)) => {
             let (db, query) = match rest.split_once('?') {
@@ -243,8 +243,20 @@ pub fn test_database_url(cfg: &Config) -> String {
             let stem = db.strip_suffix("_test").unwrap_or(db);
             format!("{prefix}/{stem}_test{query}")
         }
-        None => base.clone(),
+        None => base.to_string(),
     }
+}
+
+/// Test database for `test-plugin` and the DB-backed tests.
+/// `ADJUTANT_TEST_DATABASE_URL` overrides the derivation entirely.
+pub fn test_database_url(cfg: &Config) -> String {
+    test_database_url_with(cfg, std::env::var("ADJUTANT_TEST_DATABASE_URL").ok())
+}
+
+/// The override decision, with the environment value passed in — so tests cover
+/// both branches without mutating process-global state.
+pub fn test_database_url_with(cfg: &Config, override_url: Option<String>) -> String {
+    override_url.unwrap_or_else(|| derive_test_database_url(&cfg.database_url))
 }
 
 /// URL of the maintenance database (`/postgres`) for drop/create.
@@ -571,29 +583,57 @@ mod tests {
         let _ = std::fs::remove_dir_all(&tmp);
     }
 
-    #[tokio::test]
-    async fn test_database_url_derivation_and_safety() {
-        let mut cfg = Config {
-            database_url: "postgres://adjutant@127.0.0.1:5433/adjutant_dev".into(),
-            ..Config::default()
-        };
+    #[test]
+    fn test_database_url_derivation_is_env_independent() {
+        // Assertions run against the pure function: the ambient environment
+        // (notably ADJUTANT_TEST_DATABASE_URL, which CI and the documented
+        // workflow both set) can no longer change the outcome.
         assert_eq!(
-            test_database_url(&cfg),
+            derive_test_database_url("postgres://adjutant@127.0.0.1:5433/adjutant_dev"),
             "postgres://adjutant@127.0.0.1:5433/adjutant_dev_test",
             "live DB gets _test appended"
         );
-        // already _test → stays _test (no _test_test)
-        cfg.database_url = "postgres://adjutant@127.0.0.1:5433/adjutant_test".into();
         assert_eq!(
-            test_database_url(&cfg),
-            "postgres://adjutant@127.0.0.1:5433/adjutant_test"
+            derive_test_database_url("postgres://adjutant@127.0.0.1:5433/adjutant_test"),
+            "postgres://adjutant@127.0.0.1:5433/adjutant_test",
+            "an existing _test suffix is not doubled"
         );
+        assert_eq!(
+            derive_test_database_url("postgres://h/dbname?sslmode=disable"),
+            "postgres://h/dbname_test?sslmode=disable",
+            "query string survives the rewrite"
+        );
+        assert_eq!(derive_test_database_url("not-a-url"), "not-a-url");
         assert_eq!(
             maintenance_url("postgres://h:5433/adjutant_test"),
             "postgres://h:5433/postgres"
         );
-        // suffix preserved through query strings
-        cfg.database_url = "postgres://h/dbname?sslmode=disable".into();
-        assert_eq!(test_database_url(&cfg), "postgres://h/dbname_test?sslmode=disable");
+    }
+
+    #[test]
+    fn test_database_url_override_is_decided_explicitly() {
+        let cfg = Config {
+            database_url: "postgres://adjutant@127.0.0.1:5433/adjutant_dev".into(),
+            ..Config::default()
+        };
+        assert_eq!(
+            test_database_url_with(&cfg, Some("postgres://other/db".into())),
+            "postgres://other/db",
+            "explicit override wins"
+        );
+        assert_eq!(
+            test_database_url_with(&cfg, None),
+            "postgres://adjutant@127.0.0.1:5433/adjutant_dev_test",
+            "no override derives from the configured live URL"
+        );
+        // The public wrapper must agree with whichever branch the environment
+        // selects — this passes whether or not the variable is exported.
+        match std::env::var("ADJUTANT_TEST_DATABASE_URL") {
+            Ok(v) => assert_eq!(test_database_url(&cfg), v),
+            Err(_) => assert_eq!(
+                test_database_url(&cfg),
+                "postgres://adjutant@127.0.0.1:5433/adjutant_dev_test"
+            ),
+        }
     }
 }
