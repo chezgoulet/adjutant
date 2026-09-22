@@ -5,12 +5,18 @@ Covers: bootstrap register, login/logout/me, admin user creation, role
 enforcement, session-only access to another plugin's protected route,
 membership CRUD + OSG CSV import, and a full OIDC flow against a mock IdP.
 """
-import base64, hmac, hashlib, json, subprocess, sys, time, urllib.request, urllib.error
+import base64, hmac, hashlib, json, os, subprocess, sys, time, urllib.request, urllib.error
 from http.server import BaseHTTPRequestHandler, HTTPServer
 import threading
 
 BASE = "http://127.0.0.1:8787"
-PSQL = ["-h", "127.0.0.1", "-p", "5433", "-U", "adjutant", "-d", "adjutant_dev"]
+# Database target for the psql calls below. Taken from the environment so the
+# harness is not tied to this host's 5433/dev-database convention (CI runs
+# PostgreSQL on 5432 with a different database name).
+DSN = os.environ.get(
+    "ADJUTANT_DATABASE_URL", "postgres://adjutant@127.0.0.1:5433/adjutant_dev"
+)
+PSQL = [DSN]
 # PRECONDITION: the target server must have rate limiting disabled for this run
 # (ADJUTANT_RATE_MAX=0) or allow the burst below. The harness issues ~55
 # requests back-to-back, so against a default 120/min window two consecutive
@@ -161,8 +167,7 @@ probe_raw("0 dev-header stub is OFF", stub_probe)
 # The server must stay up (it owns the pool), so reset data instead of
 # dropping the DB. TRUNCATE ... CASCADE clears sessions/user_roles too.
 reset = subprocess.run(
-    ["psql", "-h", "127.0.0.1", "-p", "5433", "-U", "adjutant", "-d",
-     "adjutant_dev", "-c",
+    ["psql", *PSQL, "-c",
      "TRUNCATE core.users, core.audit_log, core.events, auth.oidc_states, "\
      "hello.greetings, hello.events_received, membership.members, "\
      "membership.lodges, membership.patrols, membership.proficiencies, "\
@@ -292,8 +297,7 @@ probe_raw("28 re-import updates, no new rows", csv_reimport)
 
 # ---------------------------------------------------------------- 7. OIDC end-to-end
 # Set per-plugin config, then hot-reload (M2 feature) so auth re-inits with it.
-subprocess.run(["psql", "-h", "127.0.0.1", "-p", "5433", "-U", "adjutant",
-                "-d", "adjutant_dev", "-tAc",
+subprocess.run(["psql", *PSQL, "-tAc",
                 f"UPDATE core.plugins SET config = "
                 f"'{{\"oidc\": {{\"issuer\": \"{ISSUER}\", \"client_id\": \"{CLIENT_ID}\", "
                 f"\"client_secret\": \"{SECRET}\", \"redirect_uri\": \"{BASE}/api/auth/oidc/callback\"}}}}' "
@@ -342,8 +346,7 @@ def audit_probe():
 probe_raw("37 audit chain intact after M3", audit_probe)
 
 def audit_rows():
-    out = subprocess.run(["psql", "-h", "127.0.0.1", "-p", "5433", "-U", "adjutant",
-                          "-d", "adjutant_dev", "-tAc",
+    out = subprocess.run(["psql", *PSQL, "-tAc",
                           "SELECT action FROM core.audit_log ORDER BY id;"],
                          capture_output=True, text=True)
     acts = out.stdout.split()
