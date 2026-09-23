@@ -1,5 +1,6 @@
-//! `adjutant` subcommands: `new-plugin` (scaffold) and `test-plugin`
-//! (SPEC §15 M3 exit criteria).
+//! `adjutant` subcommands: `new-plugin` (scaffold), `validate-plugin` (static
+//! checks without a database), and `test-plugin` (live route probes against a
+//! pristine test database) — SPEC §15 M3 exit criteria + SPEC §5.2a.
 //!
 //! Design note: SPEC §5.2's `manifest.json` is folded into the trait
 //! implementation — `id()`/`version()`/`permissions_granted()` *are* the
@@ -539,6 +540,101 @@ pub async fn run_test_plugin(cfg: &Config) -> Result<Vec<Probe>, String> {
 }
 
 // ---------------------------------------------------------------------------
+// validate-plugin
+// ---------------------------------------------------------------------------
+
+/// One line of the `validate-plugin` report.
+#[derive(Debug)]
+pub struct ValidationCheck {
+    pub name: String,
+    pub ok: bool,
+    pub detail: String,
+}
+
+fn ok_check(name: &str, detail: &str) -> ValidationCheck {
+    ValidationCheck { name: name.into(), ok: true, detail: detail.into() }
+}
+
+fn fail_check(name: &str, detail: &str) -> ValidationCheck {
+    ValidationCheck { name: name.into(), ok: false, detail: detail.into() }
+}
+
+/// Validate a compiled plugin `.so` without a database or a server: verify the
+/// ABI handshake, construct the plugin, run `init` against the SDK's in-memory
+/// host mocks, then validate the declaration (id, permissions, migrations,
+/// route namespace/captures/references/duplicates). Never connects to
+/// PostgreSQL — safe to run in CI before a plugin is ever installed.
+pub async fn validate_plugin(so_path: &Path) -> Result<Vec<ValidationCheck>, String> {
+    if !so_path.is_file() {
+        return Err(format!("{} is not a file", so_path.display()));
+    }
+    let lib = unsafe { libloading::Library::new(so_path) }
+        .map_err(|e| format!("load {}: {e}", so_path.display()))?;
+
+    let mut checks = Vec::new();
+
+    // 1. ABI handshake — must succeed before we touch the vtable.
+    match crate::plugin_runtime::check_sdk_abi(&lib, so_path) {
+        Ok(()) => checks.push(ok_check(
+            "sdk abi",
+            &format!("matches adjutant-sdk {}", adjutant_sdk::SDK_VERSION),
+        )),
+        Err(e) => {
+            checks.push(fail_check("sdk abi", &e.to_string()));
+            return Ok(checks); // cannot safely continue past a mismatch
+        }
+    }
+
+    // 2. Construct the plugin (same symbol the core resolves).
+    let mut plugin: Box<dyn adjutant_sdk::AdjutantPlugin> = {
+        let factory = unsafe {
+            lib.get::<adjutant_sdk::PluginFactory>(adjutant_sdk::ENTRY_SYMBOL)
+        }
+        .map_err(|e| {
+            format!(
+                "missing `{}` symbol: {e}",
+                String::from_utf8_lossy(adjutant_sdk::ENTRY_SYMBOL)
+            )
+        })?;
+        unsafe { Box::from_raw(factory()) }
+    };
+    let id = plugin.id().to_string();
+
+    // 3. Identifier.
+    match crate::plugin_runtime::validate_plugin_id(&id) {
+        Ok(()) => checks.push(ok_check("id", &id)),
+        Err(e) => checks.push(fail_check("id", &e)),
+    }
+
+    // 4. `init` against in-memory host mocks. Plugins set their context before
+    //    any fallible work, so this is enough to make `routes()` callable.
+    let host = adjutant_sdk::testing::TestHost::new();
+    match plugin.init(host.context(&id)).await {
+        Ok(()) => checks.push(ok_check("init", "ran against in-memory host mocks")),
+        Err(e) => checks.push(fail_check("init", &e.to_string())),
+    }
+
+    let granted = plugin.permissions_granted();
+    checks.push(ok_check("permissions", &format!("{} declared", granted.len())));
+
+    let migrations = plugin.migrations();
+    match crate::plugin_runtime::validate_migrations(&id, &migrations) {
+        Ok(()) => checks.push(ok_check("migrations", &format!("{} declared", migrations.len()))),
+        Err(e) => checks.push(fail_check("migrations", &e.to_string())),
+    }
+
+    let routes = plugin.routes();
+    let route_detail = format!("{} declared", routes.len());
+    let mut seen_routes = std::collections::HashMap::new();
+    match crate::plugin_runtime::validate_declaration(&id, &granted, &routes, &mut seen_routes) {
+        Ok(()) => checks.push(ok_check("routes", &route_detail)),
+        Err(e) => checks.push(fail_check("routes", &e.to_string())),
+    }
+
+    Ok(checks)
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
@@ -559,9 +655,16 @@ mod tests {
         assert!(validate_plugin_name(&"x".repeat(40)).is_err());
     }
 
+    #[tokio::test]
+    async fn validate_plugin_rejects_a_missing_file() {
+        let err = validate_plugin(Path::new("/no/such/plugin.so"))
+            .await
+            .unwrap_err();
+        assert!(err.contains("not a file"), "got: {err}");
+    }
+
     #[test]
-    fn struct_names_camel_case() {
-        assert_eq!(struct_name_for("gear_locker"), "GearLocker");
+    fn struct_names_camel_case() {        assert_eq!(struct_name_for("gear_locker"), "GearLocker");
         assert_eq!(struct_name_for("scouting"), "Scouting");
         assert_eq!(struct_name_for("a_b_c"), "ABC");
     }

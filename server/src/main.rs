@@ -83,12 +83,44 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
             }
         }
+        Some("validate-plugin") => {
+            let path = args
+                .get(1)
+                .filter(|a| !a.starts_with('-'))
+                .ok_or("--help")?;
+            match adjutant_server::cli::validate_plugin(std::path::Path::new(path)).await {
+                Ok(checks) => {
+                    println!("{:5} {:<12} DETAIL", "RESULT", "CHECK");
+                    let mut failed = 0;
+                    for c in &checks {
+                        println!(
+                            "{} {:<12} {}",
+                            if c.ok { "PASS" } else { "FAIL" },
+                            c.name,
+                            c.detail
+                        );
+                        if !c.ok {
+                            failed += 1;
+                        }
+                    }
+                    if failed > 0 {
+                        eprintln!("\n{failed} check(s) failed");
+                        std::process::exit(1);
+                    }
+                    println!("\nall checks passed");
+                    return Ok(());
+                }
+                Err(e) => {
+                    eprintln!("error: {e}");
+                    std::process::exit(2);
+                }
+            }
+        }
         Some("serve") => {}
         Some("-h") | Some("--help") | Some("help") => {
             print!("{}", config::USAGE);
             return Ok(());
-        }
-        Some(other) if !other.starts_with('-') => {
+        }        Some(other) if !other.starts_with('-') => {
             eprintln!("error: unknown command {other:?}\n\n{}", config::USAGE);
             std::process::exit(2);
         }
