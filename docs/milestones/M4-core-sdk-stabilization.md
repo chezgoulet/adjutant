@@ -57,11 +57,14 @@ document), not when the code merely exists.
 - [x] Merge `testing` → `main` as the v0.1 benchmark and tag `v0.1.0`.
 - [x] Confirm the stale `main` README is replaced by the accurate dev README
       (carried in by the merge).
-- [ ] Confirm CI is green on `main` after the merge.
+- [x] Confirm CI is green on `main` after the merge — run
+      [35935007267](https://github.com/chezgoulet/adjutant/actions/runs/35935007267),
+      all steps passed (build, clippy, tests, M1/M2 probe ladder, `test-plugin`,
+      scaffolder-compiles, e2e).
 - [x] Record the baseline above.
 
 **Exit criteria:** `main` builds and its CI passes at the tagged commit; the
-baseline numbers are recorded here.
+baseline numbers are recorded here. **Met** — `v0.1.0` @ `6a0f2d7`, CI green.
 
 ### W1 — Lock the SDK contract (target `adjutant-sdk` 0.2 → 1.0-rc)
 
