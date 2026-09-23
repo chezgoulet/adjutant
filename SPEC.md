@@ -1060,7 +1060,7 @@ SPEC §8.1 DDL error (COALESCE in PRIMARY KEY).
 **Goal:** Build the production core using the SDK.
 
 **Status: PASSED (2026-09-22).** Evidence: `docs/milestones/M2-core-server.md`
-(**63/63** live probes via the committed `scripts/probes.py`, transcript in
+(**67/67** live probes via the committed `scripts/probes.py`, transcript in
 `docs/evidence/m2_probes.json`; 28 unit tests at commit `0cb6fff`; clippy 0
 warnings). *Correction (audit, 2026-09-22): this line previously claimed "52/52
 live probes" from four gitignored JSON transcripts that in fact recorded 50 passes
@@ -1104,7 +1104,7 @@ calling `Executor::execute` directly. Also found: a `libloading::Symbol` or a
 - [x] The SDK API feels good. If building auth or membership is painful, redesign the SDK before proceeding.
 
 **Evidence:** `docs/milestones/M3-sdk-and-plugins.md` — build/test/clippy gates,
-**36/36 + 3 skipped** `test-plugin` probes, and **49/49** live end-to-end probes
+**34/34 + 4 skipped** `test-plugin` probes, and **52/52** live end-to-end probes
 with `ADJUTANT_DEV_HEADERS=false` (the harness now asserts that flag rather than
 assuming it; every identity comes from a real session; OIDC exercised against a mock
 IdP). SDK verdict: API held up; no redesign needed. All ten listed bugs are now verified

@@ -150,7 +150,12 @@ impl CliArgs {
     /// Parse `argv[1..]`. Returns `Err` with a message on bad usage.
     pub fn parse<I: IntoIterator<Item = String>>(args: I) -> Result<Self, String> {
         let mut out = Self::default();
-        let mut it = args.into_iter();
+        let mut it = args.into_iter().peekable();
+        // USAGE advertises `adjutant [serve] [OPTIONS]`; the optional subcommand is
+        // not a flag, and main() matches it without stripping it from argv.
+        if it.peek().map(|a| a == "serve").unwrap_or(false) {
+            it.next();
+        }
         while let Some(arg) = it.next() {
             // support `--flag value` and `--flag=value`
             let (flag, inline) = match arg.split_once('=') {
@@ -348,6 +353,20 @@ mod tests {
         std::env::remove_var("ADJUTANT_BIND");
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn serve_subcommand_is_optional_and_not_a_flag() {
+        // `adjutant serve --bind 1.2.3.4:1` and `adjutant --bind 1.2.3.4:1` must
+        // behave identically; the bare `serve` form used to exit 2.
+        let with = CliArgs::parse(vec!["serve".to_string(), "--bind".to_string(), "1.2.3.4:1".to_string()])
+            .expect("serve form parses");
+        let without = CliArgs::parse(vec!["--bind".to_string(), "1.2.3.4:1".to_string()])
+            .expect("flag form parses");
+        assert_eq!(with.bind, without.bind);
+        assert!(CliArgs::parse(vec!["serve".to_string()]).is_ok());
+        // A positional word that is not `serve` is still rejected.
+        assert!(CliArgs::parse(vec!["dance".to_string()]).is_err());
     }
 
     #[test]

@@ -146,6 +146,13 @@ DROP TRIGGER IF EXISTS audit_append_only ON core.audit_log;
 CREATE TRIGGER audit_append_only BEFORE UPDATE OR DELETE ON core.audit_log
   FOR EACH ROW EXECUTE FUNCTION core.audit_append_only();
 
+-- TRUNCATE does not fire row-level triggers, so without this the whole chain can
+-- be erased in one statement and core.audit_verify() then reports a healthy empty
+-- log (ok:true, rows_checked:0). Statement-level guard, same function.
+DROP TRIGGER IF EXISTS audit_no_truncate ON core.audit_log;
+CREATE TRIGGER audit_no_truncate BEFORE TRUNCATE ON core.audit_log
+  FOR EACH STATEMENT EXECUTE FUNCTION core.audit_append_only();
+
 CREATE OR REPLACE FUNCTION core.audit_verify()
 RETURNS TABLE(first_bad BIGINT, rows_checked BIGINT)
 LANGUAGE sql STABLE AS $fn$
@@ -211,6 +218,7 @@ pub async fn run_migration(
     sql: &str,
 ) -> Result<(), sqlx::Error> {
     validate_schema_name(schema)?;
+    validate_migration_name(name)?;
 
     let mut conn = pool.acquire().await?;
 
@@ -240,9 +248,12 @@ pub async fn run_migration(
     // Multi-statement DDL + search_path in one simple-query protocol round trip.
     // Parameterized APIs can't do this; every input is either validated or
     // plugin-authored SQL (which is trusted by construction — plugins are code).
+    // SET LOCAL inside the transaction: a bare SET before BEGIN is auto-committed
+    // and leaks the plugin's search_path onto the pooled connection for the rest
+    // of its life.
     let script = format!(
-        "SET search_path TO \"{schema}\";\
-         BEGIN;\
+        "BEGIN;\
+         SET LOCAL search_path TO \"{schema}\";\
          {sql};\
          INSERT INTO core.schema_migrations (schema, version, name) VALUES ('{schema}', {version}, '{name}');\
          COMMIT;"
@@ -260,6 +271,25 @@ pub async fn run_migration(
 
     tracing::info!(schema, version, name, "migration applied");
     Ok(())
+}
+
+/// Migration names are interpolated into the runner's script, so validate the
+/// shape the same way schema names are (a stray quote otherwise aborts the whole
+/// batch with an opaque error).
+fn validate_migration_name(name: &str) -> Result<(), sqlx::Error> {
+    let ok = !name.is_empty()
+        && name.len() <= 64
+        && name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.' | ' '));
+    if ok {
+        Ok(())
+    } else {
+        Err(sqlx::Error::config(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("invalid migration name {name:?}: expected [A-Za-z0-9_. -]{{1,64}}"),
+        )))
+    }
 }
 
 /// Plugin ids double as PostgreSQL schema names — constrain hard.

@@ -73,6 +73,12 @@ def probe(name, method, path, body=None, headers=None, expect_status=None, expec
     except Exception:
         return None
 
+def _get_with_token(path, token):
+    req = urllib.request.Request(BASE + path)
+    req.add_header("Cookie", f"adjutant_session={token}")
+    return _open(req)
+
+
 def probe_raw(name, fn):
     """fn returns (ok, detail)."""
     try:
@@ -166,6 +172,12 @@ probe_raw("0 dev-header stub is OFF", stub_probe)
 # ---------------------------------------------------------------- 0. reset
 # The server must stay up (it owns the pool), so reset data instead of
 # dropping the DB. TRUNCATE ... CASCADE clears sessions/user_roles too.
+# core.audit_log carries a BEFORE TRUNCATE guard (statement-level, because
+# TRUNCATE does not fire row triggers). This harness is privileged maintenance,
+# so it disables the guard around the reset and re-arms it immediately after.
+subprocess.run(["psql", *PSQL, "-tAc",
+                "ALTER TABLE core.audit_log DISABLE TRIGGER audit_no_truncate"],
+               capture_output=True, text=True)
 reset = subprocess.run(
     ["psql", *PSQL, "-c",
      "TRUNCATE core.users, core.audit_log, core.events, auth.oidc_states, "\
@@ -173,6 +185,9 @@ reset = subprocess.run(
      "membership.lodges, membership.patrols, membership.proficiencies, "\
      "membership.member_proficiencies, membership.stewards RESTART IDENTITY CASCADE;"],
     capture_output=True, text=True)
+subprocess.run(["psql", *PSQL, "-tAc",
+                "ALTER TABLE core.audit_log ENABLE TRIGGER audit_no_truncate"],
+               capture_output=True, text=True)
 if reset.returncode != 0:
     print(f"[e2e] reset failed: {reset.stderr.strip()}")
     sys.exit(2)
@@ -391,6 +406,42 @@ def reinstall():
 probe_raw("47 clear flag + reload reinstalls", reinstall)
 probe("48 route live after reinstall", "GET", "/api/membership/members",
       token=chief_token, expect_status=200, expect_in="Tiguidou")
+
+# ------------------------------------- 9. optional fields and decode fidelity
+# These paths answered 500 before the fix: SqlValue::Null binds as a TEXT null,
+# which PostgreSQL refuses to assign to a bigint column.
+new_member = None
+
+
+def member_without_patrol():
+    global new_member
+    body = json.dumps({"username": "optional_fields", "display_name": "Optional Fields"}).encode()
+    req = urllib.request.Request(BASE + "/api/membership/member", method="POST", data=body)
+    req.add_header("Content-Type", "application/json")
+    req.add_header("Cookie", f"adjutant_session={chief_token}")
+    with urllib.request.urlopen(req, timeout=10) as r:
+        out = json.loads(r.read().decode())
+    new_member = out.get("id")
+    return r.status == 201 and new_member is not None, f"status={r.status} id={new_member}"
+probe_raw("49 member without a patrol is accepted", member_without_patrol)
+def steward_without_lodge():
+    body = json.dumps({"member_id": new_member, "position": "Deputy"}).encode()
+    req = urllib.request.Request(BASE + "/api/membership/steward", method="POST", data=body)
+    req.add_header("Content-Type", "application/json")
+    req.add_header("Cookie", f"adjutant_session={chief_token}")
+    with urllib.request.urlopen(req, timeout=10) as r:
+        return r.status == 201, f"status={r.status} body={json.loads(r.read().decode())}"
+probe_raw("50 steward without a lodge is accepted", steward_without_lodge)
+def appointed_on_is_real():
+    # DATE must survive decoding: before the fix this was null while the column is
+    # NOT NULL DEFAULT current_date.
+    db = subprocess.run(["psql", *PSQL, "-tAc",
+                         "SELECT appointed_on::text FROM membership.stewards ORDER BY id LIMIT 1"],
+                        capture_output=True, text=True).stdout.strip()
+    status, raw, _ = _get_with_token("/api/membership/stewards", chief_token)
+    ok = status == 200 and bool(db) and f'"appointed_on":"{db}"' in raw.replace(" ", "")
+    return ok, f"db={db!r} api={raw[:120]}"
+probe_raw("51 appointed_on decodes as a date, not null", appointed_on_is_real)
 
 srv.shutdown()
 print()

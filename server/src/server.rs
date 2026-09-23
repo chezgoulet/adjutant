@@ -72,6 +72,22 @@ impl AppState {
         identity
     }
 
+    /// Graceful shutdown: stop event handlers, then call every plugin's
+    /// documented `shutdown()` hook (live and retired generations alike) before
+    /// the process exits. Without this, that hook was dead code.
+    pub async fn shutdown(&self) {
+        self.bus.shutdown();
+        let mut reg = self.registry.write().await;
+        // Destructure the guard so the two vecs borrow independently.
+        let PluginRegistry { plugins, retired } = &mut *reg;
+        for lp in plugins.iter_mut().chain(retired.iter_mut()) {
+            if let Err(e) = lp.plugin.shutdown().await {
+                tracing::warn!(plugin = %lp.info.id, error = %e, "plugin shutdown failed");
+            }
+        }
+        tracing::info!("plugins shut down");
+    }
+
     /// Admin gate: `core:admin` permission. Returns a ready 401/403 response
     /// when the caller isn't allowed, `None` when allowed.
     async fn require_admin(&self, headers: &axum::http::HeaderMap) -> Option<Response> {
@@ -111,8 +127,15 @@ pub async fn build_app(cfg: &Config) -> Result<(Router, Arc<AppState>), BuildErr
     .await
     .map_err(BuildError::Plugin)?;
 
-    // Bind event subscriptions before any traffic flows.
+    // Bind event subscriptions before any traffic flows — but only for plugins
+    // that are actually enabled. A plugin disabled in core.plugins is loaded with
+    // enabled=false; binding its subscriptions anyway made "disabled" mean
+    // "routes off, event handlers still running".
     for lp in &registry.plugins {
+        if !lp.enabled {
+            tracing::info!(plugin = lp.plugin.id(), "disabled at boot; not binding subscriptions");
+            continue;
+        }
         for sub in lp.plugin.subscriptions() {
             bus.subscribe(lp.plugin.id(), sub);
         }
@@ -291,6 +314,14 @@ async fn dispatch(
         })
         .unwrap_or_default();
 
+    // Captures are raw path segments; decode them once so a plugin receives the
+    // value the client meant (query parameters are already decoded — this makes
+    // the two consistent).
+    let params: HashMap<String, String> = params
+        .into_iter()
+        .map(|(k, v)| (k, decode_path(&v)))
+        .collect();
+
     let preq = PluginRequest {
         method: parts.method.to_string(),
         path: parts.uri.path().to_string(),
@@ -328,6 +359,34 @@ async fn dispatch(
             (status, Json(json!({ "error": e.to_string() }))).into_response()
         }
     }
+}
+
+/// Percent-decode one path segment (captures). Unlike the query decoder this
+/// does NOT treat `+` as a space — that is form-encoding, and a `+` in a path is
+/// a literal plus.
+fn decode_path(s: &str) -> String {
+    let bytes = s.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'%' if i + 2 < bytes.len() => {
+                let hex = std::str::from_utf8(&bytes[i + 1..i + 3]).ok();
+                if let Some(h) = hex.and_then(|h| u8::from_str_radix(h, 16).ok()) {
+                    out.push(h);
+                    i += 3;
+                    continue;
+                }
+                out.push(bytes[i]);
+                i += 1;
+            }
+            b => {
+                out.push(b);
+                i += 1;
+            }
+        }
+    }
+    String::from_utf8_lossy(&out).into_owned()
 }
 
 fn decode(s: &str) -> String {
@@ -378,6 +437,9 @@ async fn list_plugins(State(state): State<Arc<AppState>>, req: Request) -> Respo
     Json(json!({
         "plugins": reg.infos(),
         "retired_libraries": reg.retired_count(),
+        // Plugin ids with at least one bound event subscription. Disable aborts
+        // them and enable re-binds, so this is the observable proof of that.
+        "bound_subscriptions": state.bus.subscriber_ids(),
     }))
     .into_response()
 }
@@ -489,6 +551,16 @@ async fn enable_plugin(
         return (StatusCode::NOT_FOUND, Json(json!({ "error": "plugin not loaded" }))).into_response();
     }
     state.identity.set_enabled(&name, true);
+    // Re-bind subscriptions that disable aborted (only if none are bound, so a
+    // repeated enable cannot double-subscribe).
+    if !state.bus.subscriber_ids().iter().any(|id| id == &name) {
+        let reg = state.registry.read().await;
+        if let Some(lp) = reg.plugins.iter().find(|p| p.info.id == name) {
+            for sub in lp.plugin.subscriptions() {
+                state.bus.subscribe(&name, sub);
+            }
+        }
+    }
     let dbres = sqlx::query(
         "UPDATE core.plugins SET enabled = true, updated_at = now() WHERE id = $1",
     )
@@ -499,10 +571,13 @@ async fn enable_plugin(
         return (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({ "error": e.to_string() })))
             .into_response();
     }
-    let _ = state
+    if let Err(e) = state
         .audit
         .log(identity.as_ref(), "plugin.enable", "plugin", &name, json!({}))
-        .await;
+        .await
+    {
+        tracing::error!(action = "plugin.enable", plugin = %&name, error = %e, "audit write failed");
+    }
     Json(json!({ "plugin": name, "enabled": true })).into_response()
 }
 
@@ -537,6 +612,9 @@ async fn disable_plugin(
         return (StatusCode::NOT_FOUND, Json(json!({ "error": "plugin not loaded" }))).into_response();
     }
     state.identity.set_enabled(&name, false);
+    // Stop the plugin's event handlers too: routes 404-ing while its handlers keep
+    // appending audit rows and writing to its schema is not "disabled".
+    state.bus.clear_plugin(&name).await;
     let dbres = sqlx::query(
         "UPDATE core.plugins SET enabled = false, updated_at = now() WHERE id = $1",
     )
@@ -547,10 +625,13 @@ async fn disable_plugin(
         return (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({ "error": e.to_string() })))
             .into_response();
     }
-    let _ = state
+    if let Err(e) = state
         .audit
         .log(identity.as_ref(), "plugin.disable", "plugin", &name, json!({}))
-        .await;
+        .await
+    {
+        tracing::error!(action = "plugin.disable", plugin = %&name, error = %e, "audit write failed");
+    }
     Json(json!({ "plugin": name, "enabled": false })).into_response()
 }
 
@@ -604,12 +685,15 @@ async fn uninstall_plugin(
         return (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({ "error": e.to_string() })))
             .into_response();
     }
-    state.bus.clear_plugin(&name);
+    state.bus.clear_plugin(&name).await;
     state.identity.remove(&name);
-    let _ = state
+    if let Err(e) = state
         .audit
         .log(identity.as_ref(), "plugin.uninstall", "plugin", &name, json!({}))
-        .await;
+        .await
+    {
+        tracing::error!(action = "plugin.uninstall", plugin = %&name, error = %e, "audit write failed");
+    }
     Json(json!({
         "plugin": name,
         "uninstalled": true,
@@ -669,7 +753,7 @@ async fn reload_plugins(State(state): State<Arc<AppState>>, req: Request) -> Res
         state.identity.retain(&live);
     }
     for old_id in state.bus.subscriber_ids() {
-        state.bus.clear_plugin(&old_id);
+        state.bus.clear_plugin(&old_id).await;
     }
     {
         let reg = state.registry.read().await;
@@ -680,7 +764,7 @@ async fn reload_plugins(State(state): State<Arc<AppState>>, req: Request) -> Res
         }
     }
 
-    let _ = state
+    if let Err(e) = state
         .audit
         .log(
             identity.as_ref(),
@@ -689,7 +773,10 @@ async fn reload_plugins(State(state): State<Arc<AppState>>, req: Request) -> Res
             "*",
             json!({ "reloaded": ids, "routes": route_count }),
         )
-        .await;
+        .await
+    {
+        tracing::error!(action = "plugin.reload", error = %e, "audit write failed");
+    }
     tracing::info!(routes = route_count, "registry hot-reloaded");
     Json(json!({
         "reloaded": ids,
@@ -697,6 +784,23 @@ async fn reload_plugins(State(state): State<Arc<AppState>>, req: Request) -> Res
         "routes": route_count,
     }))
     .into_response()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::decode_path;
+
+    #[test]
+    fn captures_are_percent_decoded_once() {
+        assert_eq!(decode_path("%31"), "1");
+        assert_eq!(decode_path("a%2Fb"), "a/b", "an encoded slash decodes to a slash");
+        assert_eq!(decode_path("a%20b"), "a b");
+        // `+` is a literal plus in a path (unlike a query string).
+        assert_eq!(decode_path("a+b"), "a+b");
+        // Malformed escapes are left alone rather than dropped.
+        assert_eq!(decode_path("%zz"), "%zz");
+        assert_eq!(decode_path("plain"), "plain");
+    }
 }
 
 #[derive(Debug, thiserror::Error)]

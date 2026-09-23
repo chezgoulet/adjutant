@@ -187,6 +187,8 @@ def batch_m1_regression():
     # Path capture, end to end: template match -> param -> handler -> DB.
     probe(b, "9b path capture read", "GET", "/api/hello/greetings/1", status=200,
           contains="first greeting", headers=CHIEF)
+    probe(b, "9b2 percent-encoded capture decodes", "GET", "/api/hello/greetings/%31", status=200,
+          contains="first greeting", headers=CHIEF)
     probe(b, "9c path capture prefers literal", "GET", "/api/hello/greetings", status=200,
           contains="greetings", headers=CHIEF)
     probe(b, "9d non-numeric capture is a 400", "GET", "/api/hello/greetings/abc", status=400,
@@ -221,13 +223,26 @@ def batch_middleware_phase1():
           contains="authentication required")
 
 
+def plugins_json():
+    _, raw, _ = http("GET", "/api/plugins", headers=CHIEF)
+    try:
+        return json.loads(raw)
+    except Exception:  # noqa: BLE001
+        return {}
+
+
 def batch_lifecycle():
     b = "lifecycle"
     probe(b, "L1 disable", "POST", "/api/plugins/hello/disable", status=200, contains='"enabled":false', headers=CHIEF)
+    # Disable must stop the event handlers too, not just the routes.
+    bound = plugins_json().get("bound_subscriptions", [])
+    check(b, "L1b disable aborts subscriptions", "hello" not in bound, f"bound={bound}")
     probe(b, "L2 disabled route 404", "GET", "/api/hello", status=404, contains="plugin hello is disabled")
     probe(b, "L3 core routes unaffected", "GET", "/", status=200, contains='"ok"')
     probe_sql(b, "L4 db enabled=false", "SELECT enabled FROM core.plugins WHERE id='hello'", "f")
     probe(b, "L5 enable", "POST", "/api/plugins/hello/enable", status=200, contains='"enabled":true', headers=CHIEF)
+    bound = plugins_json().get("bound_subscriptions", [])
+    check(b, "L5b enable rebinds subscriptions", "hello" in bound, f"bound={bound}")
     probe(b, "L6 route works again", "GET", "/api/hello", status=200, contains="Hello, Adjutant!")
     probe_sql(b, "L7 data present before uninstall", "SELECT count(*) FROM hello.greetings", "1")
     probe(b, "L8 uninstall", "DELETE", "/api/plugins/hello", status=200,
@@ -270,6 +285,10 @@ def batch_tamper():
     check(b, "T1 UPDATE rejected", "append-only" in err, err[:120])
     _, _, err = psql("DELETE FROM core.audit_log WHERE id=1")
     check(b, "T2 DELETE rejected", "append-only" in err, err[:120])
+    # TRUNCATE does not fire row-level triggers; without the statement-level guard
+    # the whole chain can be erased and audit_verify then reports a healthy empty log.
+    _, _, err = psql("TRUNCATE core.audit_log")
+    check(b, "T2b TRUNCATE rejected", "append-only" in err, err[:120])
     probe_sql(b, "T3 row untouched", "SELECT action FROM core.audit_log WHERE id=1", "greet")
     _, raw = probe(b, "T4 chain verifies", "GET", "/api/audit/verify", status=200,
                    contains='"ok":true', headers=CHIEF)

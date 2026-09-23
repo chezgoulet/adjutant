@@ -73,8 +73,10 @@ pub struct PluginInfo {
     pub enabled: bool,
     pub routes: usize,
     pub permissions: Vec<String>,
-    /// Full route table — lets `adjutant test-plugin` probe every route
-    /// without hardcoding plugin knowledge.
+    /// Full route table — lets `adjutant test-plugin` enumerate every route
+    /// without hardcoding plugin knowledge. A path containing a capture is
+    /// reported as `skipped` by the harness (it has no concrete value to probe
+    /// with); it is not counted as a pass.
     pub route_list: Vec<RouteInfo>,
 }
 
@@ -122,6 +124,23 @@ fn match_path(template: &str, path: &str) -> Option<HashMap<String, String>> {
         }
     }
     Some(params)
+}
+
+/// Normalise a route path for collision detection: every capture becomes `{}`,
+/// so `/api/x/{id}` and `/api/x/{other}` are recognised as the same shape (the
+/// second would silently shadow the first). Literal paths are unchanged, because
+/// a literal is *meant* to win over a capture.
+fn normalized_route_path(path: &str) -> String {
+    path.split('/')
+        .map(|seg| {
+            if seg.starts_with('{') && seg.ends_with('}') {
+                "{}"
+            } else {
+                seg
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("/")
 }
 
 /// Validate `{name}` captures in a route path: a capture must be a whole
@@ -184,7 +203,10 @@ impl PluginRegistry {
                 if r.method.as_str() != method {
                     continue;
                 }
-                if r.path == path {
+                // Literal fast-path only for capture-free routes: a request whose
+                // path equals the template text (`…/{id}`) must still go through
+                // match_path, so a templated route always delivers its captures.
+                if !r.path.contains('{') && r.path == path {
                     return Self::resolve(p, r, HashMap::new());
                 }
                 if templated.is_none() {
@@ -441,7 +463,7 @@ pub async fn load_all(
                     ));
                 }
             }
-            let key = (r.method.as_str().to_string(), r.path.clone());
+            let key = (r.method.as_str().to_string(), normalized_route_path(&r.path));
             if seen_routes.contains_key(&key) {
                 return Err(PluginRuntimeError::Invalid(
                     id.clone(),
@@ -692,6 +714,35 @@ mod tests {
             }
             _ => panic!("literal route must win"),
         }
+    }
+
+    #[test]
+    fn braces_request_still_delivers_a_capture() {
+        // A request whose path equals the template text must not take the literal
+        // fast-path: the handler would otherwise see an EMPTY params map.
+        let reg = PluginRegistry::new(vec![loaded(
+            "missions",
+            true,
+            "GET",
+            "/api/missions/{id}",
+            None,
+        )]);
+        match reg.find("GET", "/api/missions/{id}") {
+            RouteLookup::Found { params, .. } => {
+                assert_eq!(params.get("id").map(String::as_str), Some("{id}"));
+            }
+            _ => panic!("templated route must always deliver its captures"),
+        }
+    }
+
+    #[test]
+    fn normalized_shapes_catch_colliding_templates() {
+        assert_eq!(normalized_route_path("/api/x/{id}"), "/api/x/{}");
+        assert_eq!(normalized_route_path("/api/x/{other}"), "/api/x/{}");
+        assert_eq!(normalized_route_path("/api/x/current"), "/api/x/current");
+        // Different shapes stay distinct; a literal is not a template.
+        assert_ne!(normalized_route_path("/api/x/{a}/y"), normalized_route_path("/api/x/{a}"));
+        assert_ne!(normalized_route_path("/api/x/literal"), normalized_route_path("/api/x/{}"));
     }
 
     #[test]

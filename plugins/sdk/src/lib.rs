@@ -137,10 +137,25 @@ pub trait IdentityRegistrar: Send + Sync + 'static {
 
 /// A bind parameter. Deliberately a closed enum: passing sqlx types across the
 /// boundary would drag sqlx (and a second tokio) into the plugin.
+///
+/// **A NULL carries a type.** `Null` is a TEXT null; use [`SqlValue::NullInt`]
+/// or [`SqlValue::NullBool`] for an optional integer or boolean column.
+/// PostgreSQL refuses a text null where a bigint is expected
+/// (`column "patrol_id" is of type bigint but expression is of type text`),
+/// which broke three shipped optional-field routes (member without a patrol,
+/// steward without a lodge, patrol without a lodge).
+///
+/// Do **not** work around it with a cast on a bare parameter —
+/// `VALUES ($1, $2::bigint)` makes PostgreSQL infer `$2` as text, so a non-null
+/// integer value then arrives as garbage (`invalid byte sequence … 0x00`).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(untagged)]
 pub enum SqlValue {
     Null,
+    /// A NULL for an integer column (`int2`/`int4`/`int8`).
+    NullInt,
+    /// A NULL for a boolean column.
+    NullBool,
     Bool(bool),
     Int(i64),
     Float(f64),
@@ -196,8 +211,11 @@ impl From<Vec<String>> for SqlValue {
 }
 
 /// Database access, mediated by the core. Rows come back as JSON objects keyed
-/// by column name — decode order in the core is jsonb → bool → i64 → f64 →
-/// text → NULL, so cast exotic types (`timestamptz`) with `::text` in your SQL.
+/// by column name. The core decodes: json/jsonb → bool → int8/int4/int2 →
+/// float8/float4 → text[] → date/time/timestamp → text. **Every other type
+/// (uuid, numeric, bytea, …) must be cast in SQL** (`id::text`); an undecodable
+/// column comes back as JSON null and is logged by the core as a warning — it is
+/// not a silent NULL, and it is not an error.
 #[async_trait]
 pub trait HostDb: Send + Sync + 'static {
     /// Run a statement; returns affected row count.
@@ -394,10 +412,19 @@ impl DbHandle {
         &self.schema
     }
 
-    /// Table name qualified with this plugin's schema, safe to interpolate (the
-    /// schema name is validated by the core: `[a-z][a-z0-9_]{0,30}`).
+    /// Table name qualified with this plugin's schema.
+    ///
+    /// The schema is core-validated (`[a-z][a-z0-9_]{0,30}`) and `name` is
+    /// escaped for a quoted identifier, but a table name is still code: pass a
+    /// literal, never a request value. (sqlx prepares a single statement, so a
+    /// second statement cannot be appended — a crafted name is limited to
+    /// rewriting the one statement, e.g. via UNION.)
     pub fn table(&self, name: &str) -> String {
-        format!("\"{}\".\"{}\"", self.schema, name)
+        format!(
+            "\"{}\".\"{}\"",
+            self.schema,
+            name.replace('"', "\"\"")
+        )
     }
 
     pub async fn execute(
@@ -577,8 +604,10 @@ where
 ///
 /// A segment may be a capture: `/api/missions/{id}` matches
 /// `/api/missions/42` and delivers `id = "42"` in `PluginRequest::params`.
-/// A capture occupies a whole segment (one path component, never a slash), and
-/// literal routes are matched before templated ones.
+/// A capture occupies a whole segment (one path component, never a slash), is
+/// **percent-decoded exactly once** before it reaches the handler, and literal
+/// routes are matched before templated ones. Two templates of the same shape
+/// (`{a}` and `{b}` in the same position) are rejected at load as duplicates.
 pub struct RouteDefinition {
     pub method: Method,
     pub path: String,

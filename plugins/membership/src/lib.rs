@@ -6,8 +6,11 @@
 //! Decision 4) and layers troop-local reality on top — trail names, patrol
 //! assignments, leadership positions, proficiencies.
 //!
-//! Route style note: the core dispatches by *exact* `METHOD path` (no path
-//! parameters), so records are addressed as `/api/membership/member?id=…`.
+//! Route style note: the core supports path captures (`/api/x/{id}`), but this
+//! plugin addresses records with a query parameter
+//! (`/api/membership/member?id=…`) because the id is optional at several call
+//! sites and sits naturally beside the other filters (`?patrol=`,
+//! `?include_inactive=`).
 
 use std::sync::OnceLock;
 
@@ -368,8 +371,8 @@ impl AdjutantPlugin for MembershipPlugin {
                                 b.trail_name.clone().into(),
                                 b.osg_id.clone().into(),
                                 b.bg_check.clone().into(),
-                                patrol_id.map(SqlValue::Int).unwrap_or(SqlValue::Null),
-                                b.is_active.map(SqlValue::Bool).unwrap_or(SqlValue::Null),
+                                patrol_id.map(SqlValue::Int).unwrap_or(SqlValue::NullInt),
+                                b.is_active.map(SqlValue::Bool).unwrap_or(SqlValue::NullBool),
                             ],
                         )
                         .await?;
@@ -620,7 +623,7 @@ impl AdjutantPlugin for MembershipPlugin {
                              RETURNING id, name",
                             vec![
                                 SqlValue::Text(b.name.trim().to_string()),
-                                lodge_id.map(SqlValue::Int).unwrap_or(SqlValue::Null),
+                                lodge_id.map(SqlValue::Int).unwrap_or(SqlValue::NullInt),
                             ],
                         )
                         .await?;
@@ -775,7 +778,7 @@ impl AdjutantPlugin for MembershipPlugin {
                             vec![
                                 SqlValue::Int(b.member_id),
                                 SqlValue::Text(b.position.trim().to_string()),
-                                lodge_id.map(SqlValue::Int).unwrap_or(SqlValue::Null),
+                                lodge_id.map(SqlValue::Int).unwrap_or(SqlValue::NullInt),
                             ],
                         )
                         .await?;
@@ -904,7 +907,7 @@ async fn upsert_from_import(
                     trail_name.into(),
                     osg_id.into(),
                     bg_check.into(),
-                    patrol_id.map(SqlValue::Int).unwrap_or(SqlValue::Null),
+                    patrol_id.map(SqlValue::Int).unwrap_or(SqlValue::NullInt),
                 ],
             )
             .await?;

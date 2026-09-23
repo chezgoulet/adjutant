@@ -11,7 +11,8 @@ use adjutant_sdk::{Event, HostDb, HostEvents, HostHttp, HttpResponse, SdkError, 
 use async_trait::async_trait;
 use serde_json::Value;
 use sqlx::postgres::PgRow;
-use sqlx::{Column, Row};
+use sqlx::{Column, Row, TypeInfo};
+use sqlx::ValueRef as _;
 use tokio::sync::broadcast;
 
 /// Core-backed database access shared by every plugin.
@@ -37,10 +38,22 @@ impl CoreDb {
     }
 }
 
-/// Decode one column, trying JSON-friendly types first (SPEC-compatible order:
-/// jsonb → bool → i64 → f64 → text → NULL). Exotic types (timestamptz) should be
-/// cast to `::text` by the query author.
+/// Decode one column into JSON.
+///
+/// sqlx requires an **exact** type match, so this is a whitelist: json/jsonb,
+/// bool, int8/int4/int2, float8/float4, text[], the chrono date/time family, and
+/// text. Anything else (uuid, numeric, bytea, inet, …) must be cast in SQL
+/// (`id::text`) — and if it is not, the fallback below logs it rather than
+/// returning a silent NULL, which is how a DATE column once came back null from a
+/// NOT NULL column in a shipped route.
 fn decode_value(row: &PgRow, idx: usize) -> Value {
+    // A genuine SQL NULL is data, not a decode failure: return it without
+    // attempting the type-specific paths below or warning about them.
+    if let Ok(raw) = row.try_get_raw(idx) {
+        if raw.is_null() {
+            return Value::Null;
+        }
+    }
     if let Ok(v) = row.try_get::<Value, _>(idx) {
         return v;
     }
@@ -50,17 +63,47 @@ fn decode_value(row: &PgRow, idx: usize) -> Value {
     if let Ok(v) = row.try_get::<i64, _>(idx) {
         return Value::from(v);
     }
+    if let Ok(v) = row.try_get::<i32, _>(idx) {
+        return Value::from(v);
+    }
+    if let Ok(v) = row.try_get::<i16, _>(idx) {
+        return Value::from(v);
+    }
     if let Ok(v) = row.try_get::<f64, _>(idx) {
         return Value::from(v);
     }
+    if let Ok(v) = row.try_get::<f32, _>(idx) {
+        return Value::from(v as f64);
+    }
     // text[] — needed for any array column (e.g. core.user_roles roles).
-    // Without this, TEXTA[] matched none of the above and fell to Null,
+    // Without this, TEXT[] matched none of the above and fell to Null,
     // which silently emptied role lists and broke permission checks.
     if let Ok(v) = row.try_get::<Vec<String>, _>(idx) {
         return Value::Array(v.into_iter().map(Value::String).collect());
     }
+    // chrono family (sqlx `chrono` feature). DATE/TIMESTAMP/TIMESTAMPTZ used to
+    // fall through to Null unless every query remembered `::text`.
+    if let Ok(v) = row.try_get::<chrono::NaiveDate, _>(idx) {
+        return Value::String(v.to_string());
+    }
+    if let Ok(v) = row.try_get::<chrono::NaiveTime, _>(idx) {
+        return Value::String(v.to_string());
+    }
+    if let Ok(v) = row.try_get::<chrono::NaiveDateTime, _>(idx) {
+        return Value::String(v.to_string());
+    }
+    if let Ok(v) = row.try_get::<chrono::DateTime<chrono::Utc>, _>(idx) {
+        return Value::String(v.to_rfc3339());
+    }
     if let Ok(v) = row.try_get::<String, _>(idx) {
         return Value::String(v);
+    }
+    if let Some(col) = row.columns().get(idx) {
+        tracing::warn!(
+            column = %col.name(),
+            pg_type = %col.type_info().name(),
+            "host cannot represent this column as JSON; returning null (cast it in SQL, e.g. ::text)"
+        );
     }
     Value::Null
 }
@@ -72,6 +115,10 @@ fn bind_params<'q>(
     for p in params {
         q = match p {
             SqlValue::Null => q.bind(Option::<String>::None),
+            // Typed nulls: a text NULL cannot be assigned to a bigint/bool column,
+            // and casting a bare parameter would make Postgres infer it as text.
+            SqlValue::NullInt => q.bind(Option::<i64>::None),
+            SqlValue::NullBool => q.bind(Option::<bool>::None),
             SqlValue::Bool(b) => q.bind(b),
             SqlValue::Int(n) => q.bind(n),
             SqlValue::Float(f) => q.bind(f),

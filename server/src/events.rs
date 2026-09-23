@@ -68,13 +68,25 @@ impl EventBus {
         tracing::debug!(plugin = plugin_id, filter = %filter_for_log, "event subscription registered");
     }
 
-    /// Abort every subscription task owned by `plugin_id` (disable/uninstall/
+    /// Stop every subscription task owned by `plugin_id` (disable/uninstall/
     /// reload rebinding). Missing id is a no-op.
-    pub fn clear_plugin(&self, plugin_id: &str) {
-        let mut map = self.subs.lock().expect("event bus poisoned");
-        if let Some(handles) = map.remove(plugin_id) {
-            for h in handles {
+    ///
+    /// `abort()` alone is fire-and-forget — it cancels at the next await point, so
+    /// a handler already inside its body can finish afterwards, and the reload
+    /// path relies on this to keep two generations from handling one event. Each
+    /// task is therefore awaited with a short bound: cancellation is immediate,
+    /// the timeout only covers a handler that ignores it.
+    pub async fn clear_plugin(&self, plugin_id: &str) {
+        let handles = {
+            let mut map = self.subs.lock().expect("event bus poisoned");
+            map.remove(plugin_id)
+        };
+        if let Some(handles) = handles {
+            for h in &handles {
                 h.abort();
+            }
+            for h in handles {
+                let _ = tokio::time::timeout(std::time::Duration::from_secs(1), h).await;
             }
             tracing::debug!(plugin = plugin_id, "event subscriptions cleared");
         }
@@ -106,5 +118,63 @@ impl Default for EventBus {
     fn default() -> Self {
         let (tx, _) = broadcast::channel(BUS_CAPACITY);
         Self { tx, subs: Mutex::new(HashMap::new()) }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+
+    fn mk_event() -> Event {
+        Event {
+            id: 1,
+            event_type: "demo.ping".into(),
+            payload: serde_json::json!({}),
+            source: "test".into(),
+            timestamp: chrono::Utc::now(),
+        }
+    }
+
+    /// What `disable`/`uninstall` and `enable` now rely on: clearing stops
+    /// delivery, and re-subscribing resumes it. Without this, "disabled" plugins
+    /// kept running their event handlers.
+    #[tokio::test]
+    async fn clear_plugin_stops_delivery_and_resubscribe_resumes() {
+        let bus = EventBus::new();
+        let seen = Arc::new(AtomicUsize::new(0));
+        let counter = seen.clone();
+        let sub = || {
+            let counter = counter.clone();
+            EventSubscription::new(
+                "demo.",
+                adjutant_sdk::event_handler(move |_| {
+                    let counter = counter.clone();
+                    async move {
+                        counter.fetch_add(1, Ordering::SeqCst);
+                        Ok(())
+                    }
+                }),
+            )
+        };
+
+        bus.subscribe("demo", sub());
+        assert_eq!(bus.subscriber_ids(), vec!["demo".to_string()]);
+        let _ = bus.sender().send(mk_event());
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        assert_eq!(seen.load(Ordering::SeqCst), 1, "subscribed handler runs");
+
+        bus.clear_plugin("demo").await;
+        assert!(bus.subscriber_ids().is_empty());
+        let _ = bus.sender().send(mk_event());
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        assert_eq!(seen.load(Ordering::SeqCst), 1, "cleared plugin must not run");
+
+        bus.subscribe("demo", sub());
+        let _ = bus.sender().send(mk_event());
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        assert_eq!(seen.load(Ordering::SeqCst), 2, "re-subscribed handler runs");
+        bus.shutdown();
     }
 }
