@@ -26,7 +26,7 @@ use serde_json::json;
 use tokio::sync::RwLock;
 use tower_http::cors::{Any, CorsLayer};
 
-use adjutant_sdk::{AuditService, PermissionService, PluginRequest, SdkError};
+use adjutant_sdk::{AuditService, PermissionService, PluginRequest};
 
 use crate::config::Config;
 use crate::db;
@@ -350,12 +350,10 @@ async fn dispatch(
         }
         Err(e) => {
             tracing::warn!(plugin = %plugin_id, error = %e, "plugin handler error");
-            // BadRequest is the plugin saying the *client* is at fault (bad
-            // credentials, malformed body) → 400, not a server error.
-            let status = match &e {
-                SdkError::BadRequest(_) => StatusCode::BAD_REQUEST,
-                SdkError::Db(_) | SdkError::Internal(_) => StatusCode::INTERNAL_SERVER_ERROR,
-            };
+            // The SDK owns the error → status mapping (SdkError::status), so the
+            // core and plugins agree on 400/401/403/404/409/500.
+            let status = StatusCode::from_u16(e.status())
+                .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
             (status, Json(json!({ "error": e.to_string() }))).into_response()
         }
     }

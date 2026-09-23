@@ -310,6 +310,35 @@ pub async fn load_all(
         let lib = Arc::new(lib);
         park(lib.clone()); // mapped until process exit, whatever happens below
 
+        // ABI handshake: resolve the SDK ABI symbol BEFORE touching the plugin
+        // vtable. A stale build (plugin not rebuilt after an SDK change) is
+        // refused with a clear error instead of running against mismatched
+        // layouts. Scoped so no `Symbol` is live across an await.
+        {
+            let abi = unsafe { lib.get::<extern "C" fn() -> u32>(adjutant_sdk::ABI_SYMBOL) }
+                .map_err(|_| {
+                    PluginRuntimeError::Load(
+                        path.display().to_string(),
+                        format!(
+                            "missing `{}` symbol: built against an older adjutant-sdk; rebuild against {}",
+                            String::from_utf8_lossy(adjutant_sdk::ABI_SYMBOL),
+                            adjutant_sdk::SDK_VERSION,
+                        ),
+                    )
+                })?;
+            let found = abi();
+            if found != adjutant_sdk::SDK_ABI_VERSION {
+                return Err(PluginRuntimeError::Load(
+                    path.display().to_string(),
+                    format!(
+                        "SDK ABI mismatch: plugin reports {found}, core requires {} (adjutant-sdk {}); rebuild the plugin",
+                        adjutant_sdk::SDK_ABI_VERSION,
+                        adjutant_sdk::SDK_VERSION,
+                    ),
+                ));
+            }
+        }
+
         // Scope the libloading `Symbol` (a raw-pointer borrow) to this block
         // so it cannot be live across any await below — a Symbol in the
         // generator state makes the future unprovable as Send.

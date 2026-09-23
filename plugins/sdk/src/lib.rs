@@ -63,17 +63,59 @@ pub use async_trait::async_trait;
 /// Boxed future used across the plugin boundary (object-safe async).
 pub type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 
+/// ABI version of the plugin/core boundary.
+///
+/// Bump this on **any** breaking change to the trait surface, the host traits,
+/// or the exported symbols. The core resolves [`ABI_SYMBOL`] *before* it calls
+/// the plugin factory and refuses a library whose value differs, so a stale
+/// build becomes a clear load error instead of undefined behaviour (the native
+/// loading caveat: core and plugin must be built against the same SDK).
+pub const SDK_ABI_VERSION: u32 = 1;
+
+/// The SDK crate's SemVer version, for diagnostics and error messages.
+pub const SDK_VERSION: &str = env!("CARGO_PKG_VERSION");
+
+/// Symbol `export_plugin!` emits so the core can check ABI compatibility before
+/// calling the factory. Do not rename without bumping [`SDK_ABI_VERSION`].
+pub const ABI_SYMBOL: &[u8] = b"adjutant_sdk_abi";
+
 /// Errors that can cross the plugin boundary. Stringly-typed on purpose:
 /// concrete error types would pin both sides to identical dependency versions
 /// at the type level (they must already match at the ABI level).
+///
+/// The variants map to HTTP statuses through [`SdkError::status`]; return one
+/// from a handler and the core answers with the matching code, so plugins don't
+/// hand-build error responses for the common cases.
 #[derive(Debug, Error)]
 pub enum SdkError {
     #[error("database error: {0}")]
     Db(String),
     #[error("bad request: {0}")]
     BadRequest(String),
+    #[error("unauthorized: {0}")]
+    Unauthorized(String),
+    #[error("forbidden: {0}")]
+    Forbidden(String),
+    #[error("not found: {0}")]
+    NotFound(String),
+    #[error("conflict: {0}")]
+    Conflict(String),
     #[error("internal error: {0}")]
     Internal(String),
+}
+
+impl SdkError {
+    /// HTTP status the core uses when this error crosses the plugin boundary.
+    pub fn status(&self) -> u16 {
+        match self {
+            SdkError::BadRequest(_) => 400,
+            SdkError::Unauthorized(_) => 401,
+            SdkError::Forbidden(_) => 403,
+            SdkError::NotFound(_) => 404,
+            SdkError::Conflict(_) => 409,
+            SdkError::Db(_) | SdkError::Internal(_) => 500,
+        }
+    }
 }
 
 /// HTTP, mediated by the core. The M1 host-I/O rule extends here: a plugin
@@ -138,8 +180,9 @@ pub trait IdentityRegistrar: Send + Sync + 'static {
 /// A bind parameter. Deliberately a closed enum: passing sqlx types across the
 /// boundary would drag sqlx (and a second tokio) into the plugin.
 ///
-/// **A NULL carries a type.** `Null` is a TEXT null; use [`SqlValue::NullInt`]
-/// or [`SqlValue::NullBool`] for an optional integer or boolean column.
+/// **A NULL carries a type.** `Null` is a TEXT null; use [`SqlValue::NullInt`],
+/// [`SqlValue::NullBool`], or [`SqlValue::NullUuid`] for an optional integer,
+/// boolean, or uuid column.
 /// PostgreSQL refuses a text null where a bigint is expected
 /// (`column "patrol_id" is of type bigint but expression is of type text`),
 /// which broke three shipped optional-field routes (member without a patrol,
@@ -156,10 +199,16 @@ pub enum SqlValue {
     NullInt,
     /// A NULL for a boolean column.
     NullBool,
+    /// A NULL for a `uuid` column (a text NULL is refused, like the integer case).
+    NullUuid,
     Bool(bool),
     Int(i64),
     Float(f64),
     Text(String),
+    /// A `uuid` value. Bound as `uuid` — no `::uuid` cast on the parameter needed.
+    Uuid(String),
+    /// `int8[]` — for `= ANY($n)` on an integer array.
+    IntArray(Vec<i64>),
     /// `text[]` — for `= ANY($n)`.
     TextArray(Vec<String>),
     /// Pre-serialized JSON. SQL must cast: `$n::jsonb`.
@@ -207,6 +256,11 @@ impl From<bool> for SqlValue {
 impl From<Vec<String>> for SqlValue {
     fn from(v: Vec<String>) -> Self {
         SqlValue::TextArray(v)
+    }
+}
+impl From<Vec<i64>> for SqlValue {
+    fn from(v: Vec<i64>) -> Self {
+        SqlValue::IntArray(v)
     }
 }
 
@@ -504,7 +558,9 @@ pub enum Method {
     Get,
     Post,
     Put,
+    Patch,
     Delete,
+    Head,
 }
 
 impl Method {
@@ -513,7 +569,9 @@ impl Method {
             Method::Get => "GET",
             Method::Post => "POST",
             Method::Put => "PUT",
+            Method::Patch => "PATCH",
             Method::Delete => "DELETE",
+            Method::Head => "HEAD",
         }
     }
 }
@@ -578,6 +636,33 @@ impl PluginResponse {
 
     pub fn empty(status: u16) -> Self {
         Self { status, headers: vec![], body: vec![] }
+    }
+
+    /// `204 No Content`.
+    pub fn no_content() -> Self {
+        Self::empty(204)
+    }
+
+    /// `302 Found` redirect to `location` (OIDC login, post-login bounce).
+    pub fn redirect(location: &str) -> Self {
+        Self {
+            status: 302,
+            headers: vec![("location".to_string(), location.to_string())],
+            body: Vec::new(),
+        }
+    }
+
+    /// `201 Created`, JSON body, and a `location` header.
+    pub fn created<T: Serialize>(location: &str, value: &T) -> Result<Self, SdkError> {
+        let mut resp = Self::json(201, value)?;
+        resp.headers.push(("location".to_string(), location.to_string()));
+        Ok(resp)
+    }
+
+    /// Add a header, returning the response for chaining.
+    pub fn with_header(mut self, name: &str, value: &str) -> Self {
+        self.headers.push((name.to_string(), value.to_string()));
+        self
     }
 
     pub fn error(status: u16, message: impl Into<String>) -> Result<Self, SdkError> {
@@ -646,8 +731,43 @@ impl RouteDefinition {
         Self { method: Method::Put, path: path.into(), required_permission: None, handler }
     }
 
+    pub fn put_protected(path: &str, permission: &str, handler: RouteHandler) -> Self {
+        Self {
+            method: Method::Put,
+            path: path.into(),
+            required_permission: Some(permission.into()),
+            handler,
+        }
+    }
+
+    pub fn patch(path: &str, handler: RouteHandler) -> Self {
+        Self { method: Method::Patch, path: path.into(), required_permission: None, handler }
+    }
+
+    pub fn patch_protected(path: &str, permission: &str, handler: RouteHandler) -> Self {
+        Self {
+            method: Method::Patch,
+            path: path.into(),
+            required_permission: Some(permission.into()),
+            handler,
+        }
+    }
+
     pub fn delete(path: &str, handler: RouteHandler) -> Self {
         Self { method: Method::Delete, path: path.into(), required_permission: None, handler }
+    }
+
+    pub fn delete_protected(path: &str, permission: &str, handler: RouteHandler) -> Self {
+        Self {
+            method: Method::Delete,
+            path: path.into(),
+            required_permission: Some(permission.into()),
+            handler,
+        }
+    }
+
+    pub fn head(path: &str, handler: RouteHandler) -> Self {
+        Self { method: Method::Head, path: path.into(), required_permission: None, handler }
     }
 }
 
@@ -753,6 +873,11 @@ pub const ENTRY_SYMBOL: &[u8] = b"adjutant_plugin_create";
 macro_rules! export_plugin {
     ($t:ty) => {
         #[no_mangle]
+        pub extern "C" fn adjutant_sdk_abi() -> u32 {
+            $crate::SDK_ABI_VERSION
+        }
+
+        #[no_mangle]
         #[allow(improper_ctypes_definitions)]
         pub extern "C" fn adjutant_plugin_create() -> *mut dyn $crate::AdjutantPlugin {
             Box::into_raw(Box::new(<$t>::new()))
@@ -773,6 +898,418 @@ pub mod prelude {
         PermissionService, PluginContext, PluginRequest, PluginResponse, RouteDefinition, SdkError,
         SqlValue,
     };
+}
+
+// ---------------------------------------------------------------------------
+// Testing support
+// ---------------------------------------------------------------------------
+
+/// In-memory host implementations and request builders so a plugin can
+/// unit-test its handlers and lifecycle without a database, a server, or a core.
+///
+/// ```
+/// use adjutant_sdk::prelude::*;
+/// use adjutant_sdk::testing::*;
+///
+/// # #[tokio::main] async fn main() {
+/// let host = TestHost::new();
+/// host.db.push_rows(vec![serde_json::json!({ "id": 1, "message": "hi" })]);
+/// let ctx = host.context("greetings");
+///
+/// let list = route_handler(move |_req: PluginRequest| {
+///     let ctx = ctx.clone();
+///     async move {
+///         let rows = ctx.db.query("SELECT * FROM greetings", vec![]).await?;
+///         PluginResponse::json(200, &serde_json::json!({ "greetings": rows }))
+///     }
+/// });
+///
+/// let resp = list(TestRequest::get("/api/greetings").build()).await.unwrap();
+/// assert_eq!(resp.status, 200);
+/// assert_eq!(response_json(&resp)["greetings"][0]["message"], "hi");
+/// # }
+/// ```
+pub mod testing {
+    use super::*;
+    use std::collections::{HashMap, VecDeque};
+    use std::sync::{Arc, Mutex};
+
+    /// A recorded call to [`HostDb`].
+    #[derive(Debug, Clone)]
+    pub struct DbCall {
+        pub sql: String,
+        pub params: Vec<SqlValue>,
+    }
+
+    impl DbCall {
+        /// True when every `needle` appears in the SQL (order-independent).
+        pub fn sql_contains(&self, needles: &[&str]) -> bool {
+            needles.iter().all(|n| self.sql.contains(n))
+        }
+    }
+
+    /// Records database calls and replays queued results.
+    ///
+    /// With no queued result, `execute` returns `Ok(1)` and `query` returns
+    /// `Ok(vec![])`, so a handler can be exercised without arranging returns for
+    /// calls it makes incidentally.
+    #[derive(Default)]
+    pub struct MockDb {
+        pub executed: Mutex<Vec<DbCall>>,
+        pub queried: Mutex<Vec<DbCall>>,
+        executes: Mutex<VecDeque<Result<u64, SdkError>>>,
+        queries: Mutex<VecDeque<Result<Vec<Value>, SdkError>>>,
+    }
+
+    impl MockDb {
+        pub fn new() -> Self {
+            Self::default()
+        }
+
+        /// Queue the result of the next `execute` call.
+        pub fn push_execute(&self, result: Result<u64, SdkError>) {
+            self.executes.lock().unwrap().push_back(result);
+        }
+
+        /// Queue the result of the next `query` call.
+        pub fn push_query(&self, result: Result<Vec<Value>, SdkError>) {
+            self.queries.lock().unwrap().push_back(result);
+        }
+
+        /// Convenience: queue a successful `query` returning `rows`.
+        pub fn push_rows(&self, rows: Vec<Value>) {
+            self.push_query(Ok(rows));
+        }
+
+        /// Every `execute` SQL string, in order.
+        pub fn executed_sql(&self) -> Vec<String> {
+            self.executed.lock().unwrap().iter().map(|c| c.sql.clone()).collect()
+        }
+
+        /// Number of `query` calls so far.
+        pub fn query_count(&self) -> usize {
+            self.queried.lock().unwrap().len()
+        }
+    }
+
+    #[async_trait]
+    impl HostDb for MockDb {
+        async fn execute(&self, sql: String, params: Vec<SqlValue>) -> Result<u64, SdkError> {
+            self.executed.lock().unwrap().push(DbCall { sql, params });
+            self.executes.lock().unwrap().pop_front().unwrap_or(Ok(1))
+        }
+
+        async fn query(&self, sql: String, params: Vec<SqlValue>) -> Result<Vec<Value>, SdkError> {
+            self.queried.lock().unwrap().push(DbCall { sql, params });
+            self.queries.lock().unwrap().pop_front().unwrap_or_else(|| Ok(Vec::new()))
+        }
+    }
+
+    /// A recorded event publish.
+    #[derive(Debug, Clone)]
+    pub struct Published {
+        pub event_type: String,
+        pub payload: Value,
+    }
+
+    /// Records published events and replays queued ones.
+    #[derive(Default)]
+    pub struct MockEvents {
+        pub published: Mutex<Vec<Published>>,
+        replay: Mutex<Vec<Event>>,
+    }
+
+    impl MockEvents {
+        pub fn new() -> Self {
+            Self::default()
+        }
+
+        /// The `event_type` of every published event, in order.
+        pub fn published_types(&self) -> Vec<String> {
+            self.published.lock().unwrap().iter().map(|p| p.event_type.clone()).collect()
+        }
+
+        /// Queue events for the next `replay` call.
+        pub fn push_replay(&self, events: Vec<Event>) {
+            self.replay.lock().unwrap().extend(events);
+        }
+    }
+
+    #[async_trait]
+    impl HostEvents for MockEvents {
+        async fn publish(&self, event_type: String, payload: Value) -> Result<(), SdkError> {
+            self.published.lock().unwrap().push(Published { event_type, payload });
+            Ok(())
+        }
+
+        async fn replay(&self, _since_id: i64, _limit: i64) -> Result<Vec<Event>, SdkError> {
+            let mut guard = self.replay.lock().unwrap();
+            let out = guard.clone();
+            guard.clear();
+            Ok(out)
+        }
+    }
+
+    /// A queued HTTP response: status, headers, body.
+    type QueuedResponse = (u16, HashMap<String, String>, Vec<u8>);
+
+    /// Records host-mediated HTTP calls and replays queued responses. A call
+    /// with no queued response fails (so a handler that unexpectedly reaches the
+    /// network is caught, not silently allowed).
+    #[derive(Default)]
+    pub struct MockHttp {
+        pub requests: Mutex<Vec<(String, String)>>,
+        responses: Mutex<VecDeque<QueuedResponse>>,
+    }
+
+    impl MockHttp {
+        pub fn new() -> Self {
+            Self::default()
+        }
+
+        /// Queue a JSON response for the next host HTTP call.
+        pub fn push_json(&self, status: u16, body: &Value) {
+            let bytes = serde_json::to_vec(body).unwrap_or_default();
+            self.responses.lock().unwrap().push_back((status, HashMap::new(), bytes));
+        }
+
+        /// Queue a raw response with headers (e.g. a `location` redirect).
+        pub fn push_raw(&self, status: u16, headers: &[(&str, &str)], body: Vec<u8>) {
+            let h = headers.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect();
+            self.responses.lock().unwrap().push_back((status, h, body));
+        }
+
+        /// `(method, url)` of every request, in order.
+        pub fn request_urls(&self) -> Vec<(String, String)> {
+            self.requests.lock().unwrap().clone()
+        }
+    }
+
+    #[async_trait]
+    impl HostHttp for MockHttp {
+        async fn request(
+            &self,
+            method: String,
+            url: String,
+            _headers: Vec<(String, String)>,
+            _body: Option<(String, Vec<u8>)>,
+        ) -> Result<HttpResponse, SdkError> {
+            self.requests.lock().unwrap().push((method, url));
+            match self.responses.lock().unwrap().pop_front() {
+                Some((status, headers, body)) => Ok(HttpResponse { status, headers, body }),
+                None => Err(SdkError::Internal("MockHttp: no queued response".into())),
+            }
+        }
+    }
+
+    /// Records identity providers registered through `PluginContext::identity`.
+    #[derive(Default)]
+    pub struct MockIdentity {
+        pub providers: Mutex<Vec<(String, Arc<dyn IdentityProvider>)>>,
+    }
+
+    impl MockIdentity {
+        pub fn new() -> Self {
+            Self::default()
+        }
+
+        /// Owner keys registered so far.
+        pub fn owners(&self) -> Vec<String> {
+            self.providers.lock().unwrap().iter().map(|(o, _)| o.clone()).collect()
+        }
+    }
+
+    impl IdentityRegistrar for MockIdentity {
+        fn register(&self, owner: &str, provider: Arc<dyn IdentityProvider>) {
+            self.providers.lock().unwrap().push((owner.to_string(), provider));
+        }
+    }
+
+    /// Bundles the mocks and builds a real [`PluginContext`] around them.
+    pub struct TestHost {
+        pub db: Arc<MockDb>,
+        pub events: Arc<MockEvents>,
+        pub http: Arc<MockHttp>,
+        pub identity: Arc<MockIdentity>,
+        pub config: Value,
+    }
+
+    impl TestHost {
+        pub fn new() -> Self {
+            Self {
+                db: Arc::new(MockDb::new()),
+                events: Arc::new(MockEvents::new()),
+                http: Arc::new(MockHttp::new()),
+                identity: Arc::new(MockIdentity::new()),
+                config: Value::Null,
+            }
+        }
+
+        pub fn with_config(mut self, config: Value) -> Self {
+            self.config = config;
+            self
+        }
+
+        /// Build the context a plugin receives from the core at `init`.
+        pub fn context(&self, plugin_id: &str) -> PluginContext {
+            let db: Arc<dyn HostDb> = self.db.clone();
+            PluginContext {
+                plugin_id: plugin_id.to_string(),
+                db: DbHandle::new(db.clone(), plugin_id.to_string()),
+                config: self.config.clone(),
+                events: EventBusHandle::new(self.events.clone(), plugin_id.to_string()),
+                permissions: PermissionService::new(db.clone()),
+                audit: AuditService::new(db, plugin_id.to_string()),
+                identity: self.identity.clone(),
+                http: self.http.clone(),
+            }
+        }
+    }
+
+    impl Default for TestHost {
+        fn default() -> Self {
+            Self::new()
+        }
+    }
+
+    /// Build a [`PluginRequest`] for a handler test.
+    pub struct TestRequest {
+        req: PluginRequest,
+    }
+
+    impl TestRequest {
+        pub fn method(method: &str, path: &str) -> Self {
+            Self {
+                req: PluginRequest {
+                    method: method.to_string(),
+                    path: path.to_string(),
+                    params: HashMap::new(),
+                    query: Vec::new(),
+                    headers: HashMap::new(),
+                    body: Vec::new(),
+                    identity: None,
+                },
+            }
+        }
+
+        pub fn get(path: &str) -> Self {
+            Self::method("GET", path)
+        }
+        pub fn post(path: &str) -> Self {
+            Self::method("POST", path)
+        }
+        pub fn put(path: &str) -> Self {
+            Self::method("PUT", path)
+        }
+        pub fn patch(path: &str) -> Self {
+            Self::method("PATCH", path)
+        }
+        pub fn delete(path: &str) -> Self {
+            Self::method("DELETE", path)
+        }
+
+        /// Set a JSON body and `content-type`.
+        pub fn json<T: Serialize>(mut self, value: &T) -> Self {
+            self.req.body = serde_json::to_vec(value).unwrap_or_default();
+            self.req
+                .headers
+                .insert("content-type".to_string(), "application/json".to_string());
+            self
+        }
+
+        /// Add a path capture (what the core extracts from `{name}`).
+        pub fn param(mut self, key: &str, value: &str) -> Self {
+            self.req.params.insert(key.to_string(), value.to_string());
+            self
+        }
+
+        /// Add a query parameter.
+        pub fn query_param(mut self, key: &str, value: &str) -> Self {
+            self.req.query.push((key.to_string(), value.to_string()));
+            self
+        }
+
+        /// Add a header (name is lowercased, as the core delivers it).
+        pub fn header(mut self, key: &str, value: &str) -> Self {
+            self.req.headers.insert(key.to_lowercase(), value.to_string());
+            self
+        }
+
+        /// Attach an authenticated caller.
+        pub fn identity(mut self, user_id: &str, roles: &[&str]) -> Self {
+            self.req.identity = Some(Identity {
+                user_id: user_id.to_string(),
+                roles: roles.iter().map(|r| r.to_string()).collect(),
+            });
+            self
+        }
+
+        pub fn build(self) -> PluginRequest {
+            self.req
+        }
+    }
+
+    /// Decode a response body as JSON (`Null` when the body is empty or not JSON).
+    pub fn response_json(resp: &PluginResponse) -> Value {
+        serde_json::from_slice(&resp.body).unwrap_or(Value::Null)
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[tokio::test]
+        async fn host_builds_a_context_that_routes_through_the_mocks() {
+            let host = TestHost::new();
+            host.db.push_rows(vec![serde_json::json!({ "id": 1, "message": "hi" })]);
+            let ctx = host.context("greetings");
+
+            let list = crate::route_handler(move |_req: PluginRequest| {
+                let ctx = ctx.clone();
+                async move {
+                    let rows = ctx.db.query("SELECT * FROM greetings", vec![]).await?;
+                    PluginResponse::json(200, &serde_json::json!({ "greetings": rows }))
+                }
+            });
+
+            let resp = list(TestRequest::get("/api/greetings").build()).await.unwrap();
+            assert_eq!(resp.status, 200);
+            assert_eq!(response_json(&resp)["greetings"][0]["message"], "hi");
+            assert_eq!(host.db.query_count(), 1);
+            assert!(host.db.queried.lock().unwrap()[0].sql_contains(&["SELECT", "greetings"]));
+        }
+
+        #[tokio::test]
+        async fn mock_http_errors_when_unexpected() {
+            let host = TestHost::new();
+            let ctx = host.context("auth");
+            let err = ctx
+                .http
+                .request("GET".into(), "https://idp/.well-known/openid-configuration".into(), vec![], None)
+                .await
+                .unwrap_err();
+            assert!(matches!(err, SdkError::Internal(_)));
+            assert_eq!(host.http.request_urls().len(), 1);
+        }
+
+        #[tokio::test]
+        async fn event_publishes_are_observed() {
+            let host = TestHost::new();
+            let ctx = host.context("hello");
+            ctx.events.publish("hello.greeted", serde_json::json!({"m": 1})).await.unwrap();
+            assert_eq!(host.events.published_types(), vec!["hello.greeted".to_string()]);
+        }
+
+        #[test]
+        fn error_statuses_map_consistently() {
+            assert_eq!(SdkError::BadRequest("x".into()).status(), 400);
+            assert_eq!(SdkError::Unauthorized("x".into()).status(), 401);
+            assert_eq!(SdkError::Forbidden("x".into()).status(), 403);
+            assert_eq!(SdkError::NotFound("x".into()).status(), 404);
+            assert_eq!(SdkError::Conflict("x".into()).status(), 409);
+            assert_eq!(SdkError::Internal("x".into()).status(), 500);
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
