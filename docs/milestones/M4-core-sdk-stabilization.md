@@ -68,34 +68,44 @@ baseline numbers are recorded here. **Met** — `v0.1.0` @ `6a0f2d7`, CI green.
 
 ### W1 — Lock the SDK contract (target `adjutant-sdk` 0.2 → 1.0-rc)
 
-- [ ] Version handshake: add a core/SDK compatibility signal (e.g.
-      `AdjutantPlugin::sdk_version()` + a core `MIN_SDK_VERSION`) and reject
-      incompatible plugins at load with an actionable error.
-- [ ] Publish a SemVer / compatibility policy and a `CHANGELOG.md` for the SDK.
-- [ ] Ergonomics:
-  - [ ] `Method::Patch` and `Method::Head`.
-  - [ ] `_protected` constructors for `put`/`delete` (or a route builder) —
-        today only `get`/`post` have them.
-  - [ ] `SdkError` gains `NotFound`, `Conflict`, `Forbidden`, `Unauthorized`;
-        central error → HTTP status mapping.
-  - [ ] `PluginResponse` helpers: redirect, `204`, created.
-  - [ ] `SqlValue` / decode coverage for uuid, numeric, timestamps, bytea, and
-        non-text arrays (or an explicit cast-only policy with typed helpers).
+**Branch:** `feature/m4-w1-sdk-contract`.
+
+- [x] Version handshake: `export_plugin!` emits an `adjutant_sdk_abi` symbol and
+      the core verifies it against `SDK_ABI_VERSION` **before** the factory,
+      rejecting stale builds with an actionable error. (Done via an exported
+      symbol rather than a trait method, so a stale plugin cannot be read through
+      a mismatched vtable before the check.)
+- [x] Publish a SemVer / compatibility policy and a `CHANGELOG.md` for the SDK —
+      `docs/sdk-compatibility.md`, `CHANGELOG.md`.
+- [x] Ergonomics:
+  - [x] `Method::Patch` and `Method::Head`.
+  - [x] `_protected` constructors for `put`/`delete`, plus `patch`/`head`
+        (all methods now have matching protected constructors).
+  - [x] `SdkError` gains `NotFound`, `Conflict`, `Forbidden`, `Unauthorized`;
+        central `SdkError::status()` used by the core.
+  - [x] `PluginResponse` helpers: redirect, `204` (`no_content`), created,
+        `with_header`.
+  - [x] `SqlValue` gains `Uuid`/`NullUuid`/`IntArray`; the host decodes uuid
+        columns. Numeric/bytea/non-text arrays remain cast-in-SQL, documented.
 - [ ] Decide the identity/scope question: `Identity` is `{user_id, roles}` today
       while SPEC §9.2 describes scoped permissions. Either model scope in the
-      SDK or narrow the SPEC.
-- [ ] Public `adjutant_sdk::testing`: mock `HostDb`/`HostEvents`/`HostHttp`/
-      `IdentityRegistrar`, a request builder, and response assertions. Retrofit
-      `auth` + `membership` tests to use it (dogfood gate).
-- [ ] `adjutant validate-plugin`: static validation (id, `/api/{id}` namespace,
-      permission references, migration ordering, capture collisions) with no
-      database; wire into the scaffold output and CI.
+      SDK or narrow the SPEC. **Open — human design decision (W1 boundary).**
+- [x] Public `adjutant_sdk::testing`: `MockDb`/`MockEvents`/`MockHttp`/
+      `MockIdentity`, `TestHost::context`, and a `TestRequest` builder, with a
+      usage doctest. **Partial dogfood:** the SDK's own tests use it; retrofitting
+      `auth` + `membership` tests is still open.
+- [x] `adjutant validate-plugin`: static validation (ABI, init against mocks, id,
+      permission references, migration versions, route namespace/captures/
+      duplicates) with no database; wired into CI (incl. the scaffolded plugin).
 - [ ] Schema isolation: enforce it (per-plugin role/grants) or correct SPEC §5.2
       to state that the per-call `search_path` is a convention, not a boundary.
+      **Open — needs a decision.**
+- [x] Documentation: `docs/plugin-development.md` written.
 
 **Exit criteria:** a plugin can be scaffolded, statically validated, unit-tested
 with only the public SDK, and loaded; `auth` + `membership` pass using only the
-public SDK + testing module.
+public SDK + testing module. **Remaining before met:** the identity/scope and
+schema-isolation decisions, and the `auth`/`membership` testing retrofit.
 
 ### W2 — Core hardening
 
