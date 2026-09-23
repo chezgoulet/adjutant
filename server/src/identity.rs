@@ -17,11 +17,27 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use adjutant_sdk::{Identity, IdentityProvider, IdentityRegistrar};
-use tokio::sync::RwLock;
+use std::sync::RwLock;
 
+/// The lock is `std::sync::RwLock`, deliberately: `register` is a SYNC trait
+/// method called from `PluginContext` inside `init`, and the reload path runs
+/// `init` *inside a request*. With tokio's lock, `try_write()` fails whenever a
+/// request holds the read guard, so the old `.expect()` panicked in a handler.
+/// These critical sections only clone maps and hold no awaits, so a std lock is
+/// safe and infallible.
 pub struct IdentityHub {
     providers: RwLock<HashMap<String, Arc<dyn IdentityProvider>>>,
     disabled: RwLock<HashSet<String>>,
+}
+
+/// A poisoned lock can only mean a panic during a clone; recover rather than
+/// propagate (the maps are still consistent).
+fn read_guard<T>(lock: &RwLock<T>) -> std::sync::RwLockReadGuard<'_, T> {
+    lock.read().unwrap_or_else(|e| e.into_inner())
+}
+
+fn write_guard<T>(lock: &RwLock<T>) -> std::sync::RwLockWriteGuard<'_, T> {
+    lock.write().unwrap_or_else(|e| e.into_inner())
 }
 
 impl IdentityHub {
@@ -38,14 +54,11 @@ impl IdentityHub {
         tracing::info!(plugin = owner, "identity provider registered");
         // Blocking lock is fine: register runs during plugin init, never
         // inside a request, and the critical section holds no awaits.
-        self.providers
-            .try_write()
-            .expect("identity hub locked during init")
-            .insert(owner.to_string(), provider);
+        write_guard(&self.providers).insert(owner.to_string(), provider);
     }
 
     pub fn set_enabled(&self, owner: &str, on: bool) {
-        let mut dis = self.disabled.try_write().expect("identity hub locked");
+        let mut dis = write_guard(&self.disabled);
         if on {
             dis.remove(owner);
         } else {
@@ -55,8 +68,8 @@ impl IdentityHub {
     }
 
     pub fn remove(&self, owner: &str) {
-        let mut p = self.providers.try_write().expect("identity hub locked");
-        let mut d = self.disabled.try_write().expect("identity hub locked");
+        let mut p = write_guard(&self.providers);
+        let mut d = write_guard(&self.disabled);
         d.remove(owner);
         if p.remove(owner).is_some() {
             tracing::info!(plugin = owner, "identity provider removed (uninstalled)");
@@ -67,8 +80,8 @@ impl IdentityHub {
     /// Live owners were (re)registered during `load_all`'s init, so pruning
     /// cannot remove a provider that just registered under the same key.
     pub fn retain(&self, live: &HashSet<String>) {
-        let mut p = self.providers.try_write().expect("identity hub locked");
-        let mut d = self.disabled.try_write().expect("identity hub locked");
+        let mut p = write_guard(&self.providers);
+        let mut d = write_guard(&self.disabled);
         p.retain(|owner, _| live.contains(owner));
         d.retain(|owner| live.contains(owner));
     }
@@ -80,16 +93,14 @@ impl IdentityHub {
     /// going away makes every authenticated route (including the admin route
     /// that would undo the change) unreachable until a restart.
     pub fn is_sole_enabled_provider(&self, owner: &str) -> bool {
-        let p = self.providers.try_read().expect("identity hub locked");
-        let d = self.disabled.try_read().expect("identity hub locked");
+        let p = read_guard(&self.providers);
+        let d = read_guard(&self.disabled);
         let mut enabled = p.keys().filter(|k| !d.contains(*k));
         matches!((enabled.next(), enabled.next()), (Some(first), None) if first == owner)
     }
 
     pub fn owners(&self) -> Vec<String> {
-        self.providers
-            .try_read()
-            .expect("identity hub locked")
+        read_guard(&self.providers)
             .keys()
             .cloned()
             .collect()
@@ -99,8 +110,8 @@ impl IdentityHub {
     /// providers must not be order-sensitive; first Some wins).
     pub async fn identify(&self, headers: &HashMap<String, String>) -> Option<Identity> {
         let snapshot: Vec<(String, Arc<dyn IdentityProvider>)> = {
-            let p = self.providers.try_read().expect("identity hub locked");
-            let d = self.disabled.try_read().expect("identity hub locked");
+            let p = read_guard(&self.providers);
+            let d = read_guard(&self.disabled);
             p.iter()
                 .filter(|(owner, _)| !d.contains(*owner))
                 .map(|(k, v)| (k.clone(), v.clone()))

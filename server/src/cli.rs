@@ -402,6 +402,20 @@ pub async fn run_test_plugin(cfg: &Config) -> Result<Vec<Probe>, String> {
     }
 
     for (pid, method, path, perm) in routes {
+        // A templated path has no concrete value to probe with. Sending the
+        // template text itself would exercise the handler with a nonsense capture
+        // and count as a pass, so report it as skipped instead (the pass tally
+        // excludes `skipped`).
+        if path.contains('{') {
+            probes.push(Probe {
+                name: format!("{pid} {method} {path} capture route"),
+                status: 0,
+                expect: "skipped".into(),
+                ok: true,
+                detail: "path capture — needs a concrete value (not probed)".into(),
+            });
+            continue;
+        }
         let url = format!("{base}{path}");
 
         // --- anonymous pass -------------------------------------------------

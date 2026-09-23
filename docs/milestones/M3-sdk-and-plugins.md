@@ -8,11 +8,11 @@
 | Gate | Result |
 |---|---|
 | `cargo build --workspace` | 0 errors |
-| `cargo test --workspace` | **56/56 passed** (2 are DB-backed and print SKIPPED without `ADJUTANT_TEST_DATABASE_URL`) |
+| `cargo test --workspace` | **62/62 passed** (2 are DB-backed and print SKIPPED without `ADJUTANT_TEST_DATABASE_URL`) |
 | `cargo clippy --workspace --all-targets` | **0 warnings** (independently re-verified on a from-scratch build) |
-| `adjutant test-plugin` | **36/36 probes passed, 3 skipped** (skips are open mutating routes — never executed, and no longer counted as passes) against a fresh test DB |
-| `docs/e2e_m3.py` (live, dev headers OFF) | **49/49 probes**, repeatable (run twice back to back, exit 0) |
-| `scripts/probes.py` (M1+M2 batches) | **63/63 probes**, committed transcript |
+| `adjutant test-plugin` | **34/34 probes passed, 4 skipped** (3 open mutating routes, 1 path-capture route whose value the harness cannot invent — none of them counted as passes) against a fresh test DB |
+| `docs/e2e_m3.py` (live, dev headers OFF) | **52/52 probes**, repeatable (run four times back to back, exit 0) |
+| `scripts/probes.py` (M1+M2 batches) | **67/67 probes**, committed transcript |
 
 Counts changed in the 2026-09-22 audit pass because the harnesses were made
 honest, not because the software moved: `docs/e2e_m3.py`'s `probe()` used an
@@ -145,7 +145,8 @@ pass" was misleading.
       (The old evidence for this line was a unit test asserting the generated
       strings, which never compiled anything.)
 - [x] `adjutant test-plugin` runs a test server with mock permissions and a
-      test database (36/36 probed, 3 open mutating routes reported as skipped)
+      test database (34/34 probed; 3 open mutating routes and 1 path-capture route
+      reported as skipped, not counted)
 - [x] Auth plugin: OIDC login, session management, role enforcement — all via
       the SDK (proved end-to-end against a mock IdP)
 - [x] Membership plugin: roster, OSG CSV import, proficiency tracking — via the SDK
@@ -212,6 +213,62 @@ these fixes (all verified by the gates above):
 14. **CI now enforces the gates** (`.github/workflows/ci.yml`): build, clippy
     with `-D warnings`, unit + DB-backed tests, the M1/M2 probe ladder,
     `test-plugin`, and the end-to-end harness against a PostgreSQL service.
+
+### Second audit round (2026-09-22, config/DB/events/audit-chain and SDK slices)
+
+Every claim below was re-verified against the code and, where possible, live
+before being fixed.
+
+1. **`TRUNCATE core.audit_log` erased the whole chain undetectably** — TRUNCATE
+   does not fire the row-level append-only trigger, and `audit_verify()` then
+   reported a healthy empty log (`ok:true, rows_checked:0`). Added a
+   statement-level `BEFORE TRUNCATE` guard; the probes now assert TRUNCATE is
+   rejected, and the e2e reset disables the guard explicitly around its privileged
+   truncate.
+2. **Type fidelity in the host DB layer.** `decode_value` handled only json/bool/
+   int8/float8/text[]/text, so UUID, int4/int2, numeric, bytea and the whole date/
+   time family came back as JSON null — a shipped route (`/api/membership/stewards`)
+   returned `appointed_on: null` for a `NOT NULL DEFAULT current_date` column.
+   Dates/timestamps and the smaller integers now decode, and an undecodable column
+   logs a warning naming the column and its PostgreSQL type instead of failing
+   silently. A genuine SQL NULL is detected first, so it is not reported as a
+   decode failure.
+3. **Three shipped optional-field routes returned 500** — `member` without a
+   patrol, `steward` without a lodge, `patrol` without a lodge — because
+   `SqlValue::Null` binds as a TEXT null and PostgreSQL refuses to assign it to a
+   bigint column. Fixed at the root: the SDK now has `SqlValue::NullInt` /
+   `NullBool`. (A cast on a bare parameter — `$n::bigint` — is not a fix: it makes
+   PostgreSQL infer the parameter as text, so a non-null integer arrives as
+   garbage. That was tried, caught by a repeatable-run failure, and reverted; the
+   SDK doc records the trap.) Probes 49–51 pin all three paths.
+4. **Disable did not stop event handlers.** Disabling a plugin aborted nothing on
+   the bus, and a plugin disabled in the DB still had its subscriptions bound at
+   boot. Disable now clears them, enable re-binds, boot skips disabled plugins, and
+   `/api/plugins` exposes `bound_subscriptions` so the behaviour is observable —
+   asserted by the lifecycle batch.
+5. **`adjutant serve` exited 2** — the documented subcommand was matched but never
+   stripped from argv, so it was parsed as a flag. Fixed with a unit test.
+6. **Audit-write failures were discarded** (`let _ =` at four sites) with no log
+   line; they now log at error level.
+7. **Migration runner hygiene**: `SET search_path` ran *before* `BEGIN`, so it was
+   auto-committed and leaked onto the pooled connection; `SET LOCAL` inside the
+   transaction fixes it. Migration names are now validated like schema names
+   (they are interpolated into the runner's script).
+8. **Captures are percent-decoded once** (they were raw, while query parameters
+   were decoded — an encoded `%2F` reached handlers as `%2F`). A request whose path
+   equals the template text no longer takes the literal fast-path, so a templated
+   route always delivers its captures; and two templates of the same shape
+   (`{a}`/`{b}` in one position) are now rejected at load instead of silently
+   shadowing each other.
+9. **`IdentityHub` could panic inside a request** — it used `try_write().expect()`
+   claiming registration never happens in a request, but `POST /api/plugins/reload`
+   runs `init` (which registers the auth provider) inside a handler, while every
+   request holds the read lock. Switched to a `std::sync::RwLock`, which cannot
+   fail; the critical sections hold no awaits.
+10. **`AdjutantPlugin::shutdown` was dead code** and `EventBus::shutdown` had no
+    caller. The process now stops the bus and calls every plugin's shutdown hook
+    (verified in the server log), and `clear_plugin` awaits each aborted task with
+    a short bound so reload cannot race two generations on one event.
 
 ## Next
 

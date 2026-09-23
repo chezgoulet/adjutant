@@ -115,7 +115,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     tracing::info!(bind = %cfg.bind, plugin_dir = %cfg.plugin_dir.display(), "starting adjutant");
 
-    let (app, _state) = build_app(&cfg).await?;
+    let (app, state) = build_app(&cfg).await?;
 
     let listener = tokio::net::TcpListener::bind(cfg.bind).await?;
     tracing::info!(addr = %listener.local_addr()?, "listening");
@@ -127,6 +127,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     )
     .with_graceful_shutdown(shutdown_signal())
     .await?;
+
+    // Give plugins their shutdown hook and stop event handlers before exiting.
+    state.shutdown().await;
 
     tracing::info!("adjutant stopped");
     Ok(())

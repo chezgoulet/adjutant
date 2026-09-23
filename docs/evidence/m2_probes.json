@@ -8,8 +8,8 @@
   "middleware2",
   "tamper"
  ],
- "passed": 63,
- "total": 63,
+ "passed": 67,
+ "total": 67,
  "results": [
   {
    "batch": "m1_regression",
@@ -27,7 +27,7 @@
    "batch": "m1_regression",
    "probe": "2b registry as chief",
    "result": "PASS",
-   "detail": "200 | {\"plugins\":[{\"enabled\":true,\"id\":\"hello\",\"name\":\"Hello World\",\"permissions\":[\"hello:read\",\"hello:write\"],\"rout"
+   "detail": "200 | {\"bound_subscriptions\":[\"hello\"],\"plugins\":[{\"enabled\":true,\"id\":\"hello\",\"name\":\"Hello World\",\"permissions\":[\""
   },
   {
    "batch": "m1_regression",
@@ -69,7 +69,7 @@
    "batch": "m1_regression",
    "probe": "8 event persisted",
    "result": "PASS",
-   "detail": "200 | {\"cursor\":1,\"events\":[{\"created_at\":\"2026-09-22 23:49:33.679367+00\",\"event_type\":\"hello.greeted\",\"id\":1,\"paylo"
+   "detail": "200 | {\"cursor\":1,\"events\":[{\"created_at\":\"2026-09-23 00:17:41.808479+00\",\"event_type\":\"hello.greeted\",\"id\":1,\"paylo"
   },
   {
    "batch": "m1_regression",
@@ -81,19 +81,25 @@
    "batch": "m1_regression",
    "probe": "9 greeting readable",
    "result": "PASS",
-   "detail": "200 | {\"greetings\":[{\"created_at\":\"2026-09-22 23:49:33.675187+00\",\"id\":1,\"message\":\"first greeting\"}]}"
+   "detail": "200 | {\"greetings\":[{\"created_at\":\"2026-09-23 00:17:41.804255+00\",\"id\":1,\"message\":\"first greeting\"}]}"
   },
   {
    "batch": "m1_regression",
    "probe": "9b path capture read",
    "result": "PASS",
-   "detail": "200 | {\"greeting\":{\"created_at\":\"2026-09-22 23:49:33.675187+00\",\"id\":1,\"message\":\"first greeting\"}}"
+   "detail": "200 | {\"greeting\":{\"created_at\":\"2026-09-23 00:17:41.804255+00\",\"id\":1,\"message\":\"first greeting\"}}"
+  },
+  {
+   "batch": "m1_regression",
+   "probe": "9b2 percent-encoded capture decodes",
+   "result": "PASS",
+   "detail": "200 | {\"greeting\":{\"created_at\":\"2026-09-23 00:17:41.804255+00\",\"id\":1,\"message\":\"first greeting\"}}"
   },
   {
    "batch": "m1_regression",
    "probe": "9c path capture prefers literal",
    "result": "PASS",
-   "detail": "200 | {\"greetings\":[{\"created_at\":\"2026-09-22 23:49:33.675187+00\",\"id\":1,\"message\":\"first greeting\"}]}"
+   "detail": "200 | {\"greetings\":[{\"created_at\":\"2026-09-23 00:17:41.804255+00\",\"id\":1,\"message\":\"first greeting\"}]}"
   },
   {
    "batch": "m1_regression",
@@ -123,7 +129,7 @@
    "batch": "middleware",
    "probe": "M1 x-request-id present",
    "result": "PASS",
-   "detail": "rid=001a0cb8655d9-00000e"
+   "detail": "rid=001a0cba0181b-00000f"
   },
   {
    "batch": "middleware",
@@ -135,13 +141,13 @@
    "batch": "middleware",
    "probe": "M4 replay since=0",
    "result": "PASS",
-   "detail": "200 | {\"cursor\":1,\"events\":[{\"created_at\":\"2026-09-22 23:49:33.679367+00\",\"event_type\":\"hello.greeted\",\"id\":1,\"paylo"
+   "detail": "200 | {\"cursor\":1,\"events\":[{\"created_at\":\"2026-09-23 00:17:41.808479+00\",\"event_type\":\"hello.greeted\",\"id\":1,\"paylo"
   },
   {
    "batch": "middleware",
    "probe": "M4b cursor equals last id",
    "result": "PASS",
-   "detail": "{\"cursor\": 1, \"events\": [{\"created_at\": \"2026-09-22 23:49:33.679367+00\", \"event_type\": \"hello.greeted\", \"id\": 1, \"payload\": {\"by\": \"christop"
+   "detail": "{\"cursor\": 1, \"events\": [{\"created_at\": \"2026-09-23 00:17:41.808479+00\", \"event_type\": \"hello.greeted\", \"id\": 1, \"payload\": {\"by\": \"christop"
   },
   {
    "batch": "middleware",
@@ -169,6 +175,12 @@
   },
   {
    "batch": "lifecycle",
+   "probe": "L1b disable aborts subscriptions",
+   "result": "PASS",
+   "detail": "bound=[]"
+  },
+  {
+   "batch": "lifecycle",
    "probe": "L2 disabled route 404",
    "result": "PASS",
    "detail": "404 | {\"error\":\"plugin hello is disabled\"}"
@@ -190,6 +202,12 @@
    "probe": "L5 enable",
    "result": "PASS",
    "detail": "200 | {\"enabled\":true,\"plugin\":\"hello\"}"
+  },
+  {
+   "batch": "lifecycle",
+   "probe": "L5b enable rebinds subscriptions",
+   "result": "PASS",
+   "detail": "bound=['hello']"
   },
   {
    "batch": "lifecycle",
@@ -237,13 +255,13 @@
    "batch": "lifecycle",
    "probe": "L13 retired library tracked",
    "result": "PASS",
-   "detail": "200 | {\"plugins\":[],\"retired_libraries\":1}"
+   "detail": "200 | {\"bound_subscriptions\":[],\"plugins\":[],\"retired_libraries\":1}"
   },
   {
    "batch": "lifecycle",
    "probe": "L13b hello absent from live registry",
    "result": "PASS",
-   "detail": "{\"plugins\":[],\"retired_libraries\":1}"
+   "detail": "{\"bound_subscriptions\":[],\"plugins\":[],\"retired_libraries\":1}"
   },
   {
    "batch": "lifecycle",
@@ -304,6 +322,12 @@
    "probe": "T2 DELETE rejected",
    "result": "PASS",
    "detail": "ERROR:  core.audit_log is append-only (attempt DELETE)\nCONTEXT:  PL/pgSQL function core.audit_append_only() line 3 at RA"
+  },
+  {
+   "batch": "tamper",
+   "probe": "T2b TRUNCATE rejected",
+   "result": "PASS",
+   "detail": "ERROR:  core.audit_log is append-only (attempt TRUNCATE)\nCONTEXT:  PL/pgSQL function core.audit_append_only() line 3 at "
   },
   {
    "batch": "tamper",
@@ -381,13 +405,13 @@
    "batch": "middleware2",
    "probe": "M3d request-id on 429",
    "result": "PASS",
-   "detail": "rid=001a0cb86596f-000009"
+   "detail": "rid=001a0cba01be6-000009"
   },
   {
    "batch": "middleware2",
    "probe": "M4 JSON log line",
    "result": "PASS",
-   "detail": "{\"timestamp\":\"2026-09-22T23:49:34.703805Z\",\"level\":\"INFO\",\"fields\":{\"message\":\"request\",\"request_id\":\"001a0cb86596f-000009\",\"method\":\"GET\",\""
+   "detail": "{\"timestamp\":\"2026-09-23T00:17:42.886376Z\",\"level\":\"INFO\",\"fields\":{\"message\":\"request\",\"request_id\":\"001a0cba01be6-000009\",\"method\":\"GET\",\""
   }
  ]
 }
