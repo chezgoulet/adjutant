@@ -425,7 +425,7 @@ mod csv_tests {
     }
 
     /// The hierarchy declaration replaces our own lodge→patrol edges from
-    /// `patrols.lodge_id` (scoped DELETE, then INSERT ... SELECT).
+    /// `patrols.lodge_id` (scoped DELETE, then the checked declare function).
     #[tokio::test]
     async fn declare_scope_hierarchy_syncs_from_patrols() {
         let host = adjutant_sdk::testing::TestHost::new();
@@ -435,7 +435,7 @@ mod csv_tests {
         assert_eq!(sql.len(), 2);
         assert!(sql[0].contains("DELETE FROM core.scope_hierarchy"));
         assert!(sql[0].contains("'lodge'"));
-        assert!(sql[1].contains("INSERT INTO core.scope_hierarchy"));
+        assert!(sql[1].contains("core.declare_scope_parent"));
         assert!(sql[1].contains("FROM patrols"));
         assert!(sql[1].contains("lodge_id"));
     }
@@ -1289,12 +1289,14 @@ export_plugin!(MembershipPlugin);
 /// `core.scope_hierarchy` from its own roster (`patrols.lodge_id`).
 ///
 /// The core resolves hierarchical coverage from that table; membership owns the
-/// roster the hierarchy is derived from, so it is the one plugin allowed to
-/// write these edges (see `core_grants` in `server/src/schema.rs`). The DELETE
-/// is scoped to our own edge kind, so a re-run cannot duplicate or disturb
-/// another plugin's edges. Called on every load and after a patrol write; a
-/// first-boot call before migrations returns `Err` (no `patrols` table yet) and
-/// the caller logs and continues.
+/// `lodge` and `patrol` scope types (see `SCOPE_OWNERS` in
+/// `server/src/schema.rs`), so it may declare these edges. Edges go through
+/// `core.declare_scope_parent`, which refuses a type the caller does not own with
+/// a clear message (a trigger enforces the same rule for raw SQL). The DELETE is
+/// scoped to our own edge kind, so a re-run cannot duplicate or disturb another
+/// plugin's edges. Called on every load and after a patrol write; a first-boot
+/// call before migrations returns `Err` (no `patrols` table yet) and the caller
+/// logs and continues.
 async fn declare_scope_hierarchy(ctx: &PluginContext) -> Result<(), SdkError> {
     ctx.db
         .execute(
@@ -1306,10 +1308,8 @@ async fn declare_scope_hierarchy(ctx: &PluginContext) -> Result<(), SdkError> {
         .await?;
     ctx.db
         .execute(
-            "INSERT INTO core.scope_hierarchy (parent_type, parent_id, child_type, child_id) \
-             SELECT 'lodge', lodge_id::text, 'patrol', id::text FROM patrols \
-             WHERE lodge_id IS NOT NULL \
-             ON CONFLICT DO NOTHING"
+            "SELECT core.declare_scope_parent('lodge', lodge_id::text, 'patrol', id::text) \
+             FROM patrols WHERE lodge_id IS NOT NULL"
                 .to_string(),
             vec![],
         )
