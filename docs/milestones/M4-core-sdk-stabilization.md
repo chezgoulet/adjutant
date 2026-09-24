@@ -165,19 +165,23 @@ command; security defaults are safe; supply-chain and doc gates are enforced in 
 tested, not asserted; the trusted-native vs untrusted-WASM distinction is
 documented.
 
-### W4 — Documentation & DX
+### W4 — Documentation & DX ✓
 
-- [ ] `docs/plugin-development.md`: lifecycle, the host-mediated I/O rule and
+- [x] `docs/plugin-development.md`: lifecycle, the host-mediated I/O rule and
       why (the M1 abort story), every `PluginContext` service, routes/captures/
       permissions, migrations/schema, events, audit, the testing module,
-      packaging/loading, compatibility, and the real traps (`SqlValue` typed
-      nulls, `raw_sql` `!Send`, `search_path`).
-- [ ] `docs/architecture.md`, `docs/api-reference.md` (core REST + SDK API),
-      `docs/deployment.md`, and a WASM authoring note.
-- [ ] Promote `plugins/examples/hello` into a proper reference example.
-- [ ] `CONTRIBUTING.md`; `docs.rs` metadata; `cargo doc` published.
+      packaging/loading, compatibility, the WASM ABI, and the real traps
+      (`SqlValue` typed nulls, `raw_sql` `!Send`, `search_path`).
+- [x] `docs/architecture.md`, `docs/api-reference.md` (core REST + SDK API),
+      `docs/deployment.md` (done in W2), and a WASM authoring note.
+- [x] Reference examples: `plugins/examples/hello` (native) and
+      `wasm/examples/hello` (sandboxed) — both documented and exercised by CI.
+- [x] `CONTRIBUTING.md`; `cargo doc -D warnings` gate (W2). (`docs.rs` metadata
+      is part of W5 publication.)
+- [x] README links the docs set.
 
 **Exit criteria:** the W6 fresh-machine test passes using documentation alone.
+(Docs complete; W6 executes the test.)
 
 ### W5 — Publication & CLI
 
