@@ -11,3 +11,6 @@ m2_probes_*.json
 Cargo.lock.bak
 .idea/
 .vscode/
+
+__pycache__/
+*.pyc
