@@ -153,17 +153,18 @@ async fn session_identity(db: &DbHandle, token: &str) -> Result<Option<SessionUs
     if row["is_active"] != serde_json::json!(true) {
         return Ok(None);
     }
+    let username = row["username"].as_str().unwrap_or_default().to_string();
     let roles: Vec<String> = row["roles"]
         .as_array()
         .map(|a| a.iter().filter_map(|v| v.as_str().map(String::from)).collect())
         .unwrap_or_default();
     let grants: Vec<RoleGrant> = row["grant_list"]
         .as_array()
-        .map(|a| a.iter().filter_map(grant_from_row).collect())
+        .map(|a| a.iter().filter_map(|g| grant_from_row(&username, g)).collect())
         .unwrap_or_default();
     Ok(Some(SessionUser {
         id: row["id"].as_str().unwrap_or_default().to_string(),
-        username: row["username"].as_str().unwrap_or_default().to_string(),
+        username,
         email: row["email"].as_str().map(String::from),
         display_name: row["display_name"].as_str().unwrap_or_default().to_string(),
         roles,
@@ -171,18 +172,31 @@ async fn session_identity(db: &DbHandle, token: &str) -> Result<Option<SessionUs
     }))
 }
 
-/// One `core.user_roles` row (as JSON) → [`RoleGrant`]. A zero-UUID scope id
-/// means troop-wide (`None`).
-fn grant_from_row(g: &serde_json::Value) -> Option<RoleGrant> {
-    let role_id = g["role_id"].as_str()?.to_string();
-    if role_id.is_empty() {
-        return None;
-    }
-    let scope_type = match g["scope_type"].as_str().unwrap_or("troop") {
+/// One `core.user_roles` row (as JSON) → [`RoleGrant`], **fail closed**.
+///
+/// An unrecognised/missing/empty `scope_type`, or a non-troop scope with no
+/// scope id, **drops the grant** and logs an error naming the user, role and
+/// offending value. The old code mapped anything unrecognised to `troop`, which
+/// [`Scope::covers`] treats as covering everything — malformed input escalated.
+/// `personal` is retired (scoped-permissions design §8) and is now rejected here
+/// like any other unknown value.
+fn grant_from_row(user: &str, g: &serde_json::Value) -> Option<RoleGrant> {
+    let role_id = match g["role_id"].as_str() {
+        Some(s) if !s.is_empty() => s.to_string(),
+        _ => return None,
+    };
+    let raw_type = g["scope_type"].as_str().unwrap_or("");
+    let scope_type = match raw_type {
+        "troop" => ScopeType::Troop,
         "lodge" => ScopeType::Lodge,
         "patrol" => ScopeType::Patrol,
-        "personal" => ScopeType::Personal,
-        _ => ScopeType::Troop,
+        other => {
+            eprintln!(
+                "[adjutant-auth] dropping grant: user={user:?} role={role_id:?} \
+                 scope_type={other:?} is not one of troop|lodge|patrol"
+            );
+            return None;
+        }
     };
     let scope_id = match g["scope_id"].as_str() {
         Some(s) if !s.is_empty() && s != "00000000-0000-0000-0000-000000000000" => {
@@ -190,6 +204,13 @@ fn grant_from_row(g: &serde_json::Value) -> Option<RoleGrant> {
         }
         _ => None,
     };
+    if scope_type != ScopeType::Troop && scope_id.is_none() {
+        eprintln!(
+            "[adjutant-auth] dropping grant: user={user:?} role={role_id:?} \
+             scope_type={raw_type:?} has no scope id"
+        );
+        return None;
+    }
     Some(RoleGrant { role_id, scope: Scope { scope_type, scope_id } })
 }
 
@@ -1239,6 +1260,57 @@ mod tests {
         // The query went through the host and bound the token hash.
         let calls = host.db.queried.lock().unwrap();
         assert!(calls[0].sql_contains(&["core.sessions", "token_hash"]));
+    }
+
+    /// Scopes fail closed: an unrecognised/missing/empty `scope_type`, or a
+    /// non-troop scope with no scope id, drops the grant instead of widening it
+    /// to `troop` (which `Scope::covers` treats as covering everything).
+    #[test]
+    fn grants_fail_closed_on_bad_scope_types() {
+        let keep = [
+            (
+                serde_json::json!({"role_id":"scout","scope_type":"troop",
+                    "scope_id":"00000000-0000-0000-0000-000000000000"}),
+                Scope::troop(),
+            ),
+            (
+                serde_json::json!({"role_id":"lc","scope_type":"lodge",
+                    "scope_id":"22222222-2222-2222-2222-222222222222"}),
+                Scope::lodge("22222222-2222-2222-2222-222222222222"),
+            ),
+            (
+                serde_json::json!({"role_id":"pc","scope_type":"patrol",
+                    "scope_id":"33333333-3333-3333-3333-333333333333"}),
+                Scope::patrol("33333333-3333-3333-3333-333333333333"),
+            ),
+        ];
+        for (row, scope) in keep {
+            let grant = grant_from_row("bea", &row).expect("a valid grant is kept");
+            assert_eq!(grant.scope, scope, "row {row}");
+        }
+
+        for bad in [
+            // capitalised / future names must not become troop
+            serde_json::json!({"role_id":"chief","scope_type":"Lodge",
+                "scope_id":"22222222-2222-2222-2222-222222222222"}),
+            // personal is retired
+            serde_json::json!({"role_id":"chief","scope_type":"personal",
+                "scope_id":"22222222-2222-2222-2222-222222222222"}),
+            // empty and missing scope_type
+            serde_json::json!({"role_id":"chief","scope_type":"",
+                "scope_id":"22222222-2222-2222-2222-222222222222"}),
+            serde_json::json!({"role_id":"chief",
+                "scope_id":"22222222-2222-2222-2222-222222222222"}),
+            // non-troop with no / zero scope id
+            serde_json::json!({"role_id":"chief","scope_type":"lodge"}),
+            serde_json::json!({"role_id":"chief","scope_type":"lodge",
+                "scope_id":"00000000-0000-0000-0000-000000000000"}),
+        ] {
+            assert!(
+                grant_from_row("bea", &bad).is_none(),
+                "a malformed grant must be dropped, not widened: {bad}"
+            );
+        }
     }
 }
 

@@ -205,6 +205,31 @@ END
 $fn$;
 
 GRANT EXECUTE ON FUNCTION core.record_migration(TEXT, BIGINT, TEXT) TO PUBLIC;
+"),
+(4, "scope_type_check", "
+-- Scope types are now a closed set (issue #22 / scoped-permissions design §3.5).
+-- Grants whose scope_type is not one of these are dropped, never widened: a
+-- malformed row used to map to 'troop' in the auth parser, which escalated it.
+-- The 'personal' value is retired; drop it and anything else unrecognised, with
+-- a warning naming the user and role so the loss is never silent.
+DO $scope$
+DECLARE r RECORD;
+BEGIN
+  FOR r IN
+    SELECT user_id, role_id, scope_type
+    FROM core.user_roles
+    WHERE scope_type NOT IN ('troop', 'lodge', 'patrol')
+  LOOP
+    RAISE WARNING 'dropping %-scoped grant for user % role % (invalid body scope type; troop/lodge/patrol only)',
+      r.scope_type, r.user_id, r.role_id;
+  END LOOP;
+END
+$scope$;
+DELETE FROM core.user_roles WHERE scope_type NOT IN ('troop', 'lodge', 'patrol');
+
+ALTER TABLE core.user_roles DROP CONSTRAINT IF EXISTS user_roles_scope_type_check;
+ALTER TABLE core.user_roles ADD CONSTRAINT user_roles_scope_type_check
+  CHECK (scope_type IN ('troop', 'lodge', 'patrol'));
 ")];
 
 /// Bootstrap roles + permissions grants. `chief` gets everything (SPEC §9 —

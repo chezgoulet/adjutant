@@ -98,7 +98,8 @@ pub fn parse_csv(input: &str) -> Result<Vec<Vec<String>>, usize> {
 
 /// Header-driven mapping. Recognized columns (case-insensitive, order-free):
 /// `username`, `email`, `display_name`, `trail_name`, `patrol`, `lodge`,
-/// `roles` (semicolon-separated), `osg_id`, `bg_check`.
+/// `osg_id`, `bg_check`. A `roles` column is accepted but **ignored** (role
+/// assignment belongs to auth, #19) and reported in `roles_ignored`.
 /// Rows missing `username` are skipped with a reason.
 #[derive(Debug, serde::Serialize)]
 pub struct ImportReport {
@@ -106,6 +107,18 @@ pub struct ImportReport {
     pub updated: usize,
     pub skipped: Vec<(usize, String)>,
     pub patrols_created: Vec<String>,
+    /// Rows whose CSV `roles` column was ignored, with the roles and why. Empty
+    /// when the CSV had no `roles` column.
+    pub roles_ignored: Vec<RoleIgnored>,
+}
+
+/// One ignored `roles` cell. Explicit so an operator sees the column did nothing
+/// instead of assuming roles were assigned.
+#[derive(Debug, serde::Serialize)]
+pub struct RoleIgnored {
+    pub line: usize,
+    pub roles: Vec<String>,
+    pub reason: String,
 }
 
 fn col(header: &[String], name: &str) -> Option<usize> {
@@ -119,6 +132,45 @@ fn col(header: &[String], name: &str) -> Option<usize> {
     };
     let target = norm(name);
     header.iter().position(|h| norm(h) == target)
+}
+
+/// Full member record. `lodge_id` is carried for the `read_lodge` scope check
+/// (#20); `lodge` (the name) is for display.
+const MEMBER_SELECT: &str = "SELECT m.id, m.username, m.email, m.display_name, m.trail_name, \
+        m.osg_id, m.bg_check, m.is_active, p.name AS patrol, l.name AS lodge, l.id AS lodge_id, \
+        COALESCE((SELECT json_agg(json_build_object(\
+            'code', pr.code, 'title', pr.title, \
+            'completed_on', mp.completed_on, \
+            'signed_off_by', mp.signed_off_by\
+         )) FROM member_proficiencies mp \
+           JOIN proficiencies pr ON pr.id = mp.proficiency_id \
+           WHERE mp.member_id = m.id), '[]') AS proficiencies, \
+        COALESCE((SELECT json_agg(json_build_object(\
+            'position', s.position, 'appointed_on', s.appointed_on, \
+            'vacant', s.vacant\
+         )) FROM stewards s WHERE s.member_id = m.id \
+           AND NOT s.vacant), '[]') AS current_positions \
+     FROM members m \
+     LEFT JOIN patrols p ON p.id = m.patrol_id \
+     LEFT JOIN lodges l ON l.id = p.lodge_id \
+     WHERE m.id = $1";
+
+/// 403 for a member the caller may not see. The **same** message covers "absent"
+/// and "forbidden" so a caller without `read_all` cannot use the status to learn
+/// which member ids exist.
+const MEMBER_FORBIDDEN: &str =
+    "reading this member requires membership:read_all, membership:read_lodge for \
+     their lodge, or membership:read for your own record";
+
+async fn fetch_member(
+    c: &PluginContext,
+    id: i64,
+) -> Result<Option<serde_json::Value>, SdkError> {
+    let rows = c
+        .db
+        .query(MEMBER_SELECT.to_string(), vec![SqlValue::Int(id)])
+        .await?;
+    Ok(rows.into_iter().next())
 }
 
 #[cfg(test)]
@@ -163,6 +215,7 @@ mod csv_tests {
             updated: 0,
             skipped: Vec::new(),
             patrols_created: Vec::new(),
+            roles_ignored: Vec::new(),
         };
         upsert_from_import(
             &ctx,
@@ -184,6 +237,191 @@ mod csv_tests {
         assert_eq!(report.updated, 0);
         assert_eq!(report.patrols_created, vec!["Otters".to_string()]);
         assert_eq!(host.db.query_count(), 3);
+    }
+
+    // --- #19: the CSV `roles` column is ignored, never written ---------------
+
+    /// A `membership:manage` caller importing a CSV with a `roles` column must
+    /// not touch `core.user_roles`, and the report must say the column was
+    /// ignored.
+    #[tokio::test]
+    async fn import_ignores_the_roles_column_and_reports_it() {
+        use adjutant_sdk::testing::{response_json, TestHost, TestRequest};
+
+        let host = TestHost::new();
+        host.db.push_rows(vec![serde_json::json!({ "inserted": true })]); // member upsert
+
+        let mut plugin = MembershipPlugin::new();
+        plugin.init(host.context("membership")).await.unwrap();
+        let routes = plugin.routes();
+        let import = routes
+            .iter()
+            .find(|r| r.path == "/api/membership/import")
+            .expect("import route");
+
+        let csv = "username,display_name,roles\nbea,Bea,scout;chief\n";
+        let mut req = TestRequest::post("/api/membership/import").build();
+        req.body = csv.as_bytes().to_vec();
+        let resp = (import.handler)(req).await.expect("handler");
+        assert_eq!(resp.status, 200);
+
+        let body = response_json(&resp);
+        assert_eq!(body["created"], serde_json::json!(1));
+        let ignored = body["roles_ignored"].as_array().expect("roles_ignored");
+        assert_eq!(ignored.len(), 1);
+        assert_eq!(ignored[0]["line"], serde_json::json!(2));
+        assert_eq!(ignored[0]["roles"], serde_json::json!(["scout", "chief"]));
+        assert!(ignored[0]["reason"].as_str().unwrap().contains("auth"));
+
+        // The importer must not read or write core.user_roles at all.
+        let queried = host.db.queried.lock().unwrap();
+        assert!(
+            queried.iter().all(|c| !c.sql.contains("core.user_roles")),
+            "the importer must not query core.user_roles"
+        );
+        drop(queried);
+        assert!(
+            host.db.executed_sql().iter().all(|s| !s.contains("core.user_roles")),
+            "the importer must not write core.user_roles"
+        );
+    }
+
+    // --- #20: per-member authorization ladder --------------------------------
+
+    async fn call_member(
+        host: &adjutant_sdk::testing::TestHost,
+        identity: Option<Identity>,
+        id: i64,
+    ) -> (u16, serde_json::Value) {
+        use adjutant_sdk::testing::{response_json, TestRequest};
+
+        let mut plugin = MembershipPlugin::new();
+        plugin.init(host.context("membership")).await.unwrap();
+        let routes = plugin.routes();
+        let route = routes
+            .iter()
+            .find(|r| r.method.as_str() == "GET" && r.path == "/api/membership/member")
+            .expect("member route");
+        let mut req = TestRequest::get("/api/membership/member")
+            .query_param("id", &id.to_string())
+            .build();
+        req.identity = identity;
+        let resp = (route.handler)(req).await.expect("handler");
+        (resp.status, response_json(&resp))
+    }
+
+    fn grant(role: &str, scope: Scope) -> Identity {
+        Identity::from_grants(
+            "11111111-1111-1111-1111-111111111111",
+            vec![RoleGrant { role_id: role.into(), scope }],
+        )
+    }
+
+    /// `membership:read_all` is troop-wide and reaches any member.
+    #[tokio::test]
+    async fn read_all_reaches_another_member() {
+        let host = adjunct_sdk_test_host();
+        host.db.push_rows(vec![serde_json::json!({ "n": 1 })]); // has(read_all)
+        host.db
+            .push_rows(vec![serde_json::json!({ "id": 1, "username": "mallory", "lodge_id": 7 })]);
+        let (status, body) = call_member(&host, Some(grant("chief", Scope::troop())), 1).await;
+        assert_eq!(status, 200);
+        assert_eq!(body["member"]["username"], serde_json::json!("mallory"));
+    }
+
+    /// `membership:read` reaches the caller's **own** record (case-insensitive).
+    #[tokio::test]
+    async fn read_reaches_self_only() {
+        let host = adjunct_sdk_test_host();
+        host.db.push_rows(vec![serde_json::json!({ "n": 0 })]); // has(read_all) -> deny
+        host.db.push_rows(vec![serde_json::json!({ "username": "bea" })]); // caller
+        host.db.push_rows(vec![serde_json::json!({ "id": 1, "username": "Bea", "lodge_id": null })]);
+        host.db.push_rows(vec![serde_json::json!({ "n": 1 })]); // has(read)
+        let (status, _) = call_member(&host, Some(grant("scout", Scope::troop())), 1).await;
+        assert_eq!(status, 200);
+    }
+
+    /// `membership:read` must **not** reach another member.
+    #[tokio::test]
+    async fn read_denies_another_member() {
+        let host = adjunct_sdk_test_host();
+        host.db.push_rows(vec![serde_json::json!({ "n": 0 })]); // has(read_all)
+        host.db.push_rows(vec![serde_json::json!({ "username": "bea" })]);
+        host.db
+            .push_rows(vec![serde_json::json!({ "id": 1, "username": "mallory", "lodge_id": 7 })]);
+        host.db.push_rows(vec![serde_json::json!({ "n": 0 })]); // has_in_scope(read_lodge)
+        let (status, body) = call_member(&host, Some(grant("scout", Scope::troop())), 1).await;
+        assert_eq!(status, 403);
+        assert!(body["error"].as_str().unwrap().contains("membership:read_all"));
+    }
+
+    /// A lodge-scoped `read_lodge` reaches its own lodge and is denied another.
+    #[tokio::test]
+    async fn read_lodge_reaches_its_lodge_only() {
+        let own = adjunct_sdk_test_host();
+        own.db.push_rows(vec![serde_json::json!({ "n": 0 })]); // has(read_all)
+        own.db.push_rows(vec![serde_json::json!({ "username": "bea" })]);
+        own.db
+            .push_rows(vec![serde_json::json!({ "id": 1, "username": "mallory", "lodge_id": 7 })]);
+        own.db.push_rows(vec![serde_json::json!({ "n": 1 })]); // covered -> has permission
+        let (status, _) = call_member(&own, Some(grant("lodge_commander", Scope::lodge("7"))), 1)
+            .await;
+        assert_eq!(status, 200, "own lodge is reachable");
+
+        let other = adjunct_sdk_test_host();
+        other.db.push_rows(vec![serde_json::json!({ "n": 0 })]); // has(read_all)
+        other.db.push_rows(vec![serde_json::json!({ "username": "bea" })]);
+        other.db
+            .push_rows(vec![serde_json::json!({ "id": 1, "username": "mallory", "lodge_id": 8 })]);
+        // lodge "8" is not covered: no permission query is even made.
+        let (status, _) = call_member(
+            &other,
+            Some(grant("lodge_commander", Scope::lodge("7"))),
+            1,
+        )
+        .await;
+        assert_eq!(status, 403, "another lodge is denied");
+    }
+
+    /// A caller without `read_all` gets 403 for an absent member — the same as
+    /// for a forbidden one, so existence is not leaked.
+    #[tokio::test]
+    async fn absent_member_is_403_not_404_for_a_restricted_caller() {
+        let host = adjunct_sdk_test_host();
+        host.db.push_rows(vec![serde_json::json!({ "n": 0 })]); // has(read_all)
+        host.db.push_rows(vec![serde_json::json!({ "username": "bea" })]);
+        host.db.push_rows(vec![]); // member not found
+        let (status, _) = call_member(&host, Some(grant("scout", Scope::troop())), 999).await;
+        assert_eq!(status, 403);
+    }
+
+    /// The reference-data routes moved off the self-service permission.
+    #[tokio::test]
+    async fn reference_routes_require_read_lodge() {
+        use adjutant_sdk::testing::TestHost;
+        let mut plugin = MembershipPlugin::new();
+        let host = TestHost::new();
+        plugin.init(host.context("membership")).await.unwrap();
+        for path in [
+            "/api/membership/lodges",
+            "/api/membership/proficiencies",
+            "/api/membership/stewards",
+        ] {
+            let r = plugin
+                .routes()
+                .into_iter()
+                .find(|r| r.path == path)
+                .unwrap_or_else(|| panic!("route {path}"));
+            assert_eq!(
+                r.required_permission.as_deref(),
+                Some("membership:read_lodge"),
+                "{path} must require membership:read_lodge"
+            );
+        }
+    }
+
+    fn adjunct_sdk_test_host() -> adjutant_sdk::testing::TestHost {
+        adjutant_sdk::testing::TestHost::new()
     }
 }
 
@@ -313,34 +551,76 @@ impl AdjutantPlugin for MembershipPlugin {
                     let Some(id) = req.query_param("id").and_then(|v| v.parse::<i64>().ok()) else {
                         return PluginResponse::error(400, "id query parameter must be a number");
                     };
-                    let rows = c
-                        .db
-                        .query(
-                            "SELECT m.id, m.username, m.email, m.display_name, m.trail_name, \
-                                    m.osg_id, m.bg_check, m.is_active, p.name AS patrol, l.name AS lodge, \
-                                    COALESCE((SELECT json_agg(json_build_object(\
-                                        'code', pr.code, 'title', pr.title, \
-                                        'completed_on', mp.completed_on, \
-                                        'signed_off_by', mp.signed_off_by\
-                                     )) FROM member_proficiencies mp \
-                                       JOIN proficiencies pr ON pr.id = mp.proficiency_id \
-                                       WHERE mp.member_id = m.id), '[]') AS proficiencies, \
-                                    COALESCE((SELECT json_agg(json_build_object(\
-                                        'position', s.position, 'appointed_on', s.appointed_on, \
-                                        'vacant', s.vacant\
-                                     )) FROM stewards s WHERE s.member_id = m.id \
-                                       AND NOT s.vacant), '[]') AS current_positions \
-                             FROM members m \
-                             LEFT JOIN patrols p ON p.id = m.patrol_id \
-                             LEFT JOIN lodges l ON l.id = p.lodge_id \
-                             WHERE m.id = $1",
-                            vec![SqlValue::Int(id)],
-                        )
-                        .await?;
-                    match rows.into_iter().next() {
-                        Some(m) => PluginResponse::json(200, &serde_json::json!({ "member": m })),
-                        None => PluginResponse::error(404, "no such member"),
+                    let identity = req.identity.as_ref();
+
+                    // `read_all` is troop-wide: it reaches any member.
+                    if c.permissions.has(identity, "membership:read_all").await {
+                        return match fetch_member(&c, id).await? {
+                            Some(m) => {
+                                PluginResponse::json(200, &serde_json::json!({ "member": m }))
+                            }
+                            None => PluginResponse::error(404, "no such member"),
+                        };
                     }
+
+                    // Resolve the caller's username for the self check. This is
+                    // an equality test, not a scope.
+                    let caller = match identity {
+                        Some(ident) => {
+                            let rows = c
+                                .db
+                                .query(
+                                    "SELECT username FROM core.users WHERE id = $1::uuid",
+                                    vec![SqlValue::Text(ident.user_id.clone())],
+                                )
+                                .await?;
+                            rows.first()
+                                .and_then(|r| r["username"].as_str())
+                                .map(str::to_lowercase)
+                        }
+                        None => None,
+                    };
+
+                    // Fetch before deciding: `read_lodge` needs the target's
+                    // lodge. A caller without `read_all` gets the same 403 for an
+                    // absent member as for a forbidden one, so existence is not
+                    // leaked.
+                    let Some(member) = fetch_member(&c, id).await? else {
+                        return PluginResponse::error(403, MEMBER_FORBIDDEN);
+                    };
+
+                    let is_self = match (&caller, member["username"].as_str()) {
+                        (Some(cu), Some(mu)) => cu.eq_ignore_ascii_case(mu),
+                        _ => false,
+                    };
+                    if is_self && c.permissions.has(identity, "membership:read").await {
+                        return PluginResponse::json(
+                            200,
+                            &serde_json::json!({ "member": member }),
+                        );
+                    }
+
+                    // A lodge-scoped `read_lodge` grant that covers the member's
+                    // lodge. NOTE: `core.user_roles.scope_id` is UUID, while
+                    // membership lodge ids are bigint, so no such grant can be
+                    // stored yet — see the PR. The check is the design's shape.
+                    if let Some(lodge_id) = member["lodge_id"].as_i64() {
+                        if c.permissions
+                            .has_in_scope(
+                                identity,
+                                "membership:read_lodge",
+                                &Scope::lodge(lodge_id.to_string()),
+                            )
+                            .await
+                        {
+                            return PluginResponse::json(
+                                200,
+                                &serde_json::json!({ "member": member }),
+                            );
+                        }
+                    }
+
+                    PluginResponse::error(403, MEMBER_FORBIDDEN)
                 }
             }),
         );
@@ -465,6 +745,7 @@ impl AdjutantPlugin for MembershipPlugin {
                         updated: 0,
                         skipped: Vec::new(),
                         patrols_created: Vec::new(),
+                        roles_ignored: Vec::new(),
                     };
 
                     for (n, row) in table.iter().skip(1).enumerate() {
@@ -521,32 +802,28 @@ impl AdjutantPlugin for MembershipPlugin {
                             )
                             .await?;
 
-                        // roles: semicolon-separated → core.user_roles if the
-                        // user already exists in core.users (auth owns that).
-                        if let (Some(_), Some(roles_col)) = (i_roles, i_roles) {
+                        // `roles` is deliberately ignored: role assignment is
+                        // auth's domain (`auth:manage_users`, POST /api/auth/roles).
+                        // Membership previously wrote core.user_roles here, which
+                        // made `membership:manage` a path to granting `chief`
+                        // (#19). Report it so the operator sees the column did
+                        // nothing rather than assuming it worked.
+                        if let Some(roles_col) = i_roles {
                             if let Some(roles) = get(Some(roles_col)) {
-                                let uid_rows = c
-                                    .db
-                                    .query(
-                                        "SELECT id::text AS id FROM core.users \
-                                         WHERE lower(username) = lower($1)",
-                                        vec![SqlValue::Text(username.clone())],
-                                    )
-                                    .await?;
-                                if let Some(uid) = uid_rows.first().and_then(|r| r["id"].as_str()) {
-                                    let uid = uid.to_string();
-                                    for role in roles.split(';').map(str::trim).filter(|r| !r.is_empty()) {
-                                        c.db
-                                            .execute(
-                                                "INSERT INTO core.user_roles (user_id, role_id) \
-                                                 VALUES ($1::uuid, $2) ON CONFLICT DO NOTHING",
-                                                vec![
-                                                    SqlValue::Text(uid.clone()),
-                                                    SqlValue::Text(role.to_string()),
-                                                ],
-                                            )
-                                            .await?;
-                                    }
+                                let names: Vec<String> = roles
+                                    .split(';')
+                                    .map(str::trim)
+                                    .filter(|r| !r.is_empty())
+                                    .map(String::from)
+                                    .collect();
+                                if !names.is_empty() {
+                                    report.roles_ignored.push(RoleIgnored {
+                                        line: lineno,
+                                        roles: names,
+                                        reason: "role assignment belongs to auth; \
+                                                 use POST /api/auth/roles"
+                                            .into(),
+                                    });
                                 }
                             }
                         }
@@ -574,7 +851,7 @@ impl AdjutantPlugin for MembershipPlugin {
         let c = ctx.clone();
         let list_lodges = RouteDefinition::get_protected(
             "/api/membership/lodges",
-            "membership:read",
+            "membership:read_lodge",
             route_handler(move |_req| {
                 let c = c.clone();
                 async move {
@@ -682,7 +959,7 @@ impl AdjutantPlugin for MembershipPlugin {
         let c = ctx.clone();
         let list_proficiencies = RouteDefinition::get_protected(
             "/api/membership/proficiencies",
-            "membership:read",
+            "membership:read_lodge",
             route_handler(move |_req| {
                 let c = c.clone();
                 async move {
@@ -843,7 +1120,7 @@ impl AdjutantPlugin for MembershipPlugin {
         let c = ctx.clone();
         let stewards = RouteDefinition::get_protected(
             "/api/membership/stewards",
-            "membership:read",
+            "membership:read_lodge",
             route_handler(move |_req| {
                 let c = c.clone();
                 async move {
