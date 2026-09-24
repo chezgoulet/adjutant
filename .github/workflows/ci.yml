@@ -103,6 +103,14 @@ jobs:
           ./target/debug/adjutant new-plugin gear_locker
           cargo build -p adjutant-gear_locker
 
+      # The fresh-machine proxy: a plugin produced only by `new-plugin` must load
+      # into a real server and answer its routes under the permission gate.
+      - name: Freshly scaffolded plugin loads and serves
+        run: |
+          mkdir -p fresh-built
+          cp target/debug/libadjutant_gear_locker.so fresh-built/
+          ADJUTANT_PLUGIN_DIR=fresh-built ./target/debug/adjutant test-plugin
+
       # Static validation: ABI handshake, init against in-memory mocks, and the
       # manifest rules — no database and no server. Proves the scaffold passes
       # the same gate a third-party plugin would.

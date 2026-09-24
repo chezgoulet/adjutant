@@ -13,7 +13,7 @@ dependencies = [
 
 [[package]]
 name = "adjutant-auth"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "adjutant-sdk",
  "argon2",
@@ -30,7 +30,7 @@ dependencies = [
 
 [[package]]
 name = "adjutant-hello"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "adjutant-sdk",
  "serde",
@@ -39,7 +39,7 @@ dependencies = [
 
 [[package]]
 name = "adjutant-membership"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "adjutant-sdk",
  "serde",
@@ -49,7 +49,7 @@ dependencies = [
 
 [[package]]
 name = "adjutant-sdk"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "async-trait",
  "chrono",
@@ -62,7 +62,7 @@ dependencies = [
 
 [[package]]
 name = "adjutant-server"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "adjutant-sdk",
  "async-trait",

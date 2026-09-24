@@ -9,10 +9,10 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ---
 
-## [Unreleased] — Milestone 4 (Core & SDK Stabilization)
+## [0.2.0] — 2026-09-24 — Milestone 4 (Core & SDK Stabilization)
 
-Targeting `adjutant-sdk` 0.2.0. Consolidates the M1–M3 contract before the first
-crates.io publication.
+Consolidates the M1–M3 contract and stabilizes the core/SDK before the first
+crates.io publication. `SDK_ABI_VERSION` is **2**.
 
 ### Added
 
