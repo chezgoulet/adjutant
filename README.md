@@ -27,6 +27,7 @@ docs/api-reference.md       Core + plugin HTTP API and the SDK surface
 docs/plugin-development.md  Plugin author guide (start here to write one)
 docs/sdk-compatibility.md   SDK version + compatibility policy
 docs/deployment.md          Deployment, upgrades, backup/restore
+docs/releasing.md           Release + crates.io publishing runbook
 docs/milestones/            Milestone evidence records
 docs/evidence/              Committed probe transcripts
 CONTRIBUTING.md             Dev setup, gates, and git flow
@@ -150,7 +151,8 @@ bundled plugins.
 
 ## Writing a plugin
 
-See [`docs/plugin-development.md`](docs/plugin-development.md). The short loop:
+See [`docs/plugin-development.md`](docs/plugin-development.md). The short loop
+(`cargo install adjutant-server` provides the `adjutant` CLI):
 
 ```bash
 adjutant new-plugin gear_locker
