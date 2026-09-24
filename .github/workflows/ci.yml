@@ -32,6 +32,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy
+          targets: wasm32-wasip1
 
       - uses: Swatinem/rust-cache@v2
 
@@ -79,6 +80,18 @@ jobs:
       # Route/registry smoke ladder against a pristine test database.
       - name: test-plugin harness
         run: ADJUTANT_PLUGIN_DIR=plugins-built ./target/debug/adjutant test-plugin
+
+      # The sandboxed path: build the WASM guest and load it through the same
+      # registry/dispatch pipeline (a separate plugin dir keeps the native
+      # harnesses above unaffected).
+      - name: Build the WASM guest
+        run: cargo build --manifest-path wasm/Cargo.toml --release --target wasm32-wasip1
+
+      - name: WASM guest loads and serves (test-plugin)
+        run: |
+          mkdir -p wasm-built
+          cp wasm/target/wasm32-wasip1/release/adjutant_hello_wasm.wasm wasm-built/
+          ADJUTANT_PLUGIN_DIR=wasm-built ./target/debug/adjutant test-plugin
 
       # End-to-end, with the spoofable dev-header stub OFF. The harness asserts
       # that precondition itself (probe 0) and exercises a mock OIDC provider.

@@ -1,6 +1,8 @@
 /target
 /local
 /plugins-built
+/wasm-built
+/wasm/target
 /.probe-plugins
 m2_probes_*.json
 *.so

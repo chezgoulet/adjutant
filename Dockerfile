@@ -5,7 +5,9 @@
 FROM rust:1.88-bookworm AS builder
 WORKDIR /src
 COPY . .
-RUN cargo build --release --workspace
+RUN rustup target add wasm32-wasip1 \
+    && cargo build --release --workspace \
+    && cargo build --manifest-path wasm/Cargo.toml --release --target wasm32-wasip1
 
 # --- runtime ----------------------------------------------------------------
 FROM debian:bookworm-slim AS runtime
@@ -19,6 +21,7 @@ RUN mkdir -p /app/plugins
 COPY --from=builder /src/target/release/libadjutant_hello.so /app/plugins/
 COPY --from=builder /src/target/release/libadjutant_auth.so /app/plugins/
 COPY --from=builder /src/target/release/libadjutant_membership.so /app/plugins/
+COPY --from=builder /src/wasm/target/wasm32-wasip1/release/adjutant_hello_wasm.wasm /app/plugins/
 
 # Dev identity headers stay OFF unless explicitly opted in (SPEC §7.1).
 ENV ADJUTANT_PLUGIN_DIR=/app/plugins \

@@ -1,5 +1,8 @@
 [workspace]
 resolver = "2"
+# The WASM guest crates are a separate workspace (built with
+# `--target wasm32-wasip1`); they must not be compiled for the host.
+exclude = ["wasm"]
 members = [
     "plugins/sdk",
     "plugins/auth",
@@ -32,6 +35,8 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 tower-http = { version = "0.6", features = ["cors"] }
 toml = "0.9"
+wasmtime = "49"
+wasmtime-wasi = "49"
 
 [profile.dev]
 debug = 0  # keep compile times sane for the prototype loop
