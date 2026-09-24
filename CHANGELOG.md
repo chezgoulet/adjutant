@@ -16,6 +16,13 @@ crates.io publication.
 
 ### Added
 
+- **Deployment assets.** `Dockerfile` + `docker-compose.yml` (server +
+  PostgreSQL, one command), `docs/deployment.md` (quick start, TLS, upgrade,
+  backup/restore), and a tag-triggered release workflow that publishes a
+  verified tarball (binary + bundled plugins).
+- **Supply-chain and doc gates.** `deny.toml` (advisories, licenses, bans,
+  sources), a `cargo doc -D warnings` gate, and an MSRV job, all in CI.
+  `rust-toolchain.toml` plus `rust-version = "1.88"` declare the toolchain.
 - **Enforced schema isolation.** Each plugin gets a `NOLOGIN` PostgreSQL role
   (`adjutant_plugin_<id>`); its runtime database handle runs under
   `SET LOCAL ROLE` with full rights on its own schema and an explicit allowlist
@@ -51,6 +58,18 @@ crates.io publication.
 
 ### Changed
 
+- **Unified error envelope + no 5xx leakage.** Every core/plugin error response
+  is `{"error": "..."}` built by one helper. `4xx` responses carry the plugin's
+  message (the client's fault); `5xx` responses are a generic `internal error`
+  with the detail logged, so SQL and driver messages never reach clients.
+- **Audit attribution is real.** `AuditService` now writes a genuine
+  `core.users` UUID to `core.audit_log.user_id`. Identities that are not users
+  (the dev-header stub) keep a NULL FK and are recorded in `details.user_id`
+  instead, so the actor is never lost.
+- **The spoofable dev identity headers are now opt-in.** `ADJUTANT_DEV_HEADERS`
+  defaults to `false`; enable it with `--allow-dev-headers`,
+  `ADJUTANT_DEV_HEADERS=true`, or `[auth] allow_dev_headers = true`. The
+  milestone harnesses set it explicitly.
 - **Breaking (ABI 2):** `Identity` gained a `grants: Vec<RoleGrant>` field. Use
   `Identity::new` / `Identity::from_grants` rather than a struct literal.
   `SDK_ABI_VERSION` is now `2`.

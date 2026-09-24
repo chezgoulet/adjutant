@@ -115,16 +115,23 @@ public SDK + testing module. **Met.**
 
 ### W2 — Core hardening
 
-- [ ] Flip `ADJUTANT_DEV_HEADERS` default to `false`; make dev headers an
-      explicit opt-in. Update harnesses and docs.
-- [ ] Write the real actor into `core.audit_log.user_id` when the auth plugin is
-      present (remove the `details`-embedded `user_id` workaround).
-- [ ] Unify the API error envelope and status mapping across core and plugins.
-- [ ] MSRV pin (`rust-toolchain.toml`), `cargo-deny`, and a `cargo doc`
-      warnings gate.
-- [ ] Dockerfile + `docker-compose.yml` (server + PostgreSQL) and a documented
-      upgrade / backup / restore story.
-- [ ] GitHub release workflow (build, tag, artifacts).
+- [x] Flip `ADJUTANT_DEV_HEADERS` default to `false`; make dev headers an
+      explicit opt-in. Update harnesses and docs. (`--allow-dev-headers` flag +
+      env + `[auth]` file; harnesses set it explicitly.)
+- [x] Write the real actor into `core.audit_log.user_id` when the auth plugin is
+      present (remove the `details`-embedded `user_id` workaround). Non-user
+      identities keep a NULL FK and fall back to `details.user_id`.
+- [x] Unify the API error envelope and status mapping across core and plugins.
+      One `{"error": ...}` envelope; 5xx responses are generic (detail logged,
+      not returned), 4xx carry the plugin message.
+- [x] MSRV pin (`rust-toolchain.toml`), `cargo-deny`, and a `cargo doc`
+      warnings gate. MSRV declared as 1.88; `deny.toml` + CI `cargo-deny`,
+      `cargo doc -D warnings`, and an MSRV `cargo check` job.
+- [x] Dockerfile + `docker-compose.yml` (server + PostgreSQL) and a documented
+      upgrade / backup / restore story — `docs/deployment.md`; image built and
+      smoke-tested against Postgres (health, open route, 401 on an admin route,
+      schema isolation active).
+- [x] GitHub release workflow (build, tag, artifacts) — `.github/workflows/release.yml`.
 
 **Exit criteria:** a fresh host can deploy the tagged core with one documented
 command; security defaults are safe; supply-chain and doc gates are enforced in CI.

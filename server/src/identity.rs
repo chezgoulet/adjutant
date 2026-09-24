@@ -10,8 +10,8 @@
 //! 1. enabled providers — first `Some(identity)` wins; a provider `Err` logs
 //!    and is skipped (never escalates, never falls through to spoofable headers
 //!    *because of* an error — the stub is gated by `allow_dev_headers` alone);
-//! 2. dev headers, only when `auth.allow_dev_headers` (default on in dev;
-//!    MUST be off in production — it is trivially spoofable).
+//! 2. dev headers, only when `auth.allow_dev_headers` (off by default; an
+//!    explicit dev opt-in — it is trivially spoofable).
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;

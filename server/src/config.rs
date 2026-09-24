@@ -51,8 +51,9 @@ pub struct Config {
     /// Empty = no CORS layer (same-origin only). `["*"]` allows everyone.
     pub cors_origins: Vec<String>,
     /// Dev identity headers (`x-dev-user`/`x-dev-role`). Trivially spoofable —
-    /// MUST be false in production; only consulted when no plugin identity
-    /// provider answered (SPEC §7.1).
+    /// **off by default**; enabling it is an explicit opt-in (`--allow-dev-headers`,
+    /// `ADJUTANT_DEV_HEADERS=true`, or `[auth] allow_dev_headers = true`). Only
+    /// consulted when no plugin identity provider answered (SPEC §7.1).
     pub allow_dev_headers: bool,
     /// Direct peers whose `x-forwarded-for` header may be trusted for rate
     /// limiting (reverse-proxy IPs). Empty = ignore the header entirely.
@@ -70,7 +71,7 @@ impl Default for Config {
             log_format: LogFormat::Pretty,
             rate: RateConfig::default(),
             cors_origins: Vec::new(),
-            allow_dev_headers: true,
+            allow_dev_headers: false,
             trusted_proxies: Vec::new(),
         }
     }
@@ -118,6 +119,8 @@ pub struct CliArgs {
     pub plugin_dir: Option<String>,
     pub log_filter: Option<String>,
     pub log_format: Option<String>,
+    /// Explicit opt-in to the spoofable dev identity headers (dev only).
+    pub allow_dev_headers: bool,
     pub help: bool,
 }
 
@@ -139,12 +142,16 @@ SERVE OPTIONS:
     --plugin-dir <PATH>    directory scanned for plugin cdylibs at boot/reload
     --log <FILTER>         tracing filter, e.g. info,adjutant_server=debug
     --log-format <FMT>     pretty | json
+    --allow-dev-headers    enable the spoofable x-dev-user/x-dev-role stub
+                           (DEVELOPMENT ONLY; off by default)
     -h, --help             print this help
 
 ENVIRONMENT (override file, overridden by flags):
     ADJUTANT_CONFIG, ADJUTANT_BIND, ADJUTANT_DATABASE_URL, ADJUTANT_PLUGIN_DIR,
     ADJUTANT_LOG, ADJUTANT_LOG_FORMAT, ADJUTANT_RATE_MAX, ADJUTANT_RATE_WINDOW,
-    ADJUTANT_CORS (comma-separated origins), ADJUTANT_MAX_BODY
+    ADJUTANT_CORS (comma-separated origins), ADJUTANT_MAX_BODY,
+    ADJUTANT_DEV_HEADERS (true enables the dev stub; off by default),
+    ADJUTANT_TRUSTED_PROXIES
 ";
 
 impl CliArgs {
@@ -177,6 +184,7 @@ impl CliArgs {
                 "--plugin-dir" => out.plugin_dir = Some(take("--plugin-dir")?),
                 "--log" => out.log_filter = Some(take("--log")?),
                 "--log-format" => out.log_format = Some(take("--log-format")?),
+                "--allow-dev-headers" => out.allow_dev_headers = true,
                 other => return Err(format!("unknown argument {other:?} (try --help)")),
             }
         }
@@ -253,6 +261,9 @@ pub fn load(cli: &CliArgs) -> Result<Config, String> {
     }
     if let Some(v) = &cli.log_format {
         cfg.log_format = LogFormat::parse(v)?;
+    }
+    if cli.allow_dev_headers {
+        cfg.allow_dev_headers = true;
     }
 
     Ok(cfg)
@@ -352,6 +363,37 @@ mod tests {
         let c = load(&cli2).unwrap();
         assert_eq!(c.bind.to_string(), "5.6.7.8:2222", "cli must beat env");
         std::env::remove_var("ADJUTANT_BIND");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn dev_headers_default_off_and_require_explicit_opt_in() {
+        // The spoofable stub must not be silently available.
+        assert!(!Config::default().allow_dev_headers);
+
+        let dir = std::env::temp_dir().join(format!("adjutant-cfg-dev-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("adjutant.toml");
+        std::fs::write(&file, "[auth]\nallow_dev_headers = true\n").unwrap();
+
+        // File opt-in.
+        let c = load(&CliArgs { config: Some(file.clone()), ..Default::default() }).unwrap();
+        assert!(c.allow_dev_headers, "file must be able to opt in");
+
+        // CLI flag is the highest layer: it beats an env that disables.
+        std::env::set_var("ADJUTANT_DEV_HEADERS", "false");
+        let c = load(&CliArgs {
+            config: Some(file.clone()),
+            allow_dev_headers: true,
+            ..Default::default()
+        })
+        .unwrap();
+        assert!(c.allow_dev_headers, "flag must beat env");
+        std::env::remove_var("ADJUTANT_DEV_HEADERS");
+
+        // And the flag parses.
+        assert!(CliArgs::parse(vec!["--allow-dev-headers".to_string()]).unwrap().allow_dev_headers);
 
         let _ = std::fs::remove_dir_all(&dir);
     }

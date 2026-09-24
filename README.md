@@ -30,7 +30,7 @@ docs/evidence/              Committed probe transcripts
 
 ## Prerequisites
 
-- Rust 1.96+ (the toolchain this repo is developed against; workspace edition 2021)
+- Rust 1.88+ (the declared MSRV; developed on stable, see `rust-toolchain.toml`)
 - PostgreSQL 14+ (18.6 in development) with `pgcrypto` available
 - `psql` on `PATH` for the probe harnesses
 
@@ -54,10 +54,10 @@ cp target/debug/libadjutant_hello.so \
    target/debug/libadjutant_auth.so \
    target/debug/libadjutant_membership.so plugins-built/
 
-# 4. run
+# 4. run (--allow-dev-headers is for local auth-less testing; dev only)
 ADJUTANT_PLUGIN_DIR=plugins-built \
 ADJUTANT_DATABASE_URL=postgres://adjutant@127.0.0.1:5433/adjutant_dev \
-  cargo run -p adjutant-server
+  cargo run -p adjutant-server -- --allow-dev-headers
 ```
 
 The server creates the `core` schema, runs core migrations, then each plugin's
@@ -81,14 +81,16 @@ Precedence is defaults < TOML file (./adjutant.toml or `--config`) < environment
 | `ADJUTANT_TRUSTED_PROXIES` | comma-separated peer IPs allowed to set `x-forwarded-for`. **Empty by default — the header is otherwise ignored**, because any client can send it |
 | `ADJUTANT_CORS` | comma-separated origins, `*` for any |
 | `ADJUTANT_MAX_BODY` | request body cap in bytes |
-| `ADJUTANT_DEV_HEADERS` | **`true` by default.** Enables the spoofable `x-dev-user`/`x-dev-role` identity stub. **Must be `false` in production.** The stub is only consulted when no plugin identity provider answered |
+| `ADJUTANT_DEV_HEADERS` | **`false` by default.** Set `true` (or pass `--allow-dev-headers`) to enable the spoofable `x-dev-user`/`x-dev-role` identity stub for development. Only consulted when no plugin identity provider answered |
 | `ADJUTANT_TEST_DATABASE_URL` | overrides the derived `_test` database for `adjutant test-plugin` and the DB-backed tests |
 
 ### Two operational hazards worth reading before deploying
 
-- **Dev headers default to on.** With `ADJUTANT_DEV_HEADERS=true`, anyone who can
-  reach the port can claim any role by setting two headers. Set it to `false` and
-  rely on the auth plugin's sessions. The milestone harnesses assert this for you.
+- **Dev headers are off by default — and spoofable when on.** With
+  `ADJUTANT_DEV_HEADERS=true` (or `--allow-dev-headers`), anyone who can reach
+  the port can claim any role by setting two headers. Keep it off (the default)
+  and rely on the auth plugin's sessions. The milestone harnesses assert this
+  for you.
 - **Disabling the last identity provider is refused.** With dev headers off the
   auth plugin is the only source of identity, so disabling or uninstalling it
   would make every authenticated route — including the admin route that would
@@ -112,7 +114,8 @@ add it there deliberately.
 ## Smoke test
 
 `GET /api/plugins` and `/api/events/recent` are admin-gated, so they need an
-identity. With dev headers on:
+identity. Start the server with dev headers enabled for the smoke test
+(`--allow-dev-headers`, or `ADJUTANT_DEV_HEADERS=true`), then:
 
 ```bash
 curl -s localhost:8787/                                # health
@@ -129,6 +132,17 @@ curl -s -H 'x-dev-user: christopher' -H 'x-dev-role: chief' \
 curl -s -H 'x-dev-user: christopher' -H 'x-dev-role: chief' \
      localhost:8787/api/events/recent                  # persisted event visible
 ```
+
+## Deployment
+
+```bash
+export POSTGRES_PASSWORD="$(openssl rand -hex 24)"
+docker compose up -d          # server + PostgreSQL
+```
+
+See [`docs/deployment.md`](docs/deployment.md) for TLS, upgrades, and
+backup/restore. Tagged releases (`v*`) publish a tarball with the binary and
+bundled plugins.
 
 ## Writing a plugin
 
