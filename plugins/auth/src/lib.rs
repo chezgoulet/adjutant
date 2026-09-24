@@ -92,6 +92,8 @@ struct SessionUser {
     email: Option<String>,
     display_name: String,
     roles: Vec<String>,
+    /// Scoped role grants (SPEC §9.2); `roles` is derived from these.
+    grants: Vec<RoleGrant>,
 }
 
 /// Extract a raw session token from `Cookie: adjutant_session=…` or
@@ -128,9 +130,16 @@ async fn session_identity(db: &DbHandle, token: &str) -> Result<Option<SessionUs
     let rows = db
         .query(
             "SELECT u.id::text AS id, u.username, u.email, u.display_name, u.is_active, \
-                    COALESCE(ARRAY(
-                        SELECT role_id FROM core.user_roles WHERE user_id = u.id
-                    ), '{}') AS roles \
+                    COALESCE(ARRAY(\
+                        SELECT role_id FROM core.user_roles WHERE user_id = u.id\
+                    ), '{}') AS roles, \
+                    COALESCE((\
+                        SELECT jsonb_agg(jsonb_build_object(\
+                            'role_id', role_id, \
+                            'scope_type', scope_type, \
+                            'scope_id', scope_id::text)) \
+                        FROM core.user_roles WHERE user_id = u.id\
+                    ), '[]'::jsonb) AS grant_list \
              FROM core.sessions s \
              JOIN core.users u ON u.id = s.user_id \
              WHERE s.token_hash = $1 AND s.expires_at > now()",
@@ -148,13 +157,40 @@ async fn session_identity(db: &DbHandle, token: &str) -> Result<Option<SessionUs
         .as_array()
         .map(|a| a.iter().filter_map(|v| v.as_str().map(String::from)).collect())
         .unwrap_or_default();
+    let grants: Vec<RoleGrant> = row["grant_list"]
+        .as_array()
+        .map(|a| a.iter().filter_map(grant_from_row).collect())
+        .unwrap_or_default();
     Ok(Some(SessionUser {
         id: row["id"].as_str().unwrap_or_default().to_string(),
         username: row["username"].as_str().unwrap_or_default().to_string(),
         email: row["email"].as_str().map(String::from),
         display_name: row["display_name"].as_str().unwrap_or_default().to_string(),
         roles,
+        grants,
     }))
+}
+
+/// One `core.user_roles` row (as JSON) → [`RoleGrant`]. A zero-UUID scope id
+/// means troop-wide (`None`).
+fn grant_from_row(g: &serde_json::Value) -> Option<RoleGrant> {
+    let role_id = g["role_id"].as_str()?.to_string();
+    if role_id.is_empty() {
+        return None;
+    }
+    let scope_type = match g["scope_type"].as_str().unwrap_or("troop") {
+        "lodge" => ScopeType::Lodge,
+        "patrol" => ScopeType::Patrol,
+        "personal" => ScopeType::Personal,
+        _ => ScopeType::Troop,
+    };
+    let scope_id = match g["scope_id"].as_str() {
+        Some(s) if !s.is_empty() && s != "00000000-0000-0000-0000-000000000000" => {
+            Some(s.to_string())
+        }
+        _ => None,
+    };
+    Some(RoleGrant { role_id, scope: Scope { scope_type, scope_id } })
 }
 
 /// PostgreSQL unique-violation detection. sqlx surfaces the driver message
@@ -232,10 +268,7 @@ impl IdentityProvider for SessionIdentityProvider {
             return Ok(None); // no credentials → core may fall back to dev headers
         };
         match session_identity(&self.db, &token).await? {
-            Some(user) => Ok(Some(Identity {
-                user_id: user.id,
-                roles: user.roles,
-            })),
+            Some(user) => Ok(Some(Identity::from_grants(user.id, user.grants))),
             None => Ok(None),
         }
     }
@@ -893,7 +926,7 @@ impl AuthPlugin {
                     let (session_token, expires) = create_session(&c.db, &uid, ttl).await?;
                     c.audit
                         .log(
-                            Some(&Identity { user_id: uid.clone(), roles: vec![] }),
+                            Some(&Identity::from_grants(uid.clone(), vec![])),
                             "auth.oidc.login",
                             "user",
                             &uid,

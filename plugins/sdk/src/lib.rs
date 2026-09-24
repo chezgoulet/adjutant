@@ -70,7 +70,7 @@ pub type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 /// the plugin factory and refuses a library whose value differs, so a stale
 /// build becomes a clear load error instead of undefined behaviour (the native
 /// loading caveat: core and plugin must be built against the same SDK).
-pub const SDK_ABI_VERSION: u32 = 1;
+pub const SDK_ABI_VERSION: u32 = 2;
 
 /// The SDK crate's SemVer version, for diagnostics and error messages.
 pub const SDK_VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -295,12 +295,111 @@ pub trait HostEvents: Send + Sync + 'static {
 // Identity & permissions
 // ---------------------------------------------------------------------------
 
-/// The authenticated caller. Produced by the core's auth middleware (Milestone 1
-/// uses a `x-dev-user` / `x-dev-role` header stub; the auth plugin replaces it).
+/// The level a role grant applies to (SPEC §9.2).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ScopeType {
+    /// Troop-wide authority.
+    Troop,
+    /// Scoped to one lodge.
+    Lodge,
+    /// Scoped to one patrol.
+    Patrol,
+    /// Scoped to the member's own data.
+    Personal,
+}
+
+/// A concrete scope. `scope_id` is `None` for troop-wide (the zero-UUID in
+/// `core.user_roles`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Scope {
+    pub scope_type: ScopeType,
+    pub scope_id: Option<String>,
+}
+
+impl Scope {
+    pub fn troop() -> Self {
+        Self { scope_type: ScopeType::Troop, scope_id: None }
+    }
+
+    pub fn lodge(id: impl Into<String>) -> Self {
+        Self { scope_type: ScopeType::Lodge, scope_id: Some(id.into()) }
+    }
+
+    pub fn patrol(id: impl Into<String>) -> Self {
+        Self { scope_type: ScopeType::Patrol, scope_id: Some(id.into()) }
+    }
+
+    pub fn personal(id: impl Into<String>) -> Self {
+        Self { scope_type: ScopeType::Personal, scope_id: Some(id.into()) }
+    }
+
+    /// Does this scope cover `other`? A troop-wide scope covers everything;
+    /// otherwise the type and id must match exactly. (The core does not know
+    /// the lodge→patrol hierarchy, so cover is intentionally flat.)
+    pub fn covers(&self, other: &Scope) -> bool {
+        if self.scope_type == ScopeType::Troop {
+            return true;
+        }
+        self.scope_type == other.scope_type && self.scope_id == other.scope_id
+    }
+}
+
+/// A role granted at a particular scope.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RoleGrant {
+    pub role_id: String,
+    pub scope: Scope,
+}
+
+/// The authenticated caller. Produced by an [`IdentityProvider`] (the auth
+/// plugin) or the gated dev-header stub.
+///
+/// `roles` is the flat set of granted role ids; `grants` carries each role with
+/// its scope. Use [`Identity::new`] for a troop-wide identity, or build
+/// `grants` explicitly for scoped ones. Route-level gating uses `roles`
+/// (any scope); in-handler checks can use
+/// [`PermissionService::has_in_scope`].
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Identity {
     pub user_id: String,
     pub roles: Vec<String>,
+    /// Scoped role grants (SPEC §9.2). Empty only for identities constructed
+    /// without [`Identity::new`]; prefer the constructor.
+    #[serde(default)]
+    pub grants: Vec<RoleGrant>,
+}
+
+impl Identity {
+    /// A troop-wide identity from a user id and role ids. Every role is granted
+    /// at troop scope.
+    pub fn new(user_id: impl Into<String>, roles: Vec<String>) -> Self {
+        let user_id = user_id.into();
+        let grants = roles
+            .iter()
+            .map(|r| RoleGrant { role_id: r.clone(), scope: Scope::troop() })
+            .collect();
+        Self { user_id, roles, grants }
+    }
+
+    /// An identity with explicit scoped grants. `roles` is derived from them.
+    pub fn from_grants(user_id: impl Into<String>, grants: Vec<RoleGrant>) -> Self {
+        let roles = grants.iter().map(|g| g.role_id.clone()).collect();
+        Self { user_id: user_id.into(), roles, grants }
+    }
+
+    /// Role ids whose grant covers `scope` (sorted, deduplicated).
+    pub fn roles_covering(&self, scope: &Scope) -> Vec<String> {
+        let mut out: Vec<String> = self
+            .grants
+            .iter()
+            .filter(|g| g.scope.covers(scope))
+            .map(|g| g.role_id.clone())
+            .collect();
+        out.sort();
+        out.dedup();
+        out
+    }
 }
 
 /// A permission a plugin defines. Registered into `core.permissions` on load.
@@ -329,18 +428,41 @@ impl PermissionService {
         Self { db }
     }
 
+    /// Check a permission against any role the identity holds, at any scope
+    /// (the route-level gate; SPEC §9.1).
     pub async fn has(&self, identity: Option<&Identity>, permission: &str) -> bool {
+        match identity {
+            Some(id) if !id.roles.is_empty() => self.roles_have(id.roles.clone(), permission).await,
+            _ => false,
+        }
+    }
+
+    /// Check a permission against only the roles whose grant **covers** `scope`
+    /// (SPEC §9.2). A troop-wide grant covers every scope; a lodge grant covers
+    /// only that lodge. Plugins call this in-handler when the action targets a
+    /// specific lodge/patrol/person; the route gate uses [`has`](Self::has).
+    pub async fn has_in_scope(
+        &self,
+        identity: Option<&Identity>,
+        permission: &str,
+        scope: &Scope,
+    ) -> bool {
         let Some(id) = identity else { return false };
-        if id.roles.is_empty() {
+        let roles = id.roles_covering(scope);
+        if roles.is_empty() {
             return false;
         }
+        self.roles_have(roles, permission).await
+    }
+
+    async fn roles_have(&self, roles: Vec<String>, permission: &str) -> bool {
         let rows = self
             .db
             .query(
                 "SELECT COUNT(*) AS n FROM core.role_permissions \
                  WHERE role_id = ANY($1) AND permission_id = $2"
                     .to_string(),
-                vec![id.roles.clone().into(), permission.to_string().into()],
+                vec![roles.into(), permission.to_string().into()],
             )
             .await;
         match rows {
@@ -895,8 +1017,8 @@ pub mod prelude {
         async_trait, export_plugin, event_handler, route_handler, AdjutantPlugin, AuditService,
         DbHandle, EventBusHandle, Event, EventSubscription, HostDb, HostEvents, HostHttp,
         HttpResponse, Identity, IdentityProvider, IdentityRegistrar, Method, Migration, Permission,
-        PermissionService, PluginContext, PluginRequest, PluginResponse, RouteDefinition, SdkError,
-        SqlValue,
+        PermissionService, PluginContext, PluginRequest, PluginResponse, RoleGrant, RouteDefinition,
+        Scope, ScopeType, SdkError, SqlValue,
     };
 }
 
@@ -1235,12 +1357,12 @@ pub mod testing {
             self
         }
 
-        /// Attach an authenticated caller.
+        /// Attach an authenticated caller (troop-wide roles).
         pub fn identity(mut self, user_id: &str, roles: &[&str]) -> Self {
-            self.req.identity = Some(Identity {
-                user_id: user_id.to_string(),
-                roles: roles.iter().map(|r| r.to_string()).collect(),
-            });
+            self.req.identity = Some(Identity::new(
+                user_id,
+                roles.iter().map(|r| r.to_string()).collect(),
+            ));
             self
         }
 
@@ -1404,11 +1526,55 @@ mod tests {
             rows: vec![serde_json::json!({"n": 1})],
         });
         let svc = PermissionService::new(db.clone());
-        let id = Some(Identity { user_id: "chris".into(), roles: vec!["chief".into()] });
+        let id = Some(Identity::new("chris", vec!["chief".into()]));
         assert!(svc.has(id.as_ref(), "hello:read").await);
         // no identity → false without touching the host
         assert!(!svc.has(None, "hello:read").await);
         assert_eq!(db.calls.lock().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn scope_cover_is_troop_wide_or_exact() {
+        assert!(Scope::troop().covers(&Scope::lodge("l1")));
+        assert!(Scope::troop().covers(&Scope::troop()));
+        assert!(Scope::lodge("l1").covers(&Scope::lodge("l1")));
+        assert!(!Scope::lodge("l1").covers(&Scope::lodge("l2")));
+        assert!(!Scope::lodge("l1").covers(&Scope::troop()));
+        assert!(!Scope::patrol("p1").covers(&Scope::lodge("p1")));
+    }
+
+    #[test]
+    fn roles_covering_filters_by_scope() {
+        let id = Identity::from_grants(
+            "bea",
+            vec![
+                RoleGrant { role_id: "chief".into(), scope: Scope::troop() },
+                RoleGrant { role_id: "lodge_commander".into(), scope: Scope::lodge("l1") },
+            ],
+        );
+        assert_eq!(id.roles_covering(&Scope::lodge("l2")), vec!["chief"]);
+        let mut at_l1 = id.roles_covering(&Scope::lodge("l1"));
+        at_l1.sort();
+        assert_eq!(at_l1, vec!["chief", "lodge_commander"]);
+        assert_eq!(id.roles, vec!["chief", "lodge_commander"]);
+    }
+
+    #[tokio::test]
+    async fn scoped_permission_check_uses_covering_roles() {
+        let db = Arc::new(StubDb {
+            calls: Mutex::new(vec![]),
+            rows: vec![serde_json::json!({"n": 1})],
+        });
+        let svc = PermissionService::new(db.clone());
+        let id = Identity::from_grants(
+            "bea",
+            vec![RoleGrant { role_id: "lodge_commander".into(), scope: Scope::lodge("l1") }],
+        );
+        assert!(svc.has_in_scope(Some(&id), "x", &Scope::lodge("l1")).await);
+        // A different lodge has no covering role: false without a query.
+        let before = db.calls.lock().unwrap().len();
+        assert!(!svc.has_in_scope(Some(&id), "x", &Scope::lodge("l2")).await);
+        assert_eq!(db.calls.lock().unwrap().len(), before);
     }
 
     #[tokio::test]
@@ -1426,7 +1592,7 @@ mod tests {
     async fn audit_log_injects_identity_and_stays_censored() {
         let db = Arc::new(StubDb::default());
         let audit = AuditService::new(db.clone(), "hello".into());
-        let id = Identity { user_id: "beatrice".into(), roles: vec!["scout".into()] };
+        let id = Identity::new("beatrice", vec!["scout".into()]);
         audit
             .log(Some(&id), "greet", "greeting", "hi", serde_json::json!({}))
             .await
