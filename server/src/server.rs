@@ -244,9 +244,13 @@ fn internal_error(what: &str, err: &dyn std::fmt::Display) -> Response {
 /// Write the audit row for a **state-changing** action; a failed write fails the
 /// request.
 ///
+/// `Some(response)` means "stop and return this 5xx" — the same shape as
+/// [`AppState::require_admin`] returns, and it keeps a large `Response` out of an
+/// `Err` variant (`clippy::result_large_err`).
+///
 /// Invariant: **a state change is never applied unless its audit row was
 /// written.** This must be called *before* the caller mutates anything; the
-/// caller applies the change only once it returns `Ok(())`. Read paths are
+/// caller applies the change only once it returns `None`. Read paths are
 /// unaffected — they stay best-effort and may warn and continue, because a
 /// failed read cannot hide a mutation.
 ///
@@ -262,12 +266,12 @@ async fn audit_state_change(
     resource_type: &str,
     resource_id: &str,
     details: serde_json::Value,
-) -> Result<(), Response> {
+) -> Option<Response> {
     match audit
         .log(identity, action, resource_type, resource_id, details)
         .await
     {
-        Ok(()) => Ok(()),
+        Ok(()) => None,
         Err(e) => {
             tracing::error!(
                 action,
@@ -275,7 +279,7 @@ async fn audit_state_change(
                 error = %e,
                 "audit write failed; failing the request"
             );
-            Err(internal_error("audit write", &e))
+            Some(internal_error("audit write", &e))
         }
     }
 }
@@ -596,7 +600,7 @@ async fn enable_plugin(
 
     // Audit, then apply — a state change is never applied unless its audit row
     // was written. Everything below this point mutates state.
-    if let Err(resp) = audit_state_change(
+    if let Some(resp) = audit_state_change(
         &state.audit,
         identity.as_ref(),
         "plugin.enable",
@@ -669,7 +673,7 @@ async fn disable_plugin(
     }
 
     // Audit, then apply (see `audit_state_change`).
-    if let Err(resp) = audit_state_change(
+    if let Some(resp) = audit_state_change(
         &state.audit,
         identity.as_ref(),
         "plugin.disable",
@@ -737,7 +741,7 @@ async fn uninstall_plugin(
     }
 
     // Audit, then apply (see `audit_state_change`).
-    if let Err(resp) = audit_state_change(
+    if let Some(resp) = audit_state_change(
         &state.audit,
         identity.as_ref(),
         "plugin.uninstall",
@@ -822,7 +826,7 @@ async fn reload_plugins(State(state): State<Arc<AppState>>, req: Request) -> Res
     // swap below is the state change this row precedes. Residual: `load_all` has
     // already run migrations/upserts, so a failed audit can leave an attempt whose
     // live effect did not land — the accepted trade (see `audit_state_change`).
-    if let Err(resp) = audit_state_change(
+    if let Some(resp) = audit_state_change(
         &state.audit,
         identity.as_ref(),
         "plugin.reload",
@@ -1036,7 +1040,7 @@ mod tests {
             serde_json::json!({}),
         )
         .await
-        .expect_err("a failed audit write must fail the request");
+        .expect("a failed audit write must fail the request");
         assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
     }
 

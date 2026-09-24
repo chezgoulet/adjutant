@@ -5,7 +5,10 @@ Adjutant is built by humans and AI agents together; the SPEC is the contract
 
 ## Prerequisites
 
-- Rust **1.96+** (`rust-toolchain.toml` pins stable + clippy + rustfmt)
+- Rust **1.96+** (the declared MSRV; `rust-toolchain.toml` pins the exact
+  toolchain + clippy + rustfmt). The toolchain is pinned in `rust-toolchain.toml`,
+  and a local toolchain that lags the pin produces a green run CI will not
+  reproduce — run `rustup update`, or just let rustup install the pinned version.
 - PostgreSQL 14+ (`pgcrypto` available)
 - `wasm32-wasip1` target if you work on WASM guests:
   `rustup target add wasm32-wasip1`
