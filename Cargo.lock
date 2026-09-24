@@ -35,6 +35,7 @@ dependencies = [
  "adjutant-sdk",
  "serde",
  "serde_json",
+ "tokio",
 ]
 
 [[package]]

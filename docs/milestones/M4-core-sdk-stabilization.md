@@ -66,9 +66,11 @@ document), not when the code merely exists.
 **Exit criteria:** `main` builds and its CI passes at the tagged commit; the
 baseline numbers are recorded here. **Met** — `v0.1.0` @ `6a0f2d7`, CI green.
 
-### W1 — Lock the SDK contract (target `adjutant-sdk` 0.2 → 1.0-rc)
+### W1 — Lock the SDK contract (target `adjutant-sdk` 0.2 → 1.0-rc) ✓
 
-**Branch:** `feature/m4-w1-sdk-contract`.
+**Branch:** `feature/m4-w1-sdk-contract` + follow-ups
+(`feature/m4-w1-identity-scope`, `feature/m4-w1-schema-isolation`,
+`feature/m4-w1-testing-dogfood`). **Status: complete.**
 
 - [x] Version handshake: `export_plugin!` emits an `adjutant_sdk_abi` symbol and
       the core verifies it against `SDK_ABI_VERSION` **before** the factory,
@@ -94,8 +96,9 @@ baseline numbers are recorded here. **Met** — `v0.1.0` @ `6a0f2d7`, CI green.
       gained `grants`). See `docs/plugin-development.md` §Scoped permissions.
 - [x] Public `adjutant_sdk::testing`: `MockDb`/`MockEvents`/`MockHttp`/
       `MockIdentity`, `TestHost::context`, and a `TestRequest` builder, with a
-      usage doctest. **Partial dogfood:** the SDK's own tests use it; retrofitting
-      `auth` + `membership` tests is still open.
+      usage doctest. **Dogfooded:** the SDK's own tests, `hello`, and now `auth`
+      (`session_identity` → scoped grants via `MockDb`) and `membership`
+      (`upsert_from_import` → `MockDb`) all exercise it.
 - [x] `adjutant validate-plugin`: static validation (ABI, init against mocks, id,
       permission references, migration versions, route namespace/captures/
       duplicates) with no database; wired into CI (incl. the scaffolded plugin).
@@ -108,8 +111,7 @@ baseline numbers are recorded here. **Met** — `v0.1.0` @ `6a0f2d7`, CI green.
 
 **Exit criteria:** a plugin can be scaffolded, statically validated, unit-tested
 with only the public SDK, and loaded; `auth` + `membership` pass using only the
-public SDK + testing module. **Remaining before met:** the `auth`/`membership`
-testing retrofit.
+public SDK + testing module. **Met.**
 
 ### W2 — Core hardening
 
