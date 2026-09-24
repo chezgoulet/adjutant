@@ -313,3 +313,25 @@ async fn probe_every_plugin_connection_is_the_plugin_role() {
     assert_eq!(r2.expect("query 2")[0]["u"], expected);
 }
 
+/// #19: `membership`'s role must have no access to `core.user_roles` at all —
+/// it had `INSERT`, which made `membership:manage` a path to granting `chief`.
+#[tokio::test]
+#[ignore = "DB-gated: needs ADJUTANT_TEST_DATABASE_URL + CREATEROLE; run with `-- --ignored`"]
+async fn probe_membership_role_cannot_write_user_roles() {
+    let (_admin, pools) = setup(&["membership"]).await;
+    let membership = host::CoreDb::new(pools[0].clone());
+
+    let err = membership
+        .execute(
+            "INSERT INTO core.user_roles (user_id, role_id) \
+             VALUES ('00000000-0000-0000-0000-000000000000', 'chief')"
+                .to_string(),
+            vec![],
+        )
+        .await
+        .expect_err("membership must not write core.user_roles");
+    assert!(
+        err.to_string().contains("permission denied"),
+        "expected a permission error, got: {err}"
+    );
+}

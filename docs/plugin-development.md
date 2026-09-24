@@ -238,9 +238,15 @@ Return an `SdkError` to short-circuit with the matching status:
 
 ## Scoped permissions (SPEC §9.2)
 
-Permissions can be scoped to a troop, lodge, patrol, or person. The route gate
-(`has`) checks the permission against any role the caller holds; an in-handler
-check can require that the role's grant actually **covers** a scope:
+Permissions can be scoped to a troop, lodge, or patrol. **A scope is checked
+where the resource is known, and the default is the restrictive one.**
+
+- The **core route gate** is unscoped today (it fires if the caller holds the
+  permission at *any* scope). A scope-aware gate (and the
+  `get_protected_any_scope` route constructor) is the 6b work in
+  [`design/scoped-permissions.md`](design/scoped-permissions.md).
+- A route whose reach is **one object** (a member, a mission) must check that
+  object's scope **in the handler** with `has_in_scope`:
 
 ```rust
 use adjutant_sdk::prelude::*;
@@ -254,14 +260,26 @@ async fn approve(ctx: &PluginContext, req: &PluginRequest, lodge_id: &str) -> Re
 }
 ```
 
-- `Identity` carries `roles` (flat) and `grants` (`RoleGrant { role_id, scope }`).
-  Build a troop-wide identity with `Identity::new(user_id, roles)`, or scoped
-  ones with `Identity::from_grants(user_id, grants)`.
+- `Identity` carries `grants` (`RoleGrant { role_id, scope }`); `roles` is the
+  flat set derived from them. Build a troop-wide identity with
+  `Identity::new(user_id, roles)`, or scoped ones with
+  `Identity::from_grants(user_id, grants)`.
 - `Scope::troop()` covers every scope; other scopes match by type and id
-  exactly. The core does not model the lodge→patrol hierarchy, so coverage is
-  intentionally flat.
+  exactly. Coverage is intentionally flat (the core does not model the
+  lodge→patrol hierarchy).
 - The auth plugin reads `core.user_roles(user_id, role_id, scope_type,
-  scope_id)` and populates `grants` for the session identity.
+  scope_id)`. **Scopes fail closed:** a `scope_type` that is not
+  `troop`/`lodge`/`patrol`, or a non-troop scope with no scope id, drops the
+  grant and logs an error — it is never widened. `personal` is retired.
+- **Role assignment is auth's alone** (`auth:manage_users`, `POST
+  /api/auth/roles`). Other plugins must not write `core.user_roles` — the
+  membership CSV importer ignores its `roles` column and reports it.
+
+A worked example of the object-route rule is membership's
+`GET /api/membership/member?id=`: `membership:read_all` reaches any member, a
+lodge-covering `membership:read_lodge` reaches that lodge, and `membership:read`
+reaches only the caller's own record. Absent and forbidden are the same 403, so
+existence is not leaked.
 
 ## Migrations and schema
 

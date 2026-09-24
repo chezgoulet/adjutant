@@ -40,7 +40,10 @@ pub fn core_grants(plugin_id: &str) -> Option<&'static [(&'static str, &'static 
         ("sessions", "SELECT, INSERT, DELETE"),
         ("user_roles", "SELECT, INSERT, DELETE"),
     ];
-    const MEMBERSHIP: &[(&str, &str)] = &[("users", "SELECT"), ("user_roles", "INSERT")];
+    // Membership reads users (to map a session to a roster entry) but must not
+    // write `core.user_roles`: role assignment belongs to auth (#19). It had
+    // INSERT here, which made `membership:manage` a path to granting `chief`.
+    const MEMBERSHIP: &[(&str, &str)] = &[("users", "SELECT")];
     match plugin_id {
         "auth" => Some(AUTH),
         "membership" => Some(MEMBERSHIP),
@@ -189,6 +192,10 @@ mod tests {
         assert!(
             membership.iter().all(|(_, p)| !p.contains("DELETE")),
             "membership is read/insert only on core tables"
+        );
+        assert!(
+            !membership.iter().any(|(t, _)| *t == "user_roles"),
+            "membership must not write/read core.user_roles (role assignment is auth's, #19)"
         );
     }
 }
