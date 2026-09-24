@@ -144,11 +144,14 @@ built on top of it, because both plugins are full of scope decisions:
 1. **Scope enforcement (SPEC §9.2).** Missions has Lodge Commander approval;
    governance has voting. Until the route gate consults scope, every granted
    permission behaves troop-wide — a lodge commander approves anything. See
-   issues #19–#22.
+   issues #19–#22 and the design for sign-off:
+   [`docs/design/scoped-permissions.md`](design/scoped-permissions.md).
 2. **The v0.2.0 boundary findings.** The three demonstrated escapes and the
    authorization defects from the v0.2.0 review (#17–#25) close before any
    third-party plugin is encouraged and before any outside-body conversation.
-   The current isolation model is a real mechanism but not yet a confinement.
+   The current isolation model is a real mechanism but not yet a confinement —
+   the fix is a design decision, not a patch:
+   [`docs/design/plugin-isolation.md`](design/plugin-isolation.md).
 
 ---
 
