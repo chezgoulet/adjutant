@@ -70,7 +70,7 @@ pub type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 /// the plugin factory and refuses a library whose value differs, so a stale
 /// build becomes a clear load error instead of undefined behaviour (the native
 /// loading caveat: core and plugin must be built against the same SDK).
-pub const SDK_ABI_VERSION: u32 = 3;
+pub const SDK_ABI_VERSION: u32 = 4;
 
 /// The SDK crate's SemVer version, for diagnostics and error messages.
 pub const SDK_VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -613,6 +613,46 @@ impl EventSubscription {
 }
 
 // ---------------------------------------------------------------------------
+// Scheduled work
+// ---------------------------------------------------------------------------
+
+/// Plugin-side scheduled handler: `Fn() -> Future<Result<(), SdkError>>`.
+pub type ScheduleHandler = Arc<dyn Fn() -> BoxFuture<'static, Result<(), SdkError>> + Send + Sync>;
+
+/// Wrap an async closure into a [`ScheduleHandler`].
+pub fn schedule_handler<F, Fut>(f: F) -> ScheduleHandler
+where
+    F: Fn() -> Fut + Send + Sync + 'static,
+    Fut: Future<Output = Result<(), SdkError>> + Send + 'static,
+{
+    Arc::new(move || Box::pin(f()))
+}
+
+/// A scheduled job a plugin declares.
+///
+/// The **core** runs `handler` every `every` on the plugin's own connection pool
+/// (its isolation role, exactly like a request), with a per-run timeout, and
+/// records each run in `core.scheduled_runs`. This is not a thread the plugin
+/// owns: the core starts the schedule when the plugin loads and stops it when the
+/// plugin is disabled, uninstalled or reloaded. One attempt per tick — a failure
+/// is recorded, not retried; the next tick is the retry.
+///
+/// Cadence is an **interval**, not cron: `Duration::from_secs(24 * 60 * 60)` is
+/// "every 24h from the last completed run". A cron parser is deliberately not in
+/// v1.
+pub struct Schedule {
+    pub name: String,
+    pub every: std::time::Duration,
+    pub handler: ScheduleHandler,
+}
+
+impl Schedule {
+    pub fn new(name: &str, every: std::time::Duration, handler: ScheduleHandler) -> Self {
+        Self { name: name.to_string(), every, handler }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Database
 // ---------------------------------------------------------------------------
 
@@ -1107,6 +1147,14 @@ pub trait AdjutantPlugin: Send + Sync {
         Vec::new()
     }
 
+    /// Scheduled work. The core starts each schedule when the plugin loads and
+    /// stops it on disable/uninstall/reload; each run is on the plugin's own
+    /// pool (isolation role) with a per-run timeout, and is recorded in
+    /// `core.scheduled_runs`.
+    fn schedules(&self) -> Vec<Schedule> {
+        Vec::new()
+    }
+
     /// Called on graceful shutdown, before the plugin instance is dropped.
     async fn shutdown(&mut self) -> Result<(), SdkError> {
         Ok(())
@@ -1152,11 +1200,11 @@ macro_rules! export_plugin {
 /// One import for plugin authors: `use adjutant_sdk::prelude::*;`
 pub mod prelude {
     pub use crate::{
-        async_trait, export_plugin, event_handler, route_handler, AdjutantPlugin, AuditService,
-        DbHandle, EventBusHandle, Event, EventSubscription, HostDb, HostEvents, HostHttp,
-        HttpResponse, Identity, IdentityProvider, IdentityRegistrar, Method, Migration, Permission,
-        PermissionService, PluginContext, PluginRequest, PluginResponse, RoleGrant, RouteDefinition,
-        Scope, ScopeType, SdkError, SqlValue,
+        async_trait, export_plugin, event_handler, route_handler, schedule_handler, AdjutantPlugin,
+        AuditService, DbHandle, EventBusHandle, Event, EventSubscription, HostDb, HostEvents,
+        HostHttp, HttpResponse, Identity, IdentityProvider, IdentityRegistrar, Method, Migration,
+        Permission, PermissionService, PluginContext, PluginRequest, PluginResponse, RoleGrant,
+        RouteDefinition, Schedule, ScheduleHandler, Scope, ScopeType, SdkError, SqlValue,
     };
 }
 
@@ -1619,6 +1667,14 @@ mod tests {
             self.replayed.lock().unwrap().push((since_id, limit));
             Ok(vec![])
         }
+    }
+
+    #[tokio::test]
+    async fn schedule_handler_wraps_a_closure() {
+        let ok = schedule_handler(|| async { Ok(()) });
+        assert!((ok)().await.is_ok());
+        let fail = schedule_handler(|| async { Err::<(), _>(SdkError::Internal("boom".into())) });
+        assert!(matches!((fail)().await, Err(SdkError::Internal(_))));
     }
 
     #[test]

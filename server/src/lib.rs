@@ -11,6 +11,7 @@ pub mod middleware;
 pub mod permissions;
 pub mod plugin_runtime;
 pub mod schema;
+pub mod scheduler;
 pub mod scope_hierarchy;
 pub mod server;
 pub mod wasm;

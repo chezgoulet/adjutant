@@ -10,6 +10,8 @@
 //! - **database**: reads/writes through the core-provided pool
 //! - **events**: publishes `hello.greeted`, subscribes to `hello.` and records
 //!   delivery — proving both halves of the bus
+//! - **schedules**: a no-op `heartbeat` the core runs, proving the scheduler
+//!   surface (declaration, loader, durable run record, admin visibility)
 
 use std::sync::OnceLock;
 
@@ -76,6 +78,18 @@ impl AdjutantPlugin for HelloPlugin {
                  payload TEXT, \
                  received_at TIMESTAMPTZ NOT NULL DEFAULT now()\
              );",
+        )]
+    }
+
+    fn schedules(&self) -> Vec<Schedule> {
+        // A no-op heartbeat proves the scheduler surface end to end: declared
+        // here, started by the core, recorded in `core.scheduled_runs`, and shown
+        // in `/api/plugins`. The first real consumer is membership's
+        // background-check timer.
+        vec![Schedule::new(
+            "heartbeat",
+            std::time::Duration::from_secs(3600),
+            schedule_handler(|| async { Ok(()) }),
         )]
     }
 

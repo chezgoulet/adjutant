@@ -59,6 +59,25 @@ new helper constructors, new `testing` mocks) do **not** bump the ABI version.
 | 0.1.0 | pre-handshake (no symbol) | M1–M3; refused by 0.2+ until rebuilt |
 | 0.2.0 (M4 target) | 2 | First version with the handshake and scoped identity (`Identity.grants`) |
 | 0.2.x (scope enforcement) | 3 | Scopes are enforced: `required_scope` on routes, `Identity.grants` is the source of truth (`roles` is derived), `ScopeType::Personal` removed, `PermissionService::has` → `has_any_scope`/`has_in_scope`/`reach` |
+| 0.2.x (core scheduler) | 4 | `AdjutantPlugin::schedules()` + `Schedule`/`schedule_handler`: the core runs plugin-declared periodic work on the plugin's pool, with a timeout, one attempt per tick, and a `core.scheduled_runs` record |
+
+## Migrating a plugin from ABI 3 to 4
+
+Rebuild against the new SDK (the core refuses an ABI-3 `.so`). `schedules()` has
+a default of "no schedules", so an existing plugin compiles unchanged. To run
+periodic work, implement:
+
+```rust
+fn schedules(&self) -> Vec<Schedule> {
+    vec![Schedule::new("renewal-sweep", Duration::from_secs(24 * 60 * 60),
+        schedule_handler(|| async { /* … */ Ok(()) }))]
+}
+```
+
+The handler runs on the plugin's own pool (its isolation role) with a 60s
+timeout; a failure is recorded in `core.scheduled_runs` and is **not** retried
+until the next interval. Cadence is an interval, not cron. Do not spawn your own
+thread.
 
 ## Migrating a plugin from ABI 2 to 3
 

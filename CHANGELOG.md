@@ -9,6 +9,32 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ---
 
+## [Unreleased] — Core scheduler
+
+**Breaking:** `SDK_ABI_VERSION` is bumped to **4**. A plugin built against ABI 3
+is refused at load with the existing actionable handshake error; rebuild it.
+
+### Added
+
+- **`AdjutantPlugin::schedules()` and `Schedule`** (#45; design
+  `docs/design/core-and-plugin-boundary.md` §4). The core runs plugin-declared
+  scheduled work with the same discipline as a request: on the plugin's own pool
+  (its isolation role), with a per-run timeout and **one attempt per tick** (a
+  failure is recorded, not retried), and one durable row per run in
+  `core.scheduled_runs`. Schedules start on load and are aborted on
+  disable/uninstall/reload. `schedule_handler(...)` wraps the closure;
+  `PluginInfo`/`/api/plugins` show each schedule's last run, last error and next
+  run. Cadence is an **interval** (`Duration`), not cron.
+
+### Migration for plugin authors
+
+Rebuild against SDK 0.2 / ABI 4. `schedules()` has a default (no schedules), so
+an existing plugin compiles unchanged; add `fn schedules(&self) -> Vec<Schedule>`
+that returns `Schedule::new(name, Duration, schedule_handler(|| async { … }))`
+to run periodic work. Do **not** spawn your own thread.
+
+---
+
 ## [Unreleased] — Scope enforcement
 
 **Breaking:** `SDK_ABI_VERSION` is bumped to **3**. A plugin built against ABI 2
