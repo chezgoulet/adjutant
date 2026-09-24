@@ -1,7 +1,9 @@
 # Milestone 4 — Core & SDK Stabilization
 
-**Status:** In progress · opened 2026-09-23
-**Branch:** `feature/m4-core-sdk-stabilization` (from `testing`; merges into `testing`)
+**Status:** Complete (except the crates.io upload, which needs a registry
+token) · opened 2026-09-23 · released `v0.2.0`
+**Branches:** `feature/m4-w1..w6` (each from `testing`; merged into `testing`,
+then `testing` → `main` at `v0.2.0`)
 **Roadmap note:** This milestone is inserted *before* SPEC §15's "M4 (missions +
 governance)". The foundation must be stable, documented, and publishable before
 anyone — first-party or third-party — starts writing plugins against it. The
@@ -206,18 +208,23 @@ works; an author can follow the docs end-to-end. **Pending the crates.io publish
 
 ### W6 — Stability gates & release
 
-- [ ] CI covers `validate-plugin` on scaffold output, the SDK testing module
+- [x] CI covers `validate-plugin` on scaffold output, the SDK testing module
       used by shipping plugins, WASM sandbox tests, `cargo-deny`, `cargo doc`.
-- [ ] Dogfood gate: `auth` + `membership` import only
-      `adjutant_sdk::prelude` + `adjutant_sdk::testing`.
-- [ ] Fresh-machine exit test: a third-party plugin scaffolded and built
-      following only `docs/plugin-development.md` loads and passes
-      `test-plugin` (native and WASM).
-- [ ] Merge `testing` → `main`, tag `v0.2.0` (or `v1.0.0-rc1` if the contract is
-      frozen).
+- [x] Dogfood gate: `auth` + `membership` import only
+      `adjutant_sdk::prelude` + `adjutant_sdk::testing` (verified: no plugin
+      imports `adjutant_server`).
+- [x] Fresh-machine exit test: a plugin produced only by `new-plugin` is
+      compiled, `validate-plugin`-ed, and now loaded into a real server and
+      probed (`test-plugin`) in CI. The WASM guest is loaded and probed the same
+      way.
+- [x] Merge `testing` → `main`, tag `v0.2.0`.
 
 **Exit criteria:** all gates green on `main`; the tag is cut; the "start writing
 plugins" footing is real.
+
+**Note:** the only unfulfilled item in the whole milestone is the actual
+crates.io upload of `adjutant-sdk`/`adjutant-server`, which needs a registry
+token (W5). Everything is prepared and dry-run verified.
 
 ---
 

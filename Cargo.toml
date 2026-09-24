@@ -12,7 +12,7 @@ members = [
 ]
 
 [workspace.package]
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 # Minimum supported Rust version. wasmtime 49 (the WASM host) requires 1.96;
 # that is the binding constraint. Bump only when a dependency (or we) require it.
@@ -21,7 +21,7 @@ license = "MIT"
 repository = "https://github.com/chezgoulet/adjutant"
 
 [workspace.dependencies]
-adjutant-sdk = { path = "plugins/sdk", version = "0.1.0" }
+adjutant-sdk = { path = "plugins/sdk", version = "0.2.0" }
 axum = "0.8"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "signal", "net"] }
 sqlx = { version = "0.8", default-features = false, features = ["postgres", "runtime-tokio", "macros", "chrono", "uuid"] }
