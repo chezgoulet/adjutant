@@ -15,7 +15,7 @@ See [`SPEC.md`](SPEC.md) for the full specification.
 server/                     Core server (library + binary `adjutant`)
   src/                      config, db, events, host, identity, middleware,
                             permissions, plugin_runtime, server, cli
-  tests/host_db.rs          DB-backed host-I/O tests (skip without a database)
+  tests/host_db.rs          DB-backed host-I/O tests (3, #[ignore]d; see Tests)
 plugins/sdk/                adjutant-sdk — the plugin contract
 plugins/auth/               auth plugin (argon2, sessions, roles, OIDC)
 plugins/membership/         membership plugin (roster, lodges, patrols, OSGi CSV)
@@ -166,13 +166,21 @@ ADJUTANT_PLUGIN_DIR=plugins-built ./target/debug/adjutant test-plugin
 ## Tests
 
 ```bash
-cargo test --workspace        # unit tests everywhere + 2 DB-backed host tests
-                              # (those two print SKIPPED unless
-                              #  ADJUTANT_TEST_DATABASE_URL is set)
+cargo test --workspace        # unit tests everywhere; the 3 DB-gated host
+                              # tests are #[ignore]d, so they are reported as
+                              # ignored, never as passed
 cargo clippy --workspace --all-targets
+# The DB-gated tests, explicitly. All 3 live in server/tests/host_db.rs:
+#   decode_covers_every_supported_type
+#   bind_params_round_trips_every_variant
+#   plugin_role_isolation_denies_cross_schema_access
 ADJUTANT_TEST_DATABASE_URL=postgres://adjutant@127.0.0.1:5433/adjutant_dev_test \
-  cargo test -p adjutant-server --test host_db
+  cargo test -p adjutant-server --test host_db -- --ignored --nocapture
 ```
+
+`ADJUTANT_TEST_DATABASE_URL` must name a database ending in `_test`; under
+`--ignored` a missing or unreachable database is a hard failure, so CI cannot
+pass while the isolation proof silently does not run.
 
 Two live harnesses prove the integration claims. Both drive a real server and a
 real database, and both are committed because the earlier, uncommitted probe
@@ -180,10 +188,12 @@ transcripts could not be reproduced by anyone else. CI runs all of them
 (`.github/workflows/ci.yml`) on every push and pull request.
 
 ```bash
-# M1 + M2: resets adjutant_dev, stages the hello plugin, boots its own server,
-# runs m1_regression -> middleware -> lifecycle -> tamper. Writes
-# docs/evidence/m2_probes.json. Needs port 8787 free.
-python3 scripts/probes.py
+# M1 + M2: drops/recreates and stages the hello plugin into the *_test database
+# named by ADJUTANT_DATABASE_URL (it refuses a name that does not end in _test),
+# boots its own server, runs m1_regression -> middleware -> lifecycle -> tamper.
+# Writes docs/evidence/m2_probes.json. Needs port 8787 free.
+ADJUTANT_DATABASE_URL=postgres://adjutant@127.0.0.1:5433/adjutant_dev_test \
+  python3 scripts/probes.py
 
 # adjutant test-plugin: pristine _test database, probes every registered route
 # with mock permissions. Requires CREATE DATABASE rights.

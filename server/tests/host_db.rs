@@ -2,34 +2,48 @@
 //! (`text[]` arrays decoded to Null, which silently emptied every role list and
 //! broke permission checks).
 //!
-//! Runs only when `ADJUTANT_TEST_DATABASE_URL` is set, so `cargo test
-//! --workspace` stays green on a machine without PostgreSQL. The skip is
-//! printed, never silent.
+//! These tests are `#[ignore]`d on purpose (issue #25). A bare
+//! `cargo test --workspace` reports them as **ignored**, never as passed, so a
+//! green local run cannot hide a database test that did not execute. CI runs
+//! them explicitly against a throwaway `_test` database:
+//!
+//! ```text
+//! ADJUTANT_TEST_DATABASE_URL=postgres://…/adjutant_dev_test \
+//!   cargo test -p adjutant-server --test host_db -- --ignored
+//! ```
+//!
+//! Under `--ignored` a missing, empty, or unreachable
+//! `ADJUTANT_TEST_DATABASE_URL` is a hard failure — never a skip.
 use std::sync::Arc;
 
 use adjutant_sdk::{HostDb, SqlValue};
 use adjutant_server::host::CoreDb;
 
-async fn repository_pool() -> Option<Arc<sqlx::PgPool>> {
-    let url = std::env::var("ADJUTANT_TEST_DATABASE_URL").ok()?;
+async fn repository_pool() -> Arc<sqlx::PgPool> {
+    let url = std::env::var("ADJUTANT_TEST_DATABASE_URL").expect(
+        "ADJUTANT_TEST_DATABASE_URL must be set to run the DB-gated host tests \
+         (they are #[ignore]d; pass `-- --ignored` and set the variable)",
+    );
+    assert!(
+        !url.trim().is_empty(),
+        "ADJUTANT_TEST_DATABASE_URL is set but empty; set it to a _test database or unset it"
+    );
     let pool = sqlx::postgres::PgPoolOptions::new()
         .max_connections(4)
         .connect(&url)
         .await
         .expect("ADJUTANT_TEST_DATABASE_URL is set but unreachable");
-    Some(Arc::new(pool))
+    Arc::new(pool)
 }
 
-async fn db() -> Option<Arc<CoreDb>> {
-    Some(CoreDb::new(repository_pool().await?))
+async fn db() -> Arc<CoreDb> {
+    CoreDb::new(repository_pool().await)
 }
 
 #[tokio::test]
+#[ignore = "DB-gated: needs ADJUTANT_TEST_DATABASE_URL; run with `-- --ignored`"]
 async fn decode_covers_every_supported_type() {
-    let Some(db) = db().await else {
-        eprintln!("SKIPPED decode_covers_every_supported_type: set ADJUTANT_TEST_DATABASE_URL");
-        return;
-    };
+    let db = db().await;
     let rows = db
         .query(
             "SELECT '{\"a\":1}'::jsonb AS j, \
@@ -59,11 +73,9 @@ async fn decode_covers_every_supported_type() {
 }
 
 #[tokio::test]
+#[ignore = "DB-gated: needs ADJUTANT_TEST_DATABASE_URL; run with `-- --ignored`"]
 async fn bind_params_round_trips_every_variant() {
-    let Some(db) = db().await else {
-        eprintln!("SKIPPED bind_params_round_trips_every_variant: set ADJUTANT_TEST_DATABASE_URL");
-        return;
-    };
+    let db = db().await;
     let out = db
         .query(
             "SELECT $1::text AS t, $2::bigint AS i, $3::bool AS b, $4::text[] AS arr, $5::jsonb AS j"
@@ -88,15 +100,16 @@ async fn bind_params_round_trips_every_variant() {
 
 /// Schema isolation is enforced by PostgreSQL, not by convention: a plugin's
 /// `SET LOCAL ROLE` handle can read its own schema but is denied another
-/// plugin's. Skips (loudly) when the test database's role cannot manage roles.
+/// plugin's. The test database role must be able to manage roles
+/// (`CREATEROLE`/superuser); if it cannot, the isolation proof cannot run and
+/// the test fails rather than skipping (issue #25 — a skipped proof is not
+/// coverage).
 #[tokio::test]
+#[ignore = "DB-gated: needs ADJUTANT_TEST_DATABASE_URL + CREATEROLE; run with `-- --ignored`"]
 async fn plugin_role_isolation_denies_cross_schema_access() {
     use adjutant_server::schema;
 
-    let Some(pool) = repository_pool().await else {
-        eprintln!("SKIPPED plugin_role_isolation_denies_cross_schema_access: set ADJUTANT_TEST_DATABASE_URL");
-        return;
-    };
+    let pool = repository_pool().await;
 
     for s in ["iso_alpha", "iso_beta"] {
         sqlx::query(&format!("DROP SCHEMA IF EXISTS \"{s}\" CASCADE"))
@@ -109,16 +122,10 @@ async fn plugin_role_isolation_denies_cross_schema_access() {
             .expect("create schema");
     }
 
-    let alpha_role = match schema::ensure_isolation(&pool, "iso_alpha").await {
-        Ok(r) => r,
-        Err(e) => {
-            eprintln!(
-                "SKIPPED plugin_role_isolation_denies_cross_schema_access: \
-                 cannot manage roles ({e})"
-            );
-            return;
-        }
-    };
+    let alpha_role = schema::ensure_isolation(&pool, "iso_alpha").await.expect(
+        "the test database role must manage roles (CREATEROLE/superuser) so the \
+         isolation proof actually runs; use a throwaway superuser database",
+    );
     let _ = schema::ensure_isolation(&pool, "iso_beta").await;
 
     sqlx::query("CREATE TABLE iso_alpha.t (id BIGINT PRIMARY KEY)")

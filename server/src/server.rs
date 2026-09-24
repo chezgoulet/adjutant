@@ -26,7 +26,7 @@ use serde_json::json;
 use tokio::sync::RwLock;
 use tower_http::cors::{Any, CorsLayer};
 
-use adjutant_sdk::{AuditService, PermissionService, PluginRequest};
+use adjutant_sdk::{AuditService, Identity, PermissionService, PluginRequest};
 
 use crate::config::Config;
 use crate::db;
@@ -239,6 +239,49 @@ fn error_response(status: StatusCode, message: impl Into<String>) -> Response {
 fn internal_error(what: &str, err: &dyn std::fmt::Display) -> Response {
     tracing::error!(operation = what, error = %err, "internal error");
     error_response(StatusCode::INTERNAL_SERVER_ERROR, "internal error")
+}
+
+/// Write the audit row for a **state-changing** action; a failed write fails the
+/// request.
+///
+/// `Some(response)` means "stop and return this 5xx" — the same shape as
+/// [`AppState::require_admin`] returns, and it keeps a large `Response` out of an
+/// `Err` variant (`clippy::result_large_err`).
+///
+/// Invariant: **a state change is never applied unless its audit row was
+/// written.** This must be called *before* the caller mutates anything; the
+/// caller applies the change only once it returns `None`. Read paths are
+/// unaffected — they stay best-effort and may warn and continue, because a
+/// failed read cannot hide a mutation.
+///
+/// Residual, deliberate: because the audit row is written first, it can precede
+/// an apply that subsequently fails (a concurrent uninstall, or a DB write
+/// error). The log then records an attempt whose effect did not land. Attempts
+/// are auditable; unaudited changes are not acceptable. There is no
+/// compensation/rollback for the in-memory registry by design.
+async fn audit_state_change(
+    audit: &AuditService,
+    identity: Option<&Identity>,
+    action: &str,
+    resource_type: &str,
+    resource_id: &str,
+    details: serde_json::Value,
+) -> Option<Response> {
+    match audit
+        .log(identity, action, resource_type, resource_id, details)
+        .await
+    {
+        Ok(()) => None,
+        Err(e) => {
+            tracing::error!(
+                action,
+                resource = resource_id,
+                error = %e,
+                "audit write failed; failing the request"
+            );
+            Some(internal_error("audit write", &e))
+        }
+    }
 }
 
 async fn dynamic_dispatch(State(state): State<Arc<AppState>>, req: Request) -> Response {
@@ -549,12 +592,34 @@ async fn enable_plugin(
         return resp;
     }
     let identity = state.resolve_identity(req.headers()).await;
-    let changed = {
-        let mut reg = state.registry.write().await;
-        reg.set_enabled(&name, true)
-    };
-    if !changed {
+
+    // Validate before any side effect: the plugin must be loaded.
+    if !state.registry.read().await.contains(&name) {
         return error_response(StatusCode::NOT_FOUND, "plugin not loaded");
+    }
+
+    // Audit, then apply — a state change is never applied unless its audit row
+    // was written. Everything below this point mutates state.
+    if let Some(resp) = audit_state_change(
+        &state.audit,
+        identity.as_ref(),
+        "plugin.enable",
+        "plugin",
+        &name,
+        json!({}),
+    )
+    .await
+    {
+        return resp;
+    }
+
+    {
+        let mut reg = state.registry.write().await;
+        if !reg.set_enabled(&name, true) {
+            // Raced with an uninstall between validation and apply. The audit row
+            // above is the accepted residual: an attempt is recorded.
+            return error_response(StatusCode::NOT_FOUND, "plugin not loaded");
+        }
     }
     state.identity.set_enabled(&name, true);
     // Re-bind subscriptions that disable aborted (only if none are bound, so a
@@ -575,13 +640,6 @@ async fn enable_plugin(
     .await;
     if let Err(e) = dbres {
         return internal_error("plugin lifecycle", &e);
-    }
-    if let Err(e) = state
-        .audit
-        .log(identity.as_ref(), "plugin.enable", "plugin", &name, json!({}))
-        .await
-    {
-        tracing::error!(action = "plugin.enable", plugin = %&name, error = %e, "audit write failed");
     }
     Json(json!({ "plugin": name, "enabled": true })).into_response()
 }
@@ -609,12 +667,30 @@ async fn disable_plugin(
             .into_response();
     }
     let identity = state.resolve_identity(req.headers()).await;
-    let changed = {
-        let mut reg = state.registry.write().await;
-        reg.set_enabled(&name, false)
-    };
-    if !changed {
+    // Validate before any side effect: the plugin must be loaded.
+    if !state.registry.read().await.contains(&name) {
         return error_response(StatusCode::NOT_FOUND, "plugin not loaded");
+    }
+
+    // Audit, then apply (see `audit_state_change`).
+    if let Some(resp) = audit_state_change(
+        &state.audit,
+        identity.as_ref(),
+        "plugin.disable",
+        "plugin",
+        &name,
+        json!({}),
+    )
+    .await
+    {
+        return resp;
+    }
+
+    {
+        let mut reg = state.registry.write().await;
+        if !reg.set_enabled(&name, false) {
+            return error_response(StatusCode::NOT_FOUND, "plugin not loaded");
+        }
     }
     state.identity.set_enabled(&name, false);
     // Stop the plugin's event handlers too: routes 404-ing while its handlers keep
@@ -628,13 +704,6 @@ async fn disable_plugin(
     .await;
     if let Err(e) = dbres {
         return internal_error("plugin lifecycle", &e);
-    }
-    if let Err(e) = state
-        .audit
-        .log(identity.as_ref(), "plugin.disable", "plugin", &name, json!({}))
-        .await
-    {
-        tracing::error!(action = "plugin.disable", plugin = %&name, error = %e, "audit write failed");
     }
     Json(json!({ "plugin": name, "enabled": false })).into_response()
 }
@@ -666,12 +735,30 @@ async fn uninstall_plugin(
             .into_response();
     }
     let identity = state.resolve_identity(req.headers()).await;
-    let removed = {
-        let mut reg = state.registry.write().await;
-        reg.uninstall(&name)
-    };
-    if !removed {
+    // Validate before any side effect: the plugin must be loaded.
+    if !state.registry.read().await.contains(&name) {
         return error_response(StatusCode::NOT_FOUND, "plugin not loaded");
+    }
+
+    // Audit, then apply (see `audit_state_change`).
+    if let Some(resp) = audit_state_change(
+        &state.audit,
+        identity.as_ref(),
+        "plugin.uninstall",
+        "plugin",
+        &name,
+        json!({}),
+    )
+    .await
+    {
+        return resp;
+    }
+
+    {
+        let mut reg = state.registry.write().await;
+        if !reg.uninstall(&name) {
+            return error_response(StatusCode::NOT_FOUND, "plugin not loaded");
+        }
     }
     // NOTE: `enabled` is deliberately NOT flipped here. Uninstall means
     // "not installed"; a later reinstall (clear the flag + reload) must come
@@ -690,13 +777,6 @@ async fn uninstall_plugin(
     }
     state.bus.clear_plugin(&name).await;
     state.identity.remove(&name);
-    if let Err(e) = state
-        .audit
-        .log(identity.as_ref(), "plugin.uninstall", "plugin", &name, json!({}))
-        .await
-    {
-        tracing::error!(action = "plugin.uninstall", plugin = %&name, error = %e, "audit write failed");
-    }
     Json(json!({
         "plugin": name,
         "uninstalled": true,
@@ -741,6 +821,24 @@ async fn reload_plugins(State(state): State<Arc<AppState>>, req: Request) -> Res
         .map(|p| (p.info.id.clone(), p.info.version.clone()))
         .collect();
 
+    // Audit, then apply. `load_all` above is the validation/preparation step (it
+    // refuses with a 5xx on a load error, before this point); the live-registry
+    // swap below is the state change this row precedes. Residual: `load_all` has
+    // already run migrations/upserts, so a failed audit can leave an attempt whose
+    // live effect did not land — the accepted trade (see `audit_state_change`).
+    if let Some(resp) = audit_state_change(
+        &state.audit,
+        identity.as_ref(),
+        "plugin.reload",
+        "plugin",
+        "*",
+        json!({ "reloaded": ids, "routes": route_count }),
+    )
+    .await
+    {
+        return resp;
+    }
+
     // Swap, then rebind subscriptions: abort every old task first so no
     // event is handled by both the old and the new instance.
     {
@@ -767,19 +865,6 @@ async fn reload_plugins(State(state): State<Arc<AppState>>, req: Request) -> Res
         }
     }
 
-    if let Err(e) = state
-        .audit
-        .log(
-            identity.as_ref(),
-            "plugin.reload",
-            "plugin",
-            "*",
-            json!({ "reloaded": ids, "routes": route_count }),
-        )
-        .await
-    {
-        tracing::error!(action = "plugin.reload", error = %e, "audit write failed");
-    }
     tracing::info!(routes = route_count, "registry hot-reloaded");
     Json(json!({
         "reloaded": ids,
@@ -791,7 +876,20 @@ async fn reload_plugins(State(state): State<Arc<AppState>>, req: Request) -> Res
 
 #[cfg(test)]
 mod tests {
-    use super::decode_path;
+    use super::{audit_state_change, decode_path, enable_plugin, AppState};
+    use adjutant_sdk::{
+        async_trait, AdjutantPlugin, AuditService, EventSubscription, HostDb, Identity, Migration,
+        Permission, PermissionService, PluginContext, RouteDefinition, SdkError, SqlValue,
+    };
+    use axum::extract::{Path, State};
+    use axum::http::StatusCode;
+    use std::sync::Arc;
+    use tokio::sync::RwLock;
+
+    use crate::config::Config;
+    use crate::events::EventBus;
+    use crate::identity::IdentityHub;
+    use crate::plugin_runtime::{LoadedPlugin, PluginInfo, PluginRegistry};
 
     #[test]
     fn captures_are_percent_decoded_once() {
@@ -803,6 +901,182 @@ mod tests {
         // Malformed escapes are left alone rather than dropped.
         assert_eq!(decode_path("%zz"), "%zz");
         assert_eq!(decode_path("plain"), "plain");
+    }
+
+    /// A host DB whose audit write always fails, so the real failure path runs.
+    struct FailingAuditDb;
+
+    #[async_trait]
+    impl HostDb for FailingAuditDb {
+        async fn execute(&self, _sql: String, _params: Vec<SqlValue>) -> Result<u64, SdkError> {
+            Err(SdkError::Db("audit table is read-only".into()))
+        }
+        async fn query(
+            &self,
+            _sql: String,
+            _params: Vec<SqlValue>,
+        ) -> Result<Vec<serde_json::Value>, SdkError> {
+            Err(SdkError::Db("core.users unavailable".into()))
+        }
+    }
+
+    /// A host DB that lets every permission check pass (`n = 1`), so
+    /// `require_admin` succeeds without a database.
+    struct AllowPermissionsDb;
+
+    #[async_trait]
+    impl HostDb for AllowPermissionsDb {
+        async fn execute(&self, _sql: String, _params: Vec<SqlValue>) -> Result<u64, SdkError> {
+            Ok(1)
+        }
+        async fn query(
+            &self,
+            _sql: String,
+            _params: Vec<SqlValue>,
+        ) -> Result<Vec<serde_json::Value>, SdkError> {
+            Ok(vec![serde_json::json!({ "n": 1 })])
+        }
+    }
+
+    /// A minimal plugin for the registry fixture; `init` is never called.
+    struct TinyPlugin;
+
+    #[async_trait]
+    impl AdjutantPlugin for TinyPlugin {
+        fn id(&self) -> &str {
+            "hello"
+        }
+        fn name(&self) -> &str {
+            "Hello"
+        }
+        fn version(&self) -> &str {
+            "0.0.1"
+        }
+        async fn init(&mut self, _ctx: PluginContext) -> Result<(), SdkError> {
+            Ok(())
+        }
+        fn routes(&self) -> Vec<RouteDefinition> {
+            Vec::new()
+        }
+        fn migrations(&self) -> Vec<Migration> {
+            Vec::new()
+        }
+        fn permissions_granted(&self) -> Vec<Permission> {
+            Vec::new()
+        }
+        fn subscriptions(&self) -> Vec<EventSubscription> {
+            Vec::new()
+        }
+    }
+
+    fn loaded_hello(enabled: bool) -> LoadedPlugin {
+        LoadedPlugin {
+            plugin: Box::new(TinyPlugin),
+            library: None,
+            routes: Vec::new(),
+            enabled,
+            info: PluginInfo {
+                id: "hello".into(),
+                name: "Hello".into(),
+                version: "0.0.1".into(),
+                enabled,
+                routes: 0,
+                kind: "native".into(),
+                permissions: Vec::new(),
+                route_list: Vec::new(),
+            },
+        }
+    }
+
+    /// An `AppState` whose audit writes always fail and whose pool is lazy (never
+    /// connected), so `enable_plugin` can be driven end to end: the permission
+    /// gate passes, the audit write fails, and any mutation would be a bug.
+    fn failing_audit_state() -> Arc<AppState> {
+        let pool = Arc::new(
+            sqlx::postgres::PgPoolOptions::new()
+                .connect_lazy("postgres://adjutant:adjutant@127.0.0.1:1/adjutant_test")
+                .expect("lazy pool URL parses"),
+        );
+        let config = Config {
+            allow_dev_headers: true,
+            ..Config::default()
+        };
+        Arc::new(AppState {
+            pool,
+            permissions: PermissionService::new(Arc::new(AllowPermissionsDb)),
+            audit: AuditService::new(Arc::new(FailingAuditDb), "core".into()),
+            registry: RwLock::new(PluginRegistry {
+                plugins: vec![loaded_hello(false)],
+                retired: Vec::new(),
+            }),
+            bus: EventBus::new(),
+            config: Arc::new(config),
+            identity: IdentityHub::new(),
+            http: crate::host::CoreHttp::new(),
+        })
+    }
+
+    fn dev_admin_request() -> axum::extract::Request {
+        axum::http::Request::builder()
+            .header("x-dev-user", "christopher")
+            .header("x-dev-role", "chief")
+            .body(axum::body::Body::empty())
+            .expect("request builds")
+    }
+
+    /// Issue #24: the lifecycle routes used to log the audit failure and still
+    /// answer success, so a mutation could commit with no audit row. The shared
+    /// helper they call must instead tell the caller the action failed (5xx).
+    #[tokio::test]
+    async fn failed_audit_write_fails_a_state_changing_request() {
+        let audit = AuditService::new(Arc::new(FailingAuditDb), "core".into());
+        let id = Identity::new("christopher", vec!["chief".into()]);
+        let resp = audit_state_change(
+            &audit,
+            Some(&id),
+            "plugin.enable",
+            "plugin",
+            "hello",
+            serde_json::json!({}),
+        )
+        .await
+        .expect("a failed audit write must fail the request");
+        assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    }
+
+    /// Issue #24 follow-up: the order must be validate → audit → apply. A failed
+    /// audit write must leave the plugin untouched. This drives the real
+    /// `enable_plugin` handler end to end (permission gate included); the old
+    /// order applied the registry change first, so this test would have found the
+    /// plugin enabled after a 5xx.
+    #[tokio::test]
+    async fn failed_audit_write_does_not_apply_the_change() {
+        let state = failing_audit_state();
+        let resp = enable_plugin(
+            State(state.clone()),
+            Path("hello".to_string()),
+            dev_admin_request(),
+        )
+        .await;
+        assert_eq!(
+            resp.status(),
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "a failed audit write must fail the request"
+        );
+
+        let reg = state.registry.read().await;
+        let plugin = reg
+            .plugins
+            .iter()
+            .find(|p| p.info.id == "hello")
+            .expect("fixture plugin");
+        assert!(!plugin.enabled, "the registry flag must not be flipped on audit failure");
+        assert!(!plugin.info.enabled);
+        drop(reg);
+        assert!(
+            !state.bus.subscriber_ids().iter().any(|id| id == "hello"),
+            "no subscription may be bound on audit failure"
+        );
     }
 }
 

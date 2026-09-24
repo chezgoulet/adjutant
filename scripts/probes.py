@@ -11,8 +11,9 @@ Run:  python3 scripts/probes.py [--json docs/evidence/m2_probes.json]
 
 Prerequisites (checked, not assumed):
   * `cargo build --workspace` has produced target/debug/adjutant
-  * PostgreSQL reachable at $ADJUTANT_DATABASE_URL (default 5433/adjutant_dev);
-    the database is DROPPED AND RECREATED unless --no-reset is passed
+  * PostgreSQL reachable at $ADJUTANT_DATABASE_URL; the name MUST end in `_test`,
+    because this harness drops and recreates it (the same guard as `adjutant
+    test-plugin`) and mutates it even under --no-reset
   * port 8787 free
 
 Batches: m1_regression, middleware, lifecycle, tamper — matching the M2 doc's
@@ -74,6 +75,21 @@ def psql(sql, db=None):
     url = DSN if db is None else re.sub(r"/[^/]+$", "/" + db, DSN)
     p = subprocess.run(["psql", url, "-tAc", sql], capture_output=True, text=True, timeout=30)
     return p.returncode, p.stdout.strip(), p.stderr.strip()
+
+
+def require_test_database():
+    """Refuse to run against a non-`_test` database.
+
+    Mirrors `adjutant test-plugin`'s guard: this harness drops, recreates, and
+    mutates whatever `ADJUTANT_DATABASE_URL` names, so pointing it at the live
+    dev database (the old default) is a data-loss footgun.
+    """
+    dbname = DSN.rsplit("/", 1)[-1].split("?")[0]
+    if not dbname.endswith("_test"):
+        sys.exit(
+            f"refusing to run against {dbname!r}: ADJUTANT_DATABASE_URL must name a "
+            f"database ending in _test (e.g. .../adjutant_dev_test)"
+        )
 
 
 def reset_db():
@@ -371,6 +387,7 @@ def main():
 
     if not (ROOT / "target/debug/adjutant").exists():
         sys.exit("target/debug/adjutant missing — run `cargo build --workspace` first")
+    require_test_database()
     if not args.no_reset:
         ok, detail = reset_db()
         print(f"[probes] {detail}")

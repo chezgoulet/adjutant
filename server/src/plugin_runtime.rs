@@ -48,8 +48,24 @@ fn park(lib: Arc<libloading::Library>) {
     PARKED.lock().expect("parking lot poisoned").push(lib);
 }
 
-/// Core-owned route namespaces plugins may never claim.
-const RESERVED_IDS: &[&str] = &["plugins", "events", "audit", "core"];
+/// Plugin ids the core keeps for itself, or for a first-party plugin whose
+/// grants are keyed on its id.
+///
+/// **Enforced for untrusted plugins only** — sandboxed WASM guests, whose id
+/// comes from a manifest they declare ([`validate_untrusted_plugin_id`]). It is
+/// deliberately NOT enforced for native `.so` plugins: they run in-process and
+/// unsandboxed, the SDK docs already state native loading "is not a security
+/// boundary", and the first-party `auth`/`membership` plugins legitimately use
+/// these ids ([`validate_plugin_id`] applies only the shape rule to them).
+///
+/// The list exists because [`crate::schema::core_grants`] keys its `core.*`
+/// allowlist on the plugin id string: a guest that declared `id: "auth"` would
+/// inherit `SELECT/INSERT/UPDATE` on `core.users` and the session/role grants.
+/// One shared list, enforced where the plugin is untrusted, is the fix for
+/// issue #21. The deeper fix — keying grants on something a plugin cannot
+/// declare — is part of the isolation work (#17/#18), not this PR.
+pub const RESERVED_IDS: &[&str] =
+    &["plugins", "events", "audit", "core", "sdk", "auth", "membership"];
 
 /// A loaded plugin: the boxed trait object, the library that owns its code,
 /// its routes, its admin snapshot, and its enabled flag.
@@ -188,6 +204,13 @@ impl PluginRegistry {
 
     pub fn is_empty(&self) -> bool {
         self.plugins.is_empty()
+    }
+
+    /// Is this plugin currently live? A read-only check for handlers that must
+    /// validate before any side effect (the lifecycle routes audit first, then
+    /// apply, so "not loaded" has to be decided without mutating).
+    pub fn contains(&self, id: &str) -> bool {
+        self.plugins.iter().any(|p| p.info.id == id)
     }
 
     /// Admin snapshots for every live plugin.
@@ -351,7 +374,17 @@ pub async fn load_all(
         let id = plugin.id().to_string();
 
         // --- validation -----------------------------------------------------
-        validate_plugin_id(&id).map_err(|e| PluginRuntimeError::Invalid(id.clone(), e))?;
+        // The reserved-id check applies to the untrusted path only: a WASM guest
+        // declares its own id, so it must not be able to name itself into a
+        // first-party plugin's `core.*` grants. A native `.so` is trusted code
+        // (see `RESERVED_IDS`), so it gets the shape rule only — the first-party
+        // `auth`/`membership` plugins use those ids.
+        if is_wasm {
+            validate_untrusted_plugin_id(&id)
+                .map_err(|e| PluginRuntimeError::Invalid(id.clone(), e))?;
+        } else {
+            validate_plugin_id(&id).map_err(|e| PluginRuntimeError::Invalid(id.clone(), e))?;
+        }
         if seen_ids.contains_key(&id) {
             return Err(PluginRuntimeError::Invalid(id, "duplicate plugin id".into()));
         }
@@ -538,9 +571,20 @@ pub async fn load_all(
     Ok(PluginRegistry::new(plugins))
 }
 
-/// Full load-time id check: shape rule plus the core-reserved names.
+/// **Native** (trusted) load-time id check: the shape rule only.
+///
+/// A native `.so` plugin is trusted code, so it may use a reserved name — the
+/// first-party `auth` and `membership` plugins do. The reserved list applies to
+/// the untrusted path in [`validate_untrusted_plugin_id`].
 pub fn validate_plugin_id(id: &str) -> Result<(), String> {
-    validate_id(id)?;
+    validate_id(id)
+}
+
+/// **Untrusted** load-time id check (sandboxed WASM guests): the shape rule plus
+/// [`RESERVED_IDS`]. A guest whose manifest declares a reserved id is refused, so
+/// it cannot inherit another plugin's `core.*` grants (issue #21).
+pub fn validate_untrusted_plugin_id(id: &str) -> Result<(), String> {
+    validate_plugin_id(id)?;
     if RESERVED_IDS.contains(&id) {
         return Err(format!("id {id:?} is reserved by the core"));
     }
@@ -679,7 +723,8 @@ mod tests {
     use adjutant_sdk::{
         async_trait, route_handler, EventSubscription, PluginRequest, PluginResponse, SdkError,
     };
-    use std::sync::OnceLock;
+    use std::path::Path;
+    use std::sync::{Arc, OnceLock};
 
     struct TestPlugin {
         ctx: OnceLock<PluginContext>,
@@ -926,16 +971,111 @@ mod tests {
     }
 
     #[test]
-    fn validate_plugin_id_rejects_reserved_and_malformed() {
+    fn native_ids_use_the_shape_rule_only() {
+        // Native `.so` plugins are trusted code: the first-party `auth` and
+        // `membership` plugins use these ids, so the loader must accept them.
         for r in RESERVED_IDS {
-            // Each reserved name is shape-valid, so only the reserved check can
-            // reject it — which is exactly what the old test failed to assert.
-            assert!(validate_id(r).is_ok(), "{r} must be shape-valid for the reserved rule to matter");
-            assert!(validate_plugin_id(r).is_err(), "reserved id {r} must be rejected at load");
+            assert!(validate_id(r).is_ok(), "{r} must be shape-valid");
+            assert!(
+                validate_plugin_id(r).is_ok(),
+                "native id {r} must be accepted (native is trusted by design)"
+            );
         }
         assert!(validate_plugin_id("hello").is_ok());
         assert!(validate_plugin_id("Hello").is_err());
         assert!(validate_plugin_id("drop table").is_err());
     }
 
+    #[test]
+    fn untrusted_ids_cannot_take_a_reserved_name() {
+        for r in RESERVED_IDS {
+            assert!(validate_id(r).is_ok(), "{r} must be shape-valid");
+            assert!(
+                validate_untrusted_plugin_id(r).is_err(),
+                "a WASM guest may not declare reserved id {r}"
+            );
+        }
+        // The ids that carry `core.*` grants are the point of the list (#21).
+        for privileged in ["auth", "membership", "sdk"] {
+            assert!(
+                RESERVED_IDS.contains(&privileged),
+                "{privileged} must stay in the single reserved list"
+            );
+            assert!(
+                validate_untrusted_plugin_id(privileged).is_err(),
+                "guest id {privileged:?} must be rejected at load"
+            );
+        }
+        assert!(validate_untrusted_plugin_id("hello").is_ok());
+        assert!(validate_untrusted_plugin_id("Hello").is_err());
+        assert!(validate_untrusted_plugin_id("drop table").is_err());
+    }
+
+    /// Write a WASM guest (compiled from WAT, so no prebuilt fixture or external
+    /// toolchain is needed) whose manifest declares `id`.
+    fn write_guest_declaring(dir: &Path, id: &str) -> std::path::PathBuf {
+        let manifest =
+            serde_json::json!({ "id": id, "name": "Impersonator", "version": "0.0.1" })
+                .to_string();
+        let len = manifest.len();
+        let escaped = manifest.replace('\\', "\\\\").replace('"', "\\\"");
+        let wat = format!(
+            r#"(module
+                (memory (export "memory") 1)
+                (data (i32.const 1024) "{escaped}")
+                (func (export "adjutant_alloc") (param i32) (result i32) (i32.const 2048))
+                (func (export "adjutant_free") (param i32 i32))
+                (func (export "adjutant_describe") (param i32 i32) (result i32)
+                    (if (result i32) (i32.eqz (local.get 0))
+                        (then (i32.const -{len}))
+                        (else
+                            (memory.copy (local.get 0) (i32.const 1024) (i32.const {len}))
+                            (i32.const {len}))))
+                (func (export "adjutant_handle") (param i32 i32 i32 i32) (result i32) (i32.const 2))
+            )"#
+        );
+        let path = dir.join(format!("{id}.wasm"));
+        std::fs::write(&path, wat).expect("write guest wat");
+        path
+    }
+
+    /// Issue #21 (narrowed): the loader must reject a WASM guest that declares a
+    /// reserved id. Validation happens before the first DB access, so a lazy pool
+    /// is enough to drive the real `load_all` path.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn load_all_rejects_a_wasm_guest_with_a_reserved_id() {
+        let dir = std::env::temp_dir().join(format!("adjutant-reserved-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        write_guest_declaring(&dir, "auth");
+
+        let pool = Arc::new(
+            sqlx::postgres::PgPoolOptions::new()
+                .connect_lazy("postgres://adjutant:adjutant@127.0.0.1:1/adjutant_test")
+                .expect("lazy pool URL parses"),
+        );
+        let (tx, _rx) = tokio::sync::broadcast::channel(1);
+        let err = match load_all(
+            &dir,
+            pool,
+            tx,
+            serde_json::Value::Null,
+            crate::identity::IdentityHub::new(),
+            crate::host::CoreHttp::new(),
+        )
+        .await
+        {
+            Ok(_) => panic!("a guest declaring a reserved id must be rejected at load"),
+            Err(e) => e,
+        };
+
+        match err {
+            PluginRuntimeError::Invalid(id, msg) => {
+                assert_eq!(id, "auth");
+                assert!(msg.contains("reserved"), "got: {msg}");
+            }
+            other => panic!("expected reserved-id Invalid error, got {other}"),
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

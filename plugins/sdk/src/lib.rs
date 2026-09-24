@@ -236,10 +236,22 @@ impl From<Option<String>> for SqlValue {
     }
 }
 impl From<Option<i64>> for SqlValue {
+    /// `None` is a *typed* null: a plain `SqlValue::Null` binds as `Option<String>`
+    /// and PostgreSQL refuses it for a bigint column (`column "x" is of type
+    /// bigint but expression is of type text`).
     fn from(v: Option<i64>) -> Self {
         match v {
             Some(n) => SqlValue::Int(n),
-            None => SqlValue::Null,
+            None => SqlValue::NullInt,
+        }
+    }
+}
+impl From<Option<bool>> for SqlValue {
+    /// Same carve-out as `Option<i64>`: a boolean null must not be a text null.
+    fn from(v: Option<bool>) -> Self {
+        match v {
+            Some(b) => SqlValue::Bool(b),
+            None => SqlValue::NullBool,
         }
     }
 }
@@ -636,11 +648,14 @@ impl AuditService {
         Self { db, source }
     }
 
-    /// Record an action. When `identity` is a real `core.users` id (a UUID),
-    /// it is written to `core.audit_log.user_id`; otherwise (e.g. the dev-header
-    /// stub, whose users don't exist in `core.users`) the FK stays NULL and the
-    /// actor is recorded in `details.user_id` instead, so attribution is never
-    /// lost.
+    /// Record an action. A UUID-shaped `identity` is written to
+    /// `core.audit_log.user_id` only when the matching `core.users` row actually
+    /// exists: `user_id` is a foreign key, so binding a UUID with no row aborts
+    /// the whole INSERT and loses the audit entry. When it is absent (the
+    /// dev-header stub, a deleted user, or a non-UUID stub id) the FK stays NULL
+    /// and the actor is recorded in `details.user_id` instead, so attribution is
+    /// never lost. Non-object `details` are coerced to an object for the same
+    /// reason.
     pub async fn log(
         &self,
         identity: Option<&Identity>,
@@ -649,20 +664,47 @@ impl AuditService {
         resource_id: &str,
         details: Value,
     ) -> Result<(), SdkError> {
-        let mut details = details;
-        let actor_uuid = identity
-            .map(|i| i.user_id.as_str())
-            .filter(|s| uuid::Uuid::parse_str(s).is_ok());
-        if actor_uuid.is_none() {
-            if let (Some(obj), Some(id)) = (details.as_object_mut(), identity) {
-                obj.insert("user_id".into(), Value::String(id.user_id.clone()));
+        // Coerce to an object first: `details.user_id` is the fallback actor, and
+        // a JSON null or scalar would otherwise have nowhere to hold it.
+        let mut details = match details {
+            Value::Object(map) => Value::Object(map),
+            other => {
+                let mut map = serde_json::Map::new();
+                if !other.is_null() {
+                    map.insert("details".into(), other);
+                }
+                Value::Object(map)
             }
-        }
-        let details = serde_json::to_string(&details).unwrap_or_else(|_| "{}".into());
-        let user_value = match actor_uuid {
-            Some(_) => SqlValue::Uuid(identity.expect("checked above").user_id.clone()),
-            None => SqlValue::NullUuid,
         };
+
+        let actor = identity.map(|i| i.user_id.as_str());
+        // Does the UUID exist in `core.users`? Binding a missing FK would abort
+        // the INSERT, so check first and fall back to details attribution.
+        let actor_exists = match actor {
+            Some(id) if uuid::Uuid::parse_str(id).is_ok() => {
+                let rows = self
+                    .db
+                    .query(
+                        "SELECT id FROM core.users WHERE id = $1".to_string(),
+                        vec![SqlValue::Uuid(id.to_string())],
+                    )
+                    .await?;
+                !rows.is_empty()
+            }
+            _ => false,
+        };
+        let user_value = if actor_exists {
+            SqlValue::Uuid(actor.expect("checked above").to_string())
+        } else {
+            if let (Some(id), Some(_)) = (actor, identity) {
+                details
+                    .as_object_mut()
+                    .expect("coerced to an object above")
+                    .insert("user_id".into(), Value::String(id.to_string()));
+            }
+            SqlValue::NullUuid
+        };
+        let details = serde_json::to_string(&details).unwrap_or_else(|_| "{}".into());
         self.db
             .execute(
                 "INSERT INTO core.audit_log (user_id, action, resource_type, resource_id, details, source) \
@@ -1532,6 +1574,19 @@ mod tests {
         ));
     }
 
+    /// Every `Option<T>` conversion must carry the correct *typed* null: a text
+    /// null bound to a bigint/bool column is a runtime SQL error, and only the
+    /// `Some` path was ever asserted before issue #23.
+    #[test]
+    fn option_conversions_bind_a_typed_null() {
+        assert!(matches!(SqlValue::from(Some("x".to_string())), SqlValue::Text(_)));
+        assert!(matches!(SqlValue::from(None::<String>), SqlValue::Null));
+        assert!(matches!(SqlValue::from(Some(7i64)), SqlValue::Int(7)));
+        assert!(matches!(SqlValue::from(None::<i64>), SqlValue::NullInt));
+        assert!(matches!(SqlValue::from(Some(true)), SqlValue::Bool(true)));
+        assert!(matches!(SqlValue::from(None::<bool>), SqlValue::NullBool));
+    }
+
     #[tokio::test]
     async fn permission_service_queries_through_host() {
         let db = Arc::new(StubDb {
@@ -1603,17 +1658,23 @@ mod tests {
 
     #[tokio::test]
     async fn audit_records_a_real_user_id_in_the_fk_column() {
-        let db = Arc::new(StubDb::default());
-        let audit = AuditService::new(db.clone(), "hello".into());
         let uuid = "11111111-1111-1111-1111-111111111111";
+        // The existence check must find the row before the FK is bound.
+        let db = Arc::new(StubDb {
+            calls: Mutex::new(vec![]),
+            rows: vec![serde_json::json!({ "id": uuid })],
+        });
+        let audit = AuditService::new(db.clone(), "hello".into());
         let id = Identity::new(uuid, vec!["scout".into()]);
         audit
             .log(Some(&id), "greet", "greeting", "hi", serde_json::json!({}))
             .await
             .unwrap();
         let calls = db.calls.lock().unwrap();
-        assert_eq!(calls.len(), 1);
-        let (sql, params) = &calls[0];
+        // One existence query, then the INSERT.
+        assert_eq!(calls.len(), 2);
+        assert!(calls[0].0.contains("core.users"));
+        let (sql, params) = &calls[1];
         assert!(sql.contains("core.audit_log"));
         assert!(
             matches!(params[0], SqlValue::Uuid(ref u) if u.as_str() == uuid),
@@ -1625,6 +1686,54 @@ mod tests {
             other => panic!("expected JSON details, got {other:?}"),
         };
         assert!(details.get("user_id").is_none());
+    }
+
+    #[tokio::test]
+    async fn audit_uuid_with_no_users_row_falls_back_to_details() {
+        // A UUID-shaped id with no `core.users` row must NOT be bound to the FK —
+        // the FK violation would abort the INSERT and lose the whole audit entry.
+        // The existence query returns no rows, so attribution moves to details.
+        let db = Arc::new(StubDb::default());
+        let audit = AuditService::new(db.clone(), "hello".into());
+        let uuid = "22222222-2222-2222-2222-222222222222";
+        let id = Identity::new(uuid, vec!["chief".into()]);
+        audit
+            .log(Some(&id), "greet", "greeting", "hi", serde_json::json!({}))
+            .await
+            .unwrap();
+        let calls = db.calls.lock().unwrap();
+        assert_eq!(calls.len(), 2, "existence query + insert");
+        let (_, params) = &calls[1];
+        assert!(
+            matches!(params[0], SqlValue::NullUuid),
+            "a missing core.users row keeps the FK NULL"
+        );
+        let details = match &params[4] {
+            SqlValue::Json(j) => serde_json::from_str::<Value>(j).unwrap(),
+            other => panic!("expected JSON details, got {other:?}"),
+        };
+        assert_eq!(details["user_id"], serde_json::json!(uuid));
+    }
+
+    #[tokio::test]
+    async fn audit_coerces_non_object_details_so_attribution_survives() {
+        // `details = null` (the WASM host default) must not drop the actor: the
+        // value is coerced to an object that can carry `user_id`.
+        let db = Arc::new(StubDb::default());
+        let audit = AuditService::new(db.clone(), "hello".into());
+        let id = Identity::new("beatrice", vec!["scout".into()]);
+        audit
+            .log(Some(&id), "greet", "greeting", "hi", Value::Null)
+            .await
+            .unwrap();
+        let calls = db.calls.lock().unwrap();
+        assert_eq!(calls.len(), 1);
+        let (_, params) = &calls[0];
+        let details = match &params[4] {
+            SqlValue::Json(j) => serde_json::from_str::<Value>(j).unwrap(),
+            other => panic!("expected JSON details, got {other:?}"),
+        };
+        assert_eq!(details["user_id"], serde_json::json!("beatrice"));
     }
 
     #[tokio::test]

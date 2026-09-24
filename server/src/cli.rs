@@ -15,9 +15,10 @@ use crate::config::Config;
 // new-plugin
 // ---------------------------------------------------------------------------
 
-const RESERVED: &[&str] = &["plugins", "events", "audit", "core", "sdk", "auth", "membership"];
-
-/// Validate a plugin id: `[a-z][a-z0-9_]{0,30}`, not reserved.
+/// Validate a new plugin name: `[a-z][a-z0-9_]{0,30}`, and not reserved. The
+/// reserved set is [`crate::plugin_runtime::RESERVED_IDS`] — the same list the
+/// loader enforces for untrusted WASM guests — so the scaffolder cannot create a
+/// plugin that would collide with a first-party or core id.
 pub fn validate_plugin_name(name: &str) -> Result<(), String> {
     let ok = !name.is_empty()
         && name.len() <= 31
@@ -28,7 +29,7 @@ pub fn validate_plugin_name(name: &str) -> Result<(), String> {
             "invalid plugin name {name:?}: expected [a-z][a-z0-9_]{{0,30}} (lowercase, underscore)"
         ));
     }
-    if RESERVED.contains(&name) {
+    if crate::plugin_runtime::RESERVED_IDS.contains(&name) {
         return Err(format!("{name:?} is reserved by the core or an existing plugin"));
     }
     Ok(())
@@ -255,9 +256,14 @@ pub fn test_database_url(cfg: &Config) -> String {
 }
 
 /// The override decision, with the environment value passed in — so tests cover
-/// both branches without mutating process-global state.
+/// both branches without mutating process-global state. An empty override is
+/// treated as unset: callers commonly export `ADJUTANT_TEST_DATABASE_URL=` to
+/// mean "derive it", and treating that as a set URL failed with
+/// `cannot parse db name from `.
 pub fn test_database_url_with(cfg: &Config, override_url: Option<String>) -> String {
-    override_url.unwrap_or_else(|| derive_test_database_url(&cfg.database_url))
+    override_url
+        .filter(|url| !url.trim().is_empty())
+        .unwrap_or_else(|| derive_test_database_url(&cfg.database_url))
 }
 
 /// URL of the maintenance database (`/postgres`) for drop/create.
@@ -743,11 +749,23 @@ mod tests {
             "postgres://adjutant@127.0.0.1:5433/adjutant_dev_test",
             "no override derives from the configured live URL"
         );
+        // An empty (or whitespace) override is "unset", not a URL to connect to.
+        assert_eq!(
+            test_database_url_with(&cfg, Some(String::new())),
+            "postgres://adjutant@127.0.0.1:5433/adjutant_dev_test",
+            "an empty override falls back to the derivation"
+        );
+        assert_eq!(
+            test_database_url_with(&cfg, Some("   ".into())),
+            "postgres://adjutant@127.0.0.1:5433/adjutant_dev_test",
+            "a whitespace override is treated as unset"
+        );
         // The public wrapper must agree with whichever branch the environment
-        // selects — this passes whether or not the variable is exported.
+        // selects — this passes whether or not the variable is exported. An
+        // empty value is "unset" (see `test_database_url_with`).
         match std::env::var("ADJUTANT_TEST_DATABASE_URL") {
-            Ok(v) => assert_eq!(test_database_url(&cfg), v),
-            Err(_) => assert_eq!(
+            Ok(v) if !v.trim().is_empty() => assert_eq!(test_database_url(&cfg), v),
+            _ => assert_eq!(
                 test_database_url(&cfg),
                 "postgres://adjutant@127.0.0.1:5433/adjutant_dev_test"
             ),

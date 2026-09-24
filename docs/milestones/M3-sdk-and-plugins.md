@@ -8,11 +8,23 @@
 | Gate | Result |
 |---|---|
 | `cargo build --workspace` | 0 errors |
-| `cargo test --workspace` | **62/62 passed** (2 are DB-backed and print SKIPPED without `ADJUTANT_TEST_DATABASE_URL`) |
+| `cargo test --workspace` | **62/62 passed** — see the correction below: the DB-gated tests were counted as passes while skipping. |
 | `cargo clippy --workspace --all-targets` | **0 warnings** (independently re-verified on a from-scratch build) |
 | `adjutant test-plugin` | **34/34 probes passed, 4 skipped** (3 open mutating routes, 1 path-capture route whose value the harness cannot invent — none of them counted as passes) against a fresh test DB |
 | `docs/e2e_m3.py` (live, dev headers OFF) | **52/52 probes**, repeatable (run four times back to back, exit 0) |
 | `scripts/probes.py` (M1+M2 batches) | **67/67 probes**, committed transcript |
+
+> **Correction (issue #25, 2026-09-24).** The "62/62 passed" tally above counted
+> the DB-gated host tests as passes even on a host without a database, because
+> each one printed `SKIPPED` and returned. There are **three** of them, not two,
+> all in `server/tests/host_db.rs`: `decode_covers_every_supported_type`,
+> `bind_params_round_trips_every_variant`, and
+> `plugin_role_isolation_denies_cross_schema_access`. They are now `#[ignore]`d,
+> so a bare `cargo test --workspace` reports them as **ignored** (never passed);
+> CI runs them explicitly with
+> `cargo test -p adjutant-server --test host_db -- --ignored`, where a missing or
+> unreachable database is a hard failure. State test **functions**, not a bare
+> total, when citing this evidence.
 
 Counts changed in the 2026-09-22 audit pass because the harnesses were made
 honest, not because the software moved: `docs/e2e_m3.py`'s `probe()` used an

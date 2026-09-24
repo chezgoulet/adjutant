@@ -1,6 +1,8 @@
-# Toolchain for contributors. `cargo check` is additionally verified against the
-# declared MSRV (1.88, see [workspace.package] rust-version) in CI.
+# Toolchain for contributors and CI. Pinned to one explicit version so a green
+# local run is the same toolchain CI uses. The declared MSRV (1.96, see
+# [workspace.package] rust-version) is a separate floor for consumers and is
+# verified by the `msrv` CI job — do not confuse the two.
 [toolchain]
-channel = "stable"
+channel = "1.96.0"
 components = ["rustfmt", "clippy"]
 profile = "minimal"

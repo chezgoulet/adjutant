@@ -29,12 +29,24 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - uses: dtolnay/rust-toolchain@stable
+      # The toolchain version lives in exactly one place. `dtolnay/rust-toolchain@stable`
+      # does NOT read rust-toolchain.toml, so it floated forward while local stable
+      # lagged — which is how a clippy lint new in 1.98 passed here and failed CI.
+      - name: Read the pinned toolchain
+        id: toolchain
+        run: echo "channel=$(grep -oP '^channel\s*=\s*"\K[^"]+' rust-toolchain.toml)" >> "$GITHUB_OUTPUT"
+
+      - uses: dtolnay/rust-toolchain@master
         with:
+          toolchain: ${{ steps.toolchain.outputs.channel }}
           components: clippy
           targets: wasm32-wasip1
 
       - uses: Swatinem/rust-cache@v2
+
+      # Make toolchain drift visible in the log instead of mysterious.
+      - name: Toolchain version
+        run: rustc --version && cargo clippy --version
 
       # The DB-backed tests connect to this database and fail loudly if it is
       # missing (that is how the first CI run after the M3 merge went red).
@@ -59,15 +71,19 @@ jobs:
       - name: Unit + integration tests
         run: cargo test --workspace
 
-      # These skip themselves without ADJUTANT_TEST_DATABASE_URL; here it is set,
-      # so they must actually run.
+      # These are #[ignore]d so a bare `cargo test` reports them as ignored, not
+      # passed (issue #25). Here the database exists, so run them explicitly and
+      # fail the job if it is unavailable.
       - name: DB-backed host tests
-        run: cargo test -p adjutant-server --test host_db -- --nocapture
+        run: cargo test -p adjutant-server --test host_db -- --ignored --nocapture
 
       # Live evidence: the committed ladder resets the database, boots its own
       # server and writes docs/evidence/m2_probes.json. A failure here means the
-      # milestone document's numbers are stale.
+      # milestone document's numbers are stale. It refuses any database whose
+      # name does not end in _test, so point it at the test database.
       - name: Live probe ladder (M1 + M2)
+        env:
+          ADJUTANT_DATABASE_URL: postgres://adjutant:adjutant@127.0.0.1:5432/adjutant_dev_test
         run: python3 scripts/probes.py
 
       - name: Stage plugins
@@ -122,6 +138,10 @@ jobs:
           ./target/debug/adjutant validate-plugin target/debug/libadjutant_gear_locker.so
 
       - name: End-to-end harness (dev headers OFF)
+        env:
+          # Keep the harness off the live `adjutant_dev` database, like the probe
+          # ladder above; `adjutant_dev_test` is created earlier in this job.
+          ADJUTANT_DATABASE_URL: postgres://adjutant:adjutant@127.0.0.1:5432/adjutant_dev_test
         run: |
           ADJUTANT_PLUGIN_DIR=plugins-built \
           ADJUTANT_DEV_HEADERS=false \
@@ -135,7 +155,7 @@ jobs:
           python3 docs/e2e_m3.py
 
   # The declared MSRV (workspace rust-version). RUSTUP_TOOLCHAIN overrides the
-  # rust-toolchain.toml `stable` channel so this job actually uses 1.96.
+  # pinned rust-toolchain.toml channel so this job actually uses 1.96.
   msrv:
     runs-on: ubuntu-latest
     env:
