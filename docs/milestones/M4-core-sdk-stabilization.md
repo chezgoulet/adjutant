@@ -115,8 +115,9 @@ public SDK + testing module. **Met.**
 
 ### W2 — Core hardening
 
-- [ ] Flip `ADJUTANT_DEV_HEADERS` default to `false`; make dev headers an
-      explicit opt-in. Update harnesses and docs.
+- [x] Flip `ADJUTANT_DEV_HEADERS` default to `false`; make dev headers an
+      explicit opt-in. Update harnesses and docs. (`--allow-dev-headers` flag +
+      env + `[auth]` file; harnesses set it explicitly.)
 - [ ] Write the real actor into `core.audit_log.user_id` when the auth plugin is
       present (remove the `details`-embedded `user_id` workaround).
 - [ ] Unify the API error envelope and status mapping across core and plugins.

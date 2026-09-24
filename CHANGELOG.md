@@ -51,6 +51,10 @@ crates.io publication.
 
 ### Changed
 
+- **The spoofable dev identity headers are now opt-in.** `ADJUTANT_DEV_HEADERS`
+  defaults to `false`; enable it with `--allow-dev-headers`,
+  `ADJUTANT_DEV_HEADERS=true`, or `[auth] allow_dev_headers = true`. The
+  milestone harnesses set it explicitly.
 - **Breaking (ABI 2):** `Identity` gained a `grants: Vec<RoleGrant>` field. Use
   `Identity::new` / `Identity::from_grants` rather than a struct literal.
   `SDK_ABI_VERSION` is now `2`.

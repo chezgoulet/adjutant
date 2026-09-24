@@ -279,7 +279,7 @@ async fn dispatch(
 
     // 1. Identity: plugin providers first (the auth plugin owns real
     // sessions), dev headers only as a gated fallback (SPEC §7.1 — spoofable,
-    // off in production via auth.allow_dev_headers).
+    // off unless auth.allow_dev_headers is explicitly enabled).
     let headers: HashMap<String, String> = parts
         .headers
         .iter()
