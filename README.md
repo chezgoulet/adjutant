@@ -39,9 +39,11 @@ docs/evidence/              Committed probe transcripts
 ```bash
 # 1. database + role (the harnesses and tests assume this DSN)
 psql -h 127.0.0.1 -p 5433 -U postgres \
-  -c "CREATE ROLE adjutant LOGIN" \
+  -c "CREATE ROLE adjutant LOGIN CREATEROLE" \
   -c "CREATE DATABASE adjutant_dev OWNER adjutant"
 # port 5433 is this host's PostgreSQL; use 5432 or your own socket if different
+# CREATEROLE (or superuser) lets the core create one role per plugin for schema
+# isolation; without it, plugins run as the base role with a boot warning.
 
 # 2. build (plugins land as .so files in target/debug)
 cargo build --workspace
@@ -93,6 +95,19 @@ Precedence is defaults < TOML file (./adjutant.toml or `--config`) < environment
   undo it — unreachable until a restart. The core now answers `409` with a hint
   instead of allowing the lockout; recovery from a manual `core.plugins` edit is
   still a restart, so register a second provider before removing the first.
+
+### Schema isolation
+
+Each plugin gets its own PostgreSQL schema and (when the database role can
+manage roles) its own `NOLOGIN` role `adjutant_plugin_<id>`. At runtime the
+plugin's database handle runs every query under `SET LOCAL ROLE`, with full
+rights on its own schema and an explicit allowlist of `core.*` tables — so a
+query that reaches into another plugin's schema fails with `permission denied`
+(SPEC §5.2). Migrations still run as the base role (some, like auth's,
+deliberately alter `core.users`). Requires `CREATEROLE` or superuser; otherwise
+the core logs a warning and runs plugins unisolated. The allowlist lives in
+`server/src/schema.rs` (`core_grants`); a plugin needing another core table must
+add it there deliberately.
 
 ## Smoke test
 

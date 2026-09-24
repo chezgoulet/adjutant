@@ -10,6 +10,7 @@ pub mod identity;
 pub mod middleware;
 pub mod permissions;
 pub mod plugin_runtime;
+pub mod schema;
 pub mod server;
 
 pub use server::build_app;

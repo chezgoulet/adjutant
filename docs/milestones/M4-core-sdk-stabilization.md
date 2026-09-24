@@ -99,14 +99,17 @@ baseline numbers are recorded here. **Met** — `v0.1.0` @ `6a0f2d7`, CI green.
 - [x] `adjutant validate-plugin`: static validation (ABI, init against mocks, id,
       permission references, migration versions, route namespace/captures/
       duplicates) with no database; wired into CI (incl. the scaffolded plugin).
-- [ ] Schema isolation — **decided: enforce via per-plugin PostgreSQL roles.**
-      In progress as a follow-up on this branch's series. Not yet implemented.
+- [x] Schema isolation — **enforced via per-plugin PostgreSQL roles.**
+      `server/src/schema.rs`: a `NOLOGIN` role per plugin, `SET LOCAL ROLE` on
+      every runtime `ctx.db` call, full rights on its own schema, and an explicit
+      `core.*` allowlist. A DB-backed test proves cross-schema access is denied.
+      Requires `CREATEROLE`/superuser; skips isolation with a warning otherwise.
 - [x] Documentation: `docs/plugin-development.md` written.
 
 **Exit criteria:** a plugin can be scaffolded, statically validated, unit-tested
 with only the public SDK, and loaded; `auth` + `membership` pass using only the
-public SDK + testing module. **Remaining before met:** schema isolation, and the
-`auth`/`membership` testing retrofit.
+public SDK + testing module. **Remaining before met:** the `auth`/`membership`
+testing retrofit.
 
 ### W2 — Core hardening
 

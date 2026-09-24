@@ -10,14 +10,18 @@ use std::sync::Arc;
 use adjutant_sdk::{HostDb, SqlValue};
 use adjutant_server::host::CoreDb;
 
-async fn db() -> Option<Arc<CoreDb>> {
+async fn repository_pool() -> Option<Arc<sqlx::PgPool>> {
     let url = std::env::var("ADJUTANT_TEST_DATABASE_URL").ok()?;
     let pool = sqlx::postgres::PgPoolOptions::new()
-        .max_connections(2)
+        .max_connections(4)
         .connect(&url)
         .await
         .expect("ADJUTANT_TEST_DATABASE_URL is set but unreachable");
-    Some(CoreDb::new(Arc::new(pool)))
+    Some(Arc::new(pool))
+}
+
+async fn db() -> Option<Arc<CoreDb>> {
+    Some(CoreDb::new(repository_pool().await?))
 }
 
 #[tokio::test]
@@ -80,4 +84,87 @@ async fn bind_params_round_trips_every_variant() {
     assert_eq!(row["b"], serde_json::json!(true));
     assert_eq!(row["arr"], serde_json::json!(["a", "b"]));
     assert_eq!(row["j"], serde_json::json!({"k": 1}));
+}
+
+/// Schema isolation is enforced by PostgreSQL, not by convention: a plugin's
+/// `SET LOCAL ROLE` handle can read its own schema but is denied another
+/// plugin's. Skips (loudly) when the test database's role cannot manage roles.
+#[tokio::test]
+async fn plugin_role_isolation_denies_cross_schema_access() {
+    use adjutant_server::schema;
+
+    let Some(pool) = repository_pool().await else {
+        eprintln!("SKIPPED plugin_role_isolation_denies_cross_schema_access: set ADJUTANT_TEST_DATABASE_URL");
+        return;
+    };
+
+    for s in ["iso_alpha", "iso_beta"] {
+        sqlx::query(&format!("DROP SCHEMA IF EXISTS \"{s}\" CASCADE"))
+            .execute(pool.as_ref())
+            .await
+            .expect("drop schema");
+        sqlx::query(&format!("CREATE SCHEMA \"{s}\""))
+            .execute(pool.as_ref())
+            .await
+            .expect("create schema");
+    }
+
+    let alpha_role = match schema::ensure_isolation(&pool, "iso_alpha").await {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!(
+                "SKIPPED plugin_role_isolation_denies_cross_schema_access: \
+                 cannot manage roles ({e})"
+            );
+            return;
+        }
+    };
+    let _ = schema::ensure_isolation(&pool, "iso_beta").await;
+
+    sqlx::query("CREATE TABLE iso_alpha.t (id BIGINT PRIMARY KEY)")
+        .execute(pool.as_ref())
+        .await
+        .expect("alpha table");
+    sqlx::query("CREATE TABLE iso_beta.t (id BIGINT PRIMARY KEY)")
+        .execute(pool.as_ref())
+        .await
+        .expect("beta table");
+    sqlx::query("INSERT INTO iso_alpha.t VALUES (1)")
+        .execute(pool.as_ref())
+        .await
+        .expect("alpha row");
+    sqlx::query("INSERT INTO iso_beta.t VALUES (2)")
+        .execute(pool.as_ref())
+        .await
+        .expect("beta row");
+    // Migrations run after the first grant pass, so refresh (as load_all does).
+    schema::grant_schema_objects(&pool, "iso_alpha", &alpha_role)
+        .await
+        .expect("refresh alpha grants");
+
+    let alpha = CoreDb::for_plugin(pool.clone(), "iso_alpha".into(), Some(alpha_role));
+
+    // Own schema reachable via a bare table name.
+    let rows = alpha
+        .query("SELECT id FROM t".to_string(), vec![])
+        .await
+        .expect("alpha can read its own table");
+    assert_eq!(rows[0]["id"], serde_json::json!(1));
+
+    // Another plugin's schema is denied by the database.
+    let err = alpha
+        .query("SELECT id FROM iso_beta.t".to_string(), vec![])
+        .await
+        .expect_err("alpha must not read beta's schema");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("permission denied") || msg.contains("does not exist"),
+        "expected a permission error, got: {msg}"
+    );
+
+    for s in ["iso_alpha", "iso_beta"] {
+        let _ = sqlx::query(&format!("DROP SCHEMA IF EXISTS \"{s}\" CASCADE"))
+            .execute(pool.as_ref())
+            .await;
+    }
 }

@@ -282,6 +282,25 @@ A migration's SQL may contain multiple statements. (This is safe because the
 runner uses `Executor::execute` on raw SQL; the *runtime* `HostDb` uses prepared
 statements, which allow only one statement per call.)
 
+## Schema isolation
+
+Each plugin gets its own PostgreSQL schema **and** — when the database role can
+manage roles (`CREATEROLE`/superuser) — its own `NOLOGIN` role
+`adjutant_plugin_<id>`. Every `ctx.db` call runs inside `SET LOCAL ROLE`, so:
+
+- bare table names resolve in your schema;
+- you have full rights on your own schema;
+- you can touch only an explicit allowlist of `core.*` tables (see
+  `core_grants` in `server/src/schema.rs` — auth and membership have entries;
+  other plugins get none);
+- reaching into **another plugin's** schema fails with `permission denied`.
+
+Migrations are authored by you and run as the base role at boot, so they may
+create objects freely (and first-party plugins may alter core tables there). The
+isolation applies to runtime queries, which is where plugin code executes. If
+your plugin needs a core table, request it be added to `core_grants`; do not
+assume `core.*` is open.
+
 ## Testing with `adjutant_sdk::testing`
 
 Unit-test handlers and lifecycle without a database, server, or core:

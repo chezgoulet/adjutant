@@ -361,6 +361,24 @@ pub async fn load_all(
         .await
         .map_err(|e| PluginRuntimeError::Migration(id.clone(), e.to_string()))?;
 
+        // --- schema isolation role (SPEC §5.2) ------------------------------
+        // Set up the per-plugin PostgreSQL role before the plugin gets a DB
+        // handle, so every runtime query runs under it. Best-effort: a database
+        // role that cannot manage roles (no CREATEROLE/superuser) gets a loud
+        // warning and the plugin runs unisolated rather than failing to boot.
+        let isolation_role = match crate::schema::ensure_isolation(&pool, &id).await {
+            Ok(role) => Some(role),
+            Err(e) => {
+                tracing::warn!(
+                    plugin = %id,
+                    error = %e,
+                    "schema isolation unavailable: the database role cannot manage roles \
+                     (needs CREATEROLE or superuser); plugin queries run as the base role"
+                );
+                None
+            }
+        };
+
         // --- per-plugin config (DB row) + enabled state ---------------------
         // Read BEFORE ctx construction: init() needs ctx.config (OIDC settings
         // etc. are per-plugin and admin-editable via the config column).
@@ -393,7 +411,7 @@ pub async fn load_all(
             // Host-mediated: these Arc<dyn Host…> impls live in the core, so no
             // sqlx/tokio is ever linked into the plugin (see SDK host-I/O note).
             db: adjutant_sdk::DbHandle::new(
-                crate::host::CoreDb::for_plugin(pool.clone(), id.clone()),
+                crate::host::CoreDb::for_plugin(pool.clone(), id.clone(), isolation_role.clone()),
                 id.clone(),
             ),
             config: plugin_config.clone(),
@@ -418,6 +436,18 @@ pub async fn load_all(
             run_migration(&pool, &id, m.version, &m.name, &m.sql)
                 .await
                 .map_err(|e| PluginRuntimeError::Migration(id.clone(), e.to_string()))?;
+        }
+
+        // Migrations created tables as the base role; refresh the plugin role's
+        // grants so the new objects are reachable at runtime.
+        if let Some(role) = &isolation_role {
+            if let Err(e) = crate::schema::grant_schema_objects(&pool, &id, role).await {
+                tracing::warn!(
+                    plugin = %id,
+                    error = %e,
+                    "refreshing schema grants after migrations failed; some tables may be unreachable"
+                );
+            }
         }
 
         // --- permissions ----------------------------------------------------
