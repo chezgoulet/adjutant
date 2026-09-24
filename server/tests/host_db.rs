@@ -16,7 +16,7 @@
 //! `ADJUTANT_TEST_DATABASE_URL` is a hard failure — never a skip.
 use std::sync::Arc;
 
-use adjutant_sdk::{HostDb, SqlValue};
+use adjutant_sdk::{HostDb, Identity, PermissionService, RoleGrant, Scope, SqlValue};
 use adjutant_server::host::CoreDb;
 use adjutant_server::{db, host, schema};
 
@@ -334,4 +334,97 @@ async fn probe_membership_role_cannot_write_user_roles() {
         err.to_string().contains("permission denied"),
         "expected a permission error, got: {err}"
     );
+}
+
+/// #33: `scope_id` is opaque TEXT owned by the plugin, `NULL` means troop-wide,
+/// and the invalid combinations are unstorable. A lodge-scoped grant with a
+/// bigint-looking id round-trips through storage and is honoured by
+/// `has_in_scope` — the case the UUID column was blocking.
+#[tokio::test]
+#[ignore = "DB-gated: needs ADJUTANT_TEST_DATABASE_URL; run with `-- --ignored`"]
+async fn probe_scope_id_is_opaque_text_and_round_trips() {
+    let (admin, _pools) = setup(&[]).await;
+    let uid = "11111111-1111-1111-1111-111111111111";
+
+    sqlx::query("DELETE FROM core.user_roles").execute(admin.as_ref()).await.expect("clear");
+    sqlx::query("INSERT INTO core.users (id, display_name) VALUES ($1::uuid, 'Bea') ON CONFLICT DO NOTHING")
+        .bind(uid)
+        .execute(admin.as_ref())
+        .await
+        .expect("user");
+    // The role must hold a permission for `has_in_scope` to allow.
+    sqlx::query(
+        "INSERT INTO core.role_permissions (role_id, permission_id) VALUES ('scout', 'core:admin') \
+         ON CONFLICT DO NOTHING",
+    )
+    .execute(admin.as_ref())
+    .await
+    .expect("grant permission to scout");
+
+    // A bigint lodge id is storable as text.
+    sqlx::query(
+        "INSERT INTO core.user_roles (user_id, role_id, scope_type, scope_id) \
+         VALUES ($1::uuid, 'scout', 'lodge', '1')",
+    )
+    .bind(uid)
+    .execute(admin.as_ref())
+    .await
+    .expect("lodge-scoped row stores a text id");
+
+    let (role_id, scope_type, scope_id): (String, String, Option<String>) = sqlx::query_as(
+        "SELECT role_id, scope_type, scope_id FROM core.user_roles WHERE user_id = $1::uuid",
+    )
+    .bind(uid)
+    .fetch_one(admin.as_ref())
+    .await
+    .expect("read the row back");
+    assert_eq!(role_id, "scout");
+    assert_eq!(scope_type, "lodge");
+    assert_eq!(scope_id.as_deref(), Some("1"), "the opaque id round-trips verbatim");
+
+    // Build the identity the way a session would and check coverage.
+    let identity = Identity::from_grants(
+        uid,
+        vec![RoleGrant { role_id, scope: Scope::lodge(scope_id.expect("id")) }],
+    );
+    let perms = PermissionService::new(host::CoreDb::new(admin.clone()));
+    assert!(
+        perms.has_in_scope(Some(&identity), "core:admin", &Scope::lodge("1")).await,
+        "a lodge-scoped grant covers its own lodge"
+    );
+    assert!(
+        !perms.has_in_scope(Some(&identity), "core:admin", &Scope::lodge("2")).await,
+        "and not another lodge"
+    );
+    assert!(
+        !perms.has_in_scope(Some(&identity), "core:admin", &Scope::troop()).await,
+        "a lodge grant does not cover troop"
+    );
+
+    // Invalid combinations are unstorable (#33 acceptance).
+    let lodge_without_id = sqlx::query(
+        "INSERT INTO core.user_roles (user_id, role_id, scope_type) VALUES ($1::uuid, 'chief', 'lodge')",
+    )
+    .bind(uid)
+    .execute(admin.as_ref())
+    .await;
+    assert!(lodge_without_id.is_err(), "a non-troop scope needs a scope_id");
+
+    let troop_with_id = sqlx::query(
+        "INSERT INTO core.user_roles (user_id, role_id, scope_type, scope_id) \
+         VALUES ($1::uuid, 'chief', 'troop', '7')",
+    )
+    .bind(uid)
+    .execute(admin.as_ref())
+    .await;
+    assert!(troop_with_id.is_err(), "a troop scope must have a NULL scope_id");
+
+    let troop_with_null = sqlx::query(
+        "INSERT INTO core.user_roles (user_id, role_id, scope_type, scope_id) \
+         VALUES ($1::uuid, 'chief', 'troop', NULL)",
+    )
+    .bind(uid)
+    .execute(admin.as_ref())
+    .await;
+    assert!(troop_with_null.is_ok(), "troop-wide is scope_id NULL");
 }

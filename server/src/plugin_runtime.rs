@@ -102,6 +102,9 @@ pub struct RouteInfo {
     pub method: String,
     pub path: String,
     pub permission: Option<String>,
+    /// `troop` (grant must cover troop) or `any` (the handler checks the
+    /// object's scope). Derived from [`RouteDefinition::required_scope`].
+    pub scope: String,
 }
 
 /// Result of resolving a request path against the registry.
@@ -109,6 +112,9 @@ pub enum RouteLookup {
     Found {
         plugin_id: String,
         required_permission: Option<String>,
+        /// `Some(scope)` = a troop-covering grant (or the declared scope);
+        /// `None` = the permission at any scope, checked in the handler.
+        required_scope: Option<adjutant_sdk::Scope>,
         handler: RouteHandler,
         /// Captures from a templated route (`/api/missions/{id}`).
         params: HashMap<String, String>,
@@ -251,6 +257,7 @@ impl PluginRegistry {
             RouteLookup::Found {
                 plugin_id: p.info.id.clone(),
                 required_permission: r.required_permission.clone(),
+                required_scope: r.required_scope.clone(),
                 handler: r.handler.clone(),
                 params,
             }
@@ -588,6 +595,10 @@ pub async fn load_all(
                     method: r.method.as_str().to_string(),
                     path: r.path.clone(),
                     permission: r.required_permission.clone(),
+                    scope: match &r.required_scope {
+                        Some(_) => "troop".into(),
+                        None => "any".into(),
+                    },
                 })
                 .collect(),
         };
@@ -852,6 +863,7 @@ mod tests {
                 method: method.into(),
                 path: path.into(),
                 permission: perm.map(String::from),
+                scope: "troop".into(),
             }],
         };
         LoadedPlugin {

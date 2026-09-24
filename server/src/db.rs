@@ -230,6 +230,30 @@ DELETE FROM core.user_roles WHERE scope_type NOT IN ('troop', 'lodge', 'patrol')
 ALTER TABLE core.user_roles DROP CONSTRAINT IF EXISTS user_roles_scope_type_check;
 ALTER TABLE core.user_roles ADD CONSTRAINT user_roles_scope_type_check
   CHECK (scope_type IN ('troop', 'lodge', 'patrol'));
+"),
+(5, "scope_id_text", "
+-- #33: a scope reference is opaque text owned by the plugin (a lodge id may be a
+-- bigint, a UUID or a slug). NULL means troop-wide, replacing the zero-UUID
+-- convention. `core.user_roles` had a PRIMARY KEY over scope_id, and a PK column
+-- cannot be nullable, so the PK is replaced by a unique index over
+-- COALESCE(scope_id,'') — which still forbids duplicate troop grants.
+ALTER TABLE core.user_roles DROP CONSTRAINT IF EXISTS user_roles_pkey;
+ALTER TABLE core.user_roles ALTER COLUMN scope_id DROP DEFAULT;
+ALTER TABLE core.user_roles ALTER COLUMN scope_id DROP NOT NULL;
+ALTER TABLE core.user_roles ALTER COLUMN scope_id TYPE TEXT USING scope_id::text;
+
+-- Normalise existing (all troop-wide) rows to NULL.
+UPDATE core.user_roles SET scope_id = NULL
+  WHERE scope_type = 'troop' OR scope_id = '00000000-0000-0000-0000-000000000000';
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_user_roles_unique
+  ON core.user_roles (user_id, role_id, COALESCE(scope_id, ''));
+
+-- Troop-wide <=> scope_id IS NULL. Both malformed combinations are unstorable.
+ALTER TABLE core.user_roles DROP CONSTRAINT IF EXISTS user_roles_scope_ref_check;
+ALTER TABLE core.user_roles ADD CONSTRAINT user_roles_scope_ref_check
+  CHECK ((scope_type = 'troop' AND scope_id IS NULL)
+      OR (scope_type <> 'troop' AND scope_id IS NOT NULL));
 ")];
 
 /// Bootstrap roles + permissions grants. `chief` gets everything (SPEC §9 —

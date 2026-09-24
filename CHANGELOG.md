@@ -9,6 +9,46 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ---
 
+## [Unreleased] — Scope enforcement
+
+**Breaking:** `SDK_ABI_VERSION` is bumped to **3**. A plugin built against ABI 2
+is refused at load with the existing actionable handshake error; rebuild it.
+
+### Changed
+
+- **A scope is a condition the gate checks, not a label on a grant**
+  (SPEC §9.2; design `docs/design/scoped-permissions.md`).
+  `RouteDefinition` gains `required_scope`: the ordinary `*_protected`
+  constructors require a **troop-covering** grant; the new
+  `*_protected_any_scope` constructors require the permission at *some* scope
+  and put the object check in the handler. `delete` always requires troop
+  coverage. The core gate passes the declared scope to `authorize` and logs a
+  denial with the permission, required scope and the caller's grants.
+- **`PermissionService::has` is gone.** The unscoped check is
+  `#[doc(hidden)] has_any_scope` (the core gate's "any scope" branch); plugin
+  authors write `has_in_scope(…, &Scope::troop())` for a troop-wide check, or
+  the new `reach(identity, permission, scope)` which returns a ready 403.
+- **`Identity`:** `grants` is the single source of truth; `roles` is a derived
+  method. An identity payload without `grants` fails to deserialize.
+- **`ScopeType::Personal` is removed.** Reading your own record is an ownership
+  check, not a scope.
+- **`core.user_roles.scope_id` is `TEXT NULL`** (was `UUID NOT NULL`), so a
+  plugin's ids may be bigints, UUIDs or slugs. `NULL` means troop-wide; a
+  non-troop scope requires an id and a troop scope requires `NULL`.
+- **WASM host:** `permissions.has` is troop-only (kept for back-compat); added
+  `permissions.has_in_scope` with `{"permission": …, "scope": {"type": …, "id": …}}`.
+
+### Migration for plugin authors
+
+Rebuild against SDK 0.2 / ABI 3 (`cargo build -p adjutant-your_plugin`;
+`adjutant validate-plugin` catches a stale build). Replace any
+`permissions.has(id, perm)` with `has_in_scope(id, perm, &Scope::troop())` or
+`reach(...)`; remove any `ScopeType::Personal` use; a hand-built
+`RouteDefinition` needs the new `required_scope` field (the constructors set it:
+troop by default, `None` for `*_protected_any_scope`).
+
+---
+
 ## [0.2.0] — 2026-09-24 — Milestone 4 (Core & SDK Stabilization)
 
 Consolidates the M1–M3 contract and stabilizes the core/SDK before the first

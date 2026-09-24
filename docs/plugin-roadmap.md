@@ -141,16 +141,17 @@ show an outside body, because it is the only part no vendor can sell back to us.
 Both of these are work that must land **before** missions and governance are
 built on top of it, because both plugins are full of scope decisions:
 
-1. **Scope enforcement (SPEC §9.2).** Missions has Lodge Commander approval;
-   governance has voting. Until the route gate consults scope, every granted
-   permission behaves troop-wide — a lodge commander approves anything. See
-   issues #19–#22 and the design for sign-off:
-   [`docs/design/scoped-permissions.md`](design/scoped-permissions.md).
-2. **The v0.2.0 boundary findings.** The three demonstrated escapes and the
-   authorization defects from the v0.2.0 review (#17–#25) close before any
-   third-party plugin is encouraged and before any outside-body conversation.
-   The current isolation model is a real mechanism but not yet a confinement —
-   the fix is a design decision, not a patch:
+1. **Scope enforcement (SPEC §9.2). — met.** The route gate consults scope:
+   ordinary routes require a troop-covering grant, object routes
+   (`*_protected_any_scope`) check the object in the handler, and `delete` is
+   troop-only. A lodge-scoped grant no longer behaves troop-wide. See issues
+   #19–#22 and [`docs/design/scoped-permissions.md`](design/scoped-permissions.md).
+   Missions and governance can now build Lodge Commander approval / voting on it.
+2. **The v0.2.0 boundary findings. — met.** The three demonstrated escapes are
+   closed: the plugin connection is now the restricted principal (its own
+   `LOGIN` role and pool, migrations on that pool), and the #17–#25 authorization
+   defects are fixed with committed regression probes. Isolation is a
+   confinement, not a convention:
    [`docs/design/plugin-isolation.md`](design/plugin-isolation.md).
 
 ---

@@ -50,7 +50,7 @@ use wasmtime_wasi::p1::WasiP1Ctx;
 
 use adjutant_sdk::{
     async_trait, AdjutantPlugin, Identity, Method, Migration, Permission, PluginContext,
-    PluginRequest, PluginResponse, RouteDefinition, SdkError, SqlValue,
+    PluginRequest, PluginResponse, RouteDefinition, Scope, ScopeType, SdkError, SqlValue,
 };
 
 /// Fixed-size guest buffers (manifest and response). Large enough for the
@@ -200,8 +200,23 @@ fn dispatch(
                 }))
             }
             "permissions.has" => {
+                // Back-compat alias: **troop-only**. The unscoped check is gone
+                // from the plugin SDK; a guest wanting a scoped check calls
+                // `permissions.has_in_scope` with `{permission, scope}`.
                 let perm = p["permission"].as_str().ok_or("permissions.has: missing permission")?;
-                let has = ctx.permissions.has(identity.as_ref(), perm).await;
+                let has = ctx
+                    .permissions
+                    .has_in_scope(identity.as_ref(), perm, &Scope::troop())
+                    .await;
+                Ok(json!({ "has": has }))
+            }
+            "permissions.has_in_scope" => {
+                let perm = p["permission"]
+                    .as_str()
+                    .ok_or("permissions.has_in_scope: missing permission")?;
+                let scope = parse_scope(p.get("scope"))
+                    .ok_or("permissions.has_in_scope: missing or invalid scope")?;
+                let has = ctx.permissions.has_in_scope(identity.as_ref(), perm, &scope).await;
                 Ok(json!({ "has": has }))
             }
             "audit.log" => {
@@ -452,6 +467,26 @@ fn route_method(s: &str) -> Option<Method> {
     }
 }
 
+/// Parse a guest `{"type":"lodge","id":"1"}` scope. Fails closed: an unknown
+/// type, or a non-troop scope with no id, is `None` (never widened to troop).
+fn parse_scope(v: Option<&Value>) -> Option<Scope> {
+    let v = v?;
+    let scope_type = match v["type"].as_str()? {
+        "troop" => ScopeType::Troop,
+        "lodge" => ScopeType::Lodge,
+        "patrol" => ScopeType::Patrol,
+        _ => return None,
+    };
+    let id = v["id"].as_str().map(str::to_string).filter(|s| !s.is_empty());
+    if scope_type != ScopeType::Troop && id.is_none() {
+        return None;
+    }
+    Some(Scope {
+        scope_type,
+        scope_id: if scope_type == ScopeType::Troop { None } else { id },
+    })
+}
+
 // ---------------------------------------------------------------------------
 // WasmPlugin
 // ---------------------------------------------------------------------------
@@ -539,6 +574,10 @@ impl AdjutantPlugin for WasmPlugin {
                 method,
                 path: meta.path.clone(),
                 required_permission: meta.permission.clone(),
+                // A guest manifest does not declare a scope yet; the safe
+                // default is troop coverage (a protected guest route is not
+                // opened by a lodge-scoped grant).
+                required_scope: Some(adjutant_sdk::Scope::troop()),
                 handler,
             });
         }
