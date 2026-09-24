@@ -276,6 +276,91 @@ CREATE TABLE IF NOT EXISTS core.scope_hierarchy (
 
 CREATE UNIQUE INDEX IF NOT EXISTS idx_scope_hierarchy_edge
   ON core.scope_hierarchy (parent_type, parent_id, child_type, child_id);
+"),
+(7, "scope_owners", "
+-- Per-scope-type ownership (#37). Written by the CORE only (seeded from a core
+-- constant at boot); plugins have NO grant on it. It is the trust anchor for
+-- hierarchy edges: whoever can write this map can legitimise any edge and so
+-- widen any plugin's coverage. It is created empty here; the core seeds it.
+CREATE TABLE IF NOT EXISTS core.scope_owners (
+    scope_type TEXT PRIMARY KEY,
+    plugin_id  TEXT NOT NULL
+);
+
+-- Refuse an edge whose parent or child scope type the declaring plugin does not
+-- own. The declaring plugin is derived from `session_user` (plugins authenticate
+-- as adjutant_plugin_<id>), so a native plugin running raw SQL is caught, not
+-- only the declare function. SECURITY DEFINER so the check can read
+-- `core.scope_owners`, which the caller cannot. Non-plugin roles (the core/app
+-- role) seed and repair the table freely.
+CREATE OR REPLACE FUNCTION core.scope_hierarchy_owner_check() RETURNS trigger
+LANGUAGE plpgsql SECURITY DEFINER SET search_path = core, pg_temp AS $fn$
+DECLARE
+  caller TEXT := session_user;
+  plugin TEXT;
+  owner TEXT;
+  pt TEXT;
+  ct TEXT;
+BEGIN
+  IF TG_OP = 'DELETE' THEN
+    pt := OLD.parent_type; ct := OLD.child_type;
+  ELSE
+    pt := NEW.parent_type; ct := NEW.child_type;
+  END IF;
+  IF caller NOT LIKE 'adjutant_plugin_%' THEN
+    RETURN CASE WHEN TG_OP = 'DELETE' THEN OLD ELSE NEW END;
+  END IF;
+  plugin := substring(caller FROM length('adjutant_plugin_') + 1);
+  SELECT plugin_id INTO owner FROM core.scope_owners WHERE scope_type = pt;
+  IF owner IS DISTINCT FROM plugin THEN
+    RAISE EXCEPTION 'plugin % may not declare an edge with parent scope type % (owned by %)',
+      plugin, pt, COALESCE(owner, '<unowned>');
+  END IF;
+  SELECT plugin_id INTO owner FROM core.scope_owners WHERE scope_type = ct;
+  IF owner IS DISTINCT FROM plugin THEN
+    RAISE EXCEPTION 'plugin % may not declare an edge with child scope type % (owned by %)',
+      plugin, ct, COALESCE(owner, '<unowned>');
+  END IF;
+  RETURN CASE WHEN TG_OP = 'DELETE' THEN OLD ELSE NEW END;
+END
+$fn$;
+
+DROP TRIGGER IF EXISTS scope_hierarchy_owner_check ON core.scope_hierarchy;
+CREATE TRIGGER scope_hierarchy_owner_check
+  BEFORE INSERT OR UPDATE OR DELETE ON core.scope_hierarchy
+  FOR EACH ROW EXECUTE FUNCTION core.scope_hierarchy_owner_check();
+
+-- The declare API: a plugin gets a clear error at declaration time; the trigger
+-- above is the backstop for raw SQL. SECURITY DEFINER so it can read
+-- `core.scope_owners`; it still uses `session_user` to identify the plugin.
+CREATE OR REPLACE FUNCTION core.declare_scope_parent(
+    p_parent_type TEXT, p_parent_id TEXT, p_child_type TEXT, p_child_id TEXT
+) RETURNS void
+LANGUAGE plpgsql SECURITY DEFINER SET search_path = core, pg_temp AS $fn$
+DECLARE
+  plugin TEXT;
+  owner TEXT;
+BEGIN
+  IF session_user LIKE 'adjutant_plugin_%' THEN
+    plugin := substring(session_user FROM length('adjutant_plugin_') + 1);
+    SELECT plugin_id INTO owner FROM core.scope_owners WHERE scope_type = p_parent_type;
+    IF owner IS DISTINCT FROM plugin THEN
+      RAISE EXCEPTION 'plugin % may not declare a % edge (owned by %)',
+        plugin, p_parent_type, COALESCE(owner, '<unowned>');
+    END IF;
+    SELECT plugin_id INTO owner FROM core.scope_owners WHERE scope_type = p_child_type;
+    IF owner IS DISTINCT FROM plugin THEN
+      RAISE EXCEPTION 'plugin % may not declare a % edge (owned by %)',
+        plugin, p_child_type, COALESCE(owner, '<unowned>');
+    END IF;
+  END IF;
+  INSERT INTO core.scope_hierarchy (parent_type, parent_id, child_type, child_id)
+  VALUES (p_parent_type, p_parent_id, p_child_type, p_child_id)
+  ON CONFLICT DO NOTHING;
+END
+$fn$;
+
+GRANT EXECUTE ON FUNCTION core.declare_scope_parent(TEXT, TEXT, TEXT, TEXT) TO PUBLIC;
 ")];
 
 /// Bootstrap roles + permissions grants. `chief` gets everything (SPEC §9 —
@@ -318,6 +403,9 @@ pub async fn migrate_core(pool: &PgPool) -> Result<(), sqlx::Error> {
 
     sqlx::query(SEED_ROLES).execute(pool).await?;
     sqlx::query(SEED_PERMS).execute(pool).await?;
+    // Seed the scope-type ownership map (issue #37): the core writes it; plugins
+    // cannot, so it is the trust anchor for hierarchy edges.
+    crate::schema::seed_scope_owners(pool).await?;
     tracing::info!("database ready (core schema migrated, bootstrap roles seeded)");
     Ok(())
 }

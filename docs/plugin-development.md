@@ -288,23 +288,34 @@ If your plugin owns a hierarchy (membership owns lodge→patrol), declare the ed
 in `core.scope_hierarchy` so the core can resolve coverage **without calling you
 at authorization time**. The table is `(parent_type, parent_id, child_type,
 child_id)`; the core follows parent → child downward, so the broader scope is the
-parent. Declare through your own database handle (`ctx.db`) — there is no SDK
-service for it (adding one would be a plugin ABI change) — and re-declare on every
-load and after a move, so it cannot drift from your data. Membership does:
+parent.
+
+Declare through your own database handle (`ctx.db`) via
+`core.declare_scope_parent(parent_type, parent_id, child_type, child_id)` — there
+is no SDK service for it (adding one would be a plugin ABI change). Re-declare on
+every load and after a move, so it cannot drift from your data. Membership does:
 
 ```sql
 DELETE FROM core.scope_hierarchy WHERE parent_type = 'lodge' AND child_type = 'patrol';
-INSERT INTO core.scope_hierarchy (parent_type, parent_id, child_type, child_id)
-SELECT 'lodge', lodge_id::text, 'patrol', id::text FROM patrols WHERE lodge_id IS NOT NULL;
+SELECT core.declare_scope_parent('lodge', lodge_id::text, 'patrol', id::text)
+FROM patrols WHERE lodge_id IS NOT NULL;
 ```
 
+**Per-scope-type ownership is enforced.** `core.scope_owners` maps each scope type
+to the plugin that owns it (`lodge`/`patrol` → `membership` today). The **core
+writes that map** — seeded from a core constant, extendable by the operator — and
+**plugins have no grant on it**. A plugin may declare an edge only whose parent
+*and* child types it owns; `declare_scope_parent` refuses with a clear message,
+and a database trigger enforces the same rule for raw SQL (a native plugin can run
+arbitrary SQL). `scope_owners` is the trust anchor for the hierarchy: whoever can
+write it can widen any plugin's coverage, so it is core-owned by construction.
+
 Your role gets `SELECT, INSERT, DELETE` on `core.scope_hierarchy` through
-`core_grants` (`server/src/schema.rs`), which is table-level: declare only edges
-you own. The loader rejects self-edges, cycles and scope types the SDK cannot
-represent; the walk is depth-bounded. **Write a check at the scope where the
-authority lives** — check a patrol object at patrol scope and let a lodge grant
-cover it by hierarchy, rather than checking at lodge scope and hoping the object
-happens to be one.
+`core_grants` (`server/src/schema.rs`). The loader rejects self-edges, cycles and
+scope types the SDK cannot represent; the walk is depth-bounded. **Write a check
+at the scope where the authority lives** — check a patrol object at patrol scope
+and let a lodge grant cover it by hierarchy, rather than checking at lodge scope
+and hoping the object happens to be one.
 
 A worked example of the object-route rule is membership's
 `GET /api/membership/member?id=`: `membership:read_all` reaches any member, a

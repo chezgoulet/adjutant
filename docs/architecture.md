@@ -140,7 +140,10 @@ Coverage is hierarchical: a troop grant covers every scope; a lodge grant covers
 that lodge **and the patrols declared inside it**; a patrol grant covers only
 that patrol. The hierarchy is core-owned data (`core.scope_hierarchy`) declared by
 the owning plugin and resolved by the core in memory (no plugin call during
-authorization, cycles rejected). A handler decides an object route with
+authorization, cycles rejected). Edges are owned **per scope type**:
+`core.scope_owners` is core-written and plugin-unreadable, and a trigger plus
+`core.declare_scope_parent` refuse an edge a plugin does not own. A handler
+decides an object route with
 `PermissionService::has_in_scope` (or `reach`, which returns a 403 naming the
 scope). `PermissionService::has_any_scope` is the core gate's unscoped branch and
 is hidden from plugin authors. Self-access is an ownership check, not a scope.

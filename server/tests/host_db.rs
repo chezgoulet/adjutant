@@ -119,6 +119,10 @@ fn base_url() -> String {
 /// parallel.
 static SETUP: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
+/// Serializes the probes that mutate the shared `core.scope_hierarchy` table
+/// (they assert on its global contents, so they must not interleave).
+static HIERARCHY: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
 /// Migrate `core` on the test database and bootstrap a plugin fixture role/schema
 /// for each id, returning `(admin_pool, plugin_pools)`. Mirrors a real
 /// deployment's first `bootstrap-isolation` run.
@@ -437,6 +441,7 @@ async fn probe_scope_id_is_opaque_text_and_round_trips() {
 #[tokio::test]
 #[ignore = "DB-gated: needs ADJUTANT_TEST_DATABASE_URL; run with `-- --ignored`"]
 async fn probe_scope_hierarchy_lodge_covers_its_patrols() {
+    let _h = HIERARCHY.lock().await;
     let (admin, _pools) = setup(&[]).await;
     sqlx::query("DELETE FROM core.scope_hierarchy").execute(admin.as_ref()).await.expect("clear");
     sqlx::query(
@@ -490,4 +495,104 @@ async fn probe_scope_hierarchy_lodge_covers_its_patrols() {
         !perms.has_in_scope(Some(&patrol_expanded), "core:admin", &Scope::lodge("3")).await,
         "covering is downward only: a patrol grant does not cover its lodge"
     );
+}
+
+/// #37: hierarchy edges are owned per scope type. A plugin granted the
+/// `core.scope_hierarchy` table but owning no scope type is refused — by the
+/// trigger on raw SQL and by the declare function — with the edge absent, while
+/// the owning plugin still succeeds and no plugin can write the ownership map.
+#[tokio::test]
+#[ignore = "DB-gated: needs ADJUTANT_TEST_DATABASE_URL + CREATEROLE; run with `-- --ignored`"]
+async fn probe_scope_edge_ownership_is_enforced() {
+    let _h = HIERARCHY.lock().await;
+    let (admin, pools) = setup(&["hello", "membership"]).await;
+    let hello = pools[0].clone();
+    let membership = pools[1].clone();
+    let hello_db = host::CoreDb::new(hello);
+
+    // The core seeds the ownership map; a plugin cannot write it.
+    let seeded: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM core.scope_owners WHERE scope_type IN ('lodge','patrol')",
+    )
+    .fetch_one(admin.as_ref())
+    .await
+    .expect("read scope_owners");
+    assert_eq!(seeded, 2, "the core seeds the ownership map");
+
+    let map_write = hello_db
+        .execute(
+            "INSERT INTO core.scope_owners (scope_type, plugin_id) VALUES ('rogue', 'hello')"
+                .to_string(),
+            vec![],
+        )
+        .await;
+    assert!(map_write.is_err(), "a plugin has no grant on core.scope_owners");
+
+    // Simulate a future plugin granted the edge table but owning no scope type.
+    sqlx::query("GRANT SELECT, INSERT, DELETE ON core.scope_hierarchy TO adjutant_plugin_hello")
+        .execute(admin.as_ref())
+        .await
+        .expect("grant the edge table to hello");
+
+    // Raw SQL is refused by the trigger, with a message naming the type/owner.
+    let raw_err = hello_db
+        .execute(
+            "INSERT INTO core.scope_hierarchy (parent_type, parent_id, child_type, child_id) \
+             VALUES ('lodge', '30', 'patrol', '90')"
+                .to_string(),
+            vec![],
+        )
+        .await
+        .expect_err("hello does not own lodge/patrol")
+        .to_string();
+    assert!(raw_err.contains("may not declare"), "clear trigger error: {raw_err}");
+    println!("[edge-ownership] trigger refusal: {raw_err}");
+
+    // The declare API refuses it too, with its own clear message.
+    let api_err = hello_db
+        .execute(
+            "SELECT core.declare_scope_parent('lodge', '30', 'patrol', '90')".to_string(),
+            vec![],
+        )
+        .await
+        .expect_err("the declare API refuses a type the plugin does not own")
+        .to_string();
+    assert!(api_err.contains("may not declare"), "clear API error: {api_err}");
+    println!("[edge-ownership] declare-API refusal: {api_err}");
+
+    // Query the table, not only the errors: the refused edge must be absent.
+    let present: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM core.scope_hierarchy \
+         WHERE parent_type = 'lodge' AND parent_id = '30' \
+           AND child_type = 'patrol' AND child_id = '90'",
+    )
+    .fetch_one(admin.as_ref())
+    .await
+    .expect("count refused edge");
+    assert_eq!(present, 0, "the refused edge must not be in the table");
+
+    // The legitimate owner still declares through the API, and the edge lands.
+    host::CoreDb::new(membership)
+        .execute(
+            "SELECT core.declare_scope_parent('lodge', '30', 'patrol', '70')".to_string(),
+            vec![],
+        )
+        .await
+        .expect("membership owns lodge/patrol");
+    let present: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM core.scope_hierarchy \
+         WHERE parent_type = 'lodge' AND parent_id = '30' \
+           AND child_type = 'patrol' AND child_id = '70'",
+    )
+    .fetch_one(admin.as_ref())
+    .await
+    .expect("count legit edge");
+    assert_eq!(present, 1, "the legitimate edge lands");
+
+    let _ = sqlx::query("DELETE FROM core.scope_hierarchy WHERE parent_id = '30'")
+        .execute(admin.as_ref())
+        .await;
+    let _ = sqlx::query("REVOKE ALL ON core.scope_hierarchy FROM adjutant_plugin_hello")
+        .execute(admin.as_ref())
+        .await;
 }

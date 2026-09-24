@@ -59,6 +59,31 @@ pub fn core_grants(plugin_id: &str) -> Option<&'static [(&'static str, &'static 
     }
 }
 
+/// Which plugin owns each scope type — the authority to declare hierarchy edges
+/// for it (issue #37). Seeded into `core.scope_owners` at boot from this
+/// constant; the operator may extend it for a future plugin.
+///
+/// **The core writes this map; plugins must never hold a grant on it.** Whoever
+/// can write it can legitimise any edge and so widen any plugin's coverage, so
+/// it is the trust anchor for the `core.scope_hierarchy` edge table.
+pub const SCOPE_OWNERS: &[(&str, &str)] = &[("lodge", "membership"), ("patrol", "membership")];
+
+/// Seed `core.scope_owners` from [`SCOPE_OWNERS`]. `ON CONFLICT DO NOTHING` so an
+/// operator extension (or an explicit reassignment) is preserved across boots.
+pub async fn seed_scope_owners(pool: &PgPool) -> Result<(), sqlx::Error> {
+    for (scope_type, plugin_id) in SCOPE_OWNERS {
+        sqlx::query(
+            "INSERT INTO core.scope_owners (scope_type, plugin_id) VALUES ($1, $2) \
+             ON CONFLICT (scope_type) DO NOTHING",
+        )
+        .bind(scope_type)
+        .bind(plugin_id)
+        .execute(pool)
+        .await?;
+    }
+    Ok(())
+}
+
 /// Create/refresh a plugin's `LOGIN` role, its schema ownership, and its
 /// `core.*` allowlist grants. Returns the role's password (a new random one when
 /// `rotate` is set or none was supplied, otherwise `existing_secret`).
@@ -280,5 +305,15 @@ mod tests {
                 .all(|(_, p)| !p.contains("DELETE")),
             "membership is read-only on the data tables it touches"
         );
+        // The ownership map is the trust anchor for hierarchy edges: no plugin
+        // may hold a grant on it (issue #37).
+        for id in ["auth", "membership", "hello"] {
+            if let Some(grants) = core_grants(id) {
+                assert!(
+                    !grants.iter().any(|(t, _)| *t == "scope_owners"),
+                    "{id} must not be granted core.scope_owners"
+                );
+            }
+        }
     }
 }
