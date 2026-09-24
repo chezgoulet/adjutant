@@ -201,6 +201,13 @@ impl PluginRegistry {
         self.plugins.is_empty()
     }
 
+    /// Is this plugin currently live? A read-only check for handlers that must
+    /// validate before any side effect (the lifecycle routes audit first, then
+    /// apply, so "not loaded" has to be decided without mutating).
+    pub fn contains(&self, id: &str) -> bool {
+        self.plugins.iter().any(|p| p.info.id == id)
+    }
+
     /// Admin snapshots for every live plugin.
     pub fn infos(&self) -> Vec<PluginInfo> {
         self.plugins.iter().map(|p| p.info.clone()).collect()
