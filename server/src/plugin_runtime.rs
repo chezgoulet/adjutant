@@ -116,6 +116,10 @@ pub struct PluginInfo {
     /// live plugin and the admin surface can show isolation is active (#31).
     pub isolated: bool,
     pub permissions: Vec<String>,
+    /// Declared schedules with their last run / last error / next run (#45).
+    /// Filled at request time from the core [`crate::scheduler::Scheduler`], so
+    /// the operator sees when a timer last fired.
+    pub schedules: Vec<ScheduleInfo>,
     /// Full route table — lets `adjutant test-plugin` enumerate every route
     /// without hardcoding plugin knowledge. A path containing a capture is
     /// reported as `skipped` by the harness (it has no concrete value to probe
@@ -131,6 +135,17 @@ pub struct RouteInfo {
     /// `troop` (grant must cover troop) or `any` (the handler checks the
     /// object's scope). Derived from [`RouteDefinition::required_scope`].
     pub scope: String,
+}
+
+/// Admin view of one declared schedule (#45): what it is, when it last ran,
+/// whether that run failed, and when it is next due.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct ScheduleInfo {
+    pub name: String,
+    pub every_secs: u64,
+    pub last_run: Option<chrono::DateTime<chrono::Utc>>,
+    pub last_error: Option<String>,
+    pub next_run: Option<chrono::DateTime<chrono::Utc>>,
 }
 
 /// Result of resolving a request path against the registry.
@@ -622,6 +637,8 @@ pub async fn load_all(
             kind: if is_wasm { "wasm".into() } else { "native".into() },
             isolated: true,
             permissions: granted.iter().map(|p| p.id.clone()).collect(),
+            // Filled at request time from the scheduler.
+            schedules: Vec::new(),
             route_list: routes
                 .iter()
                 .map(|r| RouteInfo {
@@ -894,6 +911,7 @@ mod tests {
             kind: "native".into(),
             isolated: true,
             permissions: perm.map(|p| vec![p.to_string()]).unwrap_or_default(),
+            schedules: Vec::new(),
             route_list: vec![RouteInfo {
                 method: method.into(),
                 path: path.into(),

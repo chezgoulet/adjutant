@@ -52,6 +52,7 @@ fn fixture(id: &str, pool: Arc<sqlx::PgPool>) -> LoadedPlugin {
             kind: "native".into(),
             isolated: true,
             permissions: Vec::new(),
+            schedules: Vec::new(),
             route_list: Vec::new(),
         },
     }

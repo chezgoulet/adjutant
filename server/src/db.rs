@@ -361,6 +361,22 @@ END
 $fn$;
 
 GRANT EXECUTE ON FUNCTION core.declare_scope_parent(TEXT, TEXT, TEXT, TEXT) TO PUBLIC;
+"),
+(8, "scheduled_runs", "
+-- Durable record of scheduled runs (#45): 'did the timer actually run?'
+-- In-memory state cannot answer that after a restart. The core writes one row
+-- per run; a failure is recorded here and logged, never retried in a loop.
+CREATE TABLE IF NOT EXISTS core.scheduled_runs (
+    id          BIGSERIAL PRIMARY KEY,
+    plugin_id   TEXT NOT NULL,
+    schedule    TEXT NOT NULL,
+    started_at  TIMESTAMPTZ NOT NULL,
+    finished_at TIMESTAMPTZ NOT NULL,
+    ok          BOOLEAN NOT NULL,
+    error       TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_scheduled_runs_recent
+  ON core.scheduled_runs (plugin_id, schedule, finished_at DESC);
 ")];
 
 /// Bootstrap roles + permissions grants. `chief` gets everything (SPEC §9 —

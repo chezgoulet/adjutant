@@ -236,6 +236,45 @@ Return an `SdkError` to short-circuit with the matching status:
 `BadRequest` 400, `Unauthorized` 401, `Forbidden` 403, `NotFound` 404,
 `Conflict` 409, `Db`/`Internal` 500.
 
+## Scheduled work
+
+A plugin that needs periodic work declares a schedule; the **core** runs it. Do
+not spawn your own thread — the core cannot audit, bound or stop it.
+
+```rust
+use adjutant_sdk::prelude::*;
+use std::time::Duration;
+
+fn schedules(&self) -> Vec<Schedule> {
+    let ctx = self.ctx().clone();
+    vec![Schedule::new(
+        "renewal-sweep",
+        Duration::from_secs(24 * 60 * 60),
+        schedule_handler(move || {
+            let ctx = ctx.clone();
+            async move {
+                // Runs on your own pool, as your plugin role.
+                let _rows = ctx.db.query("SELECT 1", vec![]).await?;
+                Ok(())
+            }
+        }),
+    )]
+}
+```
+
+- **Cadence is an interval, not cron**: the next run is `every` after the
+  previous one *finishes*, so a slow run delays rather than overlaps it.
+- **One attempt per tick.** A failure (or a 60s timeout) is recorded in
+  `core.scheduled_runs` and logged; the next tick is the retry. Nothing spins.
+- **Catch-up:** at load, if the last success is older than the cadence (or there
+  is none), the schedule runs **once** immediately, then resumes the cadence.
+  Missed ticks are not backfilled.
+- **Lifecycle:** schedules start when the plugin loads and are stopped when it is
+  disabled, uninstalled or reloaded — a retired plugin's timers do not keep
+  firing.
+- **Visibility:** `/api/plugins` reports each schedule with its last run, last
+  error and next run.
+
 ## Scoped permissions (SPEC §9.2)
 
 Permissions can be scoped to a troop, lodge, or patrol. **A scope is checked

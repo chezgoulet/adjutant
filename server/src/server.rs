@@ -54,6 +54,9 @@ pub struct AppState {
     /// Declared scope hierarchy (lodge→patrol), loaded at boot and on reload.
     /// Used to expand a caller's grants before the gate and handlers see them.
     pub hierarchy: RwLock<crate::scope_hierarchy::ScopeHierarchy>,
+    /// Runs plugin-declared schedules (#45): started on load, aborted on
+    /// disable/uninstall/reload.
+    pub scheduler: Arc<crate::scheduler::Scheduler>,
 }
 
 impl AppState {
@@ -87,6 +90,7 @@ impl AppState {
     /// the process exits. Without this, that hook was dead code.
     pub async fn shutdown(&self) {
         self.bus.shutdown();
+        self.scheduler.stop_all();
         let mut reg = self.registry.write().await;
         // Destructure the guard so the two vecs borrow independently.
         let PluginRegistry { plugins, retired } = &mut *reg;
@@ -152,6 +156,7 @@ pub async fn build_app(cfg: &Config) -> Result<(Router, Arc<AppState>), BuildErr
     let bus = EventBus::new();
     let identity = crate::identity::IdentityHub::new();
     let http = crate::host::CoreHttp::new();
+    let scheduler = crate::scheduler::Scheduler::new();
 
     let registry = load_all(
         &cfg.plugin_dir,
@@ -177,6 +182,9 @@ pub async fn build_app(cfg: &Config) -> Result<(Router, Arc<AppState>), BuildErr
         for sub in lp.plugin.subscriptions() {
             bus.subscribe(lp.plugin.id(), sub);
         }
+        // Same discipline as subscriptions: only enabled plugins get their
+        // schedules started, and they are aborted on disable/uninstall/reload.
+        scheduler.start(lp.plugin.id(), lp.plugin.schedules(), pool.clone());
     }
     let route_count: usize = registry.plugins.iter().map(|p| p.routes.len()).sum();
 
@@ -212,6 +220,7 @@ pub async fn build_app(cfg: &Config) -> Result<(Router, Arc<AppState>), BuildErr
         identity,
         http,
         hierarchy: RwLock::new(hierarchy),
+        scheduler,
     });
 
     let cors = cfg.cors_origins.first().map(|_| {
@@ -542,8 +551,18 @@ async fn list_plugins(State(state): State<Arc<AppState>>, req: Request) -> Respo
         return resp;
     }
     let reg = state.registry.read().await;
+    let plugins: Vec<serde_json::Value> = reg
+        .infos()
+        .into_iter()
+        .map(|mut info| {
+            // Schedules are runtime state (last run / next run), so fill them at
+            // request time rather than from the load-time snapshot.
+            info.schedules = state.scheduler.infos(&info.id);
+            serde_json::to_value(&info).unwrap_or(serde_json::Value::Null)
+        })
+        .collect();
     Json(json!({
-        "plugins": reg.infos(),
+        "plugins": plugins,
         "retired_libraries": reg.retired_count(),
         // Plugin ids with at least one bound event subscription. Disable aborts
         // them and enable re-binds, so this is the observable proof of that.
@@ -674,13 +693,20 @@ async fn enable_plugin(
         }
     }
     state.identity.set_enabled(&name, true);
-    // Re-bind subscriptions that disable aborted (only if none are bound, so a
-    // repeated enable cannot double-subscribe).
-    if !state.bus.subscriber_ids().iter().any(|id| id == &name) {
+    {
         let reg = state.registry.read().await;
         if let Some(lp) = reg.plugins.iter().find(|p| p.info.id == name) {
-            for sub in lp.plugin.subscriptions() {
-                state.bus.subscribe(&name, sub);
+            // Re-bind subscriptions that disable aborted (only if none are bound,
+            // so a repeated enable cannot double-subscribe).
+            if !state.bus.subscriber_ids().iter().any(|id| id == &name) {
+                for sub in lp.plugin.subscriptions() {
+                    state.bus.subscribe(&name, sub);
+                }
+            }
+            // Restart schedules (idempotent: `start` aborts any existing tasks).
+            let schedules = lp.plugin.schedules();
+            if !schedules.is_empty() {
+                state.scheduler.start(&name, schedules, state.pool.clone());
             }
         }
     }
@@ -748,6 +774,7 @@ async fn disable_plugin(
     // Stop the plugin's event handlers too: routes 404-ing while its handlers keep
     // appending audit rows and writing to its schema is not "disabled".
     state.bus.clear_plugin(&name).await;
+    state.scheduler.stop(&name);
     let dbres = sqlx::query(
         "UPDATE core.plugins SET enabled = false, updated_at = now() WHERE id = $1",
     )
@@ -829,6 +856,7 @@ async fn uninstall_plugin(
     }
     state.bus.clear_plugin(&name).await;
     state.identity.remove(&name);
+    state.scheduler.forget(&name);
     Json(json!({
         "plugin": name,
         "uninstalled": true,
@@ -906,13 +934,16 @@ async fn reload_plugins(State(state): State<Arc<AppState>>, req: Request) -> Res
         return resp;
     }
 
-    // Swap, then rebind subscriptions: abort every old task first so no
-    // event is handled by both the old and the new instance.
+    // Swap, then rebind subscriptions and schedules: abort every old task first
+    // so no event is handled and no timer fires for both generations.
     {
         let mut reg = state.registry.write().await;
         reg.replace_all(fresh);
     }
     *state.hierarchy.write().await = fresh_hierarchy;
+    // A reload replaces every generation: abort all old schedule tasks, then
+    // start the new set below.
+    state.scheduler.stop_all();
     // Providers from retired plugins stop answering; live ones re-registered
     // themselves during load_all's init (same owner key → replaced in place).
     {
@@ -929,6 +960,9 @@ async fn reload_plugins(State(state): State<Arc<AppState>>, req: Request) -> Res
         for lp in &reg.plugins {
             for sub in lp.plugin.subscriptions() {
                 state.bus.subscribe(lp.plugin.id(), sub);
+            }
+            if lp.enabled {
+                state.scheduler.start(lp.plugin.id(), lp.plugin.schedules(), state.pool.clone());
             }
         }
     }
@@ -1062,6 +1096,7 @@ mod tests {
                 kind: "native".into(),
                 isolated: true,
                 permissions: Vec::new(),
+                schedules: Vec::new(),
                 route_list: Vec::new(),
             },
         }
@@ -1093,6 +1128,7 @@ mod tests {
             identity: IdentityHub::new(),
             http: crate::host::CoreHttp::new(),
             hierarchy: RwLock::new(crate::scope_hierarchy::ScopeHierarchy::default()),
+            scheduler: crate::scheduler::Scheduler::new(),
         })
     }
 

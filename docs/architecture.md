@@ -155,6 +155,16 @@ a session provider at `init`; the core consults providers for every request. Dev
 headers (`x-dev-user`/`x-dev-role`) are off by default and only act as a fallback
 when enabled.
 
+## Scheduler
+
+Plugins declare periodic work (`Schedule`); the core runs it on one scheduler
+(`server/src/scheduler.rs`) with the same discipline as a request: the plugin's
+own pool/isolation role, a per-run timeout, one attempt per tick, and a durable
+row in `core.scheduled_runs`. Schedules start on load and are aborted on
+disable/uninstall/reload. Cadence is an interval, not cron; after downtime a due
+schedule runs once and resumes (no backfill). `/api/plugins` shows each
+schedule's last run, last error and next run.
+
 ## Versioning
 
 The core and `adjutant-sdk` share a version. Plugins built against a different

@@ -16,8 +16,11 @@
 //! `ADJUTANT_TEST_DATABASE_URL` is a hard failure — never a skip.
 use std::sync::Arc;
 
-use adjutant_sdk::{HostDb, Identity, PermissionService, RoleGrant, Scope, SqlValue};
+use adjutant_sdk::{
+    schedule_handler, HostDb, Identity, PermissionService, RoleGrant, Schedule, Scope, SqlValue,
+};
 use adjutant_server::host::CoreDb;
+use adjutant_server::scheduler::Scheduler;
 use adjutant_server::scope_hierarchy::ScopeHierarchy;
 use adjutant_server::{db, host, schema};
 
@@ -595,4 +598,120 @@ async fn probe_scope_edge_ownership_is_enforced() {
     let _ = sqlx::query("REVOKE ALL ON core.scope_hierarchy FROM adjutant_plugin_hello")
         .execute(admin.as_ref())
         .await;
+}
+
+/// #45: the core scheduler runs a declared schedule repeatedly (driven by a
+/// channel and the run table, never by waiting on wall-clock minutes), the
+/// handler observes the plugin's own role, a failure is recorded without
+/// crashing or spinning, and stopping the plugin stops the ticks.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "DB-gated: needs ADJUTANT_TEST_DATABASE_URL + CREATEROLE; run with `-- --ignored`"]
+async fn probe_scheduler_runs_records_and_stops() {
+    let (admin, pools) = setup(&["sched_probe"]).await;
+    let plugin_pool = pools[0].clone();
+    let role = schema::role_for("sched_probe");
+    let scheduler = Scheduler::new();
+
+    // A failing tick must not take the server down or spin: the handler returns
+    // an error; the scheduler records it and waits for the next interval.
+    let fail_sched = Schedule::new(
+        "boom",
+        std::time::Duration::from_millis(100),
+        schedule_handler(|| async { Err::<(), _>(adjutant_sdk::SdkError::Internal("boom".into())) }),
+    );
+
+    let (tx, mut rx) = tokio::sync::mpsc::channel::<String>(16);
+    let db = host::CoreDb::new(plugin_pool);
+    let tick = Schedule::new(
+        "tick",
+        std::time::Duration::from_millis(100),
+        schedule_handler(move || {
+            let db = db.clone();
+            let tx = tx.clone();
+            async move {
+                let rows = db.query("SELECT session_user AS u".to_string(), vec![]).await?;
+                let who = rows[0]["u"].as_str().unwrap_or_default().to_string();
+                let _ = tx.send(who).await;
+                Ok(())
+            }
+        }),
+    );
+    scheduler.start("sched_probe", vec![tick, fail_sched], admin.clone());
+
+    // Two ticks within a few seconds: repeated execution, observed live.
+    for _ in 0..2 {
+        let got = tokio::time::timeout(std::time::Duration::from_secs(5), rx.recv())
+            .await
+            .expect("a scheduled run within 5s")
+            .expect("channel open");
+        assert_eq!(got, role, "the handler runs as the plugin's own role");
+    }
+
+    // Durable evidence: rows in core.scheduled_runs. The handler signals the
+    // channel before the scheduler writes the row, so poll briefly.
+    let mut ok_runs: i64 = 0;
+    for _ in 0..50 {
+        ok_runs = sqlx::query_scalar(
+            "SELECT count(*) FROM core.scheduled_runs WHERE plugin_id='sched_probe' AND schedule='tick' AND ok",
+        )
+        .fetch_one(admin.as_ref())
+        .await
+        .expect("count ok runs");
+        if ok_runs >= 2 {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+    assert!(ok_runs >= 2, "at least two successful runs recorded, got {ok_runs}");
+
+    // The admin view (what PluginInfo reports) has last_run and next_run.
+    let infos = scheduler.infos("sched_probe");
+    assert_eq!(infos.len(), 2, "both schedules listed");
+    let tick_info = infos.iter().find(|s| s.name == "tick").expect("tick listed");
+    assert!(tick_info.last_run.is_some(), "last_run is reported");
+    assert!(tick_info.next_run.is_some(), "next_run is reported");
+
+    // The failing schedule records failures but does not spin.
+    let count_bad = || async {
+        sqlx::query_scalar::<_, i64>(
+            "SELECT count(*) FROM core.scheduled_runs \
+             WHERE plugin_id='sched_probe' AND schedule='boom' AND NOT ok AND error IS NOT NULL",
+        )
+        .fetch_one(admin.as_ref())
+        .await
+        .expect("count failed runs")
+    };
+    let mut bad_runs = 0;
+    for _ in 0..50 {
+        bad_runs = count_bad().await;
+        if bad_runs >= 1 {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+    assert!(bad_runs >= 1, "a failure is recorded");
+    tokio::time::sleep(std::time::Duration::from_millis(450)).await;
+    let bad_after = count_bad().await;
+    assert!(
+        bad_after <= bad_runs + 8,
+        "a failing schedule must not spin: {bad_runs} -> {bad_after} in ~0.45s"
+    );
+    let boom = scheduler.infos("sched_probe").into_iter().find(|s| s.name == "boom").unwrap();
+    assert!(boom.last_error.is_some(), "last_error is reported");
+
+    // Stop: the run count must stop rising (allow an in-flight insert to land).
+    scheduler.stop("sched_probe");
+    tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+    let before: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM core.scheduled_runs WHERE plugin_id='sched_probe'")
+            .fetch_one(admin.as_ref())
+            .await
+            .expect("count before");
+    tokio::time::sleep(std::time::Duration::from_millis(450)).await;
+    let after: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM core.scheduled_runs WHERE plugin_id='sched_probe'")
+            .fetch_one(admin.as_ref())
+            .await
+            .expect("count after");
+    assert_eq!(before, after, "a stopped plugin's schedules must not keep firing");
 }
