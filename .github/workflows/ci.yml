@@ -127,14 +127,14 @@ jobs:
           python3 docs/e2e_m3.py
 
   # The declared MSRV (workspace rust-version). RUSTUP_TOOLCHAIN overrides the
-  # rust-toolchain.toml `stable` channel so this job actually uses 1.88.
+  # rust-toolchain.toml `stable` channel so this job actually uses 1.96.
   msrv:
     runs-on: ubuntu-latest
     env:
-      RUSTUP_TOOLCHAIN: "1.88.0"
+      RUSTUP_TOOLCHAIN: "1.96.0"
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@1.88.0
+      - uses: dtolnay/rust-toolchain@1.96.0
       - uses: Swatinem/rust-cache@v2
       - name: cargo check on MSRV
         run: cargo check --workspace

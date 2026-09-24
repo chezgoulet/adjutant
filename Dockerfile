@@ -2,7 +2,7 @@
 
 # --- build ------------------------------------------------------------------
 # Pinned to the MSRV so the container builds with a known-good toolchain.
-FROM rust:1.88-bookworm AS builder
+FROM rust:1.96-bookworm AS builder
 WORKDIR /src
 COPY . .
 RUN rustup target add wasm32-wasip1 \

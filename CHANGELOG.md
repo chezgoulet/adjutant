@@ -29,7 +29,8 @@ crates.io publication.
   verified tarball (binary + bundled plugins).
 - **Supply-chain and doc gates.** `deny.toml` (advisories, licenses, bans,
   sources), a `cargo doc -D warnings` gate, and an MSRV job, all in CI.
-  `rust-toolchain.toml` plus `rust-version = "1.88"` declare the toolchain.
+  `rust-toolchain.toml` plus `rust-version = "1.96"` declare the toolchain
+  (wasmtime 49 raised the floor from 1.88).
 - **Enforced schema isolation.** Each plugin gets a `NOLOGIN` PostgreSQL role
   (`adjutant_plugin_<id>`); its runtime database handle runs under
   `SET LOCAL ROLE` with full rights on its own schema and an explicit allowlist

@@ -125,7 +125,8 @@ public SDK + testing module. **Met.**
       One `{"error": ...}` envelope; 5xx responses are generic (detail logged,
       not returned), 4xx carry the plugin message.
 - [x] MSRV pin (`rust-toolchain.toml`), `cargo-deny`, and a `cargo doc`
-      warnings gate. MSRV declared as 1.88; `deny.toml` + CI `cargo-deny`,
+      warnings gate. MSRV declared as 1.96 (wasmtime 49's floor — raised from
+      1.88 in W3); `deny.toml` + CI `cargo-deny`,
       `cargo doc -D warnings`, and an MSRV `cargo check` job.
 - [x] Dockerfile + `docker-compose.yml` (server + PostgreSQL) and a documented
       upgrade / backup / restore story — `docs/deployment.md`; image built and
