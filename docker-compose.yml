@@ -1,12 +1,24 @@
 # Adjutant — one-command self-hosted deployment (SPEC §11.1).
 #
-#   POSTGRES_PASSWORD=change-me docker compose up -d
+#   export POSTGRES_PASSWORD="$(openssl rand -hex 24)"
+#   export ADJUTANT_APP_PASSWORD="$(openssl rand -hex 24)"
+#   docker compose up -d
 #
 # Postgres is not exposed to the host; only the server is. See docs/deployment.md.
+#
+# Roles:
+#   * `adjutant` — the Postgres superuser, used only for the one-off
+#     `bootstrap-isolation` run (it creates roles). The server never connects
+#     as it.
+#   * `adjutant_app` — the server's runtime role. Created and granted by
+#     `bootstrap-isolation --app-role`; no SUPERUSER, no CREATEROLE, owns the
+#     `core` schema and holds the plugin roles. This is what makes the
+#     superuser boot refusal passable.
 services:
   postgres:
     image: postgres:18-alpine
     environment:
+      # Admin/bootstrap superuser. The server does not run as it.
       POSTGRES_USER: adjutant
       # Required: no insecure default. Set it in a .env file or the shell.
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD}
@@ -26,7 +38,11 @@ services:
       postgres:
         condition: service_healthy
     environment:
-      ADJUTANT_DATABASE_URL: postgres://adjutant:${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD}@postgres:5432/adjutant
+      # The server connects as the non-superuser app role; `bootstrap-isolation
+      # --app-role adjutant_app` creates it and hands it the core schema. An
+      # un-bootstrapped plugin (or app role) makes the server refuse to boot
+      # (`NotBootstrapped`, exit 1) — run the bootstrap first.
+      ADJUTANT_DATABASE_URL: postgres://adjutant_app:${ADJUTANT_APP_PASSWORD:?set ADJUTANT_APP_PASSWORD}@postgres:5432/adjutant
       ADJUTANT_BIND: 0.0.0.0:8787
       ADJUTANT_LOG_FORMAT: json
       # Leave ADJUTANT_DEV_HEADERS unset (off). Enable only for local dev.

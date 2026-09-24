@@ -94,6 +94,7 @@ Precedence is defaults < TOML file (./adjutant.toml or `--config`) < environment
 | `ADJUTANT_CORS` | comma-separated origins, `*` for any |
 | `ADJUTANT_MAX_BODY` | request body cap in bytes |
 | `ADJUTANT_DEV_HEADERS` | **`false` by default.** Set `true` (or pass `--allow-dev-headers`) to enable the spoofable `x-dev-user`/`x-dev-role` identity stub for development. Only consulted when no plugin identity provider answered |
+| `ADJUTANT_ALLOW_SUPERUSER` | **`false` by default.** The server refuses to boot on a PostgreSQL superuser connection (a plugin escape would be total compromise). Set `true` (or pass `--allow-superuser`) only for a throwaway database |
 | `ADJUTANT_TEST_DATABASE_URL` | overrides the derived `_test` database for `adjutant test-plugin` and the DB-backed tests |
 
 ### Two operational hazards worth reading before deploying

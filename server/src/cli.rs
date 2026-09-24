@@ -324,8 +324,18 @@ pub struct Probe {
 ///
 /// Run once by the operator against an admin URL; the runtime never needs
 /// `CREATEROLE`. Idempotent — existing passwords are preserved unless `rotate`.
-/// Returns the plugin ids that were bootstrapped.
-pub async fn bootstrap_isolation(cfg: &Config, rotate: bool) -> Result<Vec<String>, String> {
+///
+/// With `app_role`, also create/refresh the dedicated **application** role (no
+/// superuser, no CREATEROLE), hand it ownership of the `core` schema (so it can
+/// run core migrations and serve core services without being a superuser), and
+/// make it a member of every plugin role. `app_password` sets its password when
+/// given. Returns the plugin ids that were bootstrapped.
+pub async fn bootstrap_isolation(
+    cfg: &Config,
+    rotate: bool,
+    app_role: Option<&str>,
+    app_password: Option<&str>,
+) -> Result<Vec<String>, String> {
     // Core migrations first: `db_secret` and `core.record_migration` must exist.
     let pool = crate::db::connect_and_migrate(cfg)
         .await
@@ -360,6 +370,24 @@ pub async fn bootstrap_isolation(cfg: &Config, rotate: bool) -> Result<Vec<Strin
         .map_err(|e| format!("store {} credential: {e}", d.id))?;
         ids.push(d.id);
     }
+
+    if let Some(app) = app_role {
+        crate::schema::bootstrap_app_role(pool.as_ref(), app, app_password)
+            .await
+            .map_err(|e| format!("bootstrap app role {app}: {e}"))?;
+        for id in &ids {
+            sqlx::query(&format!(
+                "GRANT \"{}\" TO \"{app}\"",
+                crate::schema::role_for(id)
+            ))
+            .execute(pool.as_ref())
+            .await
+            .map_err(|e| format!("grant plugin role {id} to {app}: {e}"))?;
+        }
+        crate::schema::transfer_core_ownership(pool.as_ref(), app)
+            .await
+            .map_err(|e| format!("transfer core ownership to {app}: {e}"))?;
+    }
     Ok(ids)
 }
 
@@ -391,7 +419,7 @@ pub async fn run_test_plugin(cfg: &Config) -> Result<Vec<Probe>, String> {
 
     // A plugin now loads on its own restricted role/pool, so the pristine test
     // database needs its roles bootstrapped (the runtime cannot create them).
-    bootstrap_isolation(&cfg, false).await?;
+    bootstrap_isolation(&cfg, false, None, None).await?;
 
     let (app, _state) = crate::build_app(&cfg)
         .await

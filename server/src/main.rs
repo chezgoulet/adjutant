@@ -117,12 +117,27 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
         }
         Some("bootstrap-isolation") => {
-            let rotate = args.iter().any(|a| a == "--rotate");
-            let passthrough: Vec<String> = args[1..]
-                .iter()
-                .filter(|a| a.as_str() != "--rotate")
-                .cloned()
-                .collect();
+            // `--rotate`/`--app-role`/`--app-password` are subcommand options
+            // (not serve flags), so pull them out before the CLI parser.
+            let mut rotate = false;
+            let mut app_role: Option<String> = None;
+            let mut app_password: Option<String> = None;
+            let mut passthrough: Vec<String> = Vec::new();
+            let mut it = args[1..].iter();
+            while let Some(a) = it.next() {
+                match a.as_str() {
+                    "--rotate" => rotate = true,
+                    "--app-role" => app_role = it.next().cloned(),
+                    "--app-password" => app_password = it.next().cloned(),
+                    _ if a.starts_with("--app-role=") => {
+                        app_role = Some(a["--app-role=".len()..].to_string())
+                    }
+                    _ if a.starts_with("--app-password=") => {
+                        app_password = Some(a["--app-password=".len()..].to_string())
+                    }
+                    _ => passthrough.push(a.clone()),
+                }
+            }
             let cli = config::CliArgs::parse(passthrough).unwrap_or_else(|e| {
                 eprintln!("error: {e}\n\n{}", config::USAGE);
                 std::process::exit(2);
@@ -135,12 +150,23 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 )
                 .with_writer(std::io::stderr)
                 .init();
-            match adjutant_server::cli::bootstrap_isolation(&cfg, rotate).await {
+            match adjutant_server::cli::bootstrap_isolation(
+                &cfg,
+                rotate,
+                app_role.as_deref(),
+                app_password.as_deref(),
+            )
+            .await
+            {
                 Ok(ids) => {
                     println!(
-                        "bootstrapped {} plugin role(s){}: {}",
+                        "bootstrapped {} plugin role(s){}{}: {}",
                         ids.len(),
                         if rotate { " (passwords rotated)" } else { "" },
+                        app_role
+                            .as_deref()
+                            .map(|a| format!(" + app role {a}"))
+                            .unwrap_or_default(),
                         ids.join(", ")
                     );
                     return Ok(());

@@ -152,6 +152,74 @@ async fn generate_secret(pool: &PgPool) -> Result<String, sqlx::Error> {
         .await
 }
 
+/// Create/refresh the dedicated **application** role (design `plugin-isolation.md`
+/// §3.6): `LOGIN`, no `SUPERUSER`, no `CREATEROLE`, no `CREATEDB`. It owns no
+/// *plugin* schema. `password` is set when given (interpolated; single quotes
+/// escaped); when absent the existing password is left alone.
+pub async fn bootstrap_app_role(
+    pool: &PgPool,
+    role: &str,
+    password: Option<&str>,
+) -> Result<(), sqlx::Error> {
+    match sqlx::query(&format!(
+        "CREATE ROLE \"{role}\" LOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE"
+    ))
+    .execute(pool)
+    .await
+    {
+        Ok(_) => {}
+        Err(e) if e.as_database_error().and_then(|d| d.code()).as_deref() == Some("42710") => {}
+        Err(e) => return Err(e),
+    }
+    let mut alter =
+        format!("ALTER ROLE \"{role}\" LOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE");
+    if let Some(pw) = password {
+        alter.push_str(&format!(" PASSWORD '{}'", pw.replace('\'', "''")));
+    }
+    sqlx::query(&alter).execute(pool).await?;
+    Ok(())
+}
+
+/// Transfer ownership of the `core` schema and every object inside it to
+/// `role`, and grant it `CONNECT, CREATE` on the current database.
+///
+/// The application role must own `core` so it can run core migrations (which
+/// `ALTER core.*` tables) and serve core services **without being a superuser**.
+/// This is the one deviation from §3.6's "owns nothing": it owns the core
+/// schema, not any plugin schema. Requires a connection that owns the objects.
+pub async fn transfer_core_ownership(pool: &PgPool, role: &str) -> Result<(), sqlx::Error> {
+    let db: String = sqlx::query_scalar("SELECT current_database()").fetch_one(pool).await?;
+    sqlx::query(&format!("GRANT CONNECT, CREATE ON DATABASE \"{db}\" TO \"{role}\""))
+        .execute(pool)
+        .await?;
+    let sql = format!(
+        "DO $own$
+         DECLARE r RECORD;
+         BEGIN
+           FOR r IN SELECT tablename FROM pg_tables WHERE schemaname = 'core' LOOP
+             EXECUTE format('ALTER TABLE core.%I OWNER TO %I', r.tablename, '{role}');
+           END LOOP;
+           FOR r IN SELECT sequencename FROM pg_sequences WHERE schemaname = 'core' LOOP
+             EXECUTE format('ALTER SEQUENCE core.%I OWNER TO %I', r.sequencename, '{role}');
+           END LOOP;
+           FOR r IN SELECT p.proname, pg_get_function_identity_arguments(p.oid) AS args
+                    FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace
+                    WHERE n.nspname = 'core' LOOP
+             EXECUTE format('ALTER FUNCTION core.%I(%s) OWNER TO %I', r.proname, r.args, '{role}');
+           END LOOP;
+         END $own$;"
+    );
+    sqlx::query(&sql).execute(pool).await?;
+    sqlx::query(&format!("ALTER SCHEMA core OWNER TO \"{role}\""))
+        .execute(pool)
+        .await?;
+    sqlx::query(&format!("GRANT USAGE ON SCHEMA public TO \"{role}\""))
+        .execute(pool)
+        .await?;
+    tracing::info!(role = %role, "core schema ownership transferred to the application role");
+    Ok(())
+}
+
 /// `ALTER … OWNER TO` for every table/sequence/view inside one schema. Scoped to
 /// `schema` on purpose; idempotent (re-owning by the same role is a no-op).
 async fn transfer_schema_ownership(
