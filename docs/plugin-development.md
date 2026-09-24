@@ -125,9 +125,10 @@ store the context in a `OnceLock` or clone it into their handlers.
 
 ### Database
 
-`DbHandle` runs every call inside a transaction with `search_path` set to your
-schema, so bare table names resolve there. Core tables stay reachable as
-`core.*`. Rows come back as JSON objects keyed by column name.
+`DbHandle` runs every call on a connection authenticated as **your plugin's own
+PostgreSQL role**, whose default `search_path` is your schema, so bare table
+names resolve there. Core tables stay reachable as `core.*` (within your
+allowlist). Rows come back as JSON objects keyed by column name.
 
 ```rust
 let rows = ctx.db.query(
@@ -265,8 +266,9 @@ async fn approve(ctx: &PluginContext, req: &PluginRequest, lodge_id: &str) -> Re
 ## Migrations and schema
 
 Return `Migration`s from `migrations()`. Versions start at 1 and must be unique.
-Each runs once, in version order, inside a transaction with `search_path` set to
-your schema, recorded in `core.schema_migrations`.
+Each runs once, in version order, on **your plugin's pool as your role**, inside
+your schema, and is recorded in `core.schema_migrations`. Because the DDL runs
+as your role, it can only touch your own schema.
 
 ```rust
 fn migrations(&self) -> Vec<Migration> {
@@ -284,22 +286,29 @@ statements, which allow only one statement per call.)
 
 ## Schema isolation
 
-Each plugin gets its own PostgreSQL schema **and** — when the database role can
-manage roles (`CREATEROLE`/superuser) — its own `NOLOGIN` role
-`adjutant_plugin_<id>`. Every `ctx.db` call runs inside `SET LOCAL ROLE`, so:
+A plugin's database boundary is the **identity of its connection**. Each plugin
+gets a `LOGIN` role `adjutant_plugin_<id>` that owns its PostgreSQL schema, and
+`ctx.db` runs on a pool authenticated as that role. So:
 
-- bare table names resolve in your schema;
-- you have full rights on your own schema;
+- bare table names resolve in your schema (the role's default `search_path`);
+- you own your schema and everything in it;
 - you can touch only an explicit allowlist of `core.*` tables (see
   `core_grants` in `server/src/schema.rs` — auth and membership have entries;
   other plugins get none);
-- reaching into **another plugin's** schema fails with `permission denied`.
+- reaching into **another plugin's** schema fails with `permission denied`;
+- `SET ROLE`/`RESET ROLE` cannot lift you out: the session user *is* your role
+  and it is a member of nothing, so the old `DO`-block escape is inert.
 
-Migrations are authored by you and run as the base role at boot, so they may
-create objects freely (and first-party plugins may alter core tables there). The
-isolation applies to runtime queries, which is where plugin code executes. If
-your plugin needs a core table, request it be added to `core_grants`; do not
-assume `core.*` is open.
+Roles, schema ownership and passwords are created by the operator with
+`adjutant bootstrap-isolation`; the runtime cannot create them. If your plugin
+needs a core table, request it be added to `core_grants`; do not assume `core.*`
+is open.
+
+**Migrations run on your role and pool too**, inside your schema, so they may
+create/alter objects **in your schema only** — a migration that writes `core.*`
+now fails with `permission denied` (the core-owned columns that used to live in
+the auth plugin's migration are core migrations). Applied versions are recorded
+through a checked function, not by writing `core.schema_migrations` directly.
 
 ## Testing with `adjutant_sdk::testing`
 
@@ -420,8 +429,9 @@ the JSON boundary.
    or a `slice::Iter` in the generator state poisons the future.
 4. **One statement per `HostDb` call at runtime** — the host prepares
    statements; split multi-statement write batches.
-5. **`search_path` is per call** — don't assume a bare name resolves outside a
-   `ctx.db` call.
+5. **Your connection is your role** — bare names resolve in your schema because
+   your plugin role's `search_path` is set to it; you cannot `SET ROLE` out of
+   it.
 6. **Route namespace is enforced** — every path starts with `/api/{id}`.
 7. **Permissions are namespaced and must be granted** — a route requiring a
    permission the plugin doesn't declare is rejected at load.

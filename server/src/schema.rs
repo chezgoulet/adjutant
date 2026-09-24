@@ -1,26 +1,27 @@
-//! Per-plugin PostgreSQL role isolation (SPEC §5.2: each plugin gets its own
-//! schema and cannot read or write other plugins' schemas).
+//! Per-plugin PostgreSQL role isolation (SPEC §5.2; design:
+//! `docs/design/plugin-isolation.md`).
 //!
-//! The core's per-call `search_path` (see `host.rs`) is a *convenience*; it is
-//! not a boundary — a plugin could still write `other_plugin.secret` explicitly.
-//! This module adds the boundary: each plugin gets a `NOLOGIN` role
-//! `adjutant_plugin_<id>` that owns nothing outside its schema and holds only an
-//! explicit allowlist of privileges on `core.*` tables. At runtime the plugin's
-//! database handle runs every call inside `SET LOCAL ROLE`, so a query that
-//! reaches into another schema fails with `permission denied`.
+//! The boundary is the **identity of the connection**, not a statement filter.
+//! Each plugin gets a `LOGIN` role `adjutant_plugin_<id>` that **owns its
+//! schema**, and the host runs that plugin's SQL on a pool authenticated as that
+//! role (see [`crate::host::plugin_pool`]). A plugin therefore cannot become
+//! anything else: `SET ROLE`/`RESET ROLE` can only return it to its own identity
+//! and `DO`-block tricks are inert. The old mechanism — `SET LOCAL ROLE` on a
+//! connection whose session user was the deployment role — was a state change on
+//! a privileged session, not a restricted principal, and was defeated by a
+//! single `DO` block (design §1, E2).
 //!
-//! **Migrations still run as the base role** (they are trusted code and some,
-//! like auth's, deliberately `ALTER TABLE core.users`). Isolation applies to the
-//! plugin's *runtime* queries, which is where plugin (and eventually
-//! third-party) code actually executes.
+//! Roles, schema ownership and the `core.*` allowlist are established by
+//! [`bootstrap_role`], which the operator runs through `adjutant
+//! bootstrap-isolation` against an admin URL. The **runtime never needs
+//! `CREATEROLE`**: it reads the stored credential and connects.
 //!
-//! **Privileges required:** the connecting role must be able to `CREATE ROLE`
-//! and `GRANT` (i.e. superuser or `CREATEROLE`). Without that, isolation is
-//! skipped with a warning and the plugin runs as the base role — see the README.
+//! **Migrations run on the plugin's own pool as the plugin role**, so a guest
+//! migration can create/alter objects in its own schema and nowhere else (E1).
 
 use sqlx::PgPool;
 
-/// The PostgreSQL role backing a plugin's isolated runtime handle.
+/// The PostgreSQL role backing a plugin's connection.
 ///
 /// `plugin_id` is core-validated (`[a-z][a-z0-9_]{0,30}`) before this is called,
 /// so the name is safe to interpolate into `CREATE ROLE`.
@@ -47,41 +48,72 @@ pub fn core_grants(plugin_id: &str) -> Option<&'static [(&'static str, &'static 
     }
 }
 
-/// Create/refresh the plugin's role and grants. Returns the role name on
-/// success; `Err` when the database role cannot manage roles (isolation is then
-/// unavailable and the caller should run the plugin without it, loudly).
-pub async fn ensure_isolation(pool: &PgPool, plugin_id: &str) -> Result<String, sqlx::Error> {
+/// Create/refresh a plugin's `LOGIN` role, its schema ownership, and its
+/// `core.*` allowlist grants. Returns the role's password (a new random one when
+/// `rotate` is set or none was supplied, otherwise `existing_secret`).
+///
+/// Idempotent: safe to re-run. Passwords are **preserved by default** so a
+/// re-run does not invalidate a running deployment; `rotate` changes only the
+/// secret (the role, schema and grants are re-asserted either way).
+pub async fn bootstrap_role(
+    pool: &PgPool,
+    plugin_id: &str,
+    existing_secret: Option<&str>,
+    rotate: bool,
+) -> Result<String, sqlx::Error> {
     let role = role_for(plugin_id);
+    let secret = match existing_secret {
+        Some(existing) if !rotate => existing.to_string(),
+        _ => generate_secret(pool).await?,
+    };
 
-    // Idempotent role creation (42710 = duplicate_object).
-    match sqlx::query(&format!("CREATE ROLE \"{role}\" NOLOGIN"))
-        .execute(pool)
-        .await
+    // Create the role if absent (42710 = duplicate_object).
+    match sqlx::query(&format!(
+        "CREATE ROLE \"{role}\" LOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE"
+    ))
+    .execute(pool)
+    .await
     {
         Ok(_) => {}
-        Err(e)
-            if e.as_database_error().and_then(|d| d.code()).as_deref() == Some("42710") => {}
+        Err(e) if e.as_database_error().and_then(|d| d.code()).as_deref() == Some("42710") => {}
         Err(e) => return Err(e),
     }
 
-    // The base role must be able to `SET ROLE` into it.
-    sqlx::query(&format!("GRANT \"{role}\" TO CURRENT_USER"))
+    // Re-assert the attributes and password on every run. The secret is hex, so
+    // it is safe to interpolate into the statement.
+    sqlx::query(&format!(
+        "ALTER ROLE \"{role}\" LOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE PASSWORD '{secret}'"
+    ))
+    .execute(pool)
+    .await?;
+
+    // The plugin's schema is owned by its role; bare names resolve there via the
+    // role's default search_path, and `public` stays reachable for pgcrypto.
+    sqlx::query(&format!(
+        "CREATE SCHEMA IF NOT EXISTS \"{plugin_id}\" AUTHORIZATION \"{role}\""
+    ))
+    .execute(pool)
+    .await?;
+    sqlx::query(&format!("ALTER SCHEMA \"{plugin_id}\" OWNER TO \"{role}\""))
         .execute(pool)
         .await?;
 
-    // Rights on everything currently in the plugin's schema.
-    grant_schema_objects(pool, plugin_id, &role).await?;
-
-    // pgcrypto and friends live in `public`.
+    sqlx::query(&format!(
+        "ALTER ROLE \"{role}\" SET search_path TO \"{plugin_id}\", public"
+    ))
+    .execute(pool)
+    .await?;
     sqlx::query(&format!("GRANT USAGE ON SCHEMA public TO \"{role}\""))
         .execute(pool)
         .await?;
+    // USAGE on core is needed to call `core.record_migration` during plugin
+    // migrations. It does not grant table access — the allowlist below does.
+    sqlx::query(&format!("GRANT USAGE ON SCHEMA core TO \"{role}\""))
+        .execute(pool)
+        .await?;
 
-    // Explicit cross-schema allowlist.
+    // Explicit cross-schema allowlist (unchanged contents).
     if let Some(grants) = core_grants(plugin_id) {
-        sqlx::query(&format!("GRANT USAGE ON SCHEMA core TO \"{role}\""))
-            .execute(pool)
-            .await?;
         for (table, privs) in grants {
             // `table`/`privs` come from the static allowlist above — never user
             // input.
@@ -91,30 +123,50 @@ pub async fn ensure_isolation(pool: &PgPool, plugin_id: &str) -> Result<String, 
         }
     }
 
-    tracing::info!(plugin = plugin_id, role = %role, "schema isolation active");
-    Ok(role)
+    // Upgrade path: an install bootstrapped by an older version has its schema
+    // (and objects) owned by the deployment role. Transfer ownership of
+    // everything *inside the plugin's own schema*. Deliberately scoped — a bare
+    // `REASSIGN OWNED` would move core objects too.
+    transfer_schema_ownership(pool, plugin_id, &role).await?;
+
+    tracing::info!(plugin = plugin_id, role = %role, "plugin role bootstrapped");
+    Ok(secret)
 }
 
-/// Grant the plugin role full rights on everything in its schema, plus default
-/// privileges for future objects. Call once when isolation is established and
-/// again after migrations, so tables the migrations created are covered.
-pub async fn grant_schema_objects(
+/// A fresh 256-bit hex password from `pgcrypto` (already installed; no Rust RNG
+/// dependency). Hex keeps the value safe to interpolate into `ALTER ROLE`.
+async fn generate_secret(pool: &PgPool) -> Result<String, sqlx::Error> {
+    sqlx::query_scalar("SELECT encode(gen_random_bytes(32), 'hex')")
+        .fetch_one(pool)
+        .await
+}
+
+/// `ALTER … OWNER TO` for every table/sequence/view inside one schema. Scoped to
+/// `schema` on purpose; idempotent (re-owning by the same role is a no-op).
+async fn transfer_schema_ownership(
     pool: &PgPool,
-    plugin_id: &str,
+    schema: &str,
     role: &str,
 ) -> Result<(), sqlx::Error> {
-    let stmts = [
-        format!("GRANT USAGE ON SCHEMA \"{plugin_id}\" TO \"{role}\""),
-        format!("GRANT ALL ON ALL TABLES IN SCHEMA \"{plugin_id}\" TO \"{role}\""),
-        format!("GRANT ALL ON ALL SEQUENCES IN SCHEMA \"{plugin_id}\" TO \"{role}\""),
-        format!("GRANT ALL ON ALL FUNCTIONS IN SCHEMA \"{plugin_id}\" TO \"{role}\""),
-        format!("ALTER DEFAULT PRIVILEGES IN SCHEMA \"{plugin_id}\" GRANT ALL ON TABLES TO \"{role}\""),
-        format!("ALTER DEFAULT PRIVILEGES IN SCHEMA \"{plugin_id}\" GRANT ALL ON SEQUENCES TO \"{role}\""),
-        format!("ALTER DEFAULT PRIVILEGES IN SCHEMA \"{plugin_id}\" GRANT ALL ON FUNCTIONS TO \"{role}\""),
-    ];
-    for stmt in stmts {
-        sqlx::query(&stmt).execute(pool).await?;
-    }
+    let sql = format!(
+        "DO $own$
+         DECLARE r RECORD;
+         BEGIN
+           FOR r IN SELECT tablename FROM pg_tables WHERE schemaname = '{schema}' LOOP
+             EXECUTE format('ALTER TABLE %I.%I OWNER TO %I', '{schema}', r.tablename, '{role}');
+           END LOOP;
+           FOR r IN SELECT sequencename FROM pg_sequences WHERE schemaname = '{schema}' LOOP
+             EXECUTE format('ALTER SEQUENCE %I.%I OWNER TO %I', '{schema}', r.sequencename, '{role}');
+           END LOOP;
+           FOR r IN SELECT viewname FROM pg_views WHERE schemaname = '{schema}' LOOP
+             EXECUTE format('ALTER VIEW %I.%I OWNER TO %I', '{schema}', r.viewname, '{role}');
+           END LOOP;
+           FOR r IN SELECT matviewname FROM pg_matviews WHERE schemaname = '{schema}' LOOP
+             EXECUTE format('ALTER MATERIALIZED VIEW %I.%I OWNER TO %I', '{schema}', r.matviewname, '{role}');
+           END LOOP;
+         END $own$;"
+    );
+    sqlx::query(&sql).execute(pool).await?;
     Ok(())
 }
 

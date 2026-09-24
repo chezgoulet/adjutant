@@ -18,6 +18,7 @@ use std::sync::Arc;
 
 use adjutant_sdk::{HostDb, SqlValue};
 use adjutant_server::host::CoreDb;
+use adjutant_server::{db, host, schema};
 
 async fn repository_pool() -> Arc<sqlx::PgPool> {
     let url = std::env::var("ADJUTANT_TEST_DATABASE_URL").expect(
@@ -98,80 +99,217 @@ async fn bind_params_round_trips_every_variant() {
     assert_eq!(row["j"], serde_json::json!({"k": 1}));
 }
 
-/// Schema isolation is enforced by PostgreSQL, not by convention: a plugin's
-/// `SET LOCAL ROLE` handle can read its own schema but is denied another
-/// plugin's. The test database role must be able to manage roles
-/// (`CREATEROLE`/superuser); if it cannot, the isolation proof cannot run and
-/// the test fails rather than skipping (issue #25 — a skipped proof is not
-/// coverage).
+// ---------------------------------------------------------------------------
+// Confinement probes (issues #17/#18; design docs/design/plugin-isolation.md §5)
+//
+// The plugin's connection IS the restricted principal. Each probe below fails
+// if the mechanism regresses. They need a database whose connecting role can
+// `CREATEROLE` (a throwaway superuser container); a failure to establish the
+// boundary fails the test rather than skipping (issue #25).
+// ---------------------------------------------------------------------------
+
+fn base_url() -> String {
+    std::env::var("ADJUTANT_TEST_DATABASE_URL").expect("ADJUTANT_TEST_DATABASE_URL")
+}
+
+/// Serializes fixture setup. `CREATE SCHEMA/TABLE IF NOT EXISTS` still races
+/// between sessions, so concurrent probes would both try to migrate `core` and
+/// one would fail; the lock makes setup strict. Probes themselves still run in
+/// parallel.
+static SETUP: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+/// Migrate `core` on the test database and bootstrap a plugin fixture role/schema
+/// for each id, returning `(admin_pool, plugin_pools)`. Mirrors a real
+/// deployment's first `bootstrap-isolation` run.
+async fn setup(ids: &[&str]) -> (Arc<sqlx::PgPool>, Vec<Arc<sqlx::PgPool>>) {
+    let _guard = SETUP.lock().await;
+    let cfg = adjutant_server::config::Config {
+        database_url: base_url(),
+        ..Default::default()
+    };
+    let admin = db::connect_and_migrate(&cfg)
+        .await
+        .expect("core migrations on the test database");
+
+    let mut pools = Vec::new();
+    for id in ids {
+        let _ = sqlx::query(&format!("DROP SCHEMA IF EXISTS \"{id}\" CASCADE"))
+            .execute(admin.as_ref())
+            .await;
+        let secret = schema::bootstrap_role(admin.as_ref(), id, None, false)
+            .await
+            .expect("bootstrap plugin role (needs CREATEROLE/superuser)");
+        let pool = host::plugin_pool(&base_url(), id, &secret, 2)
+            .await
+            .expect("plugin pool");
+        pools.push(pool);
+    }
+    (admin, pools)
+}
+
+/// 1. A plugin migration that writes `core.*` must fail (E1). The DDL runs as
+/// the plugin role on its own pool, so it has no rights in `core`.
 #[tokio::test]
 #[ignore = "DB-gated: needs ADJUTANT_TEST_DATABASE_URL + CREATEROLE; run with `-- --ignored`"]
-async fn plugin_role_isolation_denies_cross_schema_access() {
-    use adjutant_server::schema;
+async fn probe_migration_cannot_create_a_core_table() {
+    let (admin, pools) = setup(&["iso_mig"]).await;
+    let pool = pools[0].as_ref();
 
-    let pool = repository_pool().await;
-
-    for s in ["iso_alpha", "iso_beta"] {
-        sqlx::query(&format!("DROP SCHEMA IF EXISTS \"{s}\" CASCADE"))
-            .execute(pool.as_ref())
-            .await
-            .expect("drop schema");
-        sqlx::query(&format!("CREATE SCHEMA \"{s}\""))
-            .execute(pool.as_ref())
-            .await
-            .expect("create schema");
-    }
-
-    let alpha_role = schema::ensure_isolation(&pool, "iso_alpha").await.expect(
-        "the test database role must manage roles (CREATEROLE/superuser) so the \
-         isolation proof actually runs; use a throwaway superuser database",
-    );
-    let _ = schema::ensure_isolation(&pool, "iso_beta").await;
-
-    sqlx::query("CREATE TABLE iso_alpha.t (id BIGINT PRIMARY KEY)")
-        .execute(pool.as_ref())
-        .await
-        .expect("alpha table");
-    sqlx::query("CREATE TABLE iso_beta.t (id BIGINT PRIMARY KEY)")
-        .execute(pool.as_ref())
-        .await
-        .expect("beta table");
-    sqlx::query("INSERT INTO iso_alpha.t VALUES (1)")
-        .execute(pool.as_ref())
-        .await
-        .expect("alpha row");
-    sqlx::query("INSERT INTO iso_beta.t VALUES (2)")
-        .execute(pool.as_ref())
-        .await
-        .expect("beta row");
-    // Migrations run after the first grant pass, so refresh (as load_all does).
-    schema::grant_schema_objects(&pool, "iso_alpha", &alpha_role)
-        .await
-        .expect("refresh alpha grants");
-
-    let alpha = CoreDb::for_plugin(pool.clone(), "iso_alpha".into(), Some(alpha_role));
-
-    // Own schema reachable via a bare table name.
-    let rows = alpha
-        .query("SELECT id FROM t".to_string(), vec![])
-        .await
-        .expect("alpha can read its own table");
-    assert_eq!(rows[0]["id"], serde_json::json!(1));
-
-    // Another plugin's schema is denied by the database.
-    let err = alpha
-        .query("SELECT id FROM iso_beta.t".to_string(), vec![])
-        .await
-        .expect_err("alpha must not read beta's schema");
-    let msg = err.to_string();
+    let err = db::run_plugin_migration(
+        pool,
+        "iso_mig",
+        1,
+        "evil",
+        "CREATE TABLE core.pwned_mig (id INT);",
+    )
+    .await
+    .expect_err("a plugin migration must not create a core table");
     assert!(
-        msg.contains("permission denied") || msg.contains("does not exist"),
-        "expected a permission error, got: {msg}"
+        err.to_string().contains("permission denied"),
+        "expected a permission error, got: {err}"
     );
 
-    for s in ["iso_alpha", "iso_beta"] {
-        let _ = sqlx::query(&format!("DROP SCHEMA IF EXISTS \"{s}\" CASCADE"))
-            .execute(pool.as_ref())
-            .await;
-    }
+    let exists: Option<String> = sqlx::query_scalar("SELECT to_regclass('core.pwned_mig')::TEXT")
+        .fetch_one(admin.as_ref())
+        .await
+        .expect("regclass");
+    assert!(exists.is_none(), "core.pwned_mig must not exist");
 }
+
+/// 2. The E2 escape: a `DO` block that `SET LOCAL ROLE`s the deployment role and
+/// then writes `core.*`. The session user is the plugin role, which is not a
+/// member of the deployment role, so `SET ROLE` is refused and nothing lands.
+#[tokio::test]
+#[ignore = "DB-gated: needs ADJUTANT_TEST_DATABASE_URL + CREATEROLE; run with `-- --ignored`"]
+async fn probe_do_block_cannot_set_role_and_write_core() {
+    let (admin, pools) = setup(&["iso_do"]).await;
+    let deployment: String = sqlx::query_scalar("SELECT current_user")
+        .fetch_one(admin.as_ref())
+        .await
+        .expect("current_user");
+
+    let evil = format!(
+        "DO $$ BEGIN EXECUTE 'SET LOCAL ROLE \"{deployment}\"'; \
+         EXECUTE 'CREATE TABLE core.pwned_do (id INT)'; END $$;"
+    );
+    let err = host::CoreDb::new(pools[0].clone())
+        .execute(evil, vec![])
+        .await
+        .expect_err("the DO-block escape must be refused");
+    assert!(
+        err.to_string().contains("permission denied"),
+        "expected a permission error, got: {err}"
+    );
+
+    let exists: Option<String> = sqlx::query_scalar("SELECT to_regclass('core.pwned_do')::TEXT")
+        .fetch_one(admin.as_ref())
+        .await
+        .expect("regclass");
+    assert!(exists.is_none(), "core.pwned_do must not exist");
+}
+
+/// 3. Plugin SQL cannot `CREATE ROLE … SUPERUSER` (E3).
+#[tokio::test]
+#[ignore = "DB-gated: needs ADJUTANT_TEST_DATABASE_URL + CREATEROLE; run with `-- --ignored`"]
+async fn probe_plugin_sql_cannot_create_a_superuser_role() {
+    let (_admin, pools) = setup(&["iso_createrole"]).await;
+    let err = host::CoreDb::new(pools[0].clone())
+        .execute("CREATE ROLE iso_evil SUPERUSER LOGIN".to_string(), vec![])
+        .await
+        .expect_err("plugin SQL must not create a role");
+    assert!(
+        err.to_string().contains("permission denied"),
+        "expected a permission error, got: {err}"
+    );
+}
+
+/// 4. `RESET ROLE` is inert (the session user is already the plugin role) and
+/// `SET ROLE <other>` is refused.
+#[tokio::test]
+#[ignore = "DB-gated: needs ADJUTANT_TEST_DATABASE_URL + CREATEROLE; run with `-- --ignored`"]
+async fn probe_reset_role_is_inert_and_set_role_is_refused() {
+    let (admin, pools) = setup(&["iso_role"]).await;
+    let plugin = host::CoreDb::new(pools[0].clone());
+    let expected = schema::role_for("iso_role");
+
+    plugin
+        .execute("RESET ROLE".to_string(), vec![])
+        .await
+        .expect("RESET ROLE is allowed but must be inert");
+    let rows = plugin
+        .query("SELECT session_user AS u, current_user AS c".to_string(), vec![])
+        .await
+        .expect("session_user query");
+    assert_eq!(rows[0]["u"], serde_json::json!(expected));
+    assert_eq!(rows[0]["c"], serde_json::json!(expected));
+
+    let deployment: String = sqlx::query_scalar("SELECT current_user")
+        .fetch_one(admin.as_ref())
+        .await
+        .expect("current_user");
+    let err = plugin
+        .execute(format!("SET ROLE \"{deployment}\""), vec![])
+        .await
+        .expect_err("SET ROLE to another role must be refused");
+    assert!(
+        err.to_string().contains("permission denied"),
+        "expected a permission error, got: {err}"
+    );
+}
+
+/// 5. Cross-schema read of another plugin's table is denied by PostgreSQL.
+#[tokio::test]
+#[ignore = "DB-gated: needs ADJUTANT_TEST_DATABASE_URL + CREATEROLE; run with `-- --ignored`"]
+async fn probe_cross_schema_read_is_denied() {
+    let (_admin, pools) = setup(&["iso_a", "iso_b"]).await;
+    let alpha = host::CoreDb::new(pools[0].clone());
+    let beta = host::CoreDb::new(pools[1].clone());
+
+    alpha
+        .execute("CREATE TABLE secret (id INT)".to_string(), vec![])
+        .await
+        .expect("alpha creates a table in its own schema");
+    let err = beta
+        .query("SELECT id FROM iso_a.secret".to_string(), vec![])
+        .await
+        .expect_err("beta must not read alpha's table");
+    assert!(
+        err.to_string().contains("permission denied"),
+        "expected a permission error, got: {err}"
+    );
+}
+
+/// 6. A `core.*` table outside the plugin's allowlist is denied.
+#[tokio::test]
+#[ignore = "DB-gated: needs ADJUTANT_TEST_DATABASE_URL + CREATEROLE; run with `-- --ignored`"]
+async fn probe_unlisted_core_table_is_denied() {
+    let (_admin, pools) = setup(&["iso_unlisted"]).await;
+    let err = host::CoreDb::new(pools[0].clone())
+        .query("SELECT count(*) FROM core.users".to_string(), vec![])
+        .await
+        .expect_err("core.users is not in the plugin's allowlist");
+    assert!(
+        err.to_string().contains("permission denied"),
+        "expected a permission error, got: {err}"
+    );
+}
+
+/// 7. Every plugin connection is the plugin role — a host regression (e.g. a
+/// plugin pool built from the wrong URL) is caught even if no plugin tries to
+/// escape.
+#[tokio::test]
+#[ignore = "DB-gated: needs ADJUTANT_TEST_DATABASE_URL + CREATEROLE; run with `-- --ignored`"]
+async fn probe_every_plugin_connection_is_the_plugin_role() {
+    let (_admin, pools) = setup(&["iso_conn"]).await;
+    let plugin = host::CoreDb::new(pools[0].clone());
+    let expected = serde_json::json!(schema::role_for("iso_conn"));
+
+    // Two concurrent queries force at least two pooled connections.
+    let (r1, r2) = tokio::join!(
+        plugin.query("SELECT session_user AS u".to_string(), vec![]),
+        plugin.query("SELECT session_user AS u".to_string(), vec![]),
+    );
+    assert_eq!(r1.expect("query 1")[0]["u"], expected);
+    assert_eq!(r2.expect("query 2")[0]["u"], expected);
+}
+

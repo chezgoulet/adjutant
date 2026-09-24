@@ -307,7 +307,7 @@ SDK v0.3  → permission macros, migration helpers (after membership plugin vali
 SDK v1.0  → stable, documented, ready for third-party plugins
 ```
 
-**Schema isolation:** Each plugin gets its own PostgreSQL schema (`missions.*`, `governance.*`, etc.). The plugin's database handle is scoped to its own schema — it cannot read or write to other plugins' schemas unless the core explicitly grants cross-schema access.
+**Schema isolation:** Each plugin gets its own PostgreSQL schema (`missions.*`, `governance.*`, etc.). The plugin's database handle is scoped to its own schema — it cannot read or write to other plugins' schemas unless the core explicitly grants cross-schema access. The boundary is the identity of the connection: each plugin runs on a pool authenticated as its own `adjutant_plugin_<id>` `LOGIN` role, which owns that schema (design: [`docs/design/plugin-isolation.md`](docs/design/plugin-isolation.md)).
 
 **WASM sandboxing (optional mode):** Plugins can be compiled to WASM and loaded into the wasmtime runtime. In WASM mode:
 - No filesystem access

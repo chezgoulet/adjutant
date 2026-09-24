@@ -166,6 +166,45 @@ SELECT min(id) FILTER (WHERE bad)::BIGINT, count(*)::BIGINT FROM (
   FROM core.audit_log a WINDOW w AS (ORDER BY a.id)
 ) t
 $fn$;
+"),
+(3, "plugin_isolation", "
+-- Per-plugin LOGIN credentials live here, never in `config` (which is handed
+-- to the plugin as ctx.config). See docs/design/plugin-isolation.md §3.2.
+ALTER TABLE core.plugins ADD COLUMN IF NOT EXISTS db_secret TEXT;
+
+-- Core-owned columns/indexes that used to be created by the auth plugin's own
+-- migration. A plugin migration now runs as the plugin role and can only touch
+-- its own schema, so anything on core.* belongs to core migrations.
+ALTER TABLE core.users ADD COLUMN IF NOT EXISTS username TEXT;
+ALTER TABLE core.users ADD COLUMN IF NOT EXISTS password_hash TEXT;
+CREATE INDEX IF NOT EXISTS idx_core_sessions_hash ON core.sessions (token_hash);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_core_users_username
+  ON core.users (lower(username)) WHERE username IS NOT NULL;
+
+-- Migration bookkeeping for the plugin pool. A plugin role cannot write
+-- core.schema_migrations directly (that would let it forge another plugin's
+-- migration state); it records its own migrations through this function, which
+-- is SECURITY DEFINER and checks the caller. The core migration runner connects
+-- as the deployment role and may record any schema.
+CREATE OR REPLACE FUNCTION core.record_migration(p_schema TEXT, p_version BIGINT, p_name TEXT)
+RETURNS void
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = core, pg_temp
+AS $fn$
+BEGIN
+  IF session_user LIKE 'adjutant_plugin_%'
+     AND p_schema <> substring(session_user FROM length('adjutant_plugin_') + 1) THEN
+    RAISE EXCEPTION 'role % may only record migrations for its own schema (got %)',
+      session_user, p_schema;
+  END IF;
+  INSERT INTO core.schema_migrations (schema, version, name)
+  VALUES (p_schema, p_version, p_name)
+  ON CONFLICT (schema, version) DO NOTHING;
+END
+$fn$;
+
+GRANT EXECUTE ON FUNCTION core.record_migration(TEXT, BIGINT, TEXT) TO PUBLIC;
 ")];
 
 /// Bootstrap roles + permissions grants. `chief` gets everything (SPEC §9 —
@@ -270,6 +309,48 @@ pub async fn run_migration(
     Executor::execute(&mut *conn, sqlx::raw_sql(&script)).await?;
 
     tracing::info!(schema, version, name, "migration applied");
+    Ok(())
+}
+
+/// Version numbers already applied for `schema`, read from
+/// `core.schema_migrations` on the **core** pool: a plugin role cannot read that
+/// table (only record its own migrations through `core.record_migration`).
+pub async fn applied_migrations(pool: &PgPool, schema: &str) -> Result<Vec<i64>, sqlx::Error> {
+    sqlx::query_scalar("SELECT version FROM core.schema_migrations WHERE schema = $1")
+        .bind(schema)
+        .fetch_all(pool)
+        .await
+}
+
+/// Run one plugin migration on the **plugin's own pool**, as the plugin role.
+///
+/// The DDL and its bookkeeping are one transaction, so a crash cannot leave DDL
+/// applied but unrecorded. The plugin role cannot write `core.schema_migrations`
+/// directly; it records through the SECURITY DEFINER `core.record_migration`,
+/// which refuses a schema that is not the caller's own (core migration 3). The
+/// DDL can therefore only touch objects inside the plugin's schema — E1 from
+/// `docs/design/plugin-isolation.md` §1 is impossible without any SQL firewall.
+pub async fn run_plugin_migration(
+    pool: &PgPool,
+    schema: &str,
+    version: i64,
+    name: &str,
+    sql: &str,
+) -> Result<(), sqlx::Error> {
+    validate_schema_name(schema)?;
+    validate_migration_name(name)?;
+
+    let mut conn = pool.acquire().await?;
+    let script = format!(
+        "BEGIN;\
+         SET LOCAL search_path TO \"{schema}\", public;\
+         {sql};\
+         SELECT core.record_migration('{schema}', {version}, '{name}');\
+         COMMIT;"
+    );
+    use sqlx::Executor;
+    Executor::execute(&mut *conn, sqlx::raw_sql(&script)).await?;
+    tracing::info!(schema, version, name, "plugin migration applied");
     Ok(())
 }
 

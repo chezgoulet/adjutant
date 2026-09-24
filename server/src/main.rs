@@ -116,6 +116,41 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
             }
         }
+        Some("bootstrap-isolation") => {
+            let rotate = args.iter().any(|a| a == "--rotate");
+            let passthrough: Vec<String> = args[1..]
+                .iter()
+                .filter(|a| a.as_str() != "--rotate")
+                .cloned()
+                .collect();
+            let cli = config::CliArgs::parse(passthrough).unwrap_or_else(|e| {
+                eprintln!("error: {e}\n\n{}", config::USAGE);
+                std::process::exit(2);
+            });
+            let cfg = config::load(&cli)?;
+            tracing_subscriber::fmt()
+                .with_env_filter(
+                    tracing_subscriber::EnvFilter::try_from_default_env()
+                        .unwrap_or_else(|_| cfg.log_filter.clone().into()),
+                )
+                .with_writer(std::io::stderr)
+                .init();
+            match adjutant_server::cli::bootstrap_isolation(&cfg, rotate).await {
+                Ok(ids) => {
+                    println!(
+                        "bootstrapped {} plugin role(s){}: {}",
+                        ids.len(),
+                        if rotate { " (passwords rotated)" } else { "" },
+                        ids.join(", ")
+                    );
+                    return Ok(());
+                }
+                Err(e) => {
+                    eprintln!("error: {e}");
+                    std::process::exit(2);
+                }
+            }
+        }
         Some("serve") => {}
         Some("-h") | Some("--help") | Some("help") => {
             print!("{}", config::USAGE);

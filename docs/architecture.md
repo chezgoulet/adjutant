@@ -68,9 +68,11 @@ Per SPEC §5.2, enforced by `plugin_runtime`:
 3. **Validate** — id shape/reserved names, `/api/{id}` namespace, path captures,
    permission references, duplicate routes.
 4. **Skip uninstalled** — before any side effect.
-5. **Schema + migrations** — create the plugin's schema, run pending migrations
-   inside it.
-6. **Isolation** — create the plugin's role and grants.
+5. **Credential + pool** — read the plugin's stored credential, build a small
+   pool authenticated as its `adjutant_plugin_<id>` role. No credential → the
+   load fails.
+6. **Migrations** — run pending migrations **on that pool**, as the plugin role,
+   inside the plugin's own schema.
 7. **Register permissions** into `core.permissions`; upsert `core.plugins`.
 8. **`init(ctx)`** — hand the plugin its `PluginContext`.
 9. **Serve** — routes and event subscriptions.
@@ -103,13 +105,21 @@ Schema isolation (below) applies to both.
 
 - **`core.*`** — users, sessions, roles, permissions, role_permissions,
   user_roles, plugins, events, audit_log, schema_migrations.
-- **`{plugin}.*`** — one PostgreSQL schema per plugin, created and migrated by
-  the core at load. Plugin runtime queries run with `search_path` pointed at
-  their schema and `SET LOCAL ROLE` bound to their isolation role, so a query
-  into another plugin's schema is denied by the database. Cross-`core` access is
-  an explicit allowlist (`server/src/schema.rs`).
+- **`{plugin}.*`** — one PostgreSQL schema per plugin, **owned by the plugin's
+  `adjutant_plugin_<id>` `LOGIN` role**. The host runs that plugin's SQL on a pool
+  authenticated as that role, so the boundary is the identity of the connection,
+  not a statement filter: the plugin cannot `SET ROLE`/`RESET ROLE` into anything
+  else, and a query into another plugin's schema is denied by the database.
+  Cross-`core` access is an explicit allowlist (`server/src/schema.rs`).
+- **Plugin credentials** live in `core.plugins.db_secret` (never in `config`,
+  which is handed to the plugin as `ctx.config`). Roles, schema ownership, the
+  allowlist and passwords are created by `adjutant bootstrap-isolation`; the
+  runtime never needs `CREATEROLE`.
 - **Audit log** is append-only (triggers reject UPDATE/DELETE/TRUNCATE) and
   hash-chained; `core.audit_verify()` recomputes the chain.
+
+See [`design/plugin-isolation.md`](design/plugin-isolation.md) for the threat
+model and the escape probes that pin it.
 
 ## Permissions
 

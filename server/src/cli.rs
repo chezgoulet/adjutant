@@ -315,6 +315,54 @@ pub struct Probe {
     pub detail: String,
 }
 
+// ---------------------------------------------------------------------------
+// bootstrap-isolation
+// ---------------------------------------------------------------------------
+
+/// Create/refresh the per-plugin `LOGIN` roles, schema ownership, `core.*`
+/// grants and stored passwords, for every plugin in the configured directory.
+///
+/// Run once by the operator against an admin URL; the runtime never needs
+/// `CREATEROLE`. Idempotent — existing passwords are preserved unless `rotate`.
+/// Returns the plugin ids that were bootstrapped.
+pub async fn bootstrap_isolation(cfg: &Config, rotate: bool) -> Result<Vec<String>, String> {
+    // Core migrations first: `db_secret` and `core.record_migration` must exist.
+    let pool = crate::db::connect_and_migrate(cfg)
+        .await
+        .map_err(|e| format!("database: {e}"))?;
+
+    let discovered = crate::plugin_runtime::discover_plugins(&cfg.plugin_dir)
+        .await
+        .map_err(|e| e.to_string())?;
+
+    let mut ids = Vec::new();
+    for d in discovered {
+        let existing: Option<Option<String>> =
+            sqlx::query_scalar::<_, Option<String>>("SELECT db_secret FROM core.plugins WHERE id = $1")
+                .bind(&d.id)
+                .fetch_optional(pool.as_ref())
+                .await
+                .map_err(|e| format!("read {} credential: {e}", d.id))?;
+        let secret =
+            crate::schema::bootstrap_role(pool.as_ref(), &d.id, existing.flatten().as_deref(), rotate)
+                .await
+                .map_err(|e| format!("bootstrap {}: {e}", d.id))?;
+        sqlx::query(
+            "INSERT INTO core.plugins (id, version, db_secret) VALUES ($1, $2, $3) \
+             ON CONFLICT (id) DO UPDATE SET version = EXCLUDED.version, \
+             db_secret = EXCLUDED.db_secret, updated_at = now()",
+        )
+        .bind(&d.id)
+        .bind(&d.version)
+        .bind(&secret)
+        .execute(pool.as_ref())
+        .await
+        .map_err(|e| format!("store {} credential: {e}", d.id))?;
+        ids.push(d.id);
+    }
+    Ok(ids)
+}
+
 /// Boot the core against a pristine test database, then probe every registered
 /// plugin route with mock permissions (dev headers = the mock identity layer):
 ///
@@ -337,6 +385,10 @@ pub async fn run_test_plugin(cfg: &Config) -> Result<Vec<Probe>, String> {
     cfg.rate.max_requests = 0; // probes would trip the limiter otherwise
     cfg.allow_dev_headers = true; // mock permissions
     cfg.log_filter = "warn".into();
+
+    // A plugin now loads on its own restricted role/pool, so the pristine test
+    // database needs its roles bootstrapped (the runtime cannot create them).
+    bootstrap_isolation(&cfg, false).await?;
 
     let (app, _state) = crate::build_app(&cfg)
         .await

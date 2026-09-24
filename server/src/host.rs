@@ -15,36 +15,42 @@ use sqlx::{Column, Row, TypeInfo};
 use sqlx::ValueRef as _;
 use tokio::sync::broadcast;
 
-/// Core-backed database access shared by every plugin.
+/// Core-backed database access. The **pool** decides the principal:
+/// core services use the deployment pool, a plugin uses the pool authenticated
+/// as its own `adjutant_plugin_<id>` role (see [`plugin_pool`]). There is no
+/// per-call `SET ROLE`/`search_path` — the connection identity is the boundary
+/// (`docs/design/plugin-isolation.md`).
 pub struct CoreDb {
     pool: Arc<sqlx::PgPool>,
-    /// When set, every call runs with `search_path` pointed at this schema so
-    /// plugin queries can use bare table names (the SDK's documented contract:
-    /// "search_path pre-set by the core"). Core-owned tables stay reachable —
-    /// plugin queries qualify them as `core.*`.
-    schema: Option<String>,
-    /// When set, every call also runs `SET LOCAL ROLE <role>` so the plugin is
-    /// bound by its per-plugin PostgreSQL role (see `schema.rs`). Without it the
-    /// schema is a convention; with it, cross-schema access is denied by the DB.
-    role: Option<String>,
 }
 
 impl CoreDb {
-    /// No schema → default search_path (core services: permissions, audit —
-    /// all of their queries are `core.*`-qualified).
     pub fn new(pool: Arc<sqlx::PgPool>) -> Arc<Self> {
-        Arc::new(Self { pool, schema: None, role: None })
+        Arc::new(Self { pool })
     }
+}
 
-    /// Handle for one plugin: bare table names resolve in its schema, and every
-    /// call runs under its isolation role when one is active.
-    pub fn for_plugin(
-        pool: Arc<sqlx::PgPool>,
-        schema: String,
-        role: Option<String>,
-    ) -> Arc<Self> {
-        Arc::new(Self { pool, schema: Some(schema), role })
-    }
+/// Build a plugin's pool, authenticated as `adjutant_plugin_<id>` with the
+/// stored secret. Connects eagerly so a missing/rotated credential fails the
+/// load loudly instead of surfacing as a 500 on the first request.
+///
+/// `max_connections` is small on purpose (design §3.3): the budget is
+/// `plugins × max_connections`; see `docs/deployment.md`.
+pub async fn plugin_pool(
+    base_url: &str,
+    plugin_id: &str,
+    secret: &str,
+    max_connections: u32,
+) -> Result<Arc<sqlx::PgPool>, sqlx::Error> {
+    use std::str::FromStr;
+    let opts = sqlx::postgres::PgConnectOptions::from_str(base_url)?
+        .username(&crate::schema::role_for(plugin_id))
+        .password(secret);
+    let pool = sqlx::postgres::PgPoolOptions::new()
+        .max_connections(max_connections)
+        .connect_with(opts)
+        .await?;
+    Ok(Arc::new(pool))
 }
 
 /// Decode one column into JSON.
@@ -154,56 +160,19 @@ fn bind_params<'q>(
     Ok(q)
 }
 
-impl CoreDb {
-    /// A transaction with the plugin's schema on `search_path` (SDK contract:
-    /// "search_path pre-set by the core"). Per acquire, never cached: pool
-    /// connections go back to the shared pool, and `SET` inside the
-    /// transaction rolls back if the call fails, so a poisoned search_path
-    /// can never poison a later plugin's queries.
-    async fn txn(&self) -> Result<sqlx::postgres::PgTransaction<'_>, SdkError> {
-        let mut txn = self
-            .pool
-            .begin()
-            .await
-            .map_err(|e| SdkError::Db(format!("begin failed: {e}")))?;
-        if let Some(schema) = &self.schema {
-            // Schema names are core-validated ([a-z][a-z0-9_]{0,30}).
-            // SET LOCAL (not SET): a committed `SET` would leak this plugin's
-            // search_path onto the pooled connection for the next plugin.
-            sqlx::query(&format!("SET LOCAL search_path TO \"{}\", public", schema))
-                .execute(&mut *txn)
-                .await
-                .map_err(|e| SdkError::Db(format!("search_path failed: {e}")))?;
-        }
-        if let Some(role) = &self.role {
-            // Role name is derived from a core-validated plugin id.
-            sqlx::query(&format!("SET LOCAL ROLE \"{role}\""))
-                .execute(&mut *txn)
-                .await
-                .map_err(|e| SdkError::Db(format!("SET ROLE failed: {e}")))?;
-        }
-        Ok(txn)
-    }
-}
-
 #[async_trait]
 impl HostDb for CoreDb {
     async fn execute(&self, sql: String, params: Vec<SqlValue>) -> Result<u64, SdkError> {
-        let mut txn = self.txn().await?;
         let res = bind_params(sqlx::query(&sql), params)?
-            .execute(&mut *txn)
+            .execute(self.pool.as_ref())
             .await
             .map_err(|e| SdkError::Db(format!("{e} (sql: {sql})")))?;
-        txn.commit()
-            .await
-            .map_err(|e| SdkError::Db(format!("commit failed: {e}")))?;
         Ok(res.rows_affected())
     }
 
     async fn query(&self, sql: String, params: Vec<SqlValue>) -> Result<Vec<Value>, SdkError> {
-        let mut txn = self.txn().await?;
         let rows = bind_params(sqlx::query(&sql), params)?
-            .fetch_all(&mut *txn)
+            .fetch_all(self.pool.as_ref())
             .await
             .map_err(|e| SdkError::Db(format!("{e} (sql: {sql})")))?;
 
@@ -216,11 +185,6 @@ impl HostDb for CoreDb {
             }
             out.push(Value::Object(obj));
         }
-        // Commit — plugins run `INSERT … RETURNING` through query(); dropping
-        // the txn would roll the write back and silently lose the row.
-        txn.commit()
-            .await
-            .map_err(|e| SdkError::Db(format!("commit failed: {e}")))?;
         Ok(out)
     }
 }

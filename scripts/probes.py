@@ -77,6 +77,31 @@ def psql(sql, db=None):
     return p.returncode, p.stdout.strip(), p.stderr.strip()
 
 
+def bootstrap_isolation():
+    """The server loads each plugin on its own restricted DB role, so the roles
+    and credentials must exist before it can boot (the runtime never needs
+    CREATEROLE). Run once after each reset, against the same database."""
+    env = dict(os.environ)
+    env.update({"ADJUTANT_DATABASE_URL": DSN, "ADJUTANT_PLUGIN_DIR": str(PLUGIN_DIR)})
+    p = subprocess.run(
+        [
+            str(ROOT / "target/debug/adjutant"),
+            "bootstrap-isolation",
+            "--database-url",
+            DSN,
+            "--plugin-dir",
+            str(PLUGIN_DIR),
+        ],
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=120,
+    )
+    if p.returncode != 0:
+        sys.exit(f"bootstrap-isolation failed:\n{p.stdout}\n{p.stderr}")
+    print(f"[probes] {p.stdout.strip()}")
+
+
 def require_test_database():
     """Refuse to run against a non-`_test` database.
 
@@ -403,6 +428,9 @@ def main():
             sys.exit(f"missing {src} — run `cargo build --workspace` first")
         shutil.copy2(src, PLUGIN_DIR / so)
     print(f"[probes] staged {len(list(PLUGIN_DIR.iterdir()))} plugin(s) into {PLUGIN_DIR}")
+
+    # The loader runs each plugin as its own DB role; create them before boot.
+    bootstrap_isolation()
 
     phase1 = start_server({"ADJUTANT_RATE_MAX": "0"}, LOG)
     try:
