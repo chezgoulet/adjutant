@@ -16,6 +16,12 @@ crates.io publication.
 
 ### Added
 
+- **Enforced schema isolation.** Each plugin gets a `NOLOGIN` PostgreSQL role
+  (`adjutant_plugin_<id>`); its runtime database handle runs under
+  `SET LOCAL ROLE` with full rights on its own schema and an explicit allowlist
+  of `core.*` tables, so cross-plugin schema access is denied by the database
+  (SPEC §5.2). Verified by a DB-backed test. Requires `CREATEROLE`/superuser;
+  otherwise isolation is skipped with a warning. See `server/src/schema.rs`.
 - **Scoped permissions (SPEC §9.2).** `ScopeType`, `Scope`, and `RoleGrant`;
   `Identity::new` (troop-wide), `Identity::from_grants`, and
   `Identity::roles_covering`; and `PermissionService::has_in_scope` for

@@ -23,18 +23,27 @@ pub struct CoreDb {
     /// "search_path pre-set by the core"). Core-owned tables stay reachable —
     /// plugin queries qualify them as `core.*`.
     schema: Option<String>,
+    /// When set, every call also runs `SET LOCAL ROLE <role>` so the plugin is
+    /// bound by its per-plugin PostgreSQL role (see `schema.rs`). Without it the
+    /// schema is a convention; with it, cross-schema access is denied by the DB.
+    role: Option<String>,
 }
 
 impl CoreDb {
     /// No schema → default search_path (core services: permissions, audit —
     /// all of their queries are `core.*`-qualified).
     pub fn new(pool: Arc<sqlx::PgPool>) -> Arc<Self> {
-        Arc::new(Self { pool, schema: None })
+        Arc::new(Self { pool, schema: None, role: None })
     }
 
-    /// Handle for one plugin: bare table names resolve in its schema.
-    pub fn for_plugin(pool: Arc<sqlx::PgPool>, schema: String) -> Arc<Self> {
-        Arc::new(Self { pool, schema: Some(schema) })
+    /// Handle for one plugin: bare table names resolve in its schema, and every
+    /// call runs under its isolation role when one is active.
+    pub fn for_plugin(
+        pool: Arc<sqlx::PgPool>,
+        schema: String,
+        role: Option<String>,
+    ) -> Arc<Self> {
+        Arc::new(Self { pool, schema: Some(schema), role })
     }
 }
 
@@ -159,10 +168,19 @@ impl CoreDb {
             .map_err(|e| SdkError::Db(format!("begin failed: {e}")))?;
         if let Some(schema) = &self.schema {
             // Schema names are core-validated ([a-z][a-z0-9_]{0,30}).
-            sqlx::query(&format!("SET search_path TO \"{}\", public", schema))
+            // SET LOCAL (not SET): a committed `SET` would leak this plugin's
+            // search_path onto the pooled connection for the next plugin.
+            sqlx::query(&format!("SET LOCAL search_path TO \"{}\", public", schema))
                 .execute(&mut *txn)
                 .await
                 .map_err(|e| SdkError::Db(format!("search_path failed: {e}")))?;
+        }
+        if let Some(role) = &self.role {
+            // Role name is derived from a core-validated plugin id.
+            sqlx::query(&format!("SET LOCAL ROLE \"{role}\""))
+                .execute(&mut *txn)
+                .await
+                .map_err(|e| SdkError::Db(format!("SET ROLE failed: {e}")))?;
         }
         Ok(txn)
     }
