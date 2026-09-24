@@ -48,8 +48,19 @@ fn park(lib: Arc<libloading::Library>) {
     PARKED.lock().expect("parking lot poisoned").push(lib);
 }
 
-/// Core-owned route namespaces plugins may never claim.
-const RESERVED_IDS: &[&str] = &["plugins", "events", "audit", "core"];
+/// Plugin ids the core keeps for itself, or for a first-party plugin whose
+/// grants are keyed on its id. Used at **load time** (native `.so` and sandboxed
+/// WASM alike) and by the CLI's static validation, so there is exactly one list.
+///
+/// **Security-relevant:** [`crate::schema::core_grants`] keys its `core.*`
+/// allowlist on the plugin id string. A plugin that declared `id: "auth"` would
+/// inherit `SELECT/INSERT/UPDATE` on `core.users` and `SELECT/INSERT/DELETE` on
+/// `core.sessions`/`core.user_roles`; declaring `membership` inherits its own
+/// grant. Reserving those ids here is what keeps a plugin from naming itself
+/// into another plugin's privileges, so the list must never shrink without
+/// changing the grants it protects.
+pub const RESERVED_IDS: &[&str] =
+    &["plugins", "events", "audit", "core", "sdk", "auth", "membership"];
 
 /// A loaded plugin: the boxed trait object, the library that owns its code,
 /// its routes, its admin snapshot, and its enabled flag.
@@ -932,6 +943,18 @@ mod tests {
             // reject it — which is exactly what the old test failed to assert.
             assert!(validate_id(r).is_ok(), "{r} must be shape-valid for the reserved rule to matter");
             assert!(validate_plugin_id(r).is_err(), "reserved id {r} must be rejected at load");
+        }
+        // The load-time check must reject the ids that carry `core.*` grants
+        // (issue #21): a plugin declaring `auth` would inherit auth's allowlist.
+        for privileged in ["auth", "membership", "sdk"] {
+            assert!(
+                RESERVED_IDS.contains(&privileged),
+                "{privileged} must stay in the single reserved list"
+            );
+            assert!(
+                validate_plugin_id(privileged).is_err(),
+                "id {privileged:?} must be rejected at load, not just by the CLI"
+            );
         }
         assert!(validate_plugin_id("hello").is_ok());
         assert!(validate_plugin_id("Hello").is_err());

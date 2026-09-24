@@ -39,11 +39,21 @@ behind and fast-forwardable).
 |---|---|
 | `cargo build --workspace` | clean, 0 errors |
 | `cargo clippy --workspace --all-targets -- -D warnings` | 0 warnings |
-| `cargo test --workspace` | **62 passed / 0 failed** (auth 14, hello 2, membership 3, sdk 7, server 34, host_db 2) |
+| `cargo test --workspace` | **62 passed / 0 failed** (auth 14, hello 2, membership 3, sdk 7, server 34, host_db 2) — the `host_db 2` count is wrong; see the correction below. |
 | Live probe ladders (`scripts/probes.py`, `docs/e2e_m3.py`) | **Not run locally** — require PostgreSQL + `psql`, absent on the authoring host. CI (`.github/workflows/ci.yml`) owns these; they must be green on `main` after the W0 merge. |
 
 Test breakdown matches `M3-sdk-and-plugins.md` (62/62), so the baseline is
 consistent with the milestone record.
+
+> **Correction (issue #25, 2026-09-24).** The baseline's `host_db 2` is wrong:
+> `server/tests/host_db.rs` holds **three** DB-gated test functions —
+> `decode_covers_every_supported_type`, `bind_params_round_trips_every_variant`,
+> and `plugin_role_isolation_denies_cross_schema_access`. All three were reported
+> `ok` while returning early on a host without `ADJUTANT_TEST_DATABASE_URL`, so
+> the "62 passed" local tally counted skips as passes. They are now `#[ignore]`d
+> (a bare run reports them as ignored) and CI runs them explicitly with
+> `cargo test -p adjutant-server --test host_db -- --ignored`, so the cross-schema
+> isolation proof above genuinely runs.
 
 ---
 

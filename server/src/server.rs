@@ -26,7 +26,7 @@ use serde_json::json;
 use tokio::sync::RwLock;
 use tower_http::cors::{Any, CorsLayer};
 
-use adjutant_sdk::{AuditService, PermissionService, PluginRequest};
+use adjutant_sdk::{AuditService, Identity, PermissionService, PluginRequest};
 
 use crate::config::Config;
 use crate::db;
@@ -239,6 +239,37 @@ fn error_response(status: StatusCode, message: impl Into<String>) -> Response {
 fn internal_error(what: &str, err: &dyn std::fmt::Display) -> Response {
     tracing::error!(operation = what, error = %err, "internal error");
     error_response(StatusCode::INTERNAL_SERVER_ERROR, "internal error")
+}
+
+/// Audit a **state-changing** action; a failed write fails the request.
+///
+/// Policy (issue #24): an action that cannot be recorded must not be reported as
+/// success, so every mutation on the admin lifecycle routes goes through here
+/// and returns the 5xx when the audit write fails. Read paths stay best-effort:
+/// they may warn and continue, because failing a read does not hide a mutation.
+async fn audit_state_change(
+    audit: &AuditService,
+    identity: Option<&Identity>,
+    action: &str,
+    resource_type: &str,
+    resource_id: &str,
+    details: serde_json::Value,
+) -> Result<(), Response> {
+    match audit
+        .log(identity, action, resource_type, resource_id, details)
+        .await
+    {
+        Ok(()) => Ok(()),
+        Err(e) => {
+            tracing::error!(
+                action,
+                resource = resource_id,
+                error = %e,
+                "audit write failed; failing the request"
+            );
+            Err(internal_error("audit write", &e))
+        }
+    }
 }
 
 async fn dynamic_dispatch(State(state): State<Arc<AppState>>, req: Request) -> Response {
@@ -576,12 +607,17 @@ async fn enable_plugin(
     if let Err(e) = dbres {
         return internal_error("plugin lifecycle", &e);
     }
-    if let Err(e) = state
-        .audit
-        .log(identity.as_ref(), "plugin.enable", "plugin", &name, json!({}))
-        .await
+    if let Err(resp) = audit_state_change(
+        &state.audit,
+        identity.as_ref(),
+        "plugin.enable",
+        "plugin",
+        &name,
+        json!({}),
+    )
+    .await
     {
-        tracing::error!(action = "plugin.enable", plugin = %&name, error = %e, "audit write failed");
+        return resp;
     }
     Json(json!({ "plugin": name, "enabled": true })).into_response()
 }
@@ -629,12 +665,17 @@ async fn disable_plugin(
     if let Err(e) = dbres {
         return internal_error("plugin lifecycle", &e);
     }
-    if let Err(e) = state
-        .audit
-        .log(identity.as_ref(), "plugin.disable", "plugin", &name, json!({}))
-        .await
+    if let Err(resp) = audit_state_change(
+        &state.audit,
+        identity.as_ref(),
+        "plugin.disable",
+        "plugin",
+        &name,
+        json!({}),
+    )
+    .await
     {
-        tracing::error!(action = "plugin.disable", plugin = %&name, error = %e, "audit write failed");
+        return resp;
     }
     Json(json!({ "plugin": name, "enabled": false })).into_response()
 }
@@ -690,12 +731,17 @@ async fn uninstall_plugin(
     }
     state.bus.clear_plugin(&name).await;
     state.identity.remove(&name);
-    if let Err(e) = state
-        .audit
-        .log(identity.as_ref(), "plugin.uninstall", "plugin", &name, json!({}))
-        .await
+    if let Err(resp) = audit_state_change(
+        &state.audit,
+        identity.as_ref(),
+        "plugin.uninstall",
+        "plugin",
+        &name,
+        json!({}),
+    )
+    .await
     {
-        tracing::error!(action = "plugin.uninstall", plugin = %&name, error = %e, "audit write failed");
+        return resp;
     }
     Json(json!({
         "plugin": name,
@@ -767,18 +813,17 @@ async fn reload_plugins(State(state): State<Arc<AppState>>, req: Request) -> Res
         }
     }
 
-    if let Err(e) = state
-        .audit
-        .log(
-            identity.as_ref(),
-            "plugin.reload",
-            "plugin",
-            "*",
-            json!({ "reloaded": ids, "routes": route_count }),
-        )
-        .await
+    if let Err(resp) = audit_state_change(
+        &state.audit,
+        identity.as_ref(),
+        "plugin.reload",
+        "plugin",
+        "*",
+        json!({ "reloaded": ids, "routes": route_count }),
+    )
+    .await
     {
-        tracing::error!(action = "plugin.reload", error = %e, "audit write failed");
+        return resp;
     }
     tracing::info!(routes = route_count, "registry hot-reloaded");
     Json(json!({
@@ -791,7 +836,10 @@ async fn reload_plugins(State(state): State<Arc<AppState>>, req: Request) -> Res
 
 #[cfg(test)]
 mod tests {
-    use super::decode_path;
+    use super::{audit_state_change, decode_path};
+    use adjutant_sdk::{async_trait, AuditService, HostDb, Identity, SdkError, SqlValue};
+    use axum::http::StatusCode;
+    use std::sync::Arc;
 
     #[test]
     fn captures_are_percent_decoded_once() {
@@ -803,6 +851,43 @@ mod tests {
         // Malformed escapes are left alone rather than dropped.
         assert_eq!(decode_path("%zz"), "%zz");
         assert_eq!(decode_path("plain"), "plain");
+    }
+
+    /// A host DB whose audit write always fails, so the real failure path runs.
+    struct FailingAuditDb;
+
+    #[async_trait]
+    impl HostDb for FailingAuditDb {
+        async fn execute(&self, _sql: String, _params: Vec<SqlValue>) -> Result<u64, SdkError> {
+            Err(SdkError::Db("audit table is read-only".into()))
+        }
+        async fn query(
+            &self,
+            _sql: String,
+            _params: Vec<SqlValue>,
+        ) -> Result<Vec<serde_json::Value>, SdkError> {
+            Err(SdkError::Db("core.users unavailable".into()))
+        }
+    }
+
+    /// Issue #24: the lifecycle routes used to log the audit failure and still
+    /// answer success, so a mutation could commit with no audit row. The shared
+    /// helper they call must instead tell the caller the action failed (5xx).
+    #[tokio::test]
+    async fn failed_audit_write_fails_a_state_changing_request() {
+        let audit = AuditService::new(Arc::new(FailingAuditDb), "core".into());
+        let id = Identity::new("christopher", vec!["chief".into()]);
+        let resp = audit_state_change(
+            &audit,
+            Some(&id),
+            "plugin.enable",
+            "plugin",
+            "hello",
+            serde_json::json!({}),
+        )
+        .await
+        .expect_err("a failed audit write must fail the request");
+        assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
     }
 }
 
