@@ -43,7 +43,15 @@ pub fn core_grants(plugin_id: &str) -> Option<&'static [(&'static str, &'static 
     // Membership reads users (to map a session to a roster entry) but must not
     // write `core.user_roles`: role assignment belongs to auth (#19). It had
     // INSERT here, which made `membership:manage` a path to granting `chief`.
-    const MEMBERSHIP: &[(&str, &str)] = &[("users", "SELECT")];
+    //
+    // `core.scope_hierarchy` is the declared lodge->patrol hierarchy; membership
+    // owns the roster it is derived from, so it is the one plugin allowed to
+    // write it (see docs/design/scoped-permissions.md 3.2). The grant is
+    // table-level, so it can write any row: the residual is called out in the PR
+    // and the loader rejects cycles/self-edges/unknown types, but per-row
+    // ownership is not expressible with a table grant alone.
+    const MEMBERSHIP: &[(&str, &str)] =
+        &[("users", "SELECT"), ("scope_hierarchy", "SELECT, INSERT, DELETE")];
     match plugin_id {
         "auth" => Some(AUTH),
         "membership" => Some(MEMBERSHIP),
@@ -190,12 +198,19 @@ mod tests {
         assert!(auth.iter().any(|(t, p)| *t == "users" && p.contains("INSERT")));
         let membership = core_grants("membership").expect("membership has a core allowlist");
         assert!(
-            membership.iter().all(|(_, p)| !p.contains("DELETE")),
-            "membership is read/insert only on core tables"
-        );
-        assert!(
             !membership.iter().any(|(t, _)| *t == "user_roles"),
             "membership must not write/read core.user_roles (role assignment is auth's, #19)"
+        );
+        assert!(
+            membership.iter().any(|(t, p)| *t == "scope_hierarchy" && p.contains("INSERT")),
+            "membership declares the lodge->patrol hierarchy"
+        );
+        assert!(
+            membership
+                .iter()
+                .filter(|(t, _)| *t != "scope_hierarchy")
+                .all(|(_, p)| !p.contains("DELETE")),
+            "membership is read-only on the data tables it touches"
         );
     }
 }

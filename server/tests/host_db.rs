@@ -18,6 +18,7 @@ use std::sync::Arc;
 
 use adjutant_sdk::{HostDb, Identity, PermissionService, RoleGrant, Scope, SqlValue};
 use adjutant_server::host::CoreDb;
+use adjutant_server::scope_hierarchy::ScopeHierarchy;
 use adjutant_server::{db, host, schema};
 
 async fn repository_pool() -> Arc<sqlx::PgPool> {
@@ -427,4 +428,66 @@ async fn probe_scope_id_is_opaque_text_and_round_trips() {
     .execute(admin.as_ref())
     .await;
     assert!(troop_with_null.is_ok(), "troop-wide is scope_id NULL");
+}
+
+/// Hierarchical coverage: with a declared lodge→patrol edge, a lodge-scoped
+/// grant covers the patrol inside it (and not another), and coverage stays
+/// downward (a patrol grant does not cover its lodge). Edges are core-owned
+/// data; no plugin is consulted at authorization time.
+#[tokio::test]
+#[ignore = "DB-gated: needs ADJUTANT_TEST_DATABASE_URL; run with `-- --ignored`"]
+async fn probe_scope_hierarchy_lodge_covers_its_patrols() {
+    let (admin, _pools) = setup(&[]).await;
+    sqlx::query("DELETE FROM core.scope_hierarchy").execute(admin.as_ref()).await.expect("clear");
+    sqlx::query(
+        "INSERT INTO core.scope_hierarchy (parent_type, parent_id, child_type, child_id) \
+         VALUES ('lodge', '3', 'patrol', '7')",
+    )
+    .execute(admin.as_ref())
+    .await
+    .expect("declare the edge");
+
+    // A self-edge is unstorable.
+    let self_edge = sqlx::query(
+        "INSERT INTO core.scope_hierarchy (parent_type, parent_id, child_type, child_id) \
+         VALUES ('patrol', '7', 'patrol', '7')",
+    )
+    .execute(admin.as_ref())
+    .await;
+    assert!(self_edge.is_err(), "a self-edge must be rejected by the CHECK");
+
+    sqlx::query(
+        "INSERT INTO core.role_permissions (role_id, permission_id) \
+         VALUES ('chief', 'core:admin'), ('scout', 'core:admin') ON CONFLICT DO NOTHING",
+    )
+    .execute(admin.as_ref())
+    .await
+    .expect("permissions");
+
+    let hierarchy = ScopeHierarchy::load(admin.as_ref()).await.expect("load the hierarchy");
+    let perms = PermissionService::new(host::CoreDb::new(admin.clone()));
+
+    let lodge_grant = Identity::from_grants(
+        "u",
+        vec![RoleGrant { role_id: "chief".into(), scope: Scope::lodge("3") }],
+    );
+    let expanded = hierarchy.expand(&lodge_grant);
+    assert!(
+        perms.has_in_scope(Some(&expanded), "core:admin", &Scope::patrol("7")).await,
+        "a lodge grant covers the patrol declared inside it"
+    );
+    assert!(
+        !perms.has_in_scope(Some(&expanded), "core:admin", &Scope::patrol("8")).await,
+        "and not a patrol that is not declared inside it"
+    );
+
+    let patrol_grant = Identity::from_grants(
+        "u",
+        vec![RoleGrant { role_id: "scout".into(), scope: Scope::patrol("7") }],
+    );
+    let patrol_expanded = hierarchy.expand(&patrol_grant);
+    assert!(
+        !perms.has_in_scope(Some(&patrol_expanded), "core:admin", &Scope::lodge("3")).await,
+        "covering is downward only: a patrol grant does not cover its lodge"
+    );
 }

@@ -423,6 +423,22 @@ mod csv_tests {
     fn adjunct_sdk_test_host() -> adjutant_sdk::testing::TestHost {
         adjutant_sdk::testing::TestHost::new()
     }
+
+    /// The hierarchy declaration replaces our own lodge→patrol edges from
+    /// `patrols.lodge_id` (scoped DELETE, then INSERT ... SELECT).
+    #[tokio::test]
+    async fn declare_scope_hierarchy_syncs_from_patrols() {
+        let host = adjutant_sdk::testing::TestHost::new();
+        let ctx = host.context("membership");
+        declare_scope_hierarchy(&ctx).await.unwrap();
+        let sql = host.db.executed_sql();
+        assert_eq!(sql.len(), 2);
+        assert!(sql[0].contains("DELETE FROM core.scope_hierarchy"));
+        assert!(sql[0].contains("'lodge'"));
+        assert!(sql[1].contains("INSERT INTO core.scope_hierarchy"));
+        assert!(sql[1].contains("FROM patrols"));
+        assert!(sql[1].contains("lodge_id"));
+    }
 }
 
 #[async_trait]
@@ -438,6 +454,14 @@ impl AdjutantPlugin for MembershipPlugin {
     }
 
     async fn init(&mut self, ctx: PluginContext) -> Result<(), SdkError> {
+        // (Re)declare the lodge→patrol scope edges from our own roster on every
+        // load, so the core's hierarchical coverage cannot drift from
+        // `patrols.lodge_id`. On the very first boot the core calls `init`
+        // before our migrations, so `patrols` may not exist yet: log and
+        // continue — the first patrol write (and every reload) re-declares.
+        if let Err(e) = declare_scope_hierarchy(&ctx).await {
+            eprintln!("[adjutant-membership] scope hierarchy re-declare skipped: {e}");
+        }
         let _ = self.ctx.set(ctx);
         Ok(())
     }
@@ -956,6 +980,12 @@ impl AdjutantPlugin for MembershipPlugin {
                             ],
                         )
                         .await?;
+                    // Keep the declared hierarchy fresh at runtime too, so a
+                    // patrol created/moved via the API is covered before the
+                    // next reload.
+                    if let Err(e) = declare_scope_hierarchy(&c).await {
+                        eprintln!("[adjutant-membership] scope hierarchy re-declare failed after patrol write: {e}");
+                    }
                     match rows.first() {
                         Some(r) => PluginResponse::json(
                             201,
@@ -1254,3 +1284,35 @@ async fn upsert_from_import(
     }
 
 export_plugin!(MembershipPlugin);
+
+/// Replace membership's declared lodge → patrol edges in
+/// `core.scope_hierarchy` from its own roster (`patrols.lodge_id`).
+///
+/// The core resolves hierarchical coverage from that table; membership owns the
+/// roster the hierarchy is derived from, so it is the one plugin allowed to
+/// write these edges (see `core_grants` in `server/src/schema.rs`). The DELETE
+/// is scoped to our own edge kind, so a re-run cannot duplicate or disturb
+/// another plugin's edges. Called on every load and after a patrol write; a
+/// first-boot call before migrations returns `Err` (no `patrols` table yet) and
+/// the caller logs and continues.
+async fn declare_scope_hierarchy(ctx: &PluginContext) -> Result<(), SdkError> {
+    ctx.db
+        .execute(
+            "DELETE FROM core.scope_hierarchy \
+             WHERE parent_type = 'lodge' AND child_type = 'patrol'"
+                .to_string(),
+            vec![],
+        )
+        .await?;
+    ctx.db
+        .execute(
+            "INSERT INTO core.scope_hierarchy (parent_type, parent_id, child_type, child_id) \
+             SELECT 'lodge', lodge_id::text, 'patrol', id::text FROM patrols \
+             WHERE lodge_id IS NOT NULL \
+             ON CONFLICT DO NOTHING"
+                .to_string(),
+            vec![],
+        )
+        .await?;
+    Ok(())
+}

@@ -51,6 +51,9 @@ pub struct AppState {
     pub identity: Arc<crate::identity::IdentityHub>,
     /// Core-mediated HTTP shared by all plugin contexts.
     pub http: Arc<crate::host::CoreHttp>,
+    /// Declared scope hierarchy (lodge→patrol), loaded at boot and on reload.
+    /// Used to expand a caller's grants before the gate and handlers see them.
+    pub hierarchy: RwLock<crate::scope_hierarchy::ScopeHierarchy>,
 }
 
 impl AppState {
@@ -69,7 +72,14 @@ impl AppState {
         if identity.is_none() && self.config.allow_dev_headers {
             identity = extract_identity(headers);
         }
-        identity
+        // Resolve hierarchical coverage in the core: expand each grant with the
+        // declared descendants of its scope (lodge -> its patrols). The SDK's
+        // flat `covers` then resolves the hierarchy for both the gate and every
+        // in-handler check, with no plugin call and no ABI change.
+        match identity {
+            Some(id) => Some(self.hierarchy.read().await.expand(&id)),
+            None => None,
+        }
     }
 
     /// Graceful shutdown: stop event handlers, then call every plugin's
@@ -156,6 +166,12 @@ pub async fn build_app(cfg: &Config) -> Result<(Router, Arc<AppState>), BuildErr
     let permissions = PermissionService::new(crate::host::CoreDb::new(pool.clone()));
     let audit = AuditService::new(crate::host::CoreDb::new(pool.clone()), "core".into());
 
+    // Plugins declared their scope edges during `init` (load_all above); read
+    // them now into the resolution map.
+    let hierarchy = crate::scope_hierarchy::ScopeHierarchy::load(pool.as_ref())
+        .await
+        .map_err(BuildError::Db)?;
+
     let state = Arc::new(AppState {
         pool: pool.clone(),
         permissions,
@@ -165,6 +181,7 @@ pub async fn build_app(cfg: &Config) -> Result<(Router, Arc<AppState>), BuildErr
         config: Arc::new(cfg.clone()),
         identity,
         http,
+        hierarchy: RwLock::new(hierarchy),
     });
 
     let cors = cfg.cors_origins.first().map(|_| {
@@ -827,6 +844,20 @@ async fn reload_plugins(State(state): State<Arc<AppState>>, req: Request) -> Res
         .map(|p| (p.info.id.clone(), p.info.version.clone()))
         .collect();
 
+    // `load_all` ran each plugin's `init`, which re-declares its scope edges;
+    // refresh the resolution map before the new generation serves.
+    let fresh_hierarchy = match crate::scope_hierarchy::ScopeHierarchy::load(state.pool.as_ref()).await
+    {
+        Ok(h) => h,
+        Err(e) => {
+            tracing::error!(error = %e, "reload failed to load scope hierarchy; old registry kept");
+            return error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "reload failed; old registry kept",
+            );
+        }
+    };
+
     // Audit, then apply. `load_all` above is the validation/preparation step (it
     // refuses with a 5xx on a load error, before this point); the live-registry
     // swap below is the state change this row precedes. Residual: `load_all` has
@@ -851,6 +882,7 @@ async fn reload_plugins(State(state): State<Arc<AppState>>, req: Request) -> Res
         let mut reg = state.registry.write().await;
         reg.replace_all(fresh);
     }
+    *state.hierarchy.write().await = fresh_hierarchy;
     // Providers from retired plugins stop answering; live ones re-registered
     // themselves during load_all's init (same owner key → replaced in place).
     {
@@ -1019,6 +1051,7 @@ mod tests {
             config: Arc::new(config),
             identity: IdentityHub::new(),
             http: crate::host::CoreHttp::new(),
+            hierarchy: RwLock::new(crate::scope_hierarchy::ScopeHierarchy::default()),
         })
     }
 

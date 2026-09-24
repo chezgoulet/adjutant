@@ -112,6 +112,9 @@ Notes:
   before starting the new binary. It creates the `adjutant_plugin_<id>` roles
   and credentials and transfers ownership of existing plugin schemas/objects to
   those roles. The new runtime refuses to load a plugin with no credential.
+  Re-run it after any upgrade that adds a core grant (e.g. the
+  `core.scope_hierarchy` grant membership needs to declare its lodge→patrol
+  hierarchy): `bootstrap-isolation` re-asserts the allowlist on every run.
 - Core migrations and plugin migrations are recorded in
   `core.schema_migrations` and run once, in order. They are additive; there are
   no down-migrations, so **restore from backup is the rollback path**.
