@@ -254,6 +254,28 @@ ALTER TABLE core.user_roles DROP CONSTRAINT IF EXISTS user_roles_scope_ref_check
 ALTER TABLE core.user_roles ADD CONSTRAINT user_roles_scope_ref_check
   CHECK ((scope_type = 'troop' AND scope_id IS NULL)
       OR (scope_type <> 'troop' AND scope_id IS NOT NULL));
+"),
+(6, "scope_hierarchy", "
+-- Declared scope edges: 'patrol 7 is inside lodge 3'. The core loads these into
+-- an in-memory map and expands a caller's grants with the descendants of each
+-- grant scope, so a lodge grant covers the patrols declared inside it. Edges are
+-- data, not policy: the core never hardcodes which type is broader, it only
+-- follows parent -> child downward.
+CREATE TABLE IF NOT EXISTS core.scope_hierarchy (
+    parent_type TEXT NOT NULL,
+    parent_id   TEXT NOT NULL,
+    child_type  TEXT NOT NULL,
+    child_id    TEXT NOT NULL,
+    created_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
+    -- troop is the implicit root and carries no id; it is never a declared edge.
+    CHECK (parent_type <> 'troop' AND child_type <> 'troop'),
+    -- No self-edge. Deeper cycles are rejected by the loader (it drops an edge
+    -- that would close one) so a bad declaration cannot hang the walk.
+    CHECK (NOT (parent_type = child_type AND parent_id = child_id))
+);
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_scope_hierarchy_edge
+  ON core.scope_hierarchy (parent_type, parent_id, child_type, child_id);
 ")];
 
 /// Bootstrap roles + permissions grants. `chief` gets everything (SPEC §9 —

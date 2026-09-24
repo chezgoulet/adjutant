@@ -136,8 +136,11 @@ A route declares its reach, and the core gate enforces it:
 | `*_protected_any_scope` | the permission at *some* scope; the **handler** checks the object | object routes (`/member?id=`, `/mission/{id}/approve`) |
 | any `delete` | a troop-covering grant | destructive operations |
 
-Coverage is strict: a troop grant covers every scope; a lodge grant covers only
-that lodge; nothing else covers anything. A handler decides an object route with
+Coverage is hierarchical: a troop grant covers every scope; a lodge grant covers
+that lodge **and the patrols declared inside it**; a patrol grant covers only
+that patrol. The hierarchy is core-owned data (`core.scope_hierarchy`) declared by
+the owning plugin and resolved by the core in memory (no plugin call during
+authorization, cycles rejected). A handler decides an object route with
 `PermissionService::has_in_scope` (or `reach`, which returns a 403 naming the
 scope). `PermissionService::has_any_scope` is the core gate's unscoped branch and
 is hidden from plugin authors. Self-access is an ownership check, not a scope.

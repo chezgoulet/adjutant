@@ -2,8 +2,9 @@
 
 **Status:** implemented (SDK ABI 3). §1 and §6 describe the pre-change state and
 the change; the code matches §3. `ScopeType::Personal` is removed. Coverage is
-flat apart from troop (§3.2, §8 #5) — that one is held for the owner's
-confirmation, not settled by the implementation.
+**hierarchical**: a lodge grant covers the patrols declared inside it (§3.2,
+§8 #5), resolved by the core from core-owned edges — no plugin is called during
+authorization and there is no ABI change.
 **Issues:** #22 (scope is never enforced), and the two concrete failures it exposes — #19 and #20.
 **Depends on:** nothing. **Blocks:** missions and governance (Lodge Commander approval, voting).
 **Related:** [`plugin-roadmap.md`](../plugin-roadmap.md) §5, SPEC §9.2, `docs/architecture.md`.
@@ -82,8 +83,16 @@ tests in §4, not statically — a static check would be a lie).
 - `authorize(identity, permissions, permission, required_scope)` where `required_scope`
   defaults to `Scope::troop()` for ordinary routes and is `None` for `_any_scope` routes.
 - A missing identity, an empty grant list, or a grant that does not *cover* the required scope
-  is a denial. **Coverage is flat**: `Troop` covers everything, and otherwise a scope covers
-  only itself — `Lodge` does **not** implicitly cover the patrols inside it (§8 #5).
+  is a denial. **Coverage is hierarchical:** `Troop` covers everything; otherwise a scope covers
+  itself and the scopes **declared inside it** — a `Lodge` grant covers the patrols declared in
+  that lodge (§8 #5). Coverage is downward only: a patrol grant never covers its lodge, and a
+  child never widens a parent.
+- The hierarchy is **core-owned data, declared by the owning plugin** in
+  `core.scope_hierarchy` (`parent_type, parent_id, child_type, child_id`). The core loads the
+  edges at boot and on reload into an in-memory map and expands a caller's grants with the
+  descendants of each grant scope, bounded in depth; the (flat) SDK `Scope::covers` then
+  resolves it. No plugin is consulted during authorization, and cycles/self-edges are rejected
+  so a bad declaration cannot hang the walk or silently widen a scope.
 - Denials are logged with permission + required scope + the caller's grant scopes.
 
 ### 3.3 In-handler checks
@@ -194,4 +203,4 @@ else>`.
 | 2 | Multi-lodge commanders | **Two grant rows**, one per lodge. `Scope` stays a single scope; no `Scope::lodges([..])`. |
 | 3 | Mutations | **`delete` requires a troop-covering grant even when the route is declared scope-any.** The rest (`post`/`put`/`patch`) may be scope-any and check in the handler. Destructive operations are not available from a lodge-scoped grant. |
 | 4 | Order of work | **After plugin isolation** (see [`plugin-isolation.md`](plugin-isolation.md) §9). |
-| 5 | Coverage across a hierarchy | **Flat, and implemented that way.** `Troop` covers everything; otherwise a scope covers only itself, so a `Lodge` grant does **not** cover a patrol-scoped check. The core does not know which patrols belong to which lodge, and resolving that would make the core depend on a plugin for an authorization decision. **Open for the owner's confirmation**, with one consequence to weigh: a Lodge Commander's single lodge-scoped grant will not satisfy a check written at patrol scope, so mission approvals should be checked at *lodge* scope (which is what the Accords describe) or the commander needs patrol-scoped grants for the patrols they oversee. Recorded rather than assumed because it changes how the Accords map onto grants. |
+| 5 | Coverage across a hierarchy | **Decided (owner, 2026-09-24): a lodge grant covers its patrols.** The hierarchy is a fact about the troop, so the core resolves it — but from **declared, core-owned edges**, not by calling a plugin and not by hardcoding lodge/patrol: the owning plugin writes `core.scope_hierarchy` (`parent_type, parent_id, child_type, child_id`), the core loads the edges into an in-memory map and expands each grant with its descendants (downward only, depth-bounded, cycles rejected). `membership` declares `lodge/<id>` → `patrol/<id>` from `patrols.lodge_id`. Only the plugin that owns the parent scope may write its edges (`core_grants`); that grant is table-level, so per-row ownership is not enforced by the allowlist alone — the loader's cycle/self-edge/type checks bound the damage. |

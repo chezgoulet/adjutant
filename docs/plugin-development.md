@@ -269,9 +269,9 @@ async fn approve(ctx: &PluginContext, req: &PluginRequest, lodge_id: &str) -> Re
   derived from them, not a second field. Build a troop-wide identity with
   `Identity::new(user_id, roles)`, or scoped ones with
   `Identity::from_grants(user_id, grants)`.
-- `Scope::troop()` covers every scope; otherwise the type and id must match
-  exactly. Coverage is intentionally flat (the core does not model the
-  lodge→patrol hierarchy). `scope_id` is opaque text owned by the plugin.
+- `Scope::troop()` covers every scope; otherwise a scope covers itself **and the
+  scopes declared inside it** (a lodge grant covers its patrols). Coverage is
+  downward only. `scope_id` is opaque text owned by the plugin.
 - `has_any_scope` is the core gate's unscoped branch and is hidden from plugin
   authors — use `has_in_scope(…, &Scope::troop())` for a troop-wide check.
 - The auth plugin reads `core.user_roles(user_id, role_id, scope_type,
@@ -281,6 +281,30 @@ async fn approve(ctx: &PluginContext, req: &PluginRequest, lodge_id: &str) -> Re
 - **Role assignment is auth's alone** (`auth:manage_users`, `POST
   /api/auth/roles`). Other plugins must not write `core.user_roles` — the
   membership CSV importer ignores its `roles` column and reports it.
+
+### Declaring a scope hierarchy
+
+If your plugin owns a hierarchy (membership owns lodge→patrol), declare the edges
+in `core.scope_hierarchy` so the core can resolve coverage **without calling you
+at authorization time**. The table is `(parent_type, parent_id, child_type,
+child_id)`; the core follows parent → child downward, so the broader scope is the
+parent. Declare through your own database handle (`ctx.db`) — there is no SDK
+service for it (adding one would be a plugin ABI change) — and re-declare on every
+load and after a move, so it cannot drift from your data. Membership does:
+
+```sql
+DELETE FROM core.scope_hierarchy WHERE parent_type = 'lodge' AND child_type = 'patrol';
+INSERT INTO core.scope_hierarchy (parent_type, parent_id, child_type, child_id)
+SELECT 'lodge', lodge_id::text, 'patrol', id::text FROM patrols WHERE lodge_id IS NOT NULL;
+```
+
+Your role gets `SELECT, INSERT, DELETE` on `core.scope_hierarchy` through
+`core_grants` (`server/src/schema.rs`), which is table-level: declare only edges
+you own. The loader rejects self-edges, cycles and scope types the SDK cannot
+represent; the walk is depth-bounded. **Write a check at the scope where the
+authority lives** — check a patrol object at patrol scope and let a lodge grant
+cover it by hierarchy, rather than checking at lodge scope and hoping the object
+happens to be one.
 
 A worked example of the object-route rule is membership's
 `GET /api/membership/member?id=`: `membership:read_all` reaches any member, a
