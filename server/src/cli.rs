@@ -15,9 +15,10 @@ use crate::config::Config;
 // new-plugin
 // ---------------------------------------------------------------------------
 
-/// Validate a plugin id: `[a-z][a-z0-9_]{0,30}`, not reserved. The reserved set
-/// is [`crate::plugin_runtime::RESERVED_IDS`] — the same list enforced at load,
-/// so the scaffolder, `validate-plugin`, and the runtime cannot disagree.
+/// Validate a new plugin name: `[a-z][a-z0-9_]{0,30}`, and not reserved. The
+/// reserved set is [`crate::plugin_runtime::RESERVED_IDS`] — the same list the
+/// loader enforces for untrusted WASM guests — so the scaffolder cannot create a
+/// plugin that would collide with a first-party or core id.
 pub fn validate_plugin_name(name: &str) -> Result<(), String> {
     let ok = !name.is_empty()
         && name.len() <= 31
