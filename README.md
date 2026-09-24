@@ -22,10 +22,14 @@ plugins/membership/         membership plugin (roster, lodges, patrols, OSGi CSV
 plugins/examples/hello/     Prototype plugin proving the SDK end to end
 scripts/probes.py           Committed M1+M2 probe harness (live server)
 docs/e2e_m3.py              Committed M3 end-to-end harness (live server)
+docs/architecture.md        How the core, plugins, and sandbox fit together
+docs/api-reference.md       Core + plugin HTTP API and the SDK surface
 docs/plugin-development.md  Plugin author guide (start here to write one)
 docs/sdk-compatibility.md   SDK version + compatibility policy
+docs/deployment.md          Deployment, upgrades, backup/restore
 docs/milestones/            Milestone evidence records
 docs/evidence/              Committed probe transcripts
+CONTRIBUTING.md             Dev setup, gates, and git flow
 ```
 
 ## Prerequisites
