@@ -466,6 +466,10 @@ The client maintains a persistent WebSocket connection when online, falling back
 
 ## 7. Plugin Specifications
 
+> **Which of these ship, in what order, and when 1.0 is earned:**
+> [`docs/plugin-roadmap.md`](docs/plugin-roadmap.md). This section defines each
+> plugin's behaviour; the roadmap owns the inventory and the release gate.
+
 ### 7.1 Auth Plugin
 
 **Purpose:** Authentication, session management, role enforcement.
@@ -1032,6 +1036,11 @@ The following were open questions in earlier versions of this spec. They are res
 
 Milestones are ordered by dependency. Each milestone has hard exit criteria — don't start the next one until the current one passes. Time estimates are deliberately absent; the milestones define *what* is done, not *when*.
 
+> **Numbering note:** `docs/milestones/M4-core-sdk-stabilization.md` is an
+> **inserted stabilization gate (M3-S)** that landed between M3 and this
+> section's M4; SPEC numbering remains canonical. See
+> [`docs/plugin-roadmap.md`](docs/plugin-roadmap.md) §2.
+
 ### Milestone 1: Prototype Validation
 
 **Goal:** Prove the core architectural bets are sound before writing application code.
@@ -1136,35 +1145,40 @@ an unverifiable re-import assertion, missing lifecycle probes, an anonymous
 
 ---
 
-### Milestone 5: MCP Server + Flutter Client MVP
+### Milestone 5: MCP Server + Flutter Client MVP + Calendar
 
-**Goal:** Ship the permissions-aware MCP server and a working Flutter client.
+**Goal:** Ship the permissions-aware MCP server and a working Flutter client, with
+the calendar scouts actually plan their lives in.
 
 **Exit criteria:**
 - [ ] MCP server plugin: tools exposed, permissions filtered, invocations logged
 - [ ] Hermes agent can connect and interact through the MCP server
-- [ ] Flutter client: login screen, mission list, membership roster, basic navigation
+- [ ] Flutter client: login screen, mission list, membership roster, calendar, basic navigation
 - [ ] Flutter client works on Android, iOS, and Web (PWA)
 - [ ] Offline mode: client caches data locally, syncs when online
+- [ ] Calendar plugin: events, RSVPs, recurring events, quorum tracking
 - [ ] Basic UI/UX review — is the navigation intuitive? Are the screens useful?
 - [ ] Deployed to The House for real use by the 161st
 
-**Deliverable:** A working MVP that scouts can actually use. This is the first release to real users.
+**Deliverable:** A working MVP that scouts can actually use. This is the first release to real users. Calendar moved here from M6 because a troop without a calendar stays in a group chat — see [`docs/plugin-roadmap.md`](docs/plugin-roadmap.md) §4.
 
 ---
 
-### Milestone 6: Finance + Equipment + Calendar
+### Milestone 6: Finance + Equipment + Archive + Conflicts + Announcements
 
-**Goal:** Build the operational plugins that scouts use daily.
+**Goal:** Build the operational plugins that scouts use daily, and the two that
+carry the Accords — searchable history and the conflict pathway.
 
 **Exit criteria:**
 - [ ] Finance plugin: fund tracking, transaction recording, budget vs. actuals, sliding scale dues
 - [ ] Equipment plugin: inventory, checkout/checkin, maintenance schedules
-- [ ] Calendar plugin: events, RSVPs, recurring events, quorum tracking
+- [ ] Archive plugin: Congress proceedings, minutes, full-text search, timeline, decision→policy→mission tracking
+- [ ] Conflicts plugin: staged pathway, case management, stage transitions, anti-dropout nudges
+- [ ] Announcements plugin: creation, read receipts, categories, push notifications
 - [ ] SDK v0.3: permission macros, migration helpers
 - [ ] All plugins built with the SDK, validating the API
 
-**Deliverable:** Seven plugins covering the full operational scope of a scout troop.
+**Deliverable:** Eleven plugins covering the full operational scope of a scout troop. Archive, conflicts and announcements were unassigned before this revision; they are in scope for 1.0, not post-1.0 — see [`docs/plugin-roadmap.md`](docs/plugin-roadmap.md) §3.
 
 ---
 
@@ -1191,7 +1205,7 @@ an unverifiable re-import assertion, missing lifecycle probes, an anonymous
 **Goal:** Stable, documented, ready for community adoption.
 
 **Exit criteria:**
-- [ ] All 7 core plugins stable and tested
+- [ ] Every Tier A plugin in [`docs/plugin-roadmap.md`](docs/plugin-roadmap.md) §3 has passed all three tests in §1 — exists through the blessed path, stable, and usable by a scout without SQL
 - [ ] SDK v1.0 published with stable API
 - [ ] Documentation site live
 - [ ] F-Droid listing
