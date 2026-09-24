@@ -1,5 +1,8 @@
 [workspace]
 resolver = "2"
+# The WASM guest crates are a separate workspace (built with
+# `--target wasm32-wasip1`); they must not be compiled for the host.
+exclude = ["wasm"]
 members = [
     "plugins/sdk",
     "plugins/auth",
@@ -11,9 +14,9 @@ members = [
 [workspace.package]
 version = "0.1.0"
 edition = "2021"
-# Minimum supported Rust version; the highest `rust-version` in the dependency
-# tree is 1.88. Bump only when a dependency (or we) require it.
-rust-version = "1.88"
+# Minimum supported Rust version. wasmtime 49 (the WASM host) requires 1.96;
+# that is the binding constraint. Bump only when a dependency (or we) require it.
+rust-version = "1.96"
 license = "MIT"
 repository = "https://github.com/chezgoulet/adjutant"
 
@@ -32,6 +35,8 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 tower-http = { version = "0.6", features = ["cors"] }
 toml = "0.9"
+wasmtime = "49"
+wasmtime-wasi = "49"
 
 [profile.dev]
 debug = 0  # keep compile times sane for the prototype loop

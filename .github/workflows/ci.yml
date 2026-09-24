@@ -32,6 +32,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy
+          targets: wasm32-wasip1
 
       - uses: Swatinem/rust-cache@v2
 
@@ -80,6 +81,18 @@ jobs:
       - name: test-plugin harness
         run: ADJUTANT_PLUGIN_DIR=plugins-built ./target/debug/adjutant test-plugin
 
+      # The sandboxed path: build the WASM guest and load it through the same
+      # registry/dispatch pipeline (a separate plugin dir keeps the native
+      # harnesses above unaffected).
+      - name: Build the WASM guest
+        run: cargo build --manifest-path wasm/Cargo.toml --release --target wasm32-wasip1
+
+      - name: WASM guest loads and serves (test-plugin)
+        run: |
+          mkdir -p wasm-built
+          cp wasm/target/wasm32-wasip1/release/adjutant_hello_wasm.wasm wasm-built/
+          ADJUTANT_PLUGIN_DIR=wasm-built ./target/debug/adjutant test-plugin
+
       # End-to-end, with the spoofable dev-header stub OFF. The harness asserts
       # that precondition itself (probe 0) and exercises a mock OIDC provider.
       # `adjutant new-plugin` output must compile — the unit test only checks
@@ -114,14 +127,14 @@ jobs:
           python3 docs/e2e_m3.py
 
   # The declared MSRV (workspace rust-version). RUSTUP_TOOLCHAIN overrides the
-  # rust-toolchain.toml `stable` channel so this job actually uses 1.88.
+  # rust-toolchain.toml `stable` channel so this job actually uses 1.96.
   msrv:
     runs-on: ubuntu-latest
     env:
-      RUSTUP_TOOLCHAIN: "1.88.0"
+      RUSTUP_TOOLCHAIN: "1.96.0"
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@1.88.0
+      - uses: dtolnay/rust-toolchain@1.96.0
       - uses: Swatinem/rust-cache@v2
       - name: cargo check on MSRV
         run: cargo check --workspace

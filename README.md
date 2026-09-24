@@ -30,7 +30,7 @@ docs/evidence/              Committed probe transcripts
 
 ## Prerequisites
 
-- Rust 1.88+ (the declared MSRV; developed on stable, see `rust-toolchain.toml`)
+- Rust 1.96+ (the declared MSRV; developed on stable, see `rust-toolchain.toml`)
 - PostgreSQL 14+ (18.6 in development) with `pgcrypto` available
 - `psql` on `PATH` for the probe harnesses
 

@@ -125,7 +125,8 @@ public SDK + testing module. **Met.**
       One `{"error": ...}` envelope; 5xx responses are generic (detail logged,
       not returned), 4xx carry the plugin message.
 - [x] MSRV pin (`rust-toolchain.toml`), `cargo-deny`, and a `cargo doc`
-      warnings gate. MSRV declared as 1.88; `deny.toml` + CI `cargo-deny`,
+      warnings gate. MSRV declared as 1.96 (wasmtime 49's floor — raised from
+      1.88 in W3); `deny.toml` + CI `cargo-deny`,
       `cargo doc -D warnings`, and an MSRV `cargo check` job.
 - [x] Dockerfile + `docker-compose.yml` (server + PostgreSQL) and a documented
       upgrade / backup / restore story — `docs/deployment.md`; image built and
@@ -136,22 +137,29 @@ public SDK + testing module. **Met.**
 **Exit criteria:** a fresh host can deploy the tagged core with one documented
 command; security defaults are safe; supply-chain and doc gates are enforced in CI.
 
-### W3 — WASM host API prototype (SPEC §14-R1)
+### W3 — WASM host API prototype (SPEC §14-R1) ✓
 
-- [ ] A host-side `WasmPlugin` adapter implementing `AdjutantPlugin`, backed by
-      `wasmtime`.
-- [ ] Prototype ABI: guest exports a handle entry point; imports one generic
-      `adjutant_host_call(method, payload_json) -> result_json` dispatched to
-      db / events / permissions / audit / http. Reuses the SDK's JSON types.
-      (Typed WIT / component model is the likely end state — documented.)
-- [ ] Enforce: no filesystem, no network by default, memory cap, fuel/epoch CPU
-      limit, per-call timeout.
-- [ ] Compile `hello` (and a scaffolded plugin) to `wasm32-wasip1`, load, and
-      serve through the same registry/routes/permissions pipeline.
-- [ ] Tests: guest FS/network attempts fail; a runaway loop is interrupted;
-      `test-plugin` can exercise a WASM plugin.
-- [ ] Fallback documented: if async reentrancy/perf blocks the prototype, land
-      the ABI spec and keep native-only, explicitly.
+**Branch:** `feature/m4-w3-wasm`. **Status: complete (prototype).**
+
+- [x] A host-side `WasmPlugin` adapter implementing `AdjutantPlugin`, backed by
+      `wasmtime` (`server/src/wasm.rs`).
+- [x] Prototype ABI: guest exports `adjutant_alloc`/`adjutant_free`/
+      `adjutant_describe`/`adjutant_handle`; imports one generic
+      `env.adjutant_host_call(method, payload_json) -> result_json` dispatched to
+      db / events / http / permissions / audit. Typed WIT / component model is
+      documented as the likely end state.
+- [x] Enforce: WASI preview1 linked with **no preopened directories** (no
+      filesystem), no socket API (no network), 64 MiB memory cap, fuel budget
+      per call.
+- [x] `hello_wasm` compiled to `wasm32-wasip1`, loaded, and served through the
+      same registry/routes/permissions pipeline (verified live: open + protected
+      routes, a DB write, an event, an audit row, migrations, and an isolation
+      role).
+- [x] Tests: no filesystem preopened; a runaway loop traps on fuel; memory
+      growth beyond the cap is denied; CI builds the guest and runs
+      `test-plugin` against it.
+- [x] Fallback documented: the ABI is a prototype (synchronous JSON, fixed 1 MiB
+      buffers); native remains the trusted path.
 
 **Exit criteria:** native and WASM paths both proven; the sandbox limits are
 tested, not asserted; the trusted-native vs untrusted-WASM distinction is

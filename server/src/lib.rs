@@ -12,5 +12,6 @@ pub mod permissions;
 pub mod plugin_runtime;
 pub mod schema;
 pub mod server;
+pub mod wasm;
 
 pub use server::build_app;

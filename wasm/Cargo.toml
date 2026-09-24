@@ -1,0 +1,18 @@
+# Separate workspace for WASM guest plugins. Build with:
+#   cargo build --manifest-path wasm/Cargo.toml --release --target wasm32-wasip1
+[workspace]
+resolver = "2"
+members = ["guest", "examples/hello"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+
+[workspace.dependencies]
+serde_json = "1"
+adjutant-wasm-guest = { path = "guest" }
+
+[profile.release]
+opt-level = "s"
+lto = true

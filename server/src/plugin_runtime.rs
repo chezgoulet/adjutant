@@ -56,9 +56,10 @@ const RESERVED_IDS: &[&str] = &["plugins", "events", "audit", "core"];
 pub struct LoadedPlugin {
     pub plugin: Box<dyn AdjutantPlugin>,
     /// Kept alive for the library-lifetime rule (see module docs): never
-    /// read, never dropped until the registry retires it.
+    /// read, never dropped until the registry retires it. `None` for WASM
+    /// plugins, whose code is owned by the wasmtime store inside the plugin.
     #[allow(dead_code)]
-    pub(crate) library: Arc<libloading::Library>,
+    pub(crate) library: Option<Arc<libloading::Library>>,
     pub routes: Vec<RouteDefinition>,
     pub enabled: bool,
     pub info: PluginInfo,
@@ -72,6 +73,8 @@ pub struct PluginInfo {
     pub version: String,
     pub enabled: bool,
     pub routes: usize,
+    /// `native` (trusted cdylib) or `wasm` (sandboxed).
+    pub kind: String,
     pub permissions: Vec<String>,
     /// Full route table — lets `adjutant test-plugin` enumerate every route
     /// without hardcoding plugin knowledge. A path containing a capture is
@@ -299,34 +302,51 @@ pub async fn load_all(
         .map_err(|e| PluginRuntimeError::Io(dir.display().to_string(), e))?
         .filter_map(|e| e.ok())
         .map(|e| e.path())
-        .filter(|p| p.extension().is_some_and(|x| x == "so"))
+        .filter(|p| {
+            p.extension()
+                .is_some_and(|x| x == "so" || x == "wasm")
+        })
         .collect();
     entries.sort();
 
     for path in entries {
-        let lib = unsafe { libloading::Library::new(&path) }.map_err(|e| {
-            PluginRuntimeError::Load(path.display().to_string(), e.to_string())
-        })?;
-        let lib = Arc::new(lib);
-        park(lib.clone()); // mapped until process exit, whatever happens below
+        let is_wasm = path.extension().is_some_and(|x| x == "wasm");
+        // Native plugins are trusted cdylibs; WASM plugins are sandboxed. Both
+        // become `Box<dyn AdjutantPlugin>` and flow through the same pipeline.
+        let (mut plugin, library): (
+            Box<dyn AdjutantPlugin>,
+            Option<Arc<libloading::Library>>,
+        ) = if is_wasm {
+            let p = crate::wasm::WasmPlugin::open(&path)
+                .await
+                .map_err(|e| PluginRuntimeError::Load(path.display().to_string(), e))?;
+            (Box::new(p), None)
+        } else {
+            let lib = unsafe { libloading::Library::new(&path) }.map_err(|e| {
+                PluginRuntimeError::Load(path.display().to_string(), e.to_string())
+            })?;
+            let lib = Arc::new(lib);
+            park(lib.clone()); // mapped until process exit, whatever happens below
 
-        // ABI handshake: resolve the SDK ABI symbol BEFORE touching the plugin
-        // vtable. A stale build (plugin not rebuilt after an SDK change) is
-        // refused with a clear error instead of running against mismatched
-        // layouts. `check_sdk_abi` is sync, so no `Symbol` is live across an
-        // await in this generator.
-        check_sdk_abi(&lib, &path)?;
+            // ABI handshake: resolve the SDK ABI symbol BEFORE touching the
+            // plugin vtable. A stale build (plugin not rebuilt after an SDK
+            // change) is refused with a clear error instead of running against
+            // mismatched layouts. `check_sdk_abi` is sync, so no `Symbol` is
+            // live across an await in this generator.
+            check_sdk_abi(&lib, &path)?;
 
-        // Scope the libloading `Symbol` (a raw-pointer borrow) to this block
-        // so it cannot be live across any await below — a Symbol in the
-        // generator state makes the future unprovable as Send.
-        let mut plugin: Box<dyn AdjutantPlugin> = {
-            let factory =
-                unsafe { lib.get::<adjutant_sdk::PluginFactory>(adjutant_sdk::ENTRY_SYMBOL) }
-                    .map_err(|e| {
-                        PluginRuntimeError::Load(path.display().to_string(), e.to_string())
-                    })?;
-            unsafe { Box::from_raw(factory()) }
+            // Scope the libloading `Symbol` (a raw-pointer borrow) to this block
+            // so it cannot be live across any await below — a Symbol in the
+            // generator state makes the future unprovable as Send.
+            let plugin: Box<dyn AdjutantPlugin> = {
+                let factory =
+                    unsafe { lib.get::<adjutant_sdk::PluginFactory>(adjutant_sdk::ENTRY_SYMBOL) }
+                        .map_err(|e| {
+                            PluginRuntimeError::Load(path.display().to_string(), e.to_string())
+                        })?;
+                unsafe { Box::from_raw(factory()) }
+            };
+            (plugin, Some(lib))
         };
         let id = plugin.id().to_string();
 
@@ -493,6 +513,7 @@ pub async fn load_all(
             version: plugin.version().to_string(),
             enabled,
             routes: routes.len(),
+            kind: if is_wasm { "wasm".into() } else { "native".into() },
             permissions: granted.iter().map(|p| p.id.clone()).collect(),
             route_list: routes
                 .iter()
@@ -507,7 +528,7 @@ pub async fn load_all(
 
         plugins.push(LoadedPlugin {
             plugin,
-            library: lib,
+            library,
             routes,
             enabled,
             info,
@@ -739,6 +760,7 @@ mod tests {
             version: "0.0.1".into(),
             enabled,
             routes: 1,
+            kind: "native".into(),
             permissions: perm.map(|p| vec![p.to_string()]).unwrap_or_default(),
             route_list: vec![RouteInfo {
                 method: method.into(),
@@ -748,7 +770,7 @@ mod tests {
         };
         LoadedPlugin {
             plugin: Box::new(TestPlugin::new()),
-            library: lib,
+            library: Some(lib),
             routes: vec![route],
             enabled,
             info,

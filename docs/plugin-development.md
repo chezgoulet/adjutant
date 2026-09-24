@@ -346,6 +346,69 @@ unexpected network call. `MockIdentity` records registered providers.
 - `adjutant validate-plugin <so>` is the fast, database-free gate. Run it in CI.
 - See [`sdk-compatibility.md`](sdk-compatibility.md) for the version policy.
 
+## WASM plugins (sandboxed)
+
+Native plugins are trusted code sharing the core's address space. A plugin can
+instead be compiled to WebAssembly and loaded from the plugin directory as a
+`*.wasm` file, where it runs sandboxed:
+
+- **no filesystem** — WASI preview1 is linked (Rust `std` needs it) but with **no
+  preopened directories**;
+- **no network** — preview1 exposes no socket API, and the core provides no
+  proxied network beyond the explicit `http.request` host call;
+- **64 MiB** linear-memory cap;
+- **a fuel budget per call** — a tight `loop {}` traps instead of hanging the
+  server.
+
+The guest reuses the same host-mediated I/O boundary as native code, through one
+imported function, `adjutant_host_call`, that carries JSON. Available methods:
+`db.query`, `db.execute`, `events.publish`, `http.request`, `permissions.has`,
+`audit.log`.
+
+### Guest ABI (prototype)
+
+Exports: `adjutant_alloc`, `adjutant_free`, `adjutant_describe` (JSON manifest),
+`adjutant_handle` (one request → one response). The manifest declares
+`id`/`name`/`version`/`permissions`/`migrations`/`routes`; response JSON is
+`{"status", "headers", "body"}`.
+
+Write a guest with the helper crate `wasm/guest` (`adjutant-wasm-guest`):
+
+```rust
+use adjutant_wasm_guest::{export_wasm_plugin, host_call, WasmPlugin};
+use serde_json::{json, Value};
+
+struct MyPlugin;
+impl WasmPlugin for MyPlugin {
+    fn manifest() -> Value { json!({ /* id, routes, permissions, migrations */ }) }
+    fn handle(req: &Value) -> Value {
+        let data = host_call("db.query", &json!({ "sql": "SELECT 1", "params": [] }).to_string());
+        json!({ "status": 200, "headers": [], "body": data.unwrap_or(Value::Null).to_string() })
+    }
+}
+export_wasm_plugin!(MyPlugin);
+```
+
+```bash
+cargo build --manifest-path wasm/Cargo.toml --release --target wasm32-wasip1
+cp wasm/target/wasm32-wasip1/release/adjutant_my_plugin.wasm plugins-built/
+```
+
+Bind parameters are tagged (`{"kind":"text","value":"x"}`, `nullint`, `uuid`,
+`textarray`, …) so a uuid is never confused with text and typed nulls survive
+the JSON boundary.
+
+### Prototype limits
+
+- The guest ABI is **synchronous JSON**, not the async `AdjutantPlugin` trait.
+  The host side is a normal `AdjutantPlugin` adapter, so registry, permissions,
+  and dispatch are shared. A typed WIT / component-model ABI is the intended end
+  state.
+- Response buffers are a fixed 1 MiB and single-shot (overflow is an error, not
+  a retry, so an operation never runs twice).
+- `validate-plugin` currently checks native `.so` files; a WASM guest is
+  validated by loading it (`adjutant test-plugin` with it staged).
+
 ## Common traps (learned the hard way)
 
 1. **Typed nulls** — use `NullInt`/`NullBool`/`NullUuid`, never `Null`, for

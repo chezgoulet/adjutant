@@ -16,13 +16,21 @@ crates.io publication.
 
 ### Added
 
+- **WASM plugin host (prototype, SPEC §14-R1).** Sandboxed plugins run in
+  `wasmtime` with no preopened filesystem, no sockets, a 64 MiB memory cap, and
+  a per-call fuel budget. A host `WasmPlugin` adapter implements the ordinary
+  `AdjutantPlugin` trait, so registry/validation/permissions/dispatch are
+  unchanged; the guest calls the core through one generic
+  `adjutant_host_call` JSON import. Ships a guest helper crate
+  (`adjutant-wasm-guest`), a `hello_wasm` example, and sandbox tests.
 - **Deployment assets.** `Dockerfile` + `docker-compose.yml` (server +
   PostgreSQL, one command), `docs/deployment.md` (quick start, TLS, upgrade,
   backup/restore), and a tag-triggered release workflow that publishes a
   verified tarball (binary + bundled plugins).
 - **Supply-chain and doc gates.** `deny.toml` (advisories, licenses, bans,
   sources), a `cargo doc -D warnings` gate, and an MSRV job, all in CI.
-  `rust-toolchain.toml` plus `rust-version = "1.88"` declare the toolchain.
+  `rust-toolchain.toml` plus `rust-version = "1.96"` declare the toolchain
+  (wasmtime 49 raised the floor from 1.88).
 - **Enforced schema isolation.** Each plugin gets a `NOLOGIN` PostgreSQL role
   (`adjutant_plugin_<id>`); its runtime database handle runs under
   `SET LOCAL ROLE` with full rights on its own schema and an explicit allowlist
