@@ -16,6 +16,12 @@ crates.io publication.
 
 ### Added
 
+- **Scoped permissions (SPEC §9.2).** `ScopeType`, `Scope`, and `RoleGrant`;
+  `Identity::new` (troop-wide), `Identity::from_grants`, and
+  `Identity::roles_covering`; and `PermissionService::has_in_scope` for
+  in-handler checks against a specific lodge/patrol/personal scope. The auth
+  plugin now populates scoped grants from `core.user_roles`. Route-level gating
+  is unchanged (`has`, any scope).
 - **ABI handshake.** `export_plugin!` now also exports `adjutant_sdk_abi`, and
   the core resolves it *before* calling the plugin factory. A plugin built
   against a different SDK ABI is refused at load with an actionable error
@@ -39,6 +45,9 @@ crates.io publication.
 
 ### Changed
 
+- **Breaking (ABI 2):** `Identity` gained a `grants: Vec<RoleGrant>` field. Use
+  `Identity::new` / `Identity::from_grants` rather than a struct literal.
+  `SDK_ABI_VERSION` is now `2`.
 - The core's plugin error mapping now uses `SdkError::status()` (a wrong
   password from a plugin is a `400`, not a `500`).
 - Loader validation is factored into shared pure functions

@@ -235,6 +235,33 @@ Return an `SdkError` to short-circuit with the matching status:
 `BadRequest` 400, `Unauthorized` 401, `Forbidden` 403, `NotFound` 404,
 `Conflict` 409, `Db`/`Internal` 500.
 
+## Scoped permissions (SPEC §9.2)
+
+Permissions can be scoped to a troop, lodge, patrol, or person. The route gate
+(`has`) checks the permission against any role the caller holds; an in-handler
+check can require that the role's grant actually **covers** a scope:
+
+```rust
+use adjutant_sdk::prelude::*;
+
+async fn approve(ctx: &PluginContext, req: &PluginRequest, lodge_id: &str) -> Result<(), SdkError> {
+    let scope = Scope::lodge(lodge_id);
+    if !ctx.permissions.has_in_scope(req.identity.as_ref(), "missions:approve", &scope).await {
+        return Err(SdkError::Forbidden("not your lodge".into()));
+    }
+    Ok(())
+}
+```
+
+- `Identity` carries `roles` (flat) and `grants` (`RoleGrant { role_id, scope }`).
+  Build a troop-wide identity with `Identity::new(user_id, roles)`, or scoped
+  ones with `Identity::from_grants(user_id, grants)`.
+- `Scope::troop()` covers every scope; other scopes match by type and id
+  exactly. The core does not model the lodge→patrol hierarchy, so coverage is
+  intentionally flat.
+- The auth plugin reads `core.user_roles(user_id, role_id, scope_type,
+  scope_id)` and populates `grants` for the session identity.
+
 ## Migrations and schema
 
 Return `Migration`s from `migrations()`. Versions start at 1 and must be unique.

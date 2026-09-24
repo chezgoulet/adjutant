@@ -87,9 +87,11 @@ baseline numbers are recorded here. **Met** — `v0.1.0` @ `6a0f2d7`, CI green.
         `with_header`.
   - [x] `SqlValue` gains `Uuid`/`NullUuid`/`IntArray`; the host decodes uuid
         columns. Numeric/bytea/non-text arrays remain cast-in-SQL, documented.
-- [ ] Decide the identity/scope question: `Identity` is `{user_id, roles}` today
-      while SPEC §9.2 describes scoped permissions. Either model scope in the
-      SDK or narrow the SPEC. **Open — human design decision (W1 boundary).**
+- [x] Decide the identity/scope question — **resolved: model scope now.**
+      `ScopeType`/`Scope`/`RoleGrant`, `Identity::{new,from_grants,roles_covering}`,
+      and `PermissionService::has_in_scope` added; auth populates scoped grants
+      from `core.user_roles`. `SDK_ABI_VERSION` bumped to 2 (breaking: `Identity`
+      gained `grants`). See `docs/plugin-development.md` §Scoped permissions.
 - [x] Public `adjutant_sdk::testing`: `MockDb`/`MockEvents`/`MockHttp`/
       `MockIdentity`, `TestHost::context`, and a `TestRequest` builder, with a
       usage doctest. **Partial dogfood:** the SDK's own tests use it; retrofitting
@@ -97,15 +99,14 @@ baseline numbers are recorded here. **Met** — `v0.1.0` @ `6a0f2d7`, CI green.
 - [x] `adjutant validate-plugin`: static validation (ABI, init against mocks, id,
       permission references, migration versions, route namespace/captures/
       duplicates) with no database; wired into CI (incl. the scaffolded plugin).
-- [ ] Schema isolation: enforce it (per-plugin role/grants) or correct SPEC §5.2
-      to state that the per-call `search_path` is a convention, not a boundary.
-      **Open — needs a decision.**
+- [ ] Schema isolation — **decided: enforce via per-plugin PostgreSQL roles.**
+      In progress as a follow-up on this branch's series. Not yet implemented.
 - [x] Documentation: `docs/plugin-development.md` written.
 
 **Exit criteria:** a plugin can be scaffolded, statically validated, unit-tested
 with only the public SDK, and loaded; `auth` + `membership` pass using only the
-public SDK + testing module. **Remaining before met:** the identity/scope and
-schema-isolation decisions, and the `auth`/`membership` testing retrofit.
+public SDK + testing module. **Remaining before met:** schema isolation, and the
+`auth`/`membership` testing retrofit.
 
 ### W2 — Core hardening
 

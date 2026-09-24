@@ -57,7 +57,7 @@ new helper constructors, new `testing` mocks) do **not** bump the ABI version.
 | Core / SDK | Plugin ABI | Notes |
 |---|---|---|
 | 0.1.0 | pre-handshake (no symbol) | M1–M3; refused by 0.2+ until rebuilt |
-| 0.2.0 (M4 target) | 1 | First version with the handshake |
+| 0.2.0 (M4 target) | 2 | First version with the handshake and scoped identity (`Identity.grants`) |
 
 ## Native-only caveat
 

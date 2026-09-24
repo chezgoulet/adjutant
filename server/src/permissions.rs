@@ -25,7 +25,7 @@ pub fn extract_identity(headers: &HeaderMap) -> Option<Identity> {
                 .collect()
         })
         .unwrap_or_default();
-    Some(Identity { user_id, roles })
+    Some(Identity::new(user_id, roles))
 }
 
 /// Check one permission for the identity on a request. Identity is extracted

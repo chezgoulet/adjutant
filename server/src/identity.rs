@@ -150,13 +150,13 @@ mod tests {
             headers: &HashMap<String, String>,
         ) -> Result<Option<Identity>, SdkError> {
             match headers.get("x-stub-user") {
-                Some(u) => Ok(Some(Identity {
-                    user_id: u.clone(),
-                    roles: headers
+                Some(u) => Ok(Some(Identity::new(
+                    u.clone(),
+                    headers
                         .get("x-stub-role")
                         .map(|r| vec![r.clone()])
                         .unwrap_or_default(),
-                })),
+                ))),
                 None => Ok(None),
             }
         }
