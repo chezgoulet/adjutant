@@ -165,6 +165,10 @@ BOOTSTRAP-ISOLATION OPTIONS:
     --database-url <URL>   admin connection string (needs CREATEROLE)
     --plugin-dir <PATH>    the plugins to create roles for
     --rotate               replace stored passwords (default: preserve them)
+    --app-role <NAME>      also create a dedicated application role (no superuser,
+                           no CREATEROLE) that owns the core schema and holds the
+                           plugin roles; serve as it to avoid a superuser
+    --app-password <PW>    set the application role's password (default: leave it)
 
 ENVIRONMENT (override file, overridden by flags):
     ADJUTANT_CONFIG, ADJUTANT_BIND, ADJUTANT_DATABASE_URL, ADJUTANT_PLUGIN_DIR,

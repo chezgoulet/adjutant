@@ -12,26 +12,54 @@ database. There is no Redis, no MinIO, and no separate cache (SPEC §2.6).
 ## Quick start (Docker Compose)
 
 ```bash
-# 1. Pick a database password (required — there is no insecure default).
-export POSTGRES_PASSWORD="$(openssl rand -hex 24)"
+# 1. Pick both passwords (required — there are no insecure defaults).
+export POSTGRES_PASSWORD="$(openssl rand -hex 24)"       # admin; bootstrap only
+export ADJUTANT_APP_PASSWORD="$(openssl rand -hex 24)"   # the server's runtime role
 
-# 2. Create the per-plugin DB roles/credentials once (needs CREATEROLE), then
-#    start server + PostgreSQL. The runtime cannot create roles itself, so a
-#    plugin with no credential refuses to load.
-docker compose run --rm adjutant bootstrap-isolation
+# 2. Bootstrap, then start.
+#    `bootstrap-isolation` is a ONE-OFF that creates the per-plugin roles,
+#    schema ownership, `core.*` grants and credentials, AND the `adjutant_app`
+#    runtime role. Three things to know:
+#      * it must run BEFORE the server;
+#      * it needs the plugin directory present — it iterates what is on disk;
+#      * re-run it whenever a plugin is added or upgraded.
+#    An un-bootstrapped plugin makes the server refuse to load it
+#    (`NotBootstrapped`, exit 1) — that is the expected state until this step.
+docker compose run --rm \
+  -e ADJUTANT_DATABASE_URL="postgres://adjutant:${POSTGRES_PASSWORD}@postgres:5432/adjutant" \
+  adjutant bootstrap-isolation --app-role adjutant_app --app-password "$ADJUTANT_APP_PASSWORD"
 docker compose up -d
 
 # 3. Check it is up
 curl -s localhost:8787/          # {"service":"adjutant","status":"ok"}
 ```
 
-On first boot the server creates the `core` schema, runs core migrations,
-loads the bundled plugins (`hello`, `auth`, `membership`), runs each plugin's
-migrations in its own schema — **on a pool authenticated as that plugin's own
-`adjutant_plugin_<id>` role** — and seeds the bootstrap roles.
+The server connects as **`adjutant_app`**, a non-superuser role (no
+`SUPERUSER`, no `CREATEROLE`); it is never the Postgres superuser. On start it
+runs core migrations, loads the bundled plugins (`hello`, `auth`, `membership`),
+and runs each plugin's migrations — **on a pool authenticated as that plugin's
+own `adjutant_plugin_<id>` role**.
 
 Postgres is **not** exposed to the host; only the server is. The first user to
 `POST /api/auth/register` while `core.users` is empty becomes `chief`.
+
+## The application role
+
+`adjutant_app` replaces the old "run as `POSTGRES_USER`" default, which was a
+superuser and turned any plugin escape into total compromise (design
+`plugin-isolation.md` §3.6). It is:
+
+- `LOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE`;
+- a member of every `adjutant_plugin_<id>` role (it administers them);
+- the **owner of the `core` schema** and its objects, and granted `CONNECT,
+  CREATE` on the database.
+
+That last point is the one deviation from the design's "owns nothing": because
+core migrations run at boot and `ALTER` core tables, the role that serves must
+own `core` — otherwise the only role that could boot would be a superuser. It
+owns **no plugin schema**; those belong to the plugin roles. The server refuses
+to boot on a superuser connection unless `ADJUTANT_ALLOW_SUPERUSER=true` is set
+for a throwaway database.
 
 ## Bare metal
 
@@ -41,13 +69,16 @@ mkdir -p plugins-built
 cp target/release/libadjutant_*.so plugins-built/
 
 # One-time, and again after adding/upgrading a plugin: create the roles,
-# schema ownership, `core.*` grants and stored credentials. Needs CREATEROLE.
+# schema ownership, `core.*` grants and stored credentials, plus the app role.
+# Needs CREATEROLE (the admin role).
 ADJUTANT_DATABASE_URL=postgres://adjutant@127.0.0.1:5432/adjutant \
-  ./target/release/adjutant bootstrap-isolation --plugin-dir plugins-built
+  ./target/release/adjutant bootstrap-isolation --plugin-dir plugins-built \
+    --app-role adjutant_app --app-password "$ADJUTANT_APP_PASSWORD"
 
-# Serve. The runtime connects as each plugin role; it never needs CREATEROLE.
+# Serve as the non-superuser app role. The runtime connects as each plugin role
+# for plugin SQL; it never needs CREATEROLE.
 ADJUTANT_PLUGIN_DIR=plugins-built \
-ADJUTANT_DATABASE_URL=postgres://adjutant@127.0.0.1:5432/adjutant \
+ADJUTANT_DATABASE_URL=postgres://adjutant_app:"$ADJUTANT_APP_PASSWORD"@127.0.0.1:5432/adjutant \
   ./target/release/adjutant serve
 ```
 
@@ -112,9 +143,14 @@ Notes:
   before starting the new binary. It creates the `adjutant_plugin_<id>` roles
   and credentials and transfers ownership of existing plugin schemas/objects to
   those roles. The new runtime refuses to load a plugin with no credential.
-  Re-run it after any upgrade that adds a core grant (e.g. the
-  `core.scope_hierarchy` grant membership needs to declare its lodge→patrol
-  hierarchy): `bootstrap-isolation` re-asserts the allowlist on every run.
+  Add `--app-role adjutant_app --app-password <pw>` to also create the runtime
+  role and hand it the `core` schema, then serve as it. Re-run it after any
+  upgrade that adds a core grant (e.g. the `core.scope_hierarchy` grant
+  membership needs to declare its lodge→patrol hierarchy): `bootstrap-isolation`
+  re-asserts the allowlist on every run.
+- **The runtime now refuses to boot on a superuser connection** (a plugin escape
+  would be total compromise). Serve as the non-superuser app role, or set
+  `ADJUTANT_ALLOW_SUPERUSER=true` for a throwaway database.
 - Core migrations and plugin migrations are recorded in
   `core.schema_migrations` and run once, in order. They are additive; there are
   no down-migrations, so **restore from backup is the rollback path**.

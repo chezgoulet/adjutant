@@ -93,6 +93,7 @@ async fn retiring_plugins_does_not_leak_connections() {
     let mut reg = PluginRegistry::new(vec![fixture(id, new_pool().await)]);
     let baseline = plugin_connections(&admin, &role).await;
     assert!(baseline >= 1, "the live pool has at least one connection");
+    println!("[pool_lifecycle] baseline connections as {role} = {baseline}");
 
     // Ten reloads; each retires the previous generation (and its pool).
     for _ in 0..10 {
@@ -113,6 +114,11 @@ async fn retiring_plugins_does_not_leak_connections() {
         );
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
     }
+    println!(
+        "[pool_lifecycle] after 10 reloads: connections = {}, retired libraries = {}",
+        plugin_connections(&admin, &role).await,
+        reg.retired_count()
+    );
 
     assert_eq!(reg.retired_count(), 10, "libraries stay retired");
     assert_eq!(
@@ -128,4 +134,5 @@ async fn retiring_plugins_does_not_leak_connections() {
         assert!(tokio::time::Instant::now() < deadline, "uninstall leaked its pool");
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
     }
+    println!("[pool_lifecycle] after uninstall: connections = 0");
 }
