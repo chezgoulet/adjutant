@@ -25,6 +25,7 @@ docs/e2e_m3.py              Committed M3 end-to-end harness (live server)
 docs/architecture.md        How the core, plugins, and sandbox fit together
 docs/api-reference.md       Core + plugin HTTP API and the SDK surface
 docs/plugin-development.md  Plugin author guide (start here to write one)
+docs/plugin-roadmap.md      Plugin inventory, sequencing, and the v1.0 gate
 docs/sdk-compatibility.md   SDK version + compatibility policy
 docs/deployment.md          Deployment, upgrades, backup/restore
 docs/releasing.md           Release + crates.io publishing runbook
