@@ -34,6 +34,16 @@ import urllib.request
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
+
+
+def workspace_version() -> str:
+    """The `[workspace.package]` version, so this probe tracks releases instead
+    of hardcoding one (a version bump must not fail the ladder)."""
+    text = (ROOT / "Cargo.toml").read_text()
+    m = re.search(r'\[workspace\.package\][^\[]*?version\s*=\s*"([^"]+)"', text, re.S)
+    return m.group(1) if m else ""
+
+
 DSN = os.environ.get("ADJUTANT_DATABASE_URL", "postgres://adjutant@127.0.0.1:5433/adjutant_dev")
 BIND = "127.0.0.1:8787"
 BASE = f"http://{BIND}"
@@ -163,7 +173,7 @@ def batch_m1_regression():
         ok = (
             info["routes"] == len(info["route_list"])
             and sorted(info["permissions"]) == ["hello:read", "hello:write"]
-            and info["version"] == "0.1.0"
+            and info["version"] == workspace_version()
         )
         check(b, "2c registry metadata", ok, json.dumps({k: info[k] for k in ("id", "version", "routes", "permissions")}))
     except Exception as e:  # noqa: BLE001
