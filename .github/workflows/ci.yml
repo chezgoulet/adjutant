@@ -26,6 +26,11 @@ jobs:
     env:
       ADJUTANT_DATABASE_URL: postgres://adjutant:adjutant@127.0.0.1:5432/adjutant_dev
       ADJUTANT_TEST_DATABASE_URL: postgres://adjutant:adjutant@127.0.0.1:5432/adjutant_dev_test
+      # CI's Postgres service user IS a superuser. The server refuses to boot on
+      # one (a plugin escape would be total compromise), so the throwaway CI
+      # database opts out explicitly. The refusal itself is covered by a unit
+      # test, not by CI.
+      ADJUTANT_ALLOW_SUPERUSER: "true"
     steps:
       - uses: actions/checkout@v4
 
@@ -73,9 +78,11 @@ jobs:
 
       # These are #[ignore]d so a bare `cargo test` reports them as ignored, not
       # passed (issue #25). Here the database exists, so run them explicitly and
-      # fail the job if it is unavailable.
-      - name: DB-backed host tests
-        run: cargo test -p adjutant-server --test host_db -- --ignored --nocapture
+      # fail the job if it is unavailable. `pool_lifecycle` is the #30 leak probe.
+      - name: DB-backed host tests + pool lifecycle
+        run: >-
+          cargo test -p adjutant-server --test host_db --test pool_lifecycle
+          -- --ignored --nocapture
 
       # Live evidence: the committed ladder resets the database, boots its own
       # server and writes docs/evidence/m2_probes.json. A failure here means the

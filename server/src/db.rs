@@ -296,26 +296,37 @@ INSERT INTO core.permissions (id, description) VALUES
 ON CONFLICT (id) DO UPDATE SET description = EXCLUDED.description;
 ";
 
-/// Connect, run core migrations, seed bootstrap roles.
-pub async fn connect_and_migrate(cfg: &Config) -> Result<Arc<PgPool>, sqlx::Error> {
+/// Connect (no migrations). Split from migration so the caller can refuse a
+/// superuser connection **before** running any DDL.
+pub async fn connect(cfg: &Config) -> Result<Arc<PgPool>, sqlx::Error> {
     let pool = PgPoolOptions::new()
         .max_connections(10)
         .connect(&cfg.database_url)
         .await?;
+    Ok(Arc::new(pool))
+}
 
+/// Run core migrations and seed bootstrap roles. Idempotent.
+pub async fn migrate_core(pool: &PgPool) -> Result<(), sqlx::Error> {
     // The schema must exist before run_migration can create its bookkeeping
     // table (core.schema_migrations) — fresh databases don't have it yet.
-    sqlx::query("CREATE SCHEMA IF NOT EXISTS core").execute(&pool).await?;
+    sqlx::query("CREATE SCHEMA IF NOT EXISTS core").execute(pool).await?;
 
     for (version, name, sql) in CORE_MIGRATIONS {
-        run_migration(&pool, "core", *version, name, sql).await?;
+        run_migration(pool, "core", *version, name, sql).await?;
     }
 
-    sqlx::query(SEED_ROLES).execute(&pool).await?;
-    sqlx::query(SEED_PERMS).execute(&pool).await?;
+    sqlx::query(SEED_ROLES).execute(pool).await?;
+    sqlx::query(SEED_PERMS).execute(pool).await?;
     tracing::info!("database ready (core schema migrated, bootstrap roles seeded)");
+    Ok(())
+}
 
-    Ok(Arc::new(pool))
+/// Connect, run core migrations, seed bootstrap roles.
+pub async fn connect_and_migrate(cfg: &Config) -> Result<Arc<PgPool>, sqlx::Error> {
+    let pool = connect(cfg).await?;
+    migrate_core(&pool).await?;
+    Ok(pool)
 }
 
 /// Run one migration inside `schema`, recording it in `core.schema_migrations`.

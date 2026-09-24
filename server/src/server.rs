@@ -116,9 +116,39 @@ impl AppState {
     }
 }
 
+/// Refuse to boot on a PostgreSQL superuser connection.
+///
+/// A plugin escape became *total* compromise while the connecting role was a
+/// superuser (design `plugin-isolation.md` §1, E3), so the default is to refuse;
+/// `ADJUTANT_ALLOW_SUPERUSER=true` (`--allow-superuser`) is the explicit opt-out
+/// for a throwaway database. Checked **before** any migration runs.
+pub fn superuser_refusal(is_superuser: bool, allow_superuser: bool) -> Result<(), String> {
+    if is_superuser && !allow_superuser {
+        return Err(
+            "refusing to boot on a PostgreSQL superuser connection: a plugin escape \
+             would be total compromise. Connect as a dedicated non-superuser role \
+             (see docs/deployment.md), or set ADJUTANT_ALLOW_SUPERUSER=true to override \
+             for a throwaway database."
+                .into(),
+        );
+    }
+    Ok(())
+}
+
 /// Build the full application: connect DB, load plugins, assemble router.
 pub async fn build_app(cfg: &Config) -> Result<(Router, Arc<AppState>), BuildError> {
-    let pool = db::connect_and_migrate(cfg).await.map_err(BuildError::Db)?;
+    let pool = db::connect(cfg).await.map_err(BuildError::Db)?;
+
+    // Refuse a superuser before running any DDL.
+    let is_superuser: bool =
+        sqlx::query_scalar("SELECT rolsuper FROM pg_roles WHERE rolname = current_user")
+            .fetch_one(pool.as_ref())
+            .await
+            .map_err(BuildError::Db)?;
+    superuser_refusal(is_superuser, cfg.allow_superuser).map_err(BuildError::Superuser)?;
+
+    db::migrate_core(pool.as_ref()).await.map_err(BuildError::Db)?;
+
     let bus = EventBus::new();
     let identity = crate::identity::IdentityHub::new();
     let http = crate::host::CoreHttp::new();
@@ -914,7 +944,7 @@ async fn reload_plugins(State(state): State<Arc<AppState>>, req: Request) -> Res
 
 #[cfg(test)]
 mod tests {
-    use super::{audit_state_change, decode_path, enable_plugin, AppState};
+    use super::{audit_state_change, decode_path, enable_plugin, superuser_refusal, AppState};
     use adjutant_sdk::{
         async_trait, AdjutantPlugin, AuditService, EventSubscription, HostDb, Identity, Migration,
         Permission, PermissionService, PluginContext, RouteDefinition, SdkError, SqlValue,
@@ -928,6 +958,15 @@ mod tests {
     use crate::events::EventBus;
     use crate::identity::IdentityHub;
     use crate::plugin_runtime::{LoadedPlugin, PluginInfo, PluginRegistry};
+
+    #[test]
+    fn superuser_boot_is_refused_unless_explicitly_allowed() {
+        assert!(superuser_refusal(false, false).is_ok());
+        assert!(superuser_refusal(true, true).is_ok(), "the opt-out permits it");
+        let err = superuser_refusal(true, false).expect_err("a superuser must be refused");
+        assert!(err.contains("superuser"), "names the reason: {err}");
+        assert!(err.contains("ADJUTANT_ALLOW_SUPERUSER"), "names the opt-out: {err}");
+    }
 
     #[test]
     fn captures_are_percent_decoded_once() {
@@ -1011,6 +1050,7 @@ mod tests {
         LoadedPlugin {
             plugin: Box::new(TinyPlugin),
             library: None,
+            pool: None,
             routes: Vec::new(),
             enabled,
             info: PluginInfo {
@@ -1020,6 +1060,7 @@ mod tests {
                 enabled,
                 routes: 0,
                 kind: "native".into(),
+                isolated: true,
                 permissions: Vec::new(),
                 route_list: Vec::new(),
             },
@@ -1125,5 +1166,7 @@ pub enum BuildError {
     Db(#[from] sqlx::Error),
     #[error("plugin runtime: {0}")]
     Plugin(#[from] crate::plugin_runtime::PluginRuntimeError),
+    #[error("{0}")]
+    Superuser(String),
 }
 

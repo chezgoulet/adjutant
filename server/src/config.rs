@@ -58,6 +58,11 @@ pub struct Config {
     /// Direct peers whose `x-forwarded-for` header may be trusted for rate
     /// limiting (reverse-proxy IPs). Empty = ignore the header entirely.
     pub trusted_proxies: Vec<String>,
+    /// Explicit opt-out of the superuser boot refusal (`ADJUTANT_ALLOW_SUPERUSER`).
+    /// A superuser connection turns a plugin escape into total compromise
+    /// (design plugin-isolation §3.6), so the default is to refuse to boot; this
+    /// exists only for a throwaway/dev database.
+    pub allow_superuser: bool,
 }
 
 impl Default for Config {
@@ -73,6 +78,7 @@ impl Default for Config {
             cors_origins: Vec::new(),
             allow_dev_headers: false,
             trusted_proxies: Vec::new(),
+            allow_superuser: false,
         }
     }
 }
@@ -91,6 +97,7 @@ struct FileConfig {
     cors: Option<FileCors>,
     auth: Option<FileAuth>,
     trusted_proxies: Option<Vec<String>>,
+    allow_superuser: Option<bool>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -121,6 +128,8 @@ pub struct CliArgs {
     pub log_format: Option<String>,
     /// Explicit opt-in to the spoofable dev identity headers (dev only).
     pub allow_dev_headers: bool,
+    /// Explicit opt-out of the superuser boot refusal (dev/throwaway only).
+    pub allow_superuser: bool,
     pub help: bool,
 }
 
@@ -148,6 +157,8 @@ SERVE OPTIONS:
     --log-format <FMT>     pretty | json
     --allow-dev-headers    enable the spoofable x-dev-user/x-dev-role stub
                            (DEVELOPMENT ONLY; off by default)
+    --allow-superuser      allow booting on a PostgreSQL superuser connection
+                           (DEVELOPMENT/throwaway ONLY; off by default)
     -h, --help             print this help
 
 BOOTSTRAP-ISOLATION OPTIONS:
@@ -160,7 +171,8 @@ ENVIRONMENT (override file, overridden by flags):
     ADJUTANT_LOG, ADJUTANT_LOG_FORMAT, ADJUTANT_RATE_MAX, ADJUTANT_RATE_WINDOW,
     ADJUTANT_CORS (comma-separated origins), ADJUTANT_MAX_BODY,
     ADJUTANT_DEV_HEADERS (true enables the dev stub; off by default),
-    ADJUTANT_TRUSTED_PROXIES
+    ADJUTANT_TRUSTED_PROXIES, ADJUTANT_ALLOW_SUPERUSER (true permits a superuser
+    connection; off by default)
 ";
 
 impl CliArgs {
@@ -194,6 +206,7 @@ impl CliArgs {
                 "--log" => out.log_filter = Some(take("--log")?),
                 "--log-format" => out.log_format = Some(take("--log-format")?),
                 "--allow-dev-headers" => out.allow_dev_headers = true,
+                "--allow-superuser" => out.allow_superuser = true,
                 other => return Err(format!("unknown argument {other:?} (try --help)")),
             }
         }
@@ -254,6 +267,9 @@ pub fn load(cli: &CliArgs) -> Result<Config, String> {
     if let Ok(v) = std::env::var("ADJUTANT_TRUSTED_PROXIES") {
         cfg.trusted_proxies = split_origins(&v);
     }
+    if let Ok(v) = std::env::var("ADJUTANT_ALLOW_SUPERUSER") {
+        cfg.allow_superuser = matches!(v.as_str(), "1" | "true" | "yes");
+    }
 
     // 3. CLI (highest precedence)
     if let Some(v) = &cli.bind {
@@ -273,6 +289,9 @@ pub fn load(cli: &CliArgs) -> Result<Config, String> {
     }
     if cli.allow_dev_headers {
         cfg.allow_dev_headers = true;
+    }
+    if cli.allow_superuser {
+        cfg.allow_superuser = true;
     }
 
     Ok(cfg)
@@ -326,6 +345,9 @@ fn merge_file(cfg: &mut Config, path: &Path) -> Result<(), String> {
     }
     if let Some(v) = f.trusted_proxies {
         cfg.trusted_proxies = v;
+    }
+    if let Some(v) = f.allow_superuser {
+        cfg.allow_superuser = v;
     }
     Ok(())
 }
