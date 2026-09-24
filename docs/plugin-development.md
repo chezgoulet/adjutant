@@ -241,36 +241,43 @@ Return an `SdkError` to short-circuit with the matching status:
 Permissions can be scoped to a troop, lodge, or patrol. **A scope is checked
 where the resource is known, and the default is the restrictive one.**
 
-- The **core route gate** is unscoped today (it fires if the caller holds the
-  permission at *any* scope). A scope-aware gate (and the
-  `get_protected_any_scope` route constructor) is the 6b work in
-  [`design/scoped-permissions.md`](design/scoped-permissions.md).
-- A route whose reach is **one object** (a member, a mission) must check that
-  object's scope **in the handler** with `has_in_scope`:
+Declare a route's reach with the constructor:
+
+| Constructor | The core gate requires | Use for |
+|---|---|---|
+| `get_protected` / `post_protected` / `put_protected` / `patch_protected` | a grant **covering troop** | collections, admin, reference data |
+| `get_protected_any_scope` / `post_protected_any_scope` / `put_protected_any_scope` / `patch_protected_any_scope` | the permission at *some* scope; **your handler checks the object** | object routes (`/member?id=`, `/mission/{id}/approve`) |
+| any `delete` | a troop-covering grant | destructive operations |
+
+The ordinary form is the restrictive one; the permissive form is explicit and
+greppable. A route whose reach is **one object** must check that object's scope
+in the handler, with `has_in_scope` or `reach`:
 
 ```rust
 use adjutant_sdk::prelude::*;
 
 async fn approve(ctx: &PluginContext, req: &PluginRequest, lodge_id: &str) -> Result<(), SdkError> {
-    let scope = Scope::lodge(lodge_id);
-    if !ctx.permissions.has_in_scope(req.identity.as_ref(), "missions:approve", &scope).await {
-        return Err(SdkError::Forbidden("not your lodge".into()));
-    }
+    // `reach` returns a ready 403 naming the scope.
+    ctx.permissions
+        .reach(req.identity.as_ref(), "missions:approve", &Scope::lodge(lodge_id))
+        .await?;
     Ok(())
 }
 ```
 
-- `Identity` carries `grants` (`RoleGrant { role_id, scope }`); `roles` is the
-  flat set derived from them. Build a troop-wide identity with
+- `Identity` carries `grants` (`RoleGrant { role_id, scope }`); `roles()` is
+  derived from them, not a second field. Build a troop-wide identity with
   `Identity::new(user_id, roles)`, or scoped ones with
   `Identity::from_grants(user_id, grants)`.
-- `Scope::troop()` covers every scope; other scopes match by type and id
+- `Scope::troop()` covers every scope; otherwise the type and id must match
   exactly. Coverage is intentionally flat (the core does not model the
-  lodge→patrol hierarchy).
+  lodge→patrol hierarchy). `scope_id` is opaque text owned by the plugin.
+- `has_any_scope` is the core gate's unscoped branch and is hidden from plugin
+  authors — use `has_in_scope(…, &Scope::troop())` for a troop-wide check.
 - The auth plugin reads `core.user_roles(user_id, role_id, scope_type,
   scope_id)`. **Scopes fail closed:** a `scope_type` that is not
   `troop`/`lodge`/`patrol`, or a non-troop scope with no scope id, drops the
-  grant and logs an error — it is never widened. `personal` is retired.
+  grant and logs an error — it is never widened. `personal` is removed.
 - **Role assignment is auth's alone** (`auth:manage_users`, `POST
   /api/auth/roles`). Other plugins must not write `core.user_roles` — the
   membership CSV importer ignores its `roles` column and reports it.

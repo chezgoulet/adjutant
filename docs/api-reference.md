@@ -91,10 +91,10 @@ Config lives in the `auth` row's `core.plugins.config` (`{"oidc": {…},
 |---|---|
 | `AdjutantPlugin` | The trait every plugin implements (`id`, `name`, `version`, `init`, `routes`, `migrations`, `permissions_granted`, `subscriptions`, `shutdown`) |
 | `PluginContext` | Runtime services handed to `init`: `db`, `config`, `events`, `permissions`, `audit`, `identity`, `http` |
-| `RouteDefinition`, `Method` | Route registration (`get`/`post`/`put`/`patch`/`delete`/`head` + `_protected`) |
+| `RouteDefinition`, `Method` | Route registration. `get`/`post`/`put`/`patch`/`delete`/`head` (+ `_protected`, which requires a troop-covering grant) and `_protected_any_scope` (the handler checks the object's scope; `delete` is always troop-only) |
 | `PluginRequest` / `PluginResponse` | Framework-neutral request/response (`param`, `query_param`, `json`, `redirect`, `created`, …) |
 | `HostDb` / `HostEvents` / `HostHttp` | Host-mediated I/O traits (implemented by the core) |
-| `Migration`, `Permission`, `Scope`, `RoleGrant` | Declarations and scoped permissions |
+| `Migration`, `Permission`, `Scope`, `ScopeType`, `RoleGrant` | Declarations and scoped permissions; `Identity.grants` is the source of truth (`roles()` is derived) |
 | `SdkError` | Error type with a single HTTP mapping (`status()`) |
 | `SqlValue` | Typed bind parameters (uuid, typed nulls, arrays, JSON) |
 | `prelude` | One import for plugin authors |

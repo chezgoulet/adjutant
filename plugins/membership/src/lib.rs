@@ -356,11 +356,12 @@ mod csv_tests {
     }
 
     /// A lodge-scoped `read_lodge` reaches its own lodge and is denied another.
+    /// A lodge grant does not cover troop, so the `read_all` check makes **no**
+    /// query (there is no covering role).
     #[tokio::test]
     async fn read_lodge_reaches_its_lodge_only() {
         let own = adjunct_sdk_test_host();
-        own.db.push_rows(vec![serde_json::json!({ "n": 0 })]); // has(read_all)
-        own.db.push_rows(vec![serde_json::json!({ "username": "bea" })]);
+        own.db.push_rows(vec![serde_json::json!({ "username": "bea" })]); // caller
         own.db
             .push_rows(vec![serde_json::json!({ "id": 1, "username": "mallory", "lodge_id": 7 })]);
         own.db.push_rows(vec![serde_json::json!({ "n": 1 })]); // covered -> has permission
@@ -369,7 +370,6 @@ mod csv_tests {
         assert_eq!(status, 200, "own lodge is reachable");
 
         let other = adjunct_sdk_test_host();
-        other.db.push_rows(vec![serde_json::json!({ "n": 0 })]); // has(read_all)
         other.db.push_rows(vec![serde_json::json!({ "username": "bea" })]);
         other.db
             .push_rows(vec![serde_json::json!({ "id": 1, "username": "mallory", "lodge_id": 8 })]);
@@ -541,8 +541,10 @@ impl AdjutantPlugin for MembershipPlugin {
         );
 
         // --- single member ----------------------------------------------------
+        // Object route: the core gate requires `membership:read` at *some*
+        // scope; the handler decides whether the caller may see this member.
         let c = ctx.clone();
-        let get_member = RouteDefinition::get_protected(
+        let get_member = RouteDefinition::get_protected_any_scope(
             "/api/membership/member",
             "membership:read",
             route_handler(move |req| {
@@ -554,7 +556,10 @@ impl AdjutantPlugin for MembershipPlugin {
                     let identity = req.identity.as_ref();
 
                     // `read_all` is troop-wide: it reaches any member.
-                    if c.permissions.has(identity, "membership:read_all").await {
+                    if c.permissions
+                        .has_in_scope(identity, "membership:read_all", &Scope::troop())
+                        .await
+                    {
                         return match fetch_member(&c, id).await? {
                             Some(m) => {
                                 PluginResponse::json(200, &serde_json::json!({ "member": m }))
@@ -593,7 +598,11 @@ impl AdjutantPlugin for MembershipPlugin {
                         (Some(cu), Some(mu)) => cu.eq_ignore_ascii_case(mu),
                         _ => false,
                     };
-                    if is_self && c.permissions.has(identity, "membership:read").await {
+                    if is_self
+                        && c.permissions
+                            .has_in_scope(identity, "membership:read", &Scope::troop())
+                            .await
+                    {
                         return PluginResponse::json(
                             200,
                             &serde_json::json!({ "member": member }),
@@ -848,8 +857,11 @@ impl AdjutantPlugin for MembershipPlugin {
         );
 
         // --- lodges ------------------------------------------------------------
+        // Reference data: the caller needs `membership:read_lodge` at *some*
+        // scope (a lodge commander's lodge grant qualifies). These are not
+        // filtered per lodge — they are the troop's reference lists.
         let c = ctx.clone();
-        let list_lodges = RouteDefinition::get_protected(
+        let list_lodges = RouteDefinition::get_protected_any_scope(
             "/api/membership/lodges",
             "membership:read_lodge",
             route_handler(move |_req| {
@@ -957,7 +969,7 @@ impl AdjutantPlugin for MembershipPlugin {
 
         // --- proficiencies ----------------------------------------------------------
         let c = ctx.clone();
-        let list_proficiencies = RouteDefinition::get_protected(
+        let list_proficiencies = RouteDefinition::get_protected_any_scope(
             "/api/membership/proficiencies",
             "membership:read_lodge",
             route_handler(move |_req| {
@@ -1118,7 +1130,7 @@ impl AdjutantPlugin for MembershipPlugin {
         );
 
         let c = ctx.clone();
-        let stewards = RouteDefinition::get_protected(
+        let stewards = RouteDefinition::get_protected_any_scope(
             "/api/membership/stewards",
             "membership:read_lodge",
             route_handler(move |_req| {

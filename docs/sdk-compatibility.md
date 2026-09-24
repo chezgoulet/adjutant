@@ -58,6 +58,22 @@ new helper constructors, new `testing` mocks) do **not** bump the ABI version.
 |---|---|---|
 | 0.1.0 | pre-handshake (no symbol) | M1–M3; refused by 0.2+ until rebuilt |
 | 0.2.0 (M4 target) | 2 | First version with the handshake and scoped identity (`Identity.grants`) |
+| 0.2.x (scope enforcement) | 3 | Scopes are enforced: `required_scope` on routes, `Identity.grants` is the source of truth (`roles` is derived), `ScopeType::Personal` removed, `PermissionService::has` → `has_any_scope`/`has_in_scope`/`reach` |
+
+## Migrating a plugin from ABI 2 to 3
+
+1. Rebuild against the new SDK. The core refuses an ABI-2 `.so` with the
+   existing handshake error; `adjutant validate-plugin` reports the same before
+   deployment.
+2. Replace `ctx.permissions.has(id, perm)` with
+   `ctx.permissions.has_in_scope(id, perm, &Scope::troop())` (or `reach(...)`,
+   which returns a ready 403 naming the scope).
+3. Remove any `ScopeType::Personal` usage (it is gone; self-access is an
+   ownership check).
+4. If you construct `RouteDefinition` by hand, set `required_scope`:
+   `Some(Scope::troop())` for an ordinary route, `None` for an object route
+   whose handler checks the scope (`*_protected_any_scope`). The constructors do
+   this for you.
 
 ## Native-only caveat
 

@@ -1,6 +1,9 @@
 # Scoped permissions: from declared to enforced
 
-**Status:** design for sign-off (no code written).
+**Status:** implemented (SDK ABI 3). §1 and §6 describe the pre-change state and
+the change; the code now matches §3, with one deviation noted inline — the core
+does not model a lodge→patrol hierarchy, so coverage is flat apart from troop
+(§3.2's "Lodge ⊇ Patrol" is not implemented). `ScopeType::Personal` is removed.
 **Issues:** #22 (scope is never enforced), and the two concrete failures it exposes — #19 and #20.
 **Depends on:** nothing. **Blocks:** missions and governance (Lodge Commander approval, voting).
 **Related:** [`plugin-roadmap.md`](../plugin-roadmap.md) §5, SPEC §9.2, `docs/architecture.md`.
@@ -115,8 +118,10 @@ intent instead of hiding it. *(ABI: this is a boundary-visible change; see §6.)
 - `plugins/auth`: an unrecognised or missing `scope_type` **drops the grant** and logs an
   error, instead of widening it to troop.
 - A non-troop `scope_type` with no/zero `scope_id` is an invalid grant, dropped.
-- Migration adds `CHECK (scope_type IN ('troop','lodge','patrol','personal'))` to
-  `core.user_roles`.
+- Migration adds `CHECK (scope_type IN ('troop','lodge','patrol'))` to
+  `core.user_roles`. (Implemented; `scope_id` became `TEXT NULL` under #33 so a
+  plugin's own ids — bigints, UUIDs or slugs — are storable, and a second CHECK
+  ties troop to `NULL`.)
 
 ### 3.6 The two concrete fixes
 

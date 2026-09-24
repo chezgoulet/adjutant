@@ -124,10 +124,23 @@ model and the escape probes that pin it.
 ## Permissions
 
 Permissions are namespaced strings (`missions:approve`). Roles map to permissions
-(`core.role_permissions`); users hold roles, optionally scoped
-(`core.user_roles.scope_type`/`scope_id`, SPEC §9.2). The route gate checks the
-permission against any held role; plugins can additionally require that a role's
-grant **covers** a scope via `PermissionService::has_in_scope`.
+(`core.role_permissions`); users hold roles, scoped to a **troop**, **lodge** or
+**patrol** (`core.user_roles.scope_type`/`scope_id`, SPEC §9.2). `scope_id` is
+opaque text owned by the plugin (`NULL` = troop-wide).
+
+A route declares its reach, and the core gate enforces it:
+
+| Constructor | Gate requires | Use for |
+|---|---|---|
+| `get_protected` (and `post`/`put`/`patch`) | a grant **covering troop** | collections, admin, reference data |
+| `*_protected_any_scope` | the permission at *some* scope; the **handler** checks the object | object routes (`/member?id=`, `/mission/{id}/approve`) |
+| any `delete` | a troop-covering grant | destructive operations |
+
+Coverage is strict: a troop grant covers every scope; a lodge grant covers only
+that lodge; nothing else covers anything. A handler decides an object route with
+`PermissionService::has_in_scope` (or `reach`, which returns a 403 naming the
+scope). `PermissionService::has_any_scope` is the core gate's unscoped branch and
+is hidden from plugin authors. Self-access is an ownership check, not a scope.
 
 ## Identity
 

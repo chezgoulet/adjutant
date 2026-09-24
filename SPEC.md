@@ -742,18 +742,21 @@ CREATE TABLE core.role_permissions (
     PRIMARY KEY (role_id, permission_id)
 );
 
--- User → Role mapping (scoped to troop or Lodge).
--- scope_id is NOT NULL DEFAULT zero-UUID rather than NULL + COALESCE-in-PK:
--- PostgreSQL forbids expressions in PRIMARY KEY column lists.
+-- User → Role mapping (scoped to troop, Lodge or Patrol).
+-- scope_id is opaque TEXT owned by the plugin; NULL means troop-wide. A
+-- non-troop scope requires a scope_id and a troop scope requires NULL (CHECK).
+-- The uniqueness is a unique index over COALESCE(scope_id,'') rather than a
+-- PRIMARY KEY, because a PK column cannot be nullable.
 CREATE TABLE IF NOT EXISTS core.user_roles (
     user_id         UUID NOT NULL REFERENCES core.users(id) ON DELETE CASCADE,
     role_id         TEXT NOT NULL REFERENCES core.roles(id) ON DELETE CASCADE,
     scope_type      TEXT NOT NULL DEFAULT 'troop',
-    scope_id        UUID NOT NULL DEFAULT '00000000-0000-0000-0000-000000000000',
+    scope_id        TEXT,
     granted_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
-    granted_by      UUID REFERENCES core.users(id),
-    PRIMARY KEY (user_id, role_id, scope_id)
+    granted_by      UUID REFERENCES core.users(id)
 );
+-- CREATE UNIQUE INDEX idx_user_roles_unique
+--   ON core.user_roles (user_id, role_id, COALESCE(scope_id, ''));
 
 -- Event bus
 CREATE TABLE core.events (
@@ -847,17 +850,27 @@ mcp:
 
 ### 9.2 Scoped Permissions
 
-Permissions are scoped to a level:
-- **Troop-wide** — The Chief, Troop Council members
-- **Lodge** — Lodge Commanders, scoped to their Lodge
-- **Patrol** — Patrol Captains, scoped to their Patrol
-- **Personal** — Regular scouts, scoped to their own data
+A role grant carries a scope:
+- **Troop-wide** — The Chief, Troop Council members. Covers everything.
+- **Lodge** — Lodge Commanders, scoped to one Lodge.
+- **Patrol** — Patrol Captains, scoped to one Patrol.
 
-**Status: designed, not implemented.** The schema carries
-`core.user_roles.scope_id` (`server/src/db.rs:66-76`) but enforcement checks the
-permission only (`server/src/permissions.rs:34-46`); nothing reads `scope_id`.
-Scope checks are a Milestone 4+ item — until then, treat every granted permission
-as troop-wide.
+`scope_id` is opaque text owned by the plugin (a bigint, UUID or slug); the core
+never interprets it. `NULL` means troop-wide. Scope is **enforced**, not merely
+declared:
+
+- The core gate checks the route's declared reach. Ordinary routes
+  (`get_protected` and friends) require a grant **covering troop**; object routes
+  (`*_protected_any_scope`) require the permission at *some* scope and the
+  handler checks the specific object with `PermissionService::has_in_scope`.
+  Coverage is strict — a troop grant covers every scope; a lodge grant covers
+  only that lodge; nothing else covers anything.
+- `delete` requires a troop-covering grant from every constructor.
+- **Personal** scope is not a scope: a caller reading their own record is an
+  ownership check, not a grant.
+
+See [`docs/design/scoped-permissions.md`](docs/design/scoped-permissions.md) and
+`docs/plugin-development.md`.
 
 ---
 

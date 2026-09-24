@@ -70,7 +70,7 @@ pub type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 /// the plugin factory and refuses a library whose value differs, so a stale
 /// build becomes a clear load error instead of undefined behaviour (the native
 /// loading caveat: core and plugin must be built against the same SDK).
-pub const SDK_ABI_VERSION: u32 = 2;
+pub const SDK_ABI_VERSION: u32 = 3;
 
 /// The SDK crate's SemVer version, for diagnostics and error messages.
 pub const SDK_VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -317,12 +317,12 @@ pub enum ScopeType {
     Lodge,
     /// Scoped to one patrol.
     Patrol,
-    /// Scoped to the member's own data.
-    Personal,
 }
 
-/// A concrete scope. `scope_id` is `None` for troop-wide (the zero-UUID in
-/// `core.user_roles`).
+/// A concrete scope. `scope_id` is `None` only for troop-wide; a non-troop scope
+/// carries the owning plugin's opaque id (a bigint, UUID or slug — the core
+/// never interprets it, it only compares for equality and asks the owning
+/// plugin's check).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Scope {
     pub scope_type: ScopeType,
@@ -342,13 +342,10 @@ impl Scope {
         Self { scope_type: ScopeType::Patrol, scope_id: Some(id.into()) }
     }
 
-    pub fn personal(id: impl Into<String>) -> Self {
-        Self { scope_type: ScopeType::Personal, scope_id: Some(id.into()) }
-    }
-
     /// Does this scope cover `other`? A troop-wide scope covers everything;
-    /// otherwise the type and id must match exactly. (The core does not know
-    /// the lodge→patrol hierarchy, so cover is intentionally flat.)
+    /// otherwise the type and id must match exactly. (The core does not know the
+    /// lodge→patrol hierarchy, so coverage is intentionally flat — a lodge grant
+    /// does not implicitly cover every patrol in it.)
     pub fn covers(&self, other: &Scope) -> bool {
         if self.scope_type == ScopeType::Troop {
             return true;
@@ -367,37 +364,44 @@ pub struct RoleGrant {
 /// The authenticated caller. Produced by an [`IdentityProvider`] (the auth
 /// plugin) or the gated dev-header stub.
 ///
-/// `roles` is the flat set of granted role ids; `grants` carries each role with
-/// its scope. Use [`Identity::new`] for a troop-wide identity, or build
-/// `grants` explicitly for scoped ones. Route-level gating uses `roles`
-/// (any scope); in-handler checks can use
-/// [`PermissionService::has_in_scope`].
+/// **`grants` is the single source of truth.** [`Identity::roles`] is derived
+/// from it, so a role set and a grant set can never disagree. Use
+/// [`Identity::new`] for a troop-wide identity (every role at troop scope — the
+/// dev-header stub's shape and the reason dev environments are more permissive
+/// than production), or [`Identity::from_grants`] for scoped ones.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Identity {
     pub user_id: String,
-    pub roles: Vec<String>,
-    /// Scoped role grants (SPEC §9.2). Empty only for identities constructed
-    /// without [`Identity::new`]; prefer the constructor.
-    #[serde(default)]
+    /// Scoped role grants (SPEC §9.2). Not `#[serde(default)]`: an identity
+    /// payload without grants must fail deserialization loudly rather than
+    /// silently holding no scopes.
     pub grants: Vec<RoleGrant>,
 }
 
 impl Identity {
     /// A troop-wide identity from a user id and role ids. Every role is granted
-    /// at troop scope.
+    /// at troop scope (the dev-header stub's constructor — more permissive than
+    /// a real session).
     pub fn new(user_id: impl Into<String>, roles: Vec<String>) -> Self {
-        let user_id = user_id.into();
         let grants = roles
             .iter()
             .map(|r| RoleGrant { role_id: r.clone(), scope: Scope::troop() })
             .collect();
-        Self { user_id, roles, grants }
+        Self { user_id: user_id.into(), grants }
     }
 
-    /// An identity with explicit scoped grants. `roles` is derived from them.
+    /// An identity with explicit scoped grants.
     pub fn from_grants(user_id: impl Into<String>, grants: Vec<RoleGrant>) -> Self {
-        let roles = grants.iter().map(|g| g.role_id.clone()).collect();
-        Self { user_id: user_id.into(), roles, grants }
+        Self { user_id: user_id.into(), grants }
+    }
+
+    /// The flat set of granted role ids, derived from `grants` (sorted,
+    /// deduplicated). There is no separate `roles` field to fall out of sync.
+    pub fn roles(&self) -> Vec<String> {
+        let mut out: Vec<String> = self.grants.iter().map(|g| g.role_id.clone()).collect();
+        out.sort();
+        out.dedup();
+        out
     }
 
     /// Role ids whose grant covers `scope` (sorted, deduplicated).
@@ -440,11 +444,15 @@ impl PermissionService {
         Self { db }
     }
 
-    /// Check a permission against any role the identity holds, at any scope
-    /// (the route-level gate; SPEC §9.1).
-    pub async fn has(&self, identity: Option<&Identity>, permission: &str) -> bool {
+    /// Check a permission against any role the identity holds, **regardless of
+    /// the grant's scope**. This is the core route gate's building block for a
+    /// route declared scope-any; plugin authors should not call it — use
+    /// [`has_in_scope`](Self::has_in_scope) with an explicit scope, which states
+    /// the intent.
+    #[doc(hidden)]
+    pub async fn has_any_scope(&self, identity: Option<&Identity>, permission: &str) -> bool {
         match identity {
-            Some(id) if !id.roles.is_empty() => self.roles_have(id.roles.clone(), permission).await,
+            Some(id) if !id.grants.is_empty() => self.roles_have(id.roles(), permission).await,
             _ => false,
         }
     }
@@ -452,7 +460,8 @@ impl PermissionService {
     /// Check a permission against only the roles whose grant **covers** `scope`
     /// (SPEC §9.2). A troop-wide grant covers every scope; a lodge grant covers
     /// only that lodge. Plugins call this in-handler when the action targets a
-    /// specific lodge/patrol/person; the route gate uses [`has`](Self::has).
+    /// specific lodge/patrol/person. For the ordinary "troop-wide permission"
+    /// check, pass `&Scope::troop()` — which says what you mean.
     pub async fn has_in_scope(
         &self,
         identity: Option<&Identity>,
@@ -465,6 +474,32 @@ impl PermissionService {
             return false;
         }
         self.roles_have(roles, permission).await
+    }
+
+    /// Same as [`has_in_scope`](Self::has_in_scope) but returns a ready
+    /// `SdkError::Forbidden` naming the permission and scope, so the safe path is
+    /// the short one:
+    ///
+    /// ```
+    /// # use adjutant_sdk::prelude::*;
+    /// # async fn f(ctx: &PluginContext, id: Option<&Identity>, lodge_id: &str)
+    /// #     -> Result<(), SdkError> {
+    /// ctx.permissions.reach(id, "missions:approve", &Scope::lodge(lodge_id)).await?;
+    /// # Ok(()) }
+    /// ```
+    pub async fn reach(
+        &self,
+        identity: Option<&Identity>,
+        permission: &str,
+        scope: &Scope,
+    ) -> Result<(), SdkError> {
+        if self.has_in_scope(identity, permission, scope).await {
+            Ok(())
+        } else {
+            Err(SdkError::Forbidden(format!(
+                "requires {permission} at scope {scope:?}"
+            )))
+        }
     }
 
     async fn roles_have(&self, roles: Vec<String>, permission: &str) -> bool {
@@ -869,81 +904,130 @@ where
 /// **percent-decoded exactly once** before it reaches the handler, and literal
 /// routes are matched before templated ones. Two templates of the same shape
 /// (`{a}` and `{b}` in the same position) are rejected at load as duplicates.
+///
+/// ## Declared reach
+///
+/// `required_scope` says what the core gate demands of the caller's grant:
+/// `Some(scope)` — the grant must **cover** that scope (the ordinary
+/// `*_protected` constructors pass [`Scope::troop`]); `None` — the caller must
+/// hold the permission at *some* scope and the handler must check the object's
+/// scope (`*_protected_any_scope`). `delete` always requires a troop-covering
+/// grant, even from an `any_scope` constructor.
 pub struct RouteDefinition {
     pub method: Method,
     pub path: String,
     pub required_permission: Option<String>,
+    pub required_scope: Option<Scope>,
     pub handler: RouteHandler,
 }
 
 impl RouteDefinition {
+    fn open(method: Method, path: &str, handler: RouteHandler) -> Self {
+        Self { method, path: path.into(), required_permission: None, required_scope: None, handler }
+    }
+
+    fn protected(method: Method, path: &str, permission: &str, handler: RouteHandler) -> Self {
+        Self {
+            method,
+            path: path.into(),
+            required_permission: Some(permission.into()),
+            required_scope: Some(Scope::troop()),
+            handler,
+        }
+    }
+
+    fn protected_any_scope(
+        method: Method,
+        path: &str,
+        permission: &str,
+        handler: RouteHandler,
+    ) -> Self {
+        // Destructive routes are never available from a scoped grant (§8 #3):
+        // an `any_scope` delete still requires troop coverage.
+        let required_scope = if method == Method::Delete {
+            Some(Scope::troop())
+        } else {
+            None
+        };
+        Self {
+            method,
+            path: path.into(),
+            required_permission: Some(permission.into()),
+            required_scope,
+            handler,
+        }
+    }
+
     pub fn get(path: &str, handler: RouteHandler) -> Self {
-        Self { method: Method::Get, path: path.into(), required_permission: None, handler }
+        Self::open(Method::Get, path, handler)
     }
 
     pub fn get_protected(path: &str, permission: &str, handler: RouteHandler) -> Self {
-        Self {
-            method: Method::Get,
-            path: path.into(),
-            required_permission: Some(permission.into()),
-            handler,
-        }
+        Self::protected(Method::Get, path, permission, handler)
+    }
+
+    /// Like [`get_protected`](Self::get_protected) but the caller only needs the
+    /// permission at *some* scope; the handler MUST check the object's scope
+    /// (with [`PermissionService::has_in_scope`] / `reach`).
+    pub fn get_protected_any_scope(path: &str, permission: &str, handler: RouteHandler) -> Self {
+        Self::protected_any_scope(Method::Get, path, permission, handler)
     }
 
     pub fn post(path: &str, handler: RouteHandler) -> Self {
-        Self { method: Method::Post, path: path.into(), required_permission: None, handler }
+        Self::open(Method::Post, path, handler)
     }
 
     pub fn post_protected(path: &str, permission: &str, handler: RouteHandler) -> Self {
-        Self {
-            method: Method::Post,
-            path: path.into(),
-            required_permission: Some(permission.into()),
-            handler,
-        }
+        Self::protected(Method::Post, path, permission, handler)
+    }
+
+    /// See [`get_protected_any_scope`](Self::get_protected_any_scope).
+    pub fn post_protected_any_scope(path: &str, permission: &str, handler: RouteHandler) -> Self {
+        Self::protected_any_scope(Method::Post, path, permission, handler)
     }
 
     pub fn put(path: &str, handler: RouteHandler) -> Self {
-        Self { method: Method::Put, path: path.into(), required_permission: None, handler }
+        Self::open(Method::Put, path, handler)
     }
 
     pub fn put_protected(path: &str, permission: &str, handler: RouteHandler) -> Self {
-        Self {
-            method: Method::Put,
-            path: path.into(),
-            required_permission: Some(permission.into()),
-            handler,
-        }
+        Self::protected(Method::Put, path, permission, handler)
+    }
+
+    /// See [`get_protected_any_scope`](Self::get_protected_any_scope).
+    pub fn put_protected_any_scope(path: &str, permission: &str, handler: RouteHandler) -> Self {
+        Self::protected_any_scope(Method::Put, path, permission, handler)
     }
 
     pub fn patch(path: &str, handler: RouteHandler) -> Self {
-        Self { method: Method::Patch, path: path.into(), required_permission: None, handler }
+        Self::open(Method::Patch, path, handler)
     }
 
     pub fn patch_protected(path: &str, permission: &str, handler: RouteHandler) -> Self {
-        Self {
-            method: Method::Patch,
-            path: path.into(),
-            required_permission: Some(permission.into()),
-            handler,
-        }
+        Self::protected(Method::Patch, path, permission, handler)
+    }
+
+    /// See [`get_protected_any_scope`](Self::get_protected_any_scope).
+    pub fn patch_protected_any_scope(path: &str, permission: &str, handler: RouteHandler) -> Self {
+        Self::protected_any_scope(Method::Patch, path, permission, handler)
     }
 
     pub fn delete(path: &str, handler: RouteHandler) -> Self {
-        Self { method: Method::Delete, path: path.into(), required_permission: None, handler }
+        Self::open(Method::Delete, path, handler)
     }
 
     pub fn delete_protected(path: &str, permission: &str, handler: RouteHandler) -> Self {
-        Self {
-            method: Method::Delete,
-            path: path.into(),
-            required_permission: Some(permission.into()),
-            handler,
-        }
+        Self::protected(Method::Delete, path, permission, handler)
+    }
+
+    /// A destructive route is **never** scope-any: this exists so a plugin that
+    /// reaches for the `any_scope` form gets troop coverage, not a hole (§8 #3).
+    pub fn delete_protected_any_scope(path: &str, permission: &str, handler: RouteHandler) -> Self {
+        Self::protected_any_scope(Method::Delete, path, permission, handler)
     }
 
     pub fn head(path: &str, handler: RouteHandler) -> Self {
-        Self { method: Method::Head, path: path.into(), required_permission: None, handler }
+        Self::open(Method::Head, path, handler)
     }
 }
 
@@ -1595,9 +1679,9 @@ mod tests {
         });
         let svc = PermissionService::new(db.clone());
         let id = Some(Identity::new("chris", vec!["chief".into()]));
-        assert!(svc.has(id.as_ref(), "hello:read").await);
+        assert!(svc.has_any_scope(id.as_ref(), "hello:read").await);
         // no identity → false without touching the host
-        assert!(!svc.has(None, "hello:read").await);
+        assert!(!svc.has_any_scope(None, "hello:read").await);
         assert_eq!(db.calls.lock().unwrap().len(), 1);
     }
 
@@ -1605,6 +1689,7 @@ mod tests {
     fn scope_cover_is_troop_wide_or_exact() {
         assert!(Scope::troop().covers(&Scope::lodge("l1")));
         assert!(Scope::troop().covers(&Scope::troop()));
+        assert!(Scope::troop().covers(&Scope::patrol("p1")));
         assert!(Scope::lodge("l1").covers(&Scope::lodge("l1")));
         assert!(!Scope::lodge("l1").covers(&Scope::lodge("l2")));
         assert!(!Scope::lodge("l1").covers(&Scope::troop()));
@@ -1624,7 +1709,62 @@ mod tests {
         let mut at_l1 = id.roles_covering(&Scope::lodge("l1"));
         at_l1.sort();
         assert_eq!(at_l1, vec!["chief", "lodge_commander"]);
-        assert_eq!(id.roles, vec!["chief", "lodge_commander"]);
+        // roles is derived from grants, sorted and deduplicated.
+        assert_eq!(id.roles(), vec!["chief", "lodge_commander"]);
+    }
+
+    /// A patrol grant covers its patrol and no sibling (the matrix's patrol row).
+    #[test]
+    fn patrol_grant_covers_only_its_patrol() {
+        let id = Identity::from_grants(
+            "bea",
+            vec![RoleGrant { role_id: "pl".into(), scope: Scope::patrol("p1") }],
+        );
+        assert_eq!(id.roles_covering(&Scope::patrol("p1")), vec!["pl"]);
+        assert!(id.roles_covering(&Scope::patrol("p2")).is_empty());
+        assert!(
+            id.roles_covering(&Scope::lodge("p1")).is_empty(),
+            "a patrol grant does not cover a lodge"
+        );
+    }
+
+    /// `grants` is the source of truth: an identity payload without them fails
+    /// loudly instead of silently holding no scopes.
+    #[test]
+    fn identity_requires_grants_to_deserialize() {
+        let ok: Identity = serde_json::from_str(
+            r#"{"user_id":"bea","grants":[{"role_id":"scout","scope":{"scope_type":"troop","scope_id":null}}]}"#,
+        )
+        .expect("grants present");
+        assert_eq!(ok.roles(), vec!["scout"]);
+
+        let missing = serde_json::from_str::<Identity>(r#"{"user_id":"bea"}"#);
+        assert!(missing.is_err(), "an identity without grants must not deserialize");
+    }
+
+    /// `delete` requires troop coverage from every constructor (§8 #3).
+    #[test]
+    fn delete_routes_always_require_troop() {
+        let handler = route_handler(|_: PluginRequest| async {
+            PluginResponse::json(200, &serde_json::json!({}))
+        });
+        let d = RouteDefinition::delete_protected("/api/x/y", "x:write", handler.clone());
+        assert_eq!(d.required_scope, Some(Scope::troop()));
+
+        // Even the permissive constructor forces troop for a delete.
+        let da = RouteDefinition::delete_protected_any_scope("/api/x/y", "x:write", handler.clone());
+        assert_eq!(
+            da.required_scope,
+            Some(Scope::troop()),
+            "a destructive route must never be scope-any"
+        );
+
+        // The safe default is troop: a plain protected route requires troop.
+        let g = RouteDefinition::get_protected("/api/x/y", "x:read", handler.clone());
+        assert_eq!(g.required_scope, Some(Scope::troop()));
+        // The permissive form is explicit and greppable.
+        let a = RouteDefinition::get_protected_any_scope("/api/x/y", "x:read", handler);
+        assert_eq!(a.required_scope, None);
     }
 
     #[tokio::test]
@@ -1643,6 +1783,28 @@ mod tests {
         let before = db.calls.lock().unwrap().len();
         assert!(!svc.has_in_scope(Some(&id), "x", &Scope::lodge("l2")).await);
         assert_eq!(db.calls.lock().unwrap().len(), before);
+    }
+
+    /// `reach` is the safe-path helper: it returns a ready 403 naming the scope.
+    #[tokio::test]
+    async fn reach_returns_forbidden_naming_the_scope() {
+        let db = Arc::new(StubDb {
+            calls: Mutex::new(vec![]),
+            rows: vec![serde_json::json!({"n": 1})],
+        });
+        let svc = PermissionService::new(db);
+        let id = Identity::from_grants(
+            "bea",
+            vec![RoleGrant { role_id: "lc".into(), scope: Scope::lodge("l1") }],
+        );
+        assert!(svc.reach(Some(&id), "missions:approve", &Scope::lodge("l1")).await.is_ok());
+        let err = svc
+            .reach(Some(&id), "missions:approve", &Scope::lodge("l2"))
+            .await
+            .expect_err("another lodge is refused");
+        assert!(matches!(err, SdkError::Forbidden(_)));
+        assert_eq!(err.status(), 403);
+        assert!(err.to_string().contains("missions:approve"), "got: {err}");
     }
 
     #[tokio::test]

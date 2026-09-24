@@ -92,7 +92,7 @@ impl AppState {
     /// when the caller isn't allowed, `None` when allowed.
     async fn require_admin(&self, headers: &axum::http::HeaderMap) -> Option<Response> {
         let identity = self.resolve_identity(headers).await;
-        match authorize(identity.as_ref(), &self.permissions, "core:admin").await {
+        match authorize(identity.as_ref(), &self.permissions, "core:admin", Some(&adjutant_sdk::Scope::troop())).await {
             Ok(()) => None,
             Err(status) => {
                 let msg = if status == 401 {
@@ -296,10 +296,11 @@ async fn dynamic_dispatch(State(state): State<Arc<AppState>>, req: Request) -> R
         match reg.find(&method, &path) {
             RouteLookup::Found {
                 required_permission,
+                required_scope,
                 handler,
                 plugin_id,
                 params,
-            } => Ok((plugin_id, required_permission, handler, params)),
+            } => Ok((plugin_id, required_permission, required_scope, handler, params)),
             RouteLookup::Disabled { plugin_id } => Err((
                 StatusCode::NOT_FOUND,
                 format!("plugin {plugin_id} is disabled"),
@@ -308,14 +309,14 @@ async fn dynamic_dispatch(State(state): State<Arc<AppState>>, req: Request) -> R
         }
     };
 
-    let (plugin_id, required, handler, params) = match lookup {
+    let (plugin_id, required, required_scope, handler, params) = match lookup {
         Ok(x) => x,
         Err((status, msg)) => {
             return error_response(status, msg);
         }
     };
 
-    dispatch(state, plugin_id, required, handler, params, req).await
+    dispatch(state, plugin_id, required, required_scope, handler, params, req).await
 }
 
 /// Permission gate → build SDK request → call handler.
@@ -323,6 +324,7 @@ async fn dispatch(
     state: Arc<AppState>,
     plugin_id: String,
     required: Option<String>,
+    required_scope: Option<adjutant_sdk::Scope>,
     handler: adjutant_sdk::RouteHandler,
     params: HashMap<String, String>,
     req: Request,
@@ -344,7 +346,9 @@ async fn dispatch(
 
     // 2. Permission gate — enforced by core, never by the plugin (SPEC §9).
     if let Some(perm) = &required {
-        if let Err(status) = authorize(identity.as_ref(), &state.permissions, perm).await {
+        if let Err(status) =
+            authorize(identity.as_ref(), &state.permissions, perm, required_scope.as_ref()).await
+        {
             let msg = if status == 401 {
                 "authentication required"
             } else {
