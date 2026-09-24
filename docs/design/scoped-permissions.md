@@ -1,9 +1,9 @@
 # Scoped permissions: from declared to enforced
 
 **Status:** implemented (SDK ABI 3). §1 and §6 describe the pre-change state and
-the change; the code now matches §3, with one deviation noted inline — the core
-does not model a lodge→patrol hierarchy, so coverage is flat apart from troop
-(§3.2's "Lodge ⊇ Patrol" is not implemented). `ScopeType::Personal` is removed.
+the change; the code matches §3. `ScopeType::Personal` is removed. Coverage is
+flat apart from troop (§3.2, §8 #5) — that one is held for the owner's
+confirmation, not settled by the implementation.
 **Issues:** #22 (scope is never enforced), and the two concrete failures it exposes — #19 and #20.
 **Depends on:** nothing. **Blocks:** missions and governance (Lodge Commander approval, voting).
 **Related:** [`plugin-roadmap.md`](../plugin-roadmap.md) §5, SPEC §9.2, `docs/architecture.md`.
@@ -82,10 +82,9 @@ tests in §4, not statically — a static check would be a lie).
 - `authorize(identity, permissions, permission, required_scope)` where `required_scope`
   defaults to `Scope::troop()` for ordinary routes and is `None` for `_any_scope` routes.
 - A missing identity, an empty grant list, or a grant that does not *cover* the required scope
-  is a denial. Coverage is strict: `Troop ⊇ Lodge/Patrol/Personal`, `Lodge ⊇ Patrol`, and
-  `Personal` covers nothing but itself.
-- Denials are logged with permission + required scope + the caller's grant scopes. (Today a
-  denial says only "insufficient permissions".)
+  is a denial. **Coverage is flat**: `Troop` covers everything, and otherwise a scope covers
+  only itself — `Lodge` does **not** implicitly cover the patrols inside it (§8 #5).
+- Denials are logged with permission + required scope + the caller's grant scopes.
 
 ### 3.3 In-handler checks
 
@@ -195,3 +194,4 @@ else>`.
 | 2 | Multi-lodge commanders | **Two grant rows**, one per lodge. `Scope` stays a single scope; no `Scope::lodges([..])`. |
 | 3 | Mutations | **`delete` requires a troop-covering grant even when the route is declared scope-any.** The rest (`post`/`put`/`patch`) may be scope-any and check in the handler. Destructive operations are not available from a lodge-scoped grant. |
 | 4 | Order of work | **After plugin isolation** (see [`plugin-isolation.md`](plugin-isolation.md) §9). |
+| 5 | Coverage across a hierarchy | **Flat, and implemented that way.** `Troop` covers everything; otherwise a scope covers only itself, so a `Lodge` grant does **not** cover a patrol-scoped check. The core does not know which patrols belong to which lodge, and resolving that would make the core depend on a plugin for an authorization decision. **Open for the owner's confirmation**, with one consequence to weigh: a Lodge Commander's single lodge-scoped grant will not satisfy a check written at patrol scope, so mission approvals should be checked at *lodge* scope (which is what the Accords describe) or the commander needs patrol-scoped grants for the patrols they oversee. Recorded rather than assumed because it changes how the Accords map onto grants. |
