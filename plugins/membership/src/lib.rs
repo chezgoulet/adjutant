@@ -145,6 +145,46 @@ mod csv_tests {
         assert_eq!(col(&h, "EMAIL"), Some(1));
         assert_eq!(col(&h, "missing"), None);
     }
+
+    /// Dogfoods `adjutant_sdk::testing`: the CSV upsert path runs against
+    /// `MockDb`, proving a new member and a newly-created patrol are reported.
+    #[tokio::test]
+    async fn upsert_from_import_reports_a_create_and_a_new_patrol() {
+        use adjutant_sdk::testing::TestHost;
+
+        let host = TestHost::new();
+        host.db.push_rows(vec![serde_json::json!({ "n": 0 })]); // patrol count: new
+        host.db.push_rows(vec![serde_json::json!({ "id": 7 })]); // created patrol id
+        host.db.push_rows(vec![serde_json::json!({ "inserted": true })]); // member upsert
+
+        let ctx = host.context("membership");
+        let mut report = ImportReport {
+            created: 0,
+            updated: 0,
+            skipped: Vec::new(),
+            patrols_created: Vec::new(),
+        };
+        upsert_from_import(
+            &ctx,
+            "bea",
+            Some("bea@example.org".to_string()),
+            "Bea",
+            None,
+            None,
+            None,
+            Some("Otters".to_string()),
+            true,
+            &mut report,
+            2,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(report.created, 1);
+        assert_eq!(report.updated, 0);
+        assert_eq!(report.patrols_created, vec!["Otters".to_string()]);
+        assert_eq!(host.db.query_count(), 3);
+    }
 }
 
 #[async_trait]

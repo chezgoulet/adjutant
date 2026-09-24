@@ -1202,6 +1202,46 @@ mod tests {
         assert_eq!(cfg.oidc.unwrap().issuer, "https://idp");
         assert!(serde_json::from_str::<AuthConfig>("{}").is_ok());
     }
+
+    /// Dogfoods `adjutant_sdk::testing`: a session lookup through `MockDb`
+    /// yields scoped grants parsed from `core.user_roles` (SPEC §9.2).
+    #[tokio::test]
+    async fn session_identity_builds_scoped_grants_from_the_test_host() {
+        use adjutant_sdk::testing::TestHost;
+
+        let host = TestHost::new();
+        host.db.push_rows(vec![serde_json::json!({
+            "id": "11111111-1111-1111-1111-111111111111",
+            "username": "bea",
+            "email": "bea@example.org",
+            "display_name": "Bea",
+            "is_active": true,
+            "roles": ["lodge_commander", "scout"],
+            "grant_list": [
+                {"role_id": "lodge_commander", "scope_type": "lodge",
+                 "scope_id": "22222222-2222-2222-2222-222222222222"},
+                {"role_id": "scout", "scope_type": "troop",
+                 "scope_id": "00000000-0000-0000-0000-000000000000"}
+            ]
+        })]);
+
+        let ctx = host.context("auth");
+        let user = session_identity(&ctx.db, "raw-token")
+            .await
+            .unwrap()
+            .expect("a session user");
+
+        assert_eq!(user.roles, vec!["lodge_commander", "scout"]);
+        assert_eq!(user.grants.len(), 2);
+        assert_eq!(
+            user.grants[0].scope,
+            Scope::lodge("22222222-2222-2222-2222-222222222222")
+        );
+        assert_eq!(user.grants[1].scope, Scope::troop());
+        // The query went through the host and bound the token hash.
+        let calls = host.db.queried.lock().unwrap();
+        assert!(calls[0].sql_contains(&["core.sessions", "token_hash"]));
+    }
 }
 
 #[cfg(test)]
