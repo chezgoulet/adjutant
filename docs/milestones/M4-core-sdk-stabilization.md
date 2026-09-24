@@ -185,15 +185,24 @@ documented.
 
 ### W5 — Publication & CLI
 
-- [ ] Publish `adjutant-sdk` to crates.io.
-- [ ] Ship an installable CLI. Decision required: publish `adjutant-server`
-      (bin `adjutant`, all subcommands) vs. split a lightweight `adjutant-cli`
-      for `new-plugin`/`validate-plugin` (no database). Document the choice.
-- [ ] Document git-tag pinning as the crates.io alternative.
-- [ ] Define the third-party plugin distribution/loading story.
+- [ ] Publish `adjutant-sdk` to crates.io. **Prepared and verified locally:**
+      crate metadata + `plugins/sdk/README.md` added, and
+      `cargo publish --dry-run -p adjutant-sdk` packages (6 files, 74 KiB) and
+      builds cleanly. **Blocked on a crates.io account/token** (repository
+      owner decision).
+- [x] Installable CLI — **decided: publish `adjutant-server`** (bin `adjutant`,
+      all subcommands). Metadata + `server/README.md` added; the server dry run
+      confirms the SDK must be published first. So `cargo install adjutant-server`
+      is the install path once the SDK is up.
+- [x] Document git-tag pinning as the crates.io alternative — `docs/releasing.md`.
+- [x] Define the third-party plugin distribution/loading story — SDK via
+      crates.io, plugins loaded from `ADJUTANT_PLUGIN_DIR` (native `.so` or
+      sandboxed `.wasm`), version pinning in `docs/releasing.md`.
+- [x] `docs/releasing.md` runbook (version bump, verify, publish order, tag).
 
 **Exit criteria:** `cargo install` yields a working CLI; `cargo add adjutant-sdk`
-works; an author can follow the docs end-to-end.
+works; an author can follow the docs end-to-end. **Pending the crates.io publish
+(blocked on a token).**
 
 ### W6 — Stability gates & release
 

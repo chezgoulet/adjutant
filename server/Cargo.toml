@@ -2,9 +2,16 @@
 name = "adjutant-server"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 description = "Adjutant core server: plugin registry, HTTP dispatch, events, permissions, audit."
+readme = "README.md"
+keywords = ["adjutant", "scouting", "plugin-host", "server"]
+categories = ["web-programming::http-server"]
+
+[package.metadata.docs.rs]
+all-features = true
 
 [lib]
 name = "adjutant_server"

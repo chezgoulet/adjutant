@@ -16,6 +16,10 @@ crates.io publication.
 
 ### Added
 
+- **Publication prep.** `adjutant-sdk` and `adjutant-server` carry crates.io
+  metadata (`readme`, `keywords`, `categories`, docs.rs config); the SDK passes
+  `cargo publish --dry-run` and the server confirms the SDK-first publish order.
+  See `docs/releasing.md`.
 - **WASM plugin host (prototype, SPEC §14-R1).** Sandboxed plugins run in
   `wasmtime` with no preopened filesystem, no sockets, a 64 MiB memory cap, and
   a per-call fuel budget. A host `WasmPlugin` adapter implements the ordinary

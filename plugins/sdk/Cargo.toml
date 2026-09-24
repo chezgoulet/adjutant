@@ -2,9 +2,16 @@
 name = "adjutant-sdk"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 description = "The contract between the Adjutant core and every plugin — first-party and third-party alike."
+readme = "README.md"
+keywords = ["adjutant", "plugin", "sdk", "wasm", "scouting"]
+categories = ["development-tools", "web-programming"]
+
+[package.metadata.docs.rs]
+all-features = true
 
 [dependencies]
 async-trait.workspace = true
