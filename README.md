@@ -15,7 +15,7 @@ See [`SPEC.md`](SPEC.md) for the full specification.
 server/                     Core server (library + binary `adjutant`)
   src/                      config, db, events, host, identity, middleware,
                             permissions, plugin_runtime, server, cli
-  tests/host_db.rs          DB-backed host-I/O tests (3, #[ignore]d; see Tests)
+  tests/host_db.rs          DB-gated host-I/O + confinement probes (#[ignore]d)
 plugins/sdk/                adjutant-sdk — the plugin contract
 plugins/auth/               auth plugin (argon2, sessions, roles, OIDC)
 plugins/membership/         membership plugin (roster, lodges, patrols, OSGi CSV)
@@ -49,8 +49,8 @@ psql -h 127.0.0.1 -p 5433 -U postgres \
   -c "CREATE ROLE adjutant LOGIN CREATEROLE" \
   -c "CREATE DATABASE adjutant_dev OWNER adjutant"
 # port 5433 is this host's PostgreSQL; use 5432 or your own socket if different
-# CREATEROLE (or superuser) lets the core create one role per plugin for schema
-# isolation; without it, plugins run as the base role with a boot warning.
+# CREATEROLE (or superuser) is needed by `bootstrap-isolation`; the running
+# server does not need it.
 
 # 2. build (plugins land as .so files in target/debug)
 cargo build --workspace
@@ -61,16 +61,21 @@ cp target/debug/libadjutant_hello.so \
    target/debug/libadjutant_auth.so \
    target/debug/libadjutant_membership.so plugins-built/
 
-# 4. run (--allow-dev-headers is for local auth-less testing; dev only)
+# 4. create the per-plugin DB roles/credentials (once, and after adding a plugin)
+ADJUTANT_DATABASE_URL=postgres://adjutant@127.0.0.1:5433/adjutant_dev \
+  cargo run -p adjutant-server -- bootstrap-isolation --plugin-dir plugins-built
+
+# 5. run (--allow-dev-headers is for local auth-less testing; dev only)
 ADJUTANT_PLUGIN_DIR=plugins-built \
 ADJUTANT_DATABASE_URL=postgres://adjutant@127.0.0.1:5433/adjutant_dev \
   cargo run -p adjutant-server -- --allow-dev-headers
 ```
 
 The server creates the `core` schema, runs core migrations, then each plugin's
-migrations in its own schema (`hello`, `auth`, `membership`), and seeds the
-bootstrap roles. `pgcrypto` is created by core migration 2, so the connecting role
-must be allowed to create extensions.
+migrations **on a pool authenticated as that plugin's own `adjutant_plugin_<id>`
+role**, and seeds the bootstrap roles. `pgcrypto` is created by core migration 2,
+so the connecting role must be allowed to create extensions. A plugin with no
+stored credential refuses to load — run `bootstrap-isolation` first.
 
 ## Configuration
 
@@ -107,16 +112,20 @@ Precedence is defaults < TOML file (./adjutant.toml or `--config`) < environment
 
 ### Schema isolation
 
-Each plugin gets its own PostgreSQL schema and (when the database role can
-manage roles) its own `NOLOGIN` role `adjutant_plugin_<id>`. At runtime the
-plugin's database handle runs every query under `SET LOCAL ROLE`, with full
-rights on its own schema and an explicit allowlist of `core.*` tables — so a
-query that reaches into another plugin's schema fails with `permission denied`
-(SPEC §5.2). Migrations still run as the base role (some, like auth's,
-deliberately alter `core.users`). Requires `CREATEROLE` or superuser; otherwise
-the core logs a warning and runs plugins unisolated. The allowlist lives in
-`server/src/schema.rs` (`core_grants`); a plugin needing another core table must
-add it there deliberately.
+Each plugin gets its own PostgreSQL schema, **owned by its own `LOGIN` role**
+`adjutant_plugin_<id>`, and `ctx.db` runs on a pool authenticated as that role —
+so the boundary is the identity of the connection, not a statement filter. The
+plugin has full rights in its own schema and only an explicit allowlist of
+`core.*` tables; reaching into another plugin's schema fails with `permission
+denied`, and `SET ROLE`/`RESET ROLE` cannot lift it out (SPEC §5.2, design
+[`docs/design/plugin-isolation.md`](docs/design/plugin-isolation.md)). Migrations
+run on that same role/pool, so they can only touch the plugin's own schema.
+
+Roles, schema ownership and credentials are created once with
+`adjutant bootstrap-isolation` (needs `CREATEROLE`); the runtime reads the
+stored credential and needs no `CREATEROLE`. A plugin with no credential
+refuses to load. The allowlist lives in `server/src/schema.rs` (`core_grants`);
+a plugin needing another core table must add it there deliberately.
 
 ## Smoke test
 
@@ -167,21 +176,27 @@ ADJUTANT_PLUGIN_DIR=plugins-built ./target/debug/adjutant test-plugin
 ## Tests
 
 ```bash
-cargo test --workspace        # unit tests everywhere; the 3 DB-gated host
-                              # tests are #[ignore]d, so they are reported as
-                              # ignored, never as passed
+cargo test --workspace        # unit tests everywhere; the DB-gated tests are
+                              # #[ignore]d, so they are reported as ignored,
+                              # never as passed
 cargo clippy --workspace --all-targets
-# The DB-gated tests, explicitly. All 3 live in server/tests/host_db.rs:
-#   decode_covers_every_supported_type
-#   bind_params_round_trips_every_variant
-#   plugin_role_isolation_denies_cross_schema_access
+# The DB-gated tests, explicitly. All live in server/tests/host_db.rs:
+#   decode_covers_every_supported_type, bind_params_round_trips_every_variant
+#   and the confinement probes (design docs/design/plugin-isolation.md §5):
+#   probe_migration_cannot_create_a_core_table,
+#   probe_do_block_cannot_set_role_and_write_core,
+#   probe_plugin_sql_cannot_create_a_superuser_role,
+#   probe_reset_role_is_inert_and_set_role_is_refused,
+#   probe_cross_schema_read_is_denied, probe_unlisted_core_table_is_denied,
+#   probe_every_plugin_connection_is_the_plugin_role
 ADJUTANT_TEST_DATABASE_URL=postgres://adjutant@127.0.0.1:5433/adjutant_dev_test \
   cargo test -p adjutant-server --test host_db -- --ignored --nocapture
 ```
 
-`ADJUTANT_TEST_DATABASE_URL` must name a database ending in `_test`; under
-`--ignored` a missing or unreachable database is a hard failure, so CI cannot
-pass while the isolation proof silently does not run.
+The confinement probes need a database role that can `CREATEROLE` (a throwaway
+superuser container). `ADJUTANT_TEST_DATABASE_URL` must name a database ending
+in `_test`; under `--ignored` a missing or unreachable database is a hard
+failure, so CI cannot pass while the isolation proof silently does not run.
 
 Two live harnesses prove the integration claims. Both drive a real server and a
 real database, and both are committed because the earlier, uncommitted probe

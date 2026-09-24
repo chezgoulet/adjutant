@@ -346,19 +346,17 @@ impl AdjutantPlugin for AuthPlugin {
     }
 
     fn migrations(&self) -> Vec<Migration> {
+        // Only the plugin's own schema. The `core.users` columns and core
+        // indexes this migration once created are core-owned and now live in
+        // the core migration (server/src/db.rs), because a plugin migration runs
+        // as the plugin role and cannot alter `core.*`.
         vec![Migration::new(
             1,
-            "oidc_states_and_session_index",
-            "ALTER TABLE core.users ADD COLUMN IF NOT EXISTS username TEXT;\
-             ALTER TABLE core.users ADD COLUMN IF NOT EXISTS password_hash TEXT;\
-             CREATE TABLE IF NOT EXISTS oidc_states (\
+            "oidc_states",
+            "CREATE TABLE IF NOT EXISTS oidc_states (\
                  state TEXT PRIMARY KEY, \
                  created_at TIMESTAMPTZ NOT NULL DEFAULT now()\
-             );\
-             CREATE INDEX IF NOT EXISTS idx_core_sessions_hash \
-                 ON core.sessions (token_hash);\
-             CREATE UNIQUE INDEX IF NOT EXISTS idx_core_users_username \
-                 ON core.users (lower(username)) WHERE username IS NOT NULL;", 
+             );",
         )]
     }
 

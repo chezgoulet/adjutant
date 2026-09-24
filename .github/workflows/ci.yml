@@ -143,6 +143,10 @@ jobs:
           # ladder above; `adjutant_dev_test` is created earlier in this job.
           ADJUTANT_DATABASE_URL: postgres://adjutant:adjutant@127.0.0.1:5432/adjutant_dev_test
         run: |
+          # The loader runs each plugin as its own restricted DB role; create the
+          # roles/credentials before boot (the runtime has no CREATEROLE).
+          ./target/debug/adjutant bootstrap-isolation \
+            --database-url "$ADJUTANT_DATABASE_URL" --plugin-dir plugins-built
           ADJUTANT_PLUGIN_DIR=plugins-built \
           ADJUTANT_DEV_HEADERS=false \
           ADJUTANT_RATE_MAX=0 \

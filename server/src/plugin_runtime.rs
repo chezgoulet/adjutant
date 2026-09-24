@@ -30,8 +30,6 @@ use adjutant_sdk::{
     RouteDefinition,
 };
 
-use crate::db::run_migration;
-
 /// Every opened plugin library, kept mapped for the process lifetime.
 ///
 /// The registry holds live plugins and `retired` holds uninstalled/superseded
@@ -300,11 +298,89 @@ impl PluginRegistry {
     }
 }
 
+/// Open one plugin file into a trait object. Native `.so`s are trusted code and
+/// are parked for the process lifetime; WASM guests are sandboxed. Returns the
+/// plugin, the (optional) library handle, and whether it is a WASM guest.
+async fn open_plugin(
+    path: &Path,
+) -> Result<(Box<dyn AdjutantPlugin>, Option<Arc<libloading::Library>>, bool), PluginRuntimeError> {
+    let is_wasm = path.extension().is_some_and(|x| x == "wasm");
+    if is_wasm {
+        let p = crate::wasm::WasmPlugin::open(path)
+            .await
+            .map_err(|e| PluginRuntimeError::Load(path.display().to_string(), e))?;
+        Ok((Box::new(p), None, true))
+    } else {
+        let lib = unsafe { libloading::Library::new(path) }
+            .map_err(|e| PluginRuntimeError::Load(path.display().to_string(), e.to_string()))?;
+        let lib = Arc::new(lib);
+        park(lib.clone()); // mapped until process exit, whatever happens below
+
+        // ABI handshake: resolve the SDK ABI symbol BEFORE touching the plugin
+        // vtable. A stale build is refused with a clear error instead of running
+        // against a mismatched layout.
+        check_sdk_abi(&lib, path)?;
+
+        // Scope the libloading `Symbol` so it cannot be live across an await.
+        let plugin: Box<dyn AdjutantPlugin> = {
+            let factory =
+                unsafe { lib.get::<adjutant_sdk::PluginFactory>(adjutant_sdk::ENTRY_SYMBOL) }
+                    .map_err(|e| {
+                        PluginRuntimeError::Load(path.display().to_string(), e.to_string())
+                    })?;
+            unsafe { Box::from_raw(factory()) }
+        };
+        Ok((plugin, Some(lib), false))
+    }
+}
+
+/// Read the id and version of every plugin in `dir`, without a database. Used by
+/// `adjutant bootstrap-isolation` to learn which roles to create. Applies the
+/// same id rules as [`load_all`].
+pub async fn discover_plugins(dir: &Path) -> Result<Vec<DiscoveredPlugin>, PluginRuntimeError> {
+    if !dir.exists() {
+        return Err(PluginRuntimeError::DirMissing(dir.display().to_string()));
+    }
+    let mut entries: Vec<_> = std::fs::read_dir(dir)
+        .map_err(|e| PluginRuntimeError::Io(dir.display().to_string(), e))?
+        .filter_map(|e| e.ok())
+        .map(|e| e.path())
+        .filter(|p| p.extension().is_some_and(|x| x == "so" || x == "wasm"))
+        .collect();
+    entries.sort();
+
+    let mut out = Vec::new();
+    for path in entries {
+        let (plugin, _library, is_wasm) = open_plugin(&path).await?;
+        let id = plugin.id().to_string();
+        if is_wasm {
+            validate_untrusted_plugin_id(&id)
+                .map_err(|e| PluginRuntimeError::Invalid(id.clone(), e))?;
+        } else {
+            validate_plugin_id(&id).map_err(|e| PluginRuntimeError::Invalid(id.clone(), e))?;
+        }
+        out.push(DiscoveredPlugin { id, version: plugin.version().to_string() });
+    }
+    Ok(out)
+}
+
+/// A plugin found on disk (id + version), for `bootstrap-isolation`.
+pub struct DiscoveredPlugin {
+    pub id: String,
+    pub version: String,
+}
+
 /// Load every *installable* plugin in `dir`. Fails the boot on any invalid
 /// plugin — a half-loaded plugin set is worse than refusing to start (SPEC §14:
 /// fail loud). Uninstalled plugins are skipped before side effects.
+///
+/// Each plugin is loaded onto its own connection pool authenticated as its
+/// `adjutant_plugin_<id>` role, using the credential `bootstrap-isolation`
+/// stored in `core.plugins.db_secret`. A plugin with no credential fails the
+/// load: there is no unisolated path to fall back to (design §3.7).
 pub async fn load_all(
     dir: &Path,
+    database_url: &str,
     pool: Arc<PgPool>,
     event_tx: tokio::sync::broadcast::Sender<adjutant_sdk::Event>,
     config: serde_json::Value,
@@ -333,44 +409,7 @@ pub async fn load_all(
     entries.sort();
 
     for path in entries {
-        let is_wasm = path.extension().is_some_and(|x| x == "wasm");
-        // Native plugins are trusted cdylibs; WASM plugins are sandboxed. Both
-        // become `Box<dyn AdjutantPlugin>` and flow through the same pipeline.
-        let (mut plugin, library): (
-            Box<dyn AdjutantPlugin>,
-            Option<Arc<libloading::Library>>,
-        ) = if is_wasm {
-            let p = crate::wasm::WasmPlugin::open(&path)
-                .await
-                .map_err(|e| PluginRuntimeError::Load(path.display().to_string(), e))?;
-            (Box::new(p), None)
-        } else {
-            let lib = unsafe { libloading::Library::new(&path) }.map_err(|e| {
-                PluginRuntimeError::Load(path.display().to_string(), e.to_string())
-            })?;
-            let lib = Arc::new(lib);
-            park(lib.clone()); // mapped until process exit, whatever happens below
-
-            // ABI handshake: resolve the SDK ABI symbol BEFORE touching the
-            // plugin vtable. A stale build (plugin not rebuilt after an SDK
-            // change) is refused with a clear error instead of running against
-            // mismatched layouts. `check_sdk_abi` is sync, so no `Symbol` is
-            // live across an await in this generator.
-            check_sdk_abi(&lib, &path)?;
-
-            // Scope the libloading `Symbol` (a raw-pointer borrow) to this block
-            // so it cannot be live across any await below — a Symbol in the
-            // generator state makes the future unprovable as Send.
-            let plugin: Box<dyn AdjutantPlugin> = {
-                let factory =
-                    unsafe { lib.get::<adjutant_sdk::PluginFactory>(adjutant_sdk::ENTRY_SYMBOL) }
-                        .map_err(|e| {
-                            PluginRuntimeError::Load(path.display().to_string(), e.to_string())
-                        })?;
-                unsafe { Box::from_raw(factory()) }
-            };
-            (plugin, Some(lib))
-        };
+        let (mut plugin, library, is_wasm) = open_plugin(&path).await?;
         let id = plugin.id().to_string();
 
         // --- validation -----------------------------------------------------
@@ -403,38 +442,30 @@ pub async fn load_all(
             continue;
         }
 
-        // --- schema + migrations -------------------------------------------
-        run_migration(
-            &pool,
-            &id,
-            0,
-            "create_schema",
-            &format!("CREATE SCHEMA IF NOT EXISTS \"{id}\";"),
-        )
-        .await
-        .map_err(|e| PluginRuntimeError::Migration(id.clone(), e.to_string()))?;
-
-        // --- schema isolation role (SPEC §5.2) ------------------------------
-        // Set up the per-plugin PostgreSQL role before the plugin gets a DB
-        // handle, so every runtime query runs under it. Best-effort: a database
-        // role that cannot manage roles (no CREATEROLE/superuser) gets a loud
-        // warning and the plugin runs unisolated rather than failing to boot.
-        let isolation_role = match crate::schema::ensure_isolation(&pool, &id).await {
-            Ok(role) => Some(role),
-            Err(e) => {
-                tracing::warn!(
-                    plugin = %id,
-                    error = %e,
-                    "schema isolation unavailable: the database role cannot manage roles \
-                     (needs CREATEROLE or superuser); plugin queries run as the base role"
-                );
-                None
-            }
+        // --- credential + per-plugin pool (design §3.1-3.3) -----------------
+        // The credential is stored by `bootstrap-isolation`. There is no
+        // unisolated fallback, so a missing one is a load error, not a warning.
+        let secret: Option<String> =
+            sqlx::query_scalar("SELECT db_secret FROM core.plugins WHERE id = $1")
+                .bind(&id)
+                .fetch_optional(pool.as_ref())
+                .await
+                .map_err(|e| PluginRuntimeError::Migration(id.clone(), e.to_string()))?
+                .flatten();
+        let Some(secret) = secret else {
+            return Err(PluginRuntimeError::NotBootstrapped(id));
         };
+        let plugin_pool = crate::host::plugin_pool(database_url, &id, &secret, 2)
+            .await
+            .map_err(|e| PluginRuntimeError::Pool(id.clone(), e.to_string()))?;
+        // The secret must not leak into anything the plugin receives: the row's
+        // `config` below is separate from `db_secret`.
+        drop(secret);
 
         // --- per-plugin config (DB row) + enabled state ---------------------
         // Read BEFORE ctx construction: init() needs ctx.config (OIDC settings
-        // etc. are per-plugin and admin-editable via the config column).
+        // etc. are per-plugin and admin-editable via the config column). The
+        // secret is a separate column and is never merged into config.
         let existing: Option<(bool, serde_json::Value)> = sqlx::query_as(
             "SELECT enabled, config FROM core.plugins WHERE id = $1",
         )
@@ -463,8 +494,10 @@ pub async fn load_all(
             plugin_id: id.clone(),
             // Host-mediated: these Arc<dyn Host…> impls live in the core, so no
             // sqlx/tokio is ever linked into the plugin (see SDK host-I/O note).
+            // `ctx.db` runs on the plugin's own pool, authenticated as its role;
+            // permissions/audit/events stay core-mediated on the core pool.
             db: adjutant_sdk::DbHandle::new(
-                crate::host::CoreDb::for_plugin(pool.clone(), id.clone(), isolation_role.clone()),
+                crate::host::CoreDb::new(plugin_pool.clone()),
                 id.clone(),
             ),
             config: plugin_config.clone(),
@@ -483,24 +516,25 @@ pub async fn load_all(
             .await
             .map_err(|e| PluginRuntimeError::Init(id.clone(), e.to_string()))?;
 
+        // --- migrations, on the plugin's own pool ---------------------------
+        // DDL runs as the plugin role, so it can only touch the plugin's own
+        // schema; the bookkeeping call is validated against the caller. Applied
+        // versions are read from the core pool (the plugin role cannot read
+        // core.schema_migrations).
         let migrations = plugin.migrations();
         validate_migrations(&id, &migrations)?;
+        let applied: std::collections::HashSet<i64> = crate::db::applied_migrations(&pool, &id)
+            .await
+            .map_err(|e| PluginRuntimeError::Migration(id.clone(), e.to_string()))?
+            .into_iter()
+            .collect();
         for m in migrations {
-            run_migration(&pool, &id, m.version, &m.name, &m.sql)
+            if applied.contains(&m.version) {
+                continue;
+            }
+            crate::db::run_plugin_migration(&plugin_pool, &id, m.version, &m.name, &m.sql)
                 .await
                 .map_err(|e| PluginRuntimeError::Migration(id.clone(), e.to_string()))?;
-        }
-
-        // Migrations created tables as the base role; refresh the plugin role's
-        // grants so the new objects are reachable at runtime.
-        if let Some(role) = &isolation_role {
-            if let Err(e) = crate::schema::grant_schema_objects(&pool, &id, role).await {
-                tracing::warn!(
-                    plugin = %id,
-                    error = %e,
-                    "refreshing schema grants after migrations failed; some tables may be unreachable"
-                );
-            }
         }
 
         // --- permissions ----------------------------------------------------
@@ -715,6 +749,13 @@ pub enum PluginRuntimeError {
     Init(String, String),
     #[error("plugin {0} migration failed: {1}")]
     Migration(String, String),
+    #[error(
+        "plugin {0} has no database credential: run `adjutant bootstrap-isolation` \
+         (see docs/design/plugin-isolation.md)"
+    )]
+    NotBootstrapped(String),
+    #[error("plugin {0} database pool failed: {1}")]
+    Pool(String, String),
 }
 
 #[cfg(test)]
@@ -1057,6 +1098,7 @@ mod tests {
         let (tx, _rx) = tokio::sync::broadcast::channel(1);
         let err = match load_all(
             &dir,
+            "postgres://adjutant:adjutant@127.0.0.1:1/adjutant_test",
             pool,
             tx,
             serde_json::Value::Null,

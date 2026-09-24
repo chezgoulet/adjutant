@@ -133,6 +133,10 @@ USAGE:
     adjutant validate-plugin <so>  statically validate a compiled plugin (no DB)
     adjutant test-plugin [OPTIONS] boot against a pristine test DB and probe
                                    every plugin route with mock permissions
+    adjutant bootstrap-isolation [--rotate] [OPTIONS]
+                                   create/refresh per-plugin DB roles, schema
+                                   ownership, grants and stored credentials
+                                   (run once by the operator, against an admin URL)
     adjutant --help                print this help
 
 SERVE OPTIONS:
@@ -145,6 +149,11 @@ SERVE OPTIONS:
     --allow-dev-headers    enable the spoofable x-dev-user/x-dev-role stub
                            (DEVELOPMENT ONLY; off by default)
     -h, --help             print this help
+
+BOOTSTRAP-ISOLATION OPTIONS:
+    --database-url <URL>   admin connection string (needs CREATEROLE)
+    --plugin-dir <PATH>    the plugins to create roles for
+    --rotate               replace stored passwords (default: preserve them)
 
 ENVIRONMENT (override file, overridden by flags):
     ADJUTANT_CONFIG, ADJUTANT_BIND, ADJUTANT_DATABASE_URL, ADJUTANT_PLUGIN_DIR,

@@ -115,6 +115,7 @@ pub async fn build_app(cfg: &Config) -> Result<(Router, Arc<AppState>), BuildErr
 
     let registry = load_all(
         &cfg.plugin_dir,
+        &cfg.database_url,
         pool.clone(),
         bus.sender(),
         serde_json::Value::Object(Default::default()),
@@ -796,6 +797,7 @@ async fn reload_plugins(State(state): State<Arc<AppState>>, req: Request) -> Res
 
     let fresh = match load_all(
         &state.config.plugin_dir,
+        &state.config.database_url,
         state.pool.clone(),
         state.bus.sender(),
         serde_json::Value::Object(Default::default()),
