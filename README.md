@@ -22,6 +22,8 @@ plugins/membership/         membership plugin (roster, lodges, patrols, OSGi CSV
 plugins/examples/hello/     Prototype plugin proving the SDK end to end
 scripts/probes.py           Committed M1+M2 probe harness (live server)
 docs/e2e_m3.py              Committed M3 end-to-end harness (live server)
+docs/plugin-development.md  Plugin author guide (start here to write one)
+docs/sdk-compatibility.md   SDK version + compatibility policy
 docs/milestones/            Milestone evidence records
 docs/evidence/              Committed probe transcripts
 ```
@@ -111,6 +113,18 @@ curl -s -H 'x-dev-user: christopher' -H 'x-dev-role: chief' \
      localhost:8787/api/hello/greet                    # 201, publishes hello.greeted
 curl -s -H 'x-dev-user: christopher' -H 'x-dev-role: chief' \
      localhost:8787/api/events/recent                  # persisted event visible
+```
+
+## Writing a plugin
+
+See [`docs/plugin-development.md`](docs/plugin-development.md). The short loop:
+
+```bash
+adjutant new-plugin gear_locker
+cargo build -p adjutant-gear_locker
+adjutant validate-plugin target/debug/libadjutant_gear_locker.so   # no DB needed
+cargo test -p adjutant-gear_locker                                  # adjutant_sdk::testing
+ADJUTANT_PLUGIN_DIR=plugins-built ./target/debug/adjutant test-plugin
 ```
 
 ## Tests

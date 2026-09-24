@@ -258,5 +258,8 @@ mod tests {
         assert!(!raw.is_null());
         let boxed = unsafe { Box::from_raw(raw) };
         assert_eq!(boxed.id(), "hello");
+        // The ABI handshake symbol must agree with the SDK the core links, or
+        // the core refuses to load this library at all.
+        assert_eq!(adjutant_sdk_abi(), adjutant_sdk::SDK_ABI_VERSION);
     }
 }

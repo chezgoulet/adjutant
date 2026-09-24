@@ -127,6 +127,7 @@ adjutant — sovereignty-first troop administration server
 USAGE:
     adjutant [serve] [OPTIONS]     start the server (default command)
     adjutant new-plugin <name>     scaffold plugins/<name> (compiling stub)
+    adjutant validate-plugin <so>  statically validate a compiled plugin (no DB)
     adjutant test-plugin [OPTIONS] boot against a pristine test DB and probe
                                    every plugin route with mock permissions
     adjutant --help                print this help

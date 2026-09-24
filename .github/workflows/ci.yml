@@ -82,6 +82,16 @@ jobs:
           ./target/debug/adjutant new-plugin gear_locker
           cargo build -p adjutant-gear_locker
 
+      # Static validation: ABI handshake, init against in-memory mocks, and the
+      # manifest rules — no database and no server. Proves the scaffold passes
+      # the same gate a third-party plugin would.
+      - name: validate-plugin (static, no DB)
+        run: |
+          ./target/debug/adjutant validate-plugin target/debug/libadjutant_hello.so
+          ./target/debug/adjutant validate-plugin target/debug/libadjutant_auth.so
+          ./target/debug/adjutant validate-plugin target/debug/libadjutant_membership.so
+          ./target/debug/adjutant validate-plugin target/debug/libadjutant_gear_locker.so
+
       - name: End-to-end harness (dev headers OFF)
         run: |
           ADJUTANT_PLUGIN_DIR=plugins-built \

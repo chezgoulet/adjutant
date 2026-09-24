@@ -95,6 +95,11 @@ fn decode_value(row: &PgRow, idx: usize) -> Value {
     if let Ok(v) = row.try_get::<chrono::DateTime<chrono::Utc>, _>(idx) {
         return Value::String(v.to_rfc3339());
     }
+    // uuid — a very common primary/foreign key; decoded to its canonical string
+    // form so plugins don't have to remember `id::text` on every query.
+    if let Ok(v) = row.try_get::<uuid::Uuid, _>(idx) {
+        return Value::String(v.to_string());
+    }
     if let Ok(v) = row.try_get::<String, _>(idx) {
         return Value::String(v);
     }
@@ -111,23 +116,33 @@ fn decode_value(row: &PgRow, idx: usize) -> Value {
 fn bind_params<'q>(
     mut q: sqlx::query::Query<'q, sqlx::Postgres, sqlx::postgres::PgArguments>,
     params: Vec<SqlValue>,
-) -> sqlx::query::Query<'q, sqlx::Postgres, sqlx::postgres::PgArguments> {
+) -> Result<sqlx::query::Query<'q, sqlx::Postgres, sqlx::postgres::PgArguments>, SdkError> {
     for p in params {
         q = match p {
             SqlValue::Null => q.bind(Option::<String>::None),
-            // Typed nulls: a text NULL cannot be assigned to a bigint/bool column,
-            // and casting a bare parameter would make Postgres infer it as text.
+            // Typed nulls: a text NULL cannot be assigned to a bigint/bool/uuid
+            // column, and casting a bare parameter would make Postgres infer it
+            // as text.
             SqlValue::NullInt => q.bind(Option::<i64>::None),
             SqlValue::NullBool => q.bind(Option::<bool>::None),
+            SqlValue::NullUuid => q.bind(Option::<uuid::Uuid>::None),
             SqlValue::Bool(b) => q.bind(b),
             SqlValue::Int(n) => q.bind(n),
             SqlValue::Float(f) => q.bind(f),
             SqlValue::Text(s) => q.bind(s),
+            // Parse at the boundary: a malformed uuid is the caller's fault (400),
+            // not a 500 from a failed SQL bind.
+            SqlValue::Uuid(s) => {
+                let u = uuid::Uuid::parse_str(&s)
+                    .map_err(|e| SdkError::BadRequest(format!("invalid uuid {s:?}: {e}")))?;
+                q.bind(u)
+            }
+            SqlValue::IntArray(v) => q.bind(v),
             SqlValue::TextArray(v) => q.bind(v),
             SqlValue::Json(j) => q.bind(j),
         };
     }
-    q
+    Ok(q)
 }
 
 impl CoreDb {
@@ -157,7 +172,7 @@ impl CoreDb {
 impl HostDb for CoreDb {
     async fn execute(&self, sql: String, params: Vec<SqlValue>) -> Result<u64, SdkError> {
         let mut txn = self.txn().await?;
-        let res = bind_params(sqlx::query(&sql), params)
+        let res = bind_params(sqlx::query(&sql), params)?
             .execute(&mut *txn)
             .await
             .map_err(|e| SdkError::Db(format!("{e} (sql: {sql})")))?;
@@ -169,7 +184,7 @@ impl HostDb for CoreDb {
 
     async fn query(&self, sql: String, params: Vec<SqlValue>) -> Result<Vec<Value>, SdkError> {
         let mut txn = self.txn().await?;
-        let rows = bind_params(sqlx::query(&sql), params)
+        let rows = bind_params(sqlx::query(&sql), params)?
             .fetch_all(&mut *txn)
             .await
             .map_err(|e| SdkError::Db(format!("{e} (sql: {sql})")))?;

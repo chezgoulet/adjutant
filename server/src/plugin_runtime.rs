@@ -310,6 +310,13 @@ pub async fn load_all(
         let lib = Arc::new(lib);
         park(lib.clone()); // mapped until process exit, whatever happens below
 
+        // ABI handshake: resolve the SDK ABI symbol BEFORE touching the plugin
+        // vtable. A stale build (plugin not rebuilt after an SDK change) is
+        // refused with a clear error instead of running against mismatched
+        // layouts. `check_sdk_abi` is sync, so no `Symbol` is live across an
+        // await in this generator.
+        check_sdk_abi(&lib, &path)?;
+
         // Scope the libloading `Symbol` (a raw-pointer borrow) to this block
         // so it cannot be live across any await below — a Symbol in the
         // generator state makes the future unprovable as Send.
@@ -405,13 +412,9 @@ pub async fn load_all(
             .await
             .map_err(|e| PluginRuntimeError::Init(id.clone(), e.to_string()))?;
 
-        for m in plugin.migrations() {
-            if m.version < 1 {
-                return Err(PluginRuntimeError::Invalid(
-                    id.clone(),
-                    format!("migration '{}' version must be >= 1", m.name),
-                ));
-            }
+        let migrations = plugin.migrations();
+        validate_migrations(&id, &migrations)?;
+        for m in migrations {
             run_migration(&pool, &id, m.version, &m.name, &m.sql)
                 .await
                 .map_err(|e| PluginRuntimeError::Migration(id.clone(), e.to_string()))?;
@@ -442,36 +445,7 @@ pub async fn load_all(
 
         // --- route validation ------------------------------------------------
         let routes = plugin.routes();
-        for r in &routes {
-            let prefix = format!("/api/{id}");
-            if !(r.path == prefix || r.path.starts_with(&format!("{prefix}/"))) {
-                return Err(PluginRuntimeError::Invalid(
-                    id.clone(),
-                    format!("route {} escapes plugin namespace (must start with {prefix})", r.path),
-                ));
-            }
-            validate_route_path(&r.path)
-                .map_err(|e| PluginRuntimeError::Invalid(id.clone(), e))?;
-            if let Some(required) = &r.required_permission {
-                if !granted.iter().any(|p| &p.id == required) {
-                    return Err(PluginRuntimeError::Invalid(
-                        id.clone(),
-                        format!(
-                            "route {} requires permission '{required}' which the plugin does not grant",
-                            r.path
-                        ),
-                    ));
-                }
-            }
-            let key = (r.method.as_str().to_string(), normalized_route_path(&r.path));
-            if seen_routes.contains_key(&key) {
-                return Err(PluginRuntimeError::Invalid(
-                    id.clone(),
-                    format!("duplicate route {} {}", key.0, key.1),
-                ));
-            }
-            seen_routes.insert(key, ());
-        }
+        validate_declaration(&id, &granted, &routes, &mut seen_routes)?;
 
         // --- enabled state (row created above; version tracked at upsert) ---
         tracing::info!(
@@ -514,10 +488,107 @@ pub async fn load_all(
 }
 
 /// Full load-time id check: shape rule plus the core-reserved names.
-fn validate_plugin_id(id: &str) -> Result<(), String> {
+pub fn validate_plugin_id(id: &str) -> Result<(), String> {
     validate_id(id)?;
     if RESERVED_IDS.contains(&id) {
         return Err(format!("id {id:?} is reserved by the core"));
+    }
+    Ok(())
+}
+
+/// Resolve and verify the SDK ABI symbol **before** the plugin factory is
+/// called. A stale build (plugin not rebuilt after an SDK change) is refused
+/// with a clear error instead of running against a mismatched vtable.
+pub(crate) fn check_sdk_abi(
+    lib: &libloading::Library,
+    path: &Path,
+) -> Result<(), PluginRuntimeError> {
+    let abi = unsafe { lib.get::<extern "C" fn() -> u32>(adjutant_sdk::ABI_SYMBOL) }.map_err(|_| {
+        PluginRuntimeError::Load(
+            path.display().to_string(),
+            format!(
+                "missing `{}` symbol: built against an older adjutant-sdk; rebuild against {}",
+                String::from_utf8_lossy(adjutant_sdk::ABI_SYMBOL),
+                adjutant_sdk::SDK_VERSION,
+            ),
+        )
+    })?;
+    let found = abi();
+    if found != adjutant_sdk::SDK_ABI_VERSION {
+        return Err(PluginRuntimeError::Load(
+            path.display().to_string(),
+            format!(
+                "SDK ABI mismatch: plugin reports {found}, core requires {} (adjutant-sdk {}); rebuild the plugin",
+                adjutant_sdk::SDK_ABI_VERSION,
+                adjutant_sdk::SDK_VERSION,
+            ),
+        ));
+    }
+    Ok(())
+}
+
+/// Validate migrations without running them: version >= 1 and versions unique.
+pub fn validate_migrations(
+    id: &str,
+    migrations: &[adjutant_sdk::Migration],
+) -> Result<(), PluginRuntimeError> {
+    let mut seen = std::collections::HashSet::new();
+    for m in migrations {
+        if m.version < 1 {
+            return Err(PluginRuntimeError::Invalid(
+                id.to_string(),
+                format!("migration '{}' version must be >= 1", m.name),
+            ));
+        }
+        if !seen.insert(m.version) {
+            return Err(PluginRuntimeError::Invalid(
+                id.to_string(),
+                format!("duplicate migration version {} ('{}')", m.version, m.name),
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Validate a plugin declaration (id, route namespace, captures, permission
+/// references, duplicate routes) without a database. `seen_routes` accumulates
+/// across plugins during a boot; pass a fresh map to validate one plugin in
+/// isolation (`adjutant validate-plugin`).
+pub fn validate_declaration(
+    id: &str,
+    granted: &[adjutant_sdk::Permission],
+    routes: &[RouteDefinition],
+    seen_routes: &mut HashMap<(String, String), ()>,
+) -> Result<(), PluginRuntimeError> {
+    validate_plugin_id(id).map_err(|e| PluginRuntimeError::Invalid(id.to_string(), e))?;
+    for r in routes {
+        let prefix = format!("/api/{id}");
+        if !(r.path == prefix || r.path.starts_with(&format!("{prefix}/"))) {
+            return Err(PluginRuntimeError::Invalid(
+                id.to_string(),
+                format!("route {} escapes plugin namespace (must start with {prefix})", r.path),
+            ));
+        }
+        validate_route_path(&r.path).map_err(|e| PluginRuntimeError::Invalid(id.to_string(), e))?;
+        if let Some(required) = &r.required_permission {
+            if !granted.iter().any(|p| &p.id == required) {
+                return Err(PluginRuntimeError::Invalid(
+                    id.to_string(),
+                    format!(
+                        "route {} requires permission '{required}' which the plugin does not grant",
+                        r.path
+                    ),
+                ));
+            }
+        }
+        let key = (r.method.as_str().to_string(), normalized_route_path(&r.path));
+        if seen_routes.contains_key(&key) {
+            return Err(PluginRuntimeError::Invalid(
+                id.to_string(),
+                format!("duplicate route {} {}", key.0, key.1),
+            ));
+        }
+        seen_routes.insert(key, ());
     }
     Ok(())
 }
