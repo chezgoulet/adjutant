@@ -46,6 +46,23 @@ fn park(lib: Arc<libloading::Library>) {
     PARKED.lock().expect("parking lot poisoned").push(lib);
 }
 
+/// Close a retired plugin's pool, leaving its library mapped.
+///
+/// `PgPool::close()` drains gracefully: a connection already checked out by an
+/// in-flight request finishes, new checkouts are refused. It is `async` while
+/// `uninstall`/`replace_all` are sync (they run under the registry lock), so the
+/// close runs on a spawned task. Retiring the *library* is deliberate and
+/// unchanged; only the pool closes, so a reload can no longer leak two
+/// connections per plugin (issue #30).
+fn close_pool(p: &LoadedPlugin) {
+    let Some(pool) = p.pool.clone() else {
+        return;
+    };
+    tokio::spawn(async move {
+        pool.close().await;
+    });
+}
+
 /// Plugin ids the core keeps for itself, or for a first-party plugin whose
 /// grants are keyed on its id.
 ///
@@ -73,7 +90,12 @@ pub struct LoadedPlugin {
     /// read, never dropped until the registry retires it. `None` for WASM
     /// plugins, whose code is owned by the wasmtime store inside the plugin.
     #[allow(dead_code)]
-    pub(crate) library: Option<Arc<libloading::Library>>,
+    pub library: Option<Arc<libloading::Library>>,
+    /// The plugin's own database pool. Closed when the plugin is retired (the
+    /// *library* stays mapped, the pool does not): a retired plugin is never
+    /// read again, and leaking 2 connections per reload exhausts PostgreSQL
+    /// (issue #30). `None` only for test fixtures.
+    pub pool: Option<Arc<sqlx::PgPool>>,
     pub routes: Vec<RouteDefinition>,
     pub enabled: bool,
     pub info: PluginInfo,
@@ -89,6 +111,10 @@ pub struct PluginInfo {
     pub routes: usize,
     /// `native` (trusted cdylib) or `wasm` (sandboxed).
     pub kind: String,
+    /// True when the plugin loaded on its own restricted role/pool; a plugin
+    /// that could not be isolated never loads, so this is always true for a
+    /// live plugin and the admin surface can show isolation is active (#31).
+    pub isolated: bool,
     pub permissions: Vec<String>,
     /// Full route table — lets `adjutant test-plugin` enumerate every route
     /// without hardcoding plugin knowledge. A path containing a capture is
@@ -202,7 +228,9 @@ pub struct PluginRegistry {
 }
 
 impl PluginRegistry {
-    fn new(plugins: Vec<LoadedPlugin>) -> Self {
+    /// Build a registry from already-loaded plugins. Public so the DB-gated
+    /// pool-lifecycle probe can drive retirement directly.
+    pub fn new(plugins: Vec<LoadedPlugin>) -> Self {
         Self { plugins, retired: Vec::new() }
     }
 
@@ -283,6 +311,7 @@ impl PluginRegistry {
     pub fn uninstall(&mut self, id: &str) -> bool {
         if let Some(i) = self.plugins.iter().position(|p| p.info.id == id) {
             let p = self.plugins.remove(i);
+            close_pool(&p);
             tracing::info!(plugin = id, "uninstalled (library retired, data archived)");
             self.retired.push(p);
             true
@@ -296,6 +325,9 @@ impl PluginRegistry {
     pub fn replace_all(&mut self, fresh: PluginRegistry) {
         let PluginRegistry { plugins, retired: _ } = fresh;
         let old = std::mem::take(&mut self.plugins);
+        for p in &old {
+            close_pool(p);
+        }
         self.retired.extend(old);
         self.plugins = plugins;
     }
@@ -588,6 +620,7 @@ pub async fn load_all(
             enabled,
             routes: routes.len(),
             kind: if is_wasm { "wasm".into() } else { "native".into() },
+            isolated: true,
             permissions: granted.iter().map(|p| p.id.clone()).collect(),
             route_list: routes
                 .iter()
@@ -607,6 +640,7 @@ pub async fn load_all(
         plugins.push(LoadedPlugin {
             plugin,
             library,
+            pool: Some(plugin_pool),
             routes,
             enabled,
             info,
@@ -858,6 +892,7 @@ mod tests {
             enabled,
             routes: 1,
             kind: "native".into(),
+            isolated: true,
             permissions: perm.map(|p| vec![p.to_string()]).unwrap_or_default(),
             route_list: vec![RouteInfo {
                 method: method.into(),
@@ -869,6 +904,7 @@ mod tests {
         LoadedPlugin {
             plugin: Box::new(TestPlugin::new()),
             library: Some(lib),
+            pool: None,
             routes: vec![route],
             enabled,
             info,

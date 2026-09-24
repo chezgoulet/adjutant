@@ -384,6 +384,9 @@ pub async fn run_test_plugin(cfg: &Config) -> Result<Vec<Probe>, String> {
     cfg.bind = "127.0.0.1:0".parse().expect("ephemeral");
     cfg.rate.max_requests = 0; // probes would trip the limiter otherwise
     cfg.allow_dev_headers = true; // mock permissions
+    // The harness runs against a throwaway `_test` database, usually as a
+    // superuser; the refusal is about a real deployment connection.
+    cfg.allow_superuser = true;
     cfg.log_filter = "warn".into();
 
     // A plugin now loads on its own restricted role/pool, so the pristine test
