@@ -182,14 +182,11 @@ else>`.
 
 ---
 
-## 8. Open questions for sign-off
+## 8. Decisions (signed off 2026-09-24)
 
-1. **`personal` scope:** currently covers nothing but itself. Is that right for member-facing
-   routes (a scout reading their own record), or should self-access be handled purely by an
-   ownership check with no scope involved?
-2. **Multi-lodge commanders:** one lodge per grant today. A commander over two lodges needs two
-   rows, which is fine — confirm that is intended rather than a `Scope::lodges([..])`.
-3. **Mutations default:** should `post`/`put`/`patch`/`delete` require a troop-covering grant
-   even when declared `_any_scope`? Recommended: yes for `delete`, no for others.
-4. **Order of work:** this after plugin isolation (#17/#18), or in parallel in a separate
-   worktree? Both touch `plugin_runtime.rs`; serialising is safer.
+| # | Question | Decision |
+|---|---|---|
+| 1 | Self-access (`personal` scope) | **Ownership check only.** The `personal` scope is **dropped**: `ScopeType` becomes `troop`/`lodge`/`patrol`. A scope that covers only itself adds a concept without adding a capability; a scout reading their own record is an equality test, not a scope. The DB migration drops the value from the `CHECK` list and drops any existing `personal` grants with a logged warning. |
+| 2 | Multi-lodge commanders | **Two grant rows**, one per lodge. `Scope` stays a single scope; no `Scope::lodges([..])`. |
+| 3 | Mutations | **`delete` requires a troop-covering grant even when the route is declared scope-any.** The rest (`post`/`put`/`patch`) may be scope-any and check in the handler. Destructive operations are not available from a lodge-scoped grant. |
+| 4 | Order of work | **After plugin isolation** (see [`plugin-isolation.md`](plugin-isolation.md) §9). |

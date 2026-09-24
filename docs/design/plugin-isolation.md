@@ -90,10 +90,15 @@ Role creation and the generated passwords need a privileged path; the *runtime* 
 - `adjutant bootstrap-isolation` (new CLI subcommand) run once by the operator against an
   admin URL: creates/updates the per-plugin roles, sets schema ownership, writes the
   allowlist grants, and emits credentials.
-- Credentials live in a `0600` file (`ADJUTANT_PLUGIN_SECRETS`, default
-  `./plugin-secrets.toml`) read at boot by the host. The plugin never sees them — the host
-  owns the pool. Threat model note: anything that can read that file can already read the
-  deployment's own database URL, so this is not a new exposure.
+- **Decided:** credentials live in the database, in a **dedicated `core.plugins.db_secret`
+  column** — *not* inside the `config` JSON, because `config` is handed to every plugin as
+  `ctx.config` and a password placed there would be given straight to the plugin it is meant
+  to constrain. `bootstrap-isolation` writes it; the host reads it at load and never
+  serialises it. Two conditions are part of the design because they are what make this safe:
+  (a) `core.plugins` is never added to a plugin's `core.*` allowlist, and (b) no API route
+  ever returns a plugin's config or secret — the admin surface reports
+  id/name/version/enabled/kind/routes/permissions and nothing else. Precedent for secrets in
+  the DB: the auth plugin's OIDC `client_secret` already lives in this table.
 - Boot **fails** if a role from the plugin directory has no credential. No silent fallback.
 
 ### 3.3 Pools and budget
@@ -142,6 +147,11 @@ Today a failure to establish isolation degrades to "run as the base role" with o
 (`plugin_runtime.rs:387-400`). Under this design there is nothing to degrade *to*: if the
 plugin's pool cannot be established, the plugin does not load. Add `isolated: true/false`
 (always true, or the plugin is absent) to `PluginInfo` so the admin surface can show it.
+
+**Decided:** the server **refuses to boot** when the connected role is a PostgreSQL
+superuser, unless `ADJUTANT_ALLOW_SUPERUSER=true` is set explicitly. The message names the
+reason (E3: a plugin escape became total compromise) and the opt-out. The shipped
+`docker-compose.yml` moves to a dedicated `adjutant_app` role so the default is the safe one.
 
 ---
 
@@ -202,13 +212,26 @@ existing native and WASM load paths.
 
 ---
 
-## 8. Open questions for sign-off
+## 8. Decisions (signed off 2026-09-24)
 
-1. **Native plugins too?** Recommended: yes, give native plugins the same per-plugin pool
-   (defence in depth; native is still trusted, but the mechanism should not be one
-   typo away from unisolated). Cheaper alternative: WASM only, native keeps today's path.
-2. **Secrets storage** — `0600` file (recommended) versus a column in `core.plugins.config`.
-3. **Boot refusal** when the connected role is a superuser: refuse by default, or warn and
-   require an explicit opt-out?
-4. **Order of work** — this before scope enforcement (#22), since it is the security-critical
-   one and touches a smaller surface.
+| # | Question | Decision |
+|---|---|---|
+| 1 | Native plugins | **Same per-plugin role and pool as WASM guests** — one code path for both; a boundary that exists on only one path is one typo away from not existing. |
+| 2 | Plugin passwords | **In the database, in a dedicated `core.plugins.db_secret` column** — not inside the `config` JSON, which plugins receive as `ctx.config` (§3.2). |
+| 3 | Superuser connection | **Refuse to boot** unless `ADJUTANT_ALLOW_SUPERUSER=true` is set explicitly (§3.7). |
+| 4 | Work order | **Isolation first**, then scoped permissions — serial, because both touch `plugin_runtime.rs`. |
+
+Recorded by the steward, not open questions: the escapes in §1 become **committed regression
+probes** (§5), and the existing native path (`SET LOCAL ROLE` on a base-role connection) is
+**deleted** in the same change rather than left as a fallback — the whole point is that there
+is no unisolated path to fall back to.
+
+---
+
+## 9. Implementation sequence (proposed)
+
+1. `bootstrap-isolation` + secrets in `core.plugins.config` + per-plugin pools (roles, ownership, allowlist grants).
+2. Migrations move to the plugin pool; delete `CoreDb::for_plugin`'s role-less form.
+3. Boot refusal for superuser; `isolated` in `PluginInfo`; deployment docs + compose app role.
+4. The seven regression probes from §5, wired into the DB-gated CI suite.
+5. Then, and only then, scoped permissions ([`scoped-permissions.md`](scoped-permissions.md)) — same branch cadence, separate PR.
