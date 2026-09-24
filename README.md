@@ -30,7 +30,7 @@ docs/evidence/              Committed probe transcripts
 
 ## Prerequisites
 
-- Rust 1.96+ (the toolchain this repo is developed against; workspace edition 2021)
+- Rust 1.88+ (the declared MSRV; developed on stable, see `rust-toolchain.toml`)
 - PostgreSQL 14+ (18.6 in development) with `pgcrypto` available
 - `psql` on `PATH` for the probe harnesses
 
@@ -132,6 +132,17 @@ curl -s -H 'x-dev-user: christopher' -H 'x-dev-role: chief' \
 curl -s -H 'x-dev-user: christopher' -H 'x-dev-role: chief' \
      localhost:8787/api/events/recent                  # persisted event visible
 ```
+
+## Deployment
+
+```bash
+export POSTGRES_PASSWORD="$(openssl rand -hex 24)"
+docker compose up -d          # server + PostgreSQL
+```
+
+See [`docs/deployment.md`](docs/deployment.md) for TLS, upgrades, and
+backup/restore. Tagged releases (`v*`) publish a tarball with the binary and
+bundled plugins.
 
 ## Writing a plugin
 

@@ -636,9 +636,11 @@ impl AuditService {
         Self { db, source }
     }
 
-    /// `user_id` is recorded inside `details` as a string while the auth plugin
-    /// (Milestone 2) is pending — `core.audit_log.user_id` is a nullable FK to
-    /// `core.users`, and stub identities don't exist there yet.
+    /// Record an action. When `identity` is a real `core.users` id (a UUID),
+    /// it is written to `core.audit_log.user_id`; otherwise (e.g. the dev-header
+    /// stub, whose users don't exist in `core.users`) the FK stays NULL and the
+    /// actor is recorded in `details.user_id` instead, so attribution is never
+    /// lost.
     pub async fn log(
         &self,
         identity: Option<&Identity>,
@@ -648,16 +650,26 @@ impl AuditService {
         details: Value,
     ) -> Result<(), SdkError> {
         let mut details = details;
-        if let (Some(obj), Some(id)) = (details.as_object_mut(), identity) {
-            obj.insert("user_id".into(), Value::String(id.user_id.clone()));
+        let actor_uuid = identity
+            .map(|i| i.user_id.as_str())
+            .filter(|s| uuid::Uuid::parse_str(s).is_ok());
+        if actor_uuid.is_none() {
+            if let (Some(obj), Some(id)) = (details.as_object_mut(), identity) {
+                obj.insert("user_id".into(), Value::String(id.user_id.clone()));
+            }
         }
         let details = serde_json::to_string(&details).unwrap_or_else(|_| "{}".into());
+        let user_value = match actor_uuid {
+            Some(_) => SqlValue::Uuid(identity.expect("checked above").user_id.clone()),
+            None => SqlValue::NullUuid,
+        };
         self.db
             .execute(
                 "INSERT INTO core.audit_log (user_id, action, resource_type, resource_id, details, source) \
-                 VALUES (NULL, $1, $2, $3, $4::jsonb, $5)"
+                 VALUES ($1, $2, $3, $4, $5::jsonb, $6)"
                     .to_string(),
                 vec![
+                    user_value,
                     action.to_string().into(),
                     resource_type.to_string().into(),
                     resource_id.to_string().into(),
@@ -1447,18 +1459,19 @@ mod tests {
     /// exercised without a database or a runtime.
     #[derive(Default)]
     struct StubDb {
-        calls: Mutex<Vec<String>>,
+        /// `(sql, params)` per call.
+        calls: Mutex<Vec<(String, Vec<SqlValue>)>>,
         rows: Vec<Value>,
     }
 
     #[async_trait]
     impl HostDb for StubDb {
-        async fn execute(&self, sql: String, _params: Vec<SqlValue>) -> Result<u64, SdkError> {
-            self.calls.lock().unwrap().push(sql);
+        async fn execute(&self, sql: String, params: Vec<SqlValue>) -> Result<u64, SdkError> {
+            self.calls.lock().unwrap().push((sql, params));
             Ok(1)
         }
-        async fn query(&self, sql: String, _params: Vec<SqlValue>) -> Result<Vec<Value>, SdkError> {
-            self.calls.lock().unwrap().push(sql);
+        async fn query(&self, sql: String, params: Vec<SqlValue>) -> Result<Vec<Value>, SdkError> {
+            self.calls.lock().unwrap().push((sql, params));
             Ok(self.rows.clone())
         }
     }
@@ -1589,7 +1602,35 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn audit_log_injects_identity_and_stays_censored() {
+    async fn audit_records_a_real_user_id_in_the_fk_column() {
+        let db = Arc::new(StubDb::default());
+        let audit = AuditService::new(db.clone(), "hello".into());
+        let uuid = "11111111-1111-1111-1111-111111111111";
+        let id = Identity::new(uuid, vec!["scout".into()]);
+        audit
+            .log(Some(&id), "greet", "greeting", "hi", serde_json::json!({}))
+            .await
+            .unwrap();
+        let calls = db.calls.lock().unwrap();
+        assert_eq!(calls.len(), 1);
+        let (sql, params) = &calls[0];
+        assert!(sql.contains("core.audit_log"));
+        assert!(
+            matches!(params[0], SqlValue::Uuid(ref u) if u.as_str() == uuid),
+            "a real user id binds to the FK column"
+        );
+        // The FK carries the actor, so details must not duplicate it.
+        let details = match &params[4] {
+            SqlValue::Json(j) => serde_json::from_str::<Value>(j).unwrap(),
+            other => panic!("expected JSON details, got {other:?}"),
+        };
+        assert!(details.get("user_id").is_none());
+    }
+
+    #[tokio::test]
+    async fn audit_keeps_stub_actors_in_details_with_a_null_fk() {
+        // The dev-header stub's users don't exist in core.users, so the FK must
+        // stay NULL; attribution moves to details instead of being lost.
         let db = Arc::new(StubDb::default());
         let audit = AuditService::new(db.clone(), "hello".into());
         let id = Identity::new("beatrice", vec!["scout".into()]);
@@ -1598,9 +1639,12 @@ mod tests {
             .await
             .unwrap();
         let calls = db.calls.lock().unwrap();
-        assert_eq!(calls.len(), 1);
-        assert!(calls[0].contains("core.audit_log"));
-        // user_id FK stays NULL; identity lands in details instead
-        assert!(calls[0].contains("VALUES (NULL,"));
+        let (_, params) = &calls[0];
+        assert!(matches!(params[0], SqlValue::NullUuid), "non-uuid actor → NULL FK");
+        let details = match &params[4] {
+            SqlValue::Json(j) => serde_json::from_str::<Value>(j).unwrap(),
+            other => panic!("expected JSON details, got {other:?}"),
+        };
+        assert_eq!(details["user_id"], serde_json::json!("beatrice"));
     }
 }

@@ -1,0 +1,43 @@
+name: Release
+
+# Cut a release by pushing a version tag (e.g. `git tag v0.2.0 && git push origin v0.2.0`).
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build release
+        run: cargo build --release --workspace
+
+      - name: Assemble tarball
+        run: |
+          set -euo pipefail
+          name="adjutant-${GITHUB_REF_NAME}-x86_64-unknown-linux-gnu"
+          mkdir -p "dist/$name/plugins"
+          cp target/release/adjutant "dist/$name/"
+          cp target/release/libadjutant_hello.so "dist/$name/plugins/"
+          cp target/release/libadjutant_auth.so "dist/$name/plugins/"
+          cp target/release/libadjutant_membership.so "dist/$name/plugins/"
+          cp README.md LICENSE "dist/$name/"
+          tar -C dist -czf "dist/$name.tar.gz" "$name"
+          (cd dist && sha256sum "$name.tar.gz" > "$name.tar.gz.sha256")
+
+      - name: Create release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dist/*.tar.gz
+            dist/*.sha256
+          generate_release_notes: true

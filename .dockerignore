@@ -1,0 +1,10 @@
+# Build context exclusions. `target/` is rebuilt inside the image.
+target
+plugins-built
+.git
+.gitignore
+.probe-plugins
+*.so
+*.dylib
+*.dll
+docs/evidence

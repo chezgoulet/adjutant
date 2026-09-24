@@ -47,6 +47,14 @@ jobs:
       - name: Clippy
         run: cargo clippy --workspace --all-targets -- -D warnings
 
+      # Docs build must be warning-free (broken intra-doc links fail here).
+      - name: Docs (warnings are errors)
+        run: RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps
+
+      # Advisories, licenses, bans, and sources (config: deny.toml).
+      - name: cargo-deny
+        uses: EmbarkStudios/cargo-deny-action@v2
+
       - name: Unit + integration tests
         run: cargo test --workspace
 
@@ -104,3 +112,16 @@ jobs:
             sleep 0.2
           done
           python3 docs/e2e_m3.py
+
+  # The declared MSRV (workspace rust-version). RUSTUP_TOOLCHAIN overrides the
+  # rust-toolchain.toml `stable` channel so this job actually uses 1.88.
+  msrv:
+    runs-on: ubuntu-latest
+    env:
+      RUSTUP_TOOLCHAIN: "1.88.0"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.88.0
+      - uses: Swatinem/rust-cache@v2
+      - name: cargo check on MSRV
+        run: cargo check --workspace

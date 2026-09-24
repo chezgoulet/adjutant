@@ -1,0 +1,38 @@
+# Adjutant — one-command self-hosted deployment (SPEC §11.1).
+#
+#   POSTGRES_PASSWORD=change-me docker compose up -d
+#
+# Postgres is not exposed to the host; only the server is. See docs/deployment.md.
+services:
+  postgres:
+    image: postgres:18-alpine
+    environment:
+      POSTGRES_USER: adjutant
+      # Required: no insecure default. Set it in a .env file or the shell.
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD}
+      POSTGRES_DB: adjutant
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U adjutant"]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+    restart: unless-stopped
+
+  adjutant:
+    build: .
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      ADJUTANT_DATABASE_URL: postgres://adjutant:${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD}@postgres:5432/adjutant
+      ADJUTANT_BIND: 0.0.0.0:8787
+      ADJUTANT_LOG_FORMAT: json
+      # Leave ADJUTANT_DEV_HEADERS unset (off). Enable only for local dev.
+    ports:
+      - "8787:8787"
+    restart: unless-stopped
+
+volumes:
+  pgdata:

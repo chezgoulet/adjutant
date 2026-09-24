@@ -100,10 +100,7 @@ impl AppState {
                 } else {
                     "insufficient permissions"
                 };
-                Some(
-                    (StatusCode::from_u16(status).unwrap(), Json(json!({ "error": msg })))
-                        .into_response(),
-                )
+                Some(error_response(StatusCode::from_u16(status).unwrap(), msg))
             }
         }
     }
@@ -230,6 +227,20 @@ async fn rate_limit_layer(
 // Dynamic plugin dispatch
 // ---------------------------------------------------------------------------
 
+/// The one error envelope every core and plugin error uses: `{"error": "..."}`.
+/// Keeping construction in one place means clients can rely on the shape, and
+/// it is the single spot to change if the envelope evolves.
+fn error_response(status: StatusCode, message: impl Into<String>) -> Response {
+    (status, Json(json!({ "error": message.into() }))).into_response()
+}
+
+/// 5xx responses must not leak internals (SQL, paths, driver messages) to
+/// clients. The detail is logged; the client gets a generic message.
+fn internal_error(what: &str, err: &dyn std::fmt::Display) -> Response {
+    tracing::error!(operation = what, error = %err, "internal error");
+    error_response(StatusCode::INTERNAL_SERVER_ERROR, "internal error")
+}
+
 async fn dynamic_dispatch(State(state): State<Arc<AppState>>, req: Request) -> Response {
     let method = req.method().to_string();
     let path = req.uri().path().to_string();
@@ -256,7 +267,7 @@ async fn dynamic_dispatch(State(state): State<Arc<AppState>>, req: Request) -> R
     let (plugin_id, required, handler, params) = match lookup {
         Ok(x) => x,
         Err((status, msg)) => {
-            return (status, Json(json!({ "error": msg }))).into_response();
+            return error_response(status, msg);
         }
     };
 
@@ -295,8 +306,7 @@ async fn dispatch(
             } else {
                 "insufficient permissions"
             };
-            return (StatusCode::from_u16(status).unwrap(), Json(json!({ "error": msg })))
-                .into_response();
+            return error_response(StatusCode::from_u16(status).unwrap(), msg);
         }
     }
 
@@ -349,12 +359,17 @@ async fn dispatch(
             response
         }
         Err(e) => {
-            tracing::warn!(plugin = %plugin_id, error = %e, "plugin handler error");
             // The SDK owns the error → status mapping (SdkError::status), so the
             // core and plugins agree on 400/401/403/404/409/500.
             let status = StatusCode::from_u16(e.status())
                 .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
-            (status, Json(json!({ "error": e.to_string() }))).into_response()
+            if status.is_server_error() {
+                // Never echo Db/Internal detail (it can carry SQL) to the client.
+                internal_error("plugin handler", &e)
+            } else {
+                tracing::debug!(plugin = %plugin_id, error = %e, "plugin rejected the request");
+                error_response(status, e.to_string())
+            }
         }
     }
 }
@@ -517,14 +532,7 @@ async fn audit_verify(State(state): State<Arc<AppState>>, req: Request) -> Respo
             "rows_checked": rows,
         }))
         .into_response(),
-        Err(e) => {
-            tracing::error!(error = %e, "audit verification query failed");
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(json!({ "error": format!("audit verification unavailable: {e}") })),
-            )
-                .into_response()
-        }
+        Err(e) => internal_error("audit verification", &e),
     }
 }
 
@@ -546,7 +554,7 @@ async fn enable_plugin(
         reg.set_enabled(&name, true)
     };
     if !changed {
-        return (StatusCode::NOT_FOUND, Json(json!({ "error": "plugin not loaded" }))).into_response();
+        return error_response(StatusCode::NOT_FOUND, "plugin not loaded");
     }
     state.identity.set_enabled(&name, true);
     // Re-bind subscriptions that disable aborted (only if none are bound, so a
@@ -566,8 +574,7 @@ async fn enable_plugin(
     .execute(state.pool.as_ref())
     .await;
     if let Err(e) = dbres {
-        return (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({ "error": e.to_string() })))
-            .into_response();
+        return internal_error("plugin lifecycle", &e);
     }
     if let Err(e) = state
         .audit
@@ -607,7 +614,7 @@ async fn disable_plugin(
         reg.set_enabled(&name, false)
     };
     if !changed {
-        return (StatusCode::NOT_FOUND, Json(json!({ "error": "plugin not loaded" }))).into_response();
+        return error_response(StatusCode::NOT_FOUND, "plugin not loaded");
     }
     state.identity.set_enabled(&name, false);
     // Stop the plugin's event handlers too: routes 404-ing while its handlers keep
@@ -620,8 +627,7 @@ async fn disable_plugin(
     .execute(state.pool.as_ref())
     .await;
     if let Err(e) = dbres {
-        return (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({ "error": e.to_string() })))
-            .into_response();
+        return internal_error("plugin lifecycle", &e);
     }
     if let Err(e) = state
         .audit
@@ -665,7 +671,7 @@ async fn uninstall_plugin(
         reg.uninstall(&name)
     };
     if !removed {
-        return (StatusCode::NOT_FOUND, Json(json!({ "error": "plugin not loaded" }))).into_response();
+        return error_response(StatusCode::NOT_FOUND, "plugin not loaded");
     }
     // NOTE: `enabled` is deliberately NOT flipped here. Uninstall means
     // "not installed"; a later reinstall (clear the flag + reload) must come
@@ -680,8 +686,7 @@ async fn uninstall_plugin(
     .execute(state.pool.as_ref())
     .await;
     if let Err(e) = dbres {
-        return (StatusCode::INTERNAL_SERVER_ERROR, Json(json!({ "error": e.to_string() })))
-            .into_response();
+        return internal_error("plugin lifecycle", &e);
     }
     state.bus.clear_plugin(&name).await;
     state.identity.remove(&name);
@@ -721,11 +726,11 @@ async fn reload_plugins(State(state): State<Arc<AppState>>, req: Request) -> Res
     {
         Ok(r) => r,
         Err(e) => {
-            return (
+            tracing::error!(error = %e, "reload failed; old registry kept");
+            return error_response(
                 StatusCode::INTERNAL_SERVER_ERROR,
-                Json(json!({ "error": format!("reload failed, old registry kept: {e}") })),
-            )
-                .into_response();
+                "reload failed; old registry kept",
+            );
         }
     };
     let route_count: usize = fresh.plugins.iter().map(|p| p.routes.len()).sum();
