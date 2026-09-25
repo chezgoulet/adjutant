@@ -159,13 +159,23 @@ Stated so nobody assumes otherwise:
   design note. Until it lands, a plugin's `ctx.http` is not yet fenced to declared hosts, and
   the safety of §2(b) rests on forwarding the caller's credential rather than on the allowlist.
 - **No plugin currently calls another plugin as the caller except `mcp`.**
-- **The payments plugin exists** (`stripe`, SPEC §7.13) and §3.2 is decided — the
-  outbox, the relay and the service-principal registry are **not built yet**. Until
-  they are, a webhook-confirmed payment books through finance's idempotent
-  `payment.received` subscriber, carries a truthful `ledger_status`, and appears in
-  `GET /api/stripe/unbooked` if no ledger entry confirms it. That is a named,
-  visible gap rather than a silent one, and it is the first thing the relay
-  replaces.
+- **The payments plugin exists** (`stripe`, SPEC §7.13), and §3.2's mechanism is
+  **built**: `core.outbox`, the draining relay, and the declared service-principal
+  registry are in the core as migration 9, with `svc.stripe.ledger` declared for the
+  `stripe` producer and the operator routes in the Core section of `api-reference.md`.
+  Verified against live databases rather than by inspection: a principal whose grant
+  does not cover the operation is refused by the **target's own gate** (with the
+  target's handler never running), a plugin cannot forge or assert a principal (the
+  enqueue function takes no identity parameter, and a refused forgery writes no row),
+  a failed delivery is retried with its exhaustion **visible in the data**, a
+  redelivery does not double-write, and a delivered request carries **no headers at
+  all** — the identity is built from the intent row, so there is no credential to
+  forward, steal or replay.
+  **What is still not built is a producer.** No plugin enqueues an intent yet, so
+  `stripe` still books through finance's idempotent `payment.received` subscriber,
+  carries a truthful `ledger_status`, and appears in `GET /api/stripe/unbooked` if no
+  ledger entry confirms it. That named gap is the next step, and it is the one that
+  makes this rail load-bearing rather than merely verified.
 
 ---
 
