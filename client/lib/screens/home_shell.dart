@@ -3,6 +3,7 @@ import 'package:provider/provider.dart';
 
 import '../state/session.dart';
 import '../theme/app_theme.dart';
+import 'announcements_screen.dart';
 import 'calendar_screen.dart';
 import 'dashboard_screen.dart';
 import 'members_screen.dart';
@@ -24,8 +25,15 @@ class HomeShell extends StatefulWidget {
 class _HomeShellState extends State<HomeShell> {
   int _index = 0;
 
+  /// Where the announcements inbox sits in the destinations. It is here rather
+  /// than under Settings because it is daily work: the notice that tonight's
+  /// meeting moved is the first thing a scout needs, and the badge beside it is
+  /// the only reason to open the app at all on some days.
+  static const _inbox = 1;
+
   static const _destinations = [
     _Destination('Dashboard', Icons.dashboard_outlined, Icons.dashboard),
+    _Destination('Inbox', Icons.inbox_outlined, Icons.inbox),
     _Destination('Missions', Icons.flag_outlined, Icons.flag),
     _Destination('Calendar', Icons.calendar_month_outlined, Icons.calendar_month),
     _Destination('Members', Icons.groups_outlined, Icons.groups),
@@ -34,19 +42,54 @@ class _HomeShellState extends State<HomeShell> {
     _Destination('Settings', Icons.settings_outlined, Icons.settings),
   ];
 
+  @override
+  void initState() {
+    super.initState();
+    // The badge is the server's count, read once when the shell appears. It is
+    // cached like every other read, so a scout in the woods still sees the last
+    // number the server gave rather than an empty badge that means nothing.
+    context.read<SessionState>().refreshAnnouncementBadge();
+  }
+
   Widget _body() => switch (_index) {
         0 => const DashboardScreen(),
-        1 => const MissionsScreen(),
-        2 => const CalendarScreen(),
-        3 => const MembersScreen(),
+        1 => const AnnouncementsScreen(),
+        2 => const MissionsScreen(),
+        3 => const CalendarScreen(),
+        4 => const MembersScreen(),
         _ => const SettingsScreen(),
       };
+
+  /// A destination's icon, carrying the unread count when it is the inbox.
+  ///
+  /// The badge is red only when an *unread urgent* announcement exists — that is
+  /// the category that exists to interrupt, and a count that looks the same
+  /// either way wastes it.
+  Widget _iconFor(
+    int i, {
+    required bool selected,
+    required int unread,
+    required bool urgent,
+  }) {
+    final destination = _destinations[i];
+    final icon = Icon(
+      selected ? destination.selectedIcon : destination.icon,
+    );
+    if (i != _inbox || unread <= 0) return icon;
+    return Badge(
+      backgroundColor: urgent ? AppColors.error : null,
+      label: Text(unread > 99 ? '99+' : '$unread'),
+      child: icon,
+    );
+  }
 
   @override
   Widget build(BuildContext context) {
     final width = MediaQuery.sizeOf(context).width;
     final session = context.watch<SessionState>();
     final title = _destinations[_index].label;
+    final unread = session.announcementUnread;
+    final urgent = session.announcementUrgent;
 
     final actions = <Widget>[
       if (session.offline)
@@ -91,11 +134,12 @@ class _HomeShellState extends State<HomeShell> {
           selectedIndex: _index,
           onDestinationSelected: (i) => setState(() => _index = i),
           destinations: [
-            for (final d in _destinations)
+            for (var i = 0; i < _destinations.length; i++)
               NavigationDestination(
-                icon: Icon(d.icon),
-                selectedIcon: Icon(d.selectedIcon),
-                label: d.label,
+                icon: _iconFor(i, selected: false, unread: unread, urgent: urgent),
+                selectedIcon:
+                    _iconFor(i, selected: true, unread: unread, urgent: urgent),
+                label: _destinations[i].label,
               ),
           ],
         ),
@@ -113,11 +157,12 @@ class _HomeShellState extends State<HomeShell> {
               onDestinationSelected: (i) => setState(() => _index = i),
               labelType: NavigationRailLabelType.all,
               destinations: [
-                for (final d in _destinations)
+                for (var i = 0; i < _destinations.length; i++)
                   NavigationRailDestination(
-                    icon: Icon(d.icon),
-                    selectedIcon: Icon(d.selectedIcon),
-                    label: Text(d.label),
+                    icon: _iconFor(i, selected: false, unread: unread, urgent: urgent),
+                    selectedIcon:
+                        _iconFor(i, selected: true, unread: unread, urgent: urgent),
+                    label: Text(_destinations[i].label),
                   ),
               ],
             ),
@@ -137,6 +182,9 @@ class _HomeShellState extends State<HomeShell> {
             onSelected: (i) => setState(() => _index = i),
             destinations: _destinations,
             displayName: session.displayName,
+            badgeIndex: _inbox,
+            unread: unread,
+            urgent: urgent,
           ),
           const VerticalDivider(width: 1),
           Expanded(
@@ -165,12 +213,20 @@ class _Sidebar extends StatelessWidget {
     required this.onSelected,
     required this.destinations,
     required this.displayName,
+    required this.badgeIndex,
+    required this.unread,
+    required this.urgent,
   });
 
   final int index;
   final ValueChanged<int> onSelected;
   final List<_Destination> destinations;
   final String displayName;
+
+  /// Which destination carries the unread count, and how many there are.
+  final int badgeIndex;
+  final int unread;
+  final bool urgent;
 
   @override
   Widget build(BuildContext context) {
@@ -217,13 +273,27 @@ class _Sidebar extends StatelessWidget {
                     ),
                     child: Row(
                       children: [
-                        Icon(
-                          i == index ? destinations[i].selectedIcon : destinations[i].icon,
-                          size: 20,
-                          color: i == index
-                              ? scheme.onPrimaryContainer
-                              : scheme.onSurface.withValues(alpha: 0.7),
-                        ),
+                        if (i == badgeIndex && unread > 0)
+                          Badge(
+                            backgroundColor: urgent ? AppColors.error : null,
+                            label: Text(unread > 99 ? '99+' : '$unread'),
+                            child: Icon(
+                              i == index
+                                  ? destinations[i].selectedIcon
+                                  : destinations[i].icon,
+                              size: 20,
+                            ),
+                          )
+                        else
+                          Icon(
+                            i == index
+                                ? destinations[i].selectedIcon
+                                : destinations[i].icon,
+                            size: 20,
+                            color: i == index
+                                ? scheme.onPrimaryContainer
+                                : scheme.onSurface.withValues(alpha: 0.7),
+                          ),
                         const SizedBox(width: AppSpacing.md),
                         Text(
                           destinations[i].label,

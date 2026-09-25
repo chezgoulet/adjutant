@@ -142,13 +142,20 @@ class _StatsRow extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     final scheme = Theme.of(context).colorScheme;
-    return GridView.count(
-      crossAxisCount: columns,
+    // A fixed row height rather than an aspect ratio: an aspect ratio makes a
+    // card's height depend on the phone's width, and on a narrow one the label
+    // and the figure no longer fit inside their own card (the numbers are large
+    // on purpose — they are read at a glance, outdoors). A stated extent is the
+    // same on every phone and cannot overflow.
+    return GridView(
       shrinkWrap: true,
       physics: const NeverScrollableScrollPhysics(),
-      mainAxisSpacing: AppSpacing.sm,
-      crossAxisSpacing: AppSpacing.sm,
-      childAspectRatio: 1.9,
+      gridDelegate: SliverGridDelegateWithFixedCrossAxisCount(
+        crossAxisCount: columns,
+        mainAxisSpacing: AppSpacing.sm,
+        crossAxisSpacing: AppSpacing.sm,
+        mainAxisExtent: 96,
+      ),
       children: [
         for (final s in stats)
           AppCard(

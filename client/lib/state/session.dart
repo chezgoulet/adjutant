@@ -144,6 +144,80 @@ class SessionState extends ChangeNotifier {
     }
   }
 
+  /// Read a single object through the cache, the same contract as
+  /// [cachedList]: fresh on success, last-known on a network failure, and an
+  /// authorisation refusal propagated rather than folded into a stale read.
+  Future<Cached<Map<String, dynamic>>> cachedMap(
+    String key,
+    Future<Map<String, dynamic>> Function() fetch,
+  ) async {
+    final prefs = await SharedPreferences.getInstance();
+    try {
+      final fresh = await fetch();
+      await prefs.setString('cache.$key', jsonEncode(fresh));
+      await prefs.setString('cache.$key.at', DateTime.now().toIso8601String());
+      offline = false;
+      return Cached(fresh, isStale: false, cachedAt: DateTime.now());
+    } on OfflineException {
+      offline = true;
+      return Cached(_readCachedMap(prefs, key),
+          isStale: true, cachedAt: _readCacheAt(prefs, key));
+    }
+  }
+
+  Map<String, dynamic> _readCachedMap(SharedPreferences prefs, String key) {
+    final raw = prefs.getString('cache.$key');
+    if (raw == null) return const {};
+    try {
+      final decoded = jsonDecode(raw);
+      if (decoded is Map) return Map<String, dynamic>.from(decoded);
+    } on FormatException {
+      // A corrupt cache is not worth crashing over; nothing is honest.
+    }
+    return const {};
+  }
+
+  // --- the announcement badge ----------------------------------------------
+
+  /// The last badge the server reported, held here because the shell shows it
+  /// on a destination and the inbox screen is what changes it. Null until the
+  /// server has ever answered: a count this client invented would be a lie, and
+  /// no count is a truthful "I do not know yet".
+  Map<String, dynamic>? announcementBadge;
+
+  int get announcementUnread =>
+      (announcementBadge?['unread'] as num?)?.toInt() ?? 0;
+
+  /// Whether any *unread* announcement is urgent — the badge that must not be
+  /// mistaken for routine.
+  bool get announcementUrgent => announcementBadge?['has_urgent'] == true;
+
+  /// Load the badge into the session for the shell to render.
+  ///
+  /// A refusal is not an offline read and is not swallowed on the screen's
+  /// behalf; here it simply leaves the badge empty, because a caller without
+  /// `announcements:read` genuinely has nothing counted and the inbox screen is
+  /// where the refusal is stated in words.
+  Future<void> refreshAnnouncementBadge() async {
+    try {
+      final cached =
+          await cachedMap('announcement.badge', api.unreadAnnouncements);
+      setAnnouncementBadge(cached.value);
+    } on ApiException {
+      // Nothing to badge. The destination stays, because hiding it would be a
+      // client-side guess at the caller's permissions.
+    }
+  }
+
+  /// Adopt a badge the server just returned. Every read/unread response and the
+  /// list payload carry the fresh count, so the shell's badge updates from the
+  /// server's answer instead of a number this client increments itself.
+  void setAnnouncementBadge(Map<String, dynamic>? badge) {
+    if (badge == null || badge.isEmpty) return;
+    announcementBadge = badge;
+    notifyListeners();
+  }
+
   List<Map<String, dynamic>> _readCache(SharedPreferences prefs, String key) {
     final raw = prefs.getString('cache.$key');
     if (raw == null) return const [];

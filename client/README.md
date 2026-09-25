@@ -32,9 +32,16 @@ lib/
     login_screen.dart            sign in + point at your server
     home_shell.dart              adaptive shell: bottom bar / rail / sidebar
     dashboard_screen.dart        Monitor surface
+    announcements_screen.dart    the inbox: unread badge, urgent in words,
+                                 mark read/unread from the row
+    announcement_detail_screen.dart  one notice; opening it records the receipt
     missions_screen.dart         the six-stage lifecycle, list + detail
     calendar_screen.dart         month grid, upcoming, quorum visibility
     members_screen.dart          roster with search
+    dues_screen.dart             what I owe (derived from the ledger) and
+                                 self-reporting my sliding-scale tier
+    settings_screen.dart         Dues + Plugins, pushed from the shell
+    plugins_screen.dart          the admin switchboard (under Settings)
 test/widget_test.dart            unit + widget tests for the logic and legibility
 ```
 
@@ -134,7 +141,11 @@ Stated plainly so nobody assumes otherwise:
   design doc calls workable for first-party plugins. Metadata is what lets a
   *community* plugin have a screen without a client release.
 - **Queued writes** (the outbox).
-- **Push notifications.**
+- **Push notifications.** Announcements are recorded and land in the in-app
+  inbox; nothing buzzes, and both the inbox and a notice say so.
+- **Paying dues.** What you owe and self-reporting your tier are both in the
+  client; taking the money is the payments plugin's job, and the dues screen
+  states where that affordance goes rather than offering one that cannot work.
 - **Governance screens** (motions, voting, minutes) — the plugin is built and the
   API is there; the screens are not.
 - **Roster editing, mission creation, event creation** — the client is read-only

@@ -86,10 +86,10 @@ class ApiClient {
     }
 
     if (response.statusCode >= 200 && response.statusCode < 300) {
-      if (response.body.isEmpty) return null;
+      if (response.bodyBytes.isEmpty) return null;
       // A 204 or an empty body is not JSON; guards the common case of a route
       // that succeeds without a payload.
-      final text = response.body.trim();
+      final text = _bodyText(response).trim();
       if (text.isEmpty) return null;
       try {
         return jsonDecode(text);
@@ -101,16 +101,34 @@ class ApiClient {
     throw ApiException(response.statusCode, _errorMessage(response));
   }
 
+  /// The response body as text.
+  ///
+  /// JSON on the wire is UTF-8 by specification (RFC 8259 §8.1), whatever the
+  /// content-type header happens to say — and `http`'s default, with no charset
+  /// stated, is latin1. Left alone that turns “Procès-verbal” into mojibake and
+  /// mangles every em dash in a notice body, so the bytes are decoded here
+  /// rather than trusted to a guess.
+  String _bodyText(http.Response response) {
+    try {
+      return utf8.decode(response.bodyBytes);
+    } on FormatException {
+      // Not valid UTF-8: fall back to whatever the client guessed rather than
+      // losing the response entirely.
+      return response.body;
+    }
+  }
+
   /// The server answers errors as `{"error": "..."}`; fall back to the raw body.
   String _errorMessage(http.Response response) {
+    final text = _bodyText(response);
     try {
-      final decoded = jsonDecode(response.body);
+      final decoded = jsonDecode(text);
       if (decoded is Map && decoded['error'] is String) return decoded['error'] as String;
       if (decoded is Map && decoded['message'] is String) return decoded['message'] as String;
     } on FormatException {
       // fall through
     }
-    return response.body.isEmpty ? 'Request failed' : response.body;
+    return text.isEmpty ? 'Request failed' : text;
   }
 
   // --- auth ---------------------------------------------------------------
@@ -180,6 +198,99 @@ class ApiClient {
       _asMap(await _send('POST', '/api/calendar/event/$eventId/rsvp',
           body: {'response': response}));
 
+  // --- announcements ------------------------------------------------------
+
+  /// The caller's inbox — every announcement whose scope addresses them.
+  ///
+  /// Visibility is the server's rule, not a filter the client can guess: an
+  /// announcement is addressed to a scope, so a Lodge reader does not see a
+  /// troop-wide notice unless they hold a troop-scope grant. `status` defaults
+  /// to `published` server-side (`all` also returns drafts and retracted ones),
+  /// expired notices are hidden unless `includeExpired`, and urgent sorts first.
+  Future<List<Map<String, dynamic>>> announcements({
+    String? status,
+    String? category,
+    bool unreadOnly = false,
+    bool includeExpired = false,
+  }) async {
+    final query = <String, String>{
+      'status': ?status,
+      'category': ?category,
+      if (unreadOnly) 'unread': 'true',
+      if (includeExpired) 'include_expired': 'true',
+    };
+    return _asList(await _send('GET', '/api/announcements/announcements',
+        query: query.isEmpty ? null : query));
+  }
+
+  /// The unread badge on its own: `unread`, `urgent_unread`, `has_urgent`,
+  /// `unread_by_category` and the scopes the caller is addressed by.
+  Future<Map<String, dynamic>> unreadAnnouncements() async =>
+      _asMap(await _send('GET', '/api/announcements/unread'));
+
+  /// One announcement, plus this caller's receipt and the read count.
+  ///
+  /// The server answers 403 for an announcement not sent to a scope the caller
+  /// holds — the same answer as one that does not exist, which is the point.
+  Future<Map<String, dynamic>> announcement(String id) async =>
+      _asMap(await _send('GET', '/api/announcements/announcement/$id'));
+
+  /// Record the caller's own receipt. Idempotent: marking read twice writes no
+  /// second receipt and returns `already_read: true`.
+  ///
+  /// Returns the response, whose `unread` is the fresh badge.
+  Future<Map<String, dynamic>> markAnnouncementRead(String id) async =>
+      _asMap(await _send('POST', '/api/announcements/announcement/$id/read',
+          body: {'via': 'flutter'}));
+
+  /// Clear the caller's own receipt. Forgetting twice is not an error.
+  Future<Map<String, dynamic>> markAnnouncementUnread(String id) async =>
+      _asMap(await _send('POST', '/api/announcements/announcement/$id/unread'));
+
+  // --- finance: dues ------------------------------------------------------
+
+  /// One scout's dues: the assessment, the standing derived from the ledger
+  /// (`paid_cents`, `outstanding_cents`, `settled`) and the dues payments.
+  ///
+  /// Your own record needs only `finance:read` at any scope — an ownership
+  /// check, not a grant — which is the whole reason the client asks for itself
+  /// by id rather than for "me": the route takes a member, and yours is the one
+  /// you may read. Somebody else's needs `finance:read_all` covering the troop,
+  /// and the server, not this client, decides that.
+  Future<Map<String, dynamic>> memberDues(String member, {int? fiscalYear}) async =>
+      _asMap(await _send(
+          'GET', '/api/finance/dues/member/${Uri.encodeComponent(member)}',
+          query: fiscalYear == null ? null : {'fiscal_year': '$fiscalYear'}));
+
+  /// The sliding scale for the troop's configured membership cost: each tier's
+  /// share, what it assesses, and the sentence a scout reads when choosing.
+  ///
+  /// A constant table server-side (no database call), which is what makes it
+  /// the honest source for the tier chooser rather than labels hardcoded here.
+  Future<Map<String, dynamic>> slidingScale() async =>
+      _asMap(await _send('GET', '/api/finance/sliding-scale'));
+
+  /// Report your own sliding-scale tier — the honor system's one write.
+  ///
+  /// No `member_id` is sent, so the subject is the caller and nothing else. A
+  /// self-report never sets the base cost it is a fraction of: that is the
+  /// treasurer's number, and the server reuses the existing assessment's base
+  /// or the troop's configured membership cost, answering 409 when neither
+  /// exists rather than inventing a price.
+  Future<Map<String, dynamic>> selfReportDues({
+    required String tier,
+    int? fiscalYear,
+    String? note,
+  }) async {
+    final body = <String, Object>{
+      'tier': tier,
+      'fiscal_year': ?fiscalYear,
+      if (note != null && note.trim().isNotEmpty) 'note': note.trim(),
+    };
+    return _asMap(
+        await _send('POST', '/api/finance/dues/self-report', body: body));
+  }
+
   // --- governance ---------------------------------------------------------
 
   Future<List<Map<String, dynamic>>> motions() async =>
@@ -232,7 +343,15 @@ List<Map<String, dynamic>> _asList(dynamic value) {
     return value.whereType<Map>().map((e) => Map<String, dynamic>.from(e)).toList();
   }
   if (value is Map) {
-    for (final key in const ['items', 'data', 'members', 'missions', 'events', 'motions']) {
+    for (final key in const [
+      'items',
+      'data',
+      'members',
+      'missions',
+      'events',
+      'motions',
+      'announcements',
+    ]) {
       final inner = value[key];
       if (inner is List) {
         return inner.whereType<Map>().map((e) => Map<String, dynamic>.from(e)).toList();

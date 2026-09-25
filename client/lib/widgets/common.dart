@@ -146,7 +146,11 @@ class EmptyState extends StatelessWidget {
   Widget build(BuildContext context) {
     final scheme = Theme.of(context).colorScheme;
     return Center(
-      child: Padding(
+      // Scrollable, so a long message is never clipped: a short window (a
+      // landscape phone, a small desktop window) must show the whole
+      // explanation rather than the top half of it, and this is the widget that
+      // has to keep the "never a blank screen" promise.
+      child: SingleChildScrollView(
         padding: const EdgeInsets.all(AppSpacing.xl),
         child: Column(
           mainAxisSize: MainAxisSize.min,
@@ -264,6 +268,25 @@ String formatDate(String? iso, {bool withTime = false}) {
   if (!withTime) return d;
   return '$d ${local.hour.toString().padLeft(2, '0')}:'
       '${local.minute.toString().padLeft(2, '0')}';
+}
+
+/// Money, as the finance plugin states it: an integer number of cents, rendered
+/// here the way the server renders it (`$1,234.56`, two decimals, grouped).
+///
+/// A balance is derived server-side from the ledger and never stored, so this
+/// only ever *renders* a figure the server computed — the client does not add
+/// up money, because a second implementation of that is a second answer.
+String formatCents(int? cents) {
+  if (cents == null) return '—';
+  final abs = cents.abs();
+  final digits = (abs ~/ 100).toString();
+  final remainder = (abs % 100).toString().padLeft(2, '0');
+  final grouped = StringBuffer();
+  for (var i = 0; i < digits.length; i++) {
+    if (i > 0 && (digits.length - i) % 3 == 0) grouped.write(',');
+    grouped.write(digits[i]);
+  }
+  return '${cents < 0 ? '-' : ''}\$$grouped.$remainder';
 }
 
 /// "Today", "Tomorrow", or a date — for upcoming lists where the relative day
