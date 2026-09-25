@@ -790,12 +790,166 @@ INSERT INTO core.role_permissions (role_id, permission_id) VALUES
 ON CONFLICT DO NOTHING;
 ```
 
-**What is deliberately not here.** The storefront (uniforms, patches),
-equipment rentals with a troop-set fee, sliding-scale pricing across the
-storefront, and free/comp sales for commanders and above were specified by the
-owner and have no SPEC section yet; where they live is not decided, so nothing
-here anticipates it. Refunds are absent too (SPEC §7.13 does not ask for them):
-a refund is an *expense* in finance's vocabulary and belongs to finance's routes.
+**What is deliberately not here.** Those responsibilities live in `store` (§7.16)
+now: the catalogue, sliding-scale pricing, equipment rentals as a priced product,
+and comp sales as a commander-and-above authority. The shop takes money *through*
+this plugin — it calls `/api/stripe/checkout` as the caller — and holds no money of
+its own. Refunds are absent too (SPEC §7.13 does not ask for them): a refund is an
+*expense* in finance's vocabulary and belongs to finance's routes.
+
+### Store (SPEC §7.16)
+
+The troop's shop: a catalogue of what it sells, per-item prices with a **sliding
+scale**, equipment rentals as a priced product, orders and their completion, and
+comp sales. The shop holds no money and keeps no books — it writes its own schema
+and nothing else's, and every entry in the ledger stays finance's (`§3.3` of
+[`design/plugin-to-plugin.md`](design/plugin-to-plugin.md)).
+
+**Anything free, deducted or discounted draws on the scholarship fund.** An item
+sells at its price; what a member is *not* charged is a **draw on `scholarship`**,
+recorded on the order as `funded_cents` and moved as a **balanced transfer**
+(`POST /api/finance/transfer` — both legs, one statement, one group) out of
+`scholarship` into the fund the order's proceeds land in. Nothing is modelled as
+a price of zero: every order carries three figures, and the database refuses an
+order where they disagree —
+
+| Column | Meaning |
+|---|---|
+| `price_cents` | What the goods cost at the shop's price — the sale's value |
+| `charged_cents` | What the member actually pays (`0` when comped) |
+| `funded_cents` | `price_cents - charged_cents` — the draw on `scholarship` |
+
+A comp is therefore not a zero-amount ledger entry, and it does not need to be
+one: `finance` refuses a zero-amount transaction at two layers
+(`transactions_amount_nonzero`, and income requiring a positive magnitude), while
+the subsidy it produces is a **positive** transfer, which finance expresses
+exactly and the Annual Financial Report already reports in its fund and transfer
+sections.
+
+**The dues scale prices the shop, capped at the shop's price.** The four tiers are
+`finance`'s own codes — `patron`, `standard`, `supported`, `hardship` — so one
+self-report carries across both plugins; the shares are `20000`, `10000`, `5000`,
+`0` basis points, and a share above the price is charged as the price. A patron
+therefore pays the shop's price rather than twice it: a payment split across two
+funds is not expressible through one Stripe payment (`finance.transactions.external_ref`
+is unique per payment), and a member who wants to give more gives to `scholarship`
+directly — an income entry into any fund by **id** is a donation into it, and a
+transfer into it is an allocation into it, both already finance's routes.
+
+**How a paid order completes — and the one path that cannot.** Every cross-plugin
+call is made **as the caller**, with the caller's own `authorization`/`cookie`
+forwarded so the target's own gate re-decides, and its refusal passed through
+rather than swallowed:
+
+1. `POST /api/store/order/{id}/checkout` — a member's own session buys a patch.
+   This plugin calls **stripe**'s `POST /api/stripe/checkout` for the order's
+   `charged_cents` (never the price: the difference is the scholarship's business,
+   not the card's) and stores the session references it gets back. It holds no
+   secret and never sees a card detail. Stripe's purpose vocabulary has no
+   `purchase`, so the session is opened as a `donation` with `category: "store"`
+   and the order's `fund_code` — the ledger is right, and stripe's own purpose
+   column is the seam a `purchase` purpose would close.
+2. `POST /api/store/order/{id}/complete` — a shopkeeper completes a paid order:
+   **stripe**'s `GET /api/stripe/payment/{id}` verifies the payment against the
+   order (amount, and the session and member when stripe recorded them), then
+   **stripe**'s `POST /api/stripe/payment/{id}/book` asks finance to book it, both
+   as the caller, so the completion and the ledger write land in one flow with
+   answers. Finance's refusal is passed through and recorded: the order is paid
+   (the payment is real) and its `ledger_status` says exactly how far the entry
+   got.
+3. `POST /api/store/order/{id}/comp` — a `store:comp` holder comps an order. The
+   comp is recorded with its mandatory reason and its authority, and the draw it
+   produces is booked in the same call by asking finance to transfer the whole
+   price out of `scholarship`, as the caller.
+
+**What has no caller, said plainly.** A sliding-scale reduction is applied by the
+shop, and a Stripe webhook confirming a payment carries no Adjutant caller, so
+neither can forward a credential — and minting one is what `§3.1` refuses. So the
+reduction's draw is recorded truthfully and left `unbooked`, a shopkeeper
+completes a paid order by hand, and `GET /api/store/orders/unsettled` is the
+worklist of both. `POST /api/store/order/{id}/draw` lets a treasurer book an
+outstanding draw **as themselves** (which needs their own `finance:write`);
+closing the gap structurally needs the core outbox `§3.2` decided and has not
+built.
+
+Config lives in the `store` row's `core.plugins.config`:
+
+```json
+{
+  "base_url": "http://127.0.0.1:8787", "fund_code": "general",
+  "category": "store", "success_url": "https://troop.example/store/paid",
+  "cancel_url": "https://troop.example/store", "unsettled_after_minutes": 30
+}
+```
+
+`base_url` is *this* Adjutant instance — where stripe's and finance's routes are
+dialled. This plugin holds **no secret of its own**: it charges nothing, and the
+only payment reference it ever writes is stripe's own opaque `pi_…`/`cs_…`.
+
+| Method | Path | Permission | Body / notes |
+|---|---|---|---|
+| GET | `/api/store/health` | `store:read` | What is configured (presence, never a value), the scale, the funds, and the `money_path` block: which path each call takes, that the reduction's draw is not synchronous, and what it is blocked on. No database |
+| GET | `/api/store/items?kind=&category=&include_inactive=&limit=` | `store:read` | The catalogue with each item's whole scale (charge **and** draw per tier). `kind` is `product` or `rental` |
+| POST | `/api/store/item` | `store:manage` | `{kind, name, category, base_price_cents, sku?, description?, currency?, fund_code?, equipment_item_id?}` → `201` + `Location`. `category` is one of `uniform`, `patch`, `insignia`, `gear`, `merch`, `other`; a **rental must name `equipment_item_id`** (the id only — no name, no condition) and a product may not name one: there is one checkout state machine in this system and it is equipment's |
+| GET | `/api/store/item/{id}` | `store:read` | One item, its scale, and — for a rental — a `custody` block naming equipment's own `availability`/`checkout` routes for the item id |
+| PATCH | `/api/store/item/{id}` | `store:manage` | `{name?, sku?, category?, description?, base_price_cents?, fund_code?, active?}`. An omitted field is unchanged and an **empty string leaves a text field as it is**; `kind` is immutable |
+| POST | `/api/store/order` | `store:buy` (any scope) | `{lines: [{item_id, quantity}], tier?, member_id?, currency?, note?}` → `201` + `Location` + `{order, lines, draw}`. Priced **from the catalogue**, never from the request. Naming another `member_id` needs `store:manage`; an order whose lines name two funds is a `400` (one payment lands in one fund) |
+| GET | `/api/store/orders?status=&member_id=&before_id=&limit=` | `store:read` (any scope) | Newest first. A caller without `store:read_all` is narrowed to their own orders (`narrowed_to_caller: true`) and somebody else's `member_id` is a `403` |
+| GET | `/api/store/orders/unsettled?older_than_minutes=&limit=` | `store:read_all` | **The worklist**: orders awaiting payment past the threshold, and completed orders whose draw is not `booked` or whose ledger entry stripe did not confirm, with `by_reason` and a note saying a paid-but-unseen order cannot be told from an unpaid one |
+| GET | `/api/store/order/{id}` | `store:read` (any scope) | The order, its lines, its `draw`, its `ledger`. Somebody else's order is a `403` that reads `"no such order"` |
+| POST | `/api/store/order/{id}/checkout` | `store:buy` (any scope) | Opens a Stripe Checkout session **as the caller** for `charged_cents` and settles the order to `awaiting_payment`. `403` when the request carries no credential to forward (nothing is called); stripe's own status is passed through otherwise. A zero charge is a `409` pointing at `/comp` — Stripe cannot take zero |
+| POST | `/api/store/order/{id}/complete` | `store:manage` | `{stripe_payment_id}` — verifies the payment with stripe as the caller, asks stripe to book it as the caller, and marks the order `paid` with finance's own answer. A payment that is not this order's is a `409` and nothing is written; a second completion is a `409`. Finance's refusal is passed through with the order paid and its `ledger_status` truthful |
+| POST | `/api/store/order/{id}/comp` | `store:comp` | `{reason, allow_overdraft?}` — completes at no charge with the reason **required** and the authority recorded, and books the draw (the whole price, `scholarship` → the order's fund) as the caller. The comp stands even if the draw does not, and the draw's outcome is recorded beside it. `409` when the order's proceeds already land in `scholarship` (a transfer to itself is not a transfer) |
+| POST | `/api/store/order/{id}/draw` | `store:manage` | `{allow_overdraft?}` — books an outstanding draw **as the caller** (`finance:write` decides). Guarded on the order being `paid` or `comped`: a draw is booked for a sale that happened |
+| GET | `/api/store/comps?from=&to=&limit=` | `store:read_all` | Every comp with its reason, its authority, the draw it produced, and the funded total. The ledger shows the draw; this route shows the comp |
+
+**Events:** `store.order.placed`, `store.order.awaiting_payment`,
+`store.order.paid`, `store.order.comped`, `store.order.draw_booked`,
+`store.orders.unsettled` (the six-hourly sweep's notice). No payload carries a
+secret or a card detail; a payment reference is stripe's opaque id.
+
+**Subscribes to:** nothing, on purpose — a paid order is completed by a caller
+(`§2(b)`), and a subscriber that marked an order paid from a broadcast would be
+exactly the fire-and-forget money path `§3.2` refuses. It could not even
+correlate reliably: `stripe.payment.confirmed` carries the Checkout session id
+only for one of the two event shapes.
+
+**Permissions this plugin defines:** `store:read` (the catalogue and your own
+orders), `store:read_all` (every order, and the worklists), `store:buy` (place an
+order and pay for it), `store:manage` (catalogue, other members' orders, paid
+completion, outstanding draws), `store:comp` (complete an order at no charge).
+
+**Role grants.** **"Commander and above" is a role grant, not a rank this plugin
+knows**: the plugin defines `store:comp` and nothing else, and which roles hold it
+is the troop's business, recorded in `core.role_permissions` like every other
+permission. A comping or draw-booking caller needs `finance:write` as well —
+finance's own gate decides the money, and the store cannot widen it.
+
+```sql
+INSERT INTO core.role_permissions (role_id, permission_id) VALUES
+  ('treasurer',      'store:read_all'),
+  ('treasurer',      'store:buy'),
+  ('treasurer',      'store:manage'),
+  ('treasurer',      'finance:write'),
+  ('shopkeeper',     'store:read_all'),
+  ('shopkeeper',     'store:manage'),
+  ('shopkeeper',     'stripe:read_all'),
+  ('shopkeeper',     'stripe:manage'),
+  ('commander',      'store:comp'),
+  ('commander',      'finance:write'),
+  ('scout',          'store:read'),
+  ('scout',          'store:buy')
+ON CONFLICT DO NOTHING;
+```
+
+**What is deliberately not here.** The client screens for the shop (a separate
+parity workstream); a cash sale — SPEC §7.16 gives the shop one money path and it
+is stripe's, so a payment recorded directly in finance does not complete a store
+order; a refund route, which is an *expense* in finance's vocabulary and belongs
+to finance; and any write into `stripe.*` or `finance.*`. Two seams are reported
+rather than patched from here: stripe's purpose vocabulary has no `purchase`, and
+finance's write routes take a fund **id**, so addressing a fund by **code** is a
+read (`GET /api/finance/funds`) followed by the write.
 
 ### Announcements (SPEC §7.14)
 
@@ -930,6 +1084,9 @@ ON CONFLICT DO NOTHING;
 | `PluginRequest` / `PluginResponse` | Framework-neutral request/response (`param`, `query_param`, `json`, `redirect`, `created`, …) |
 | `HostDb` / `HostEvents` / `HostHttp` | Host-mediated I/O traits (implemented by the core) |
 | `Migration`, `Permission`, `Scope`, `ScopeType`, `RoleGrant` | Declarations and scoped permissions; `Identity.grants` is the source of truth (`roles()` is derived) |
+| `permissions!` / `migrations!` | Declaration macros: the permission vocabulary and the migrations each in one place, with `migrations!` embedding `.sql` files. A duplicate permission id, a duplicate or out-of-order migration version, or a version below 1 is a **compile error at the invocation** |
+| `PermissionDecl`, `PermissionSet`, `MigrationSource` | The const-constructible declarations the macros generate (`From<&PermissionDecl> for Permission` bridges to the boundary type) |
+| `testing::assert_routes_gate_declared` / `undeclared_route_gates` | Assert every route gates on a permission the crate declared — the loader's rule, moved into `cargo test` where the failure names the offending route |
 | `SdkError` | Error type with a single HTTP mapping (`status()`) |
 | `SqlValue` | Typed bind parameters (uuid, typed nulls, arrays, JSON) |
 | `prelude` | One import for plugin authors |

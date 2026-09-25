@@ -42,6 +42,21 @@ first-party plugin to pick the helpers up.
   read/manage audience with it, where one query replaces one per grant. It is
   additive (no ABI change), and because the answer is derived from the grants the
   caller already holds, asking cannot widen reach.
+- **SDK v0.3 declaration macros.** `permissions!` and `migrations!` declare a
+  plugin's vocabulary and its migrations in one place, in a module the author
+  names, and the two trait methods become one line each (`perms::granted()`,
+  `migrations::all()`). Each permission id and description occurs exactly once in
+  the crate, so a literal drifting from the declaration beside it is
+  unrepresentable. Compile-time traps at the invocation: a duplicate permission id,
+  a duplicate or out-of-order migration version, a version below 1, and an empty id
+  or description. `migrations!` embeds `.sql` files (`include_str!`), so SQL leaves
+  Rust string literals and version, name and path are each written once. The route
+  gate stays a plain id string — genericising the constructors would change a public
+  signature on a boundary type — so the invariant becomes an assertion instead:
+  `testing::assert_routes_gate_declared` fails naming the route when a gate reads a
+  permission the crate never declared. Additive: no ABI bump, `SDK_ABI_VERSION`
+  stays 4. `adjutant-conflicts` is converted as the proof, its migration versions
+  and names unchanged and its SQL byte-identical, so no database re-runs anything.
 - **`adjutant-missions`** (SPEC §7.3, Accords Art 8): the six-stage lifecycle
   (`request → review → approval → execution → debrief → report`) as routes, each
   guarded by the stage the mission is actually in and each written to a stage
@@ -100,6 +115,32 @@ first-party plugin to pick the helpers up.
   forwarding the caller's own credential so finance's gate re-decides
   `finance:write`. Closing it structurally needs the pattern
   `docs/design/plugin-to-plugin.md` §3.2 deliberately leaves open.
+
+- **`adjutant-store`** (SPEC §7.16): the troop's shop — a catalogue (products and
+  rentals, addressed to a fund by its finance **code**), per-item prices with the
+  dues scale's four tiers, orders priced **from the catalogue and never from the
+  request**, and comp sales as a `store:comp` authority with a mandatory reason.
+  `store.catalogue_items`, `store.orders` and `store.order_lines` in its own
+  schema; an order and its lines are written in **one statement** (a
+  data-modifying CTE over `unnest`ed arrays, the shape finance's transfer uses),
+  so an order priced for goods it does not list is unrepresentable. **Anything
+  free, deducted or discounted draws on the `scholarship` fund**, recorded as
+  `funded_cents = price_cents - charged_cents` and moved as a balanced transfer
+  out of `scholarship` into the order's fund — because `finance` refuses a
+  zero-amount transaction (`transactions_amount_nonzero`), a comp could not be a
+  zero entry and does not need to be one. **The money path, and its limits:**
+  `checkout`, `complete` and `comp` each call another plugin **as the caller**
+  (stripe's checkout and payment routes, finance's transfer) with the caller's own
+  credential forwarded and the target's refusal passed through; a sliding-scale
+  reduction applied by the shop, and a Stripe webhook confirming a payment, have
+  **no caller** — so the draw is left `unbooked` with its amount visible,
+  `GET /api/store/orders/unsettled` is the worklist, `POST
+  /api/store/order/{id}/draw` lets a treasurer book it with their own
+  `finance:write`, and nothing is faked. Custody stays equipment's: a rental holds
+  the item **id** only and names equipment's own availability and checkout routes.
+  `store:read` / `store:read_all` / `store:buy` / `store:manage` / `store:comp` —
+  and no rank in the software: commander-and-above is a `core.role_permissions`
+  row the troop writes.
 
 ### Notes for plugin authors
 
