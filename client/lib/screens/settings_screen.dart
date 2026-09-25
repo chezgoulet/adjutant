@@ -3,6 +3,7 @@ import 'package:flutter/material.dart';
 import '../theme/app_theme.dart';
 import 'dues_screen.dart';
 import 'plugins_screen.dart';
+import 'store_admin_screen.dart';
 
 /// Settings — where you go when something needs changing.
 ///
@@ -32,6 +33,18 @@ class SettingsScreen extends StatelessWidget {
         ),
         const Divider(height: 1),
         _SectionHeader('The House'),
+        ListTile(
+          leading: const Icon(Icons.storefront_outlined),
+          title: const Text('The shop'),
+          subtitle: const Text(
+            'Unsettled orders and draws, adding an item, and every comp',
+          ),
+          trailing: const Icon(Icons.chevron_right),
+          onTap: () => Navigator.of(context).push(
+            MaterialPageRoute<void>(builder: (_) => const StoreAdminScreen()),
+          ),
+        ),
+        const Divider(height: 1),
         ListTile(
           leading: const Icon(Icons.extension_outlined),
           title: const Text('Plugins'),
