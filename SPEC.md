@@ -544,6 +544,8 @@ Adjutant can act as an identity provider for other troop systems. A separate plu
 - Transaction recording (income, expense, transfer)
 - Budget vs. actuals tracking
 - Sliding scale dues administration
+- **The Scholarship fund as the funding source for anything free, deducted or waived.** A comp, a sliding-scale reduction, a scholarship award or a waived due is *drawn from* `scholarship` — recorded as a balanced transfer into the fund that would otherwise have received the money — so the subsidy is visible in the ledger and the Annual Financial Report instead of being expressed as a price of zero. A zero price hides who paid; a draw names them.
+- **Donations and allocations addressed to a named fund** — a scout or troop management may give to the troop, or direct money into a fund (Scholarship above all), and the gift is income to that fund like any other
 - Annual Financial Report generation
 - Lodge dues tracking
 
@@ -685,10 +687,10 @@ These are optional — troops choose which integrations they need.
 
 **Responsibilities:**
 - A catalogue of what a troop sells: uniforms, patches, insignia, camp gear, event merchandise
-- Prices per item, with a **sliding scale** — the same principle as dues, so cost never decides who belongs
+- Prices per item, with a **sliding scale** — the same principle as dues, so cost never decides who belongs; a reduction is funded by a draw on the Scholarship fund (§7.5), never by a lower recorded price
 - **Equipment rentals** as a priced product: the fee is the shop's, the custody and condition stay `equipment`'s (§7.6)
 - Order placement and completion, with the record of what was sold and to whom
-- **Comp sales** — a commander-and-above authority to complete an order at no charge, with the reason and the authority recorded, and the zero amount visible in the ledger and the Annual Financial Report
+- **Comp sales** — a commander-and-above authority to sell to a member at no charge, with the reason and the authority recorded. The amount is **not zero**: it is **drawn from the Scholarship fund**, so who paid for it is visible in the ledger and the Annual Financial Report rather than hidden in a waived price.
 
 **Depends on:** `stripe` (§7.13) to take money and `finance` (§7.5) to record it.
 The shop holds no money and keeps no books of its own: a paid order is completed by
