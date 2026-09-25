@@ -98,6 +98,27 @@ impl Default for __STRUCT__ {
     }
 }
 
+/// The plugin's permission vocabulary, declared once. A route may only gate on a
+/// permission declared here; `perms::assert_routes_gate_declared(&routes)` in a
+/// test proves it, which is the same check the loader makes at startup.
+pub mod perms {
+    adjutant_sdk::permissions! {
+        /// Read __TITLE__ data.
+        READ = "__NAME__:read" => "Read __TITLE__ data";
+        /// Modify __TITLE__ data.
+        MANAGE = "__NAME__:manage" => "Modify __TITLE__ data";
+    }
+}
+
+/// The migrations, with their SQL in `migrations/*.sql` rather than in a Rust
+/// string literal. Version, name and file are bound together, and the macro refuses
+/// to build on a duplicate version, a missing file or a version below 1.
+pub mod migrations {
+    adjutant_sdk::migrations! {
+        1 => "initial_schema" => "../migrations/001_initial_schema.sql";
+    }
+}
+
 #[async_trait]
 impl AdjutantPlugin for __STRUCT__ {
     fn id(&self) -> &str {
@@ -117,27 +138,16 @@ impl AdjutantPlugin for __STRUCT__ {
         Ok(())
     }
 
-    /// Permissions this plugin defines. A route may only require a permission
-    /// the plugin itself grants — the core rejects anything else at load time.
+    /// Permissions and migrations are declared in the `perms` and `migrations`
+    /// modules above: one place per declaration, checked at compile time.
     fn permissions_granted(&self) -> Vec<Permission> {
-        vec![
-            Permission::new("__NAME__:read", "Read __TITLE__ data"),
-            Permission::new("__NAME__:manage", "Modify __TITLE__ data"),
-        ]
+        perms::granted()
     }
 
     /// Runs once, in order, inside this plugin's own PostgreSQL schema
     /// (search_path pre-set by the core). Recorded in core.schema_migrations.
     fn migrations(&self) -> Vec<Migration> {
-        vec![Migration::new(
-            1,
-            "initial_schema",
-            "CREATE TABLE IF NOT EXISTS items (\
-                 id BIGSERIAL PRIMARY KEY, \
-                 name TEXT NOT NULL, \
-                 created_at TIMESTAMPTZ NOT NULL DEFAULT now()\
-             );",
-        )]
+        migrations::all()
     }
 
     /// Routes must live under /api/__NAME__/ — the core rejects namespace
@@ -180,6 +190,17 @@ impl AdjutantPlugin for __STRUCT__ {
 
 export_plugin!(__STRUCT__);
 "#;
+
+/// The scaffolded plugin's first migration, kept beside the template that names it:
+/// a template pointing at a `.sql` file the scaffolder did not write would produce a
+/// crate that cannot compile (`include_str!` would fail to resolve), which is a worse
+/// first impression than the inline form it replaced.
+const INITIAL_SCHEMA_SQL: &str = r#"CREATE TABLE IF NOT EXISTS items (
+    id BIGSERIAL PRIMARY KEY,
+    name TEXT NOT NULL,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+"#;
     let lib = lib
         .replace("__NAME__", name)
         .replace("__STRUCT__", &struct_name_for(name))
@@ -188,6 +209,15 @@ export_plugin!(__STRUCT__);
     std::fs::create_dir_all(dir.join("src")).map_err(|e| e.to_string())?;
     std::fs::write(dir.join("Cargo.toml"), cargo).map_err(|e| e.to_string())?;
     std::fs::write(dir.join("src").join("lib.rs"), lib).map_err(|e| e.to_string())?;
+    // The SQL the template embeds, in the directory the template names. The file
+    // carries no `__NAME__`: the table belongs to the plugin's own schema, and the
+    // schema is already the plugin id.
+    std::fs::create_dir_all(dir.join("migrations")).map_err(|e| e.to_string())?;
+    std::fs::write(
+        dir.join("migrations").join("001_initial_schema.sql"),
+        INITIAL_SCHEMA_SQL,
+    )
+    .map_err(|e| e.to_string())?;
 
     // Register in the workspace members list (idempotent).
     let ws_path = repo_root.join("Cargo.toml");
@@ -776,7 +806,20 @@ mod tests {
         assert!(lib.contains("impl AdjutantPlugin for GearLocker"));
         assert!(lib.contains("export_plugin!(GearLocker)"));
         assert!(lib.contains("\"gear_locker:read\""));
-        assert!(lib.contains("Migration::new"));
+        // The template teaches the SDK macros, not the older inline form, and the
+        // SQL file it names must exist — the macro embeds it with `include_str!`, so
+        // a template naming a file the scaffolder does not write is a crate that
+        // cannot compile.
+        assert!(lib.contains("adjutant_sdk::permissions!"));
+        assert!(lib.contains("adjutant_sdk::migrations!"));
+        assert!(
+            !lib.contains("Permission::new") && !lib.contains("Migration::new"),
+            "the scaffold must teach the current idiom, not the one it replaced"
+        );
+        assert!(
+            dir.join("migrations/001_initial_schema.sql").exists(),
+            "the migration the template embeds must be written"
+        );
 
         let ws = std::fs::read_to_string(tmp.join("Cargo.toml")).unwrap();
         assert!(ws.contains("\"plugins/gear_locker\","));

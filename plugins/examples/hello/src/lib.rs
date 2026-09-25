@@ -37,6 +37,29 @@ impl Default for HelloPlugin {
     }
 }
 
+/// Permissions this plugin defines, declared once. A route may only require a
+/// permission the plugin itself grants — the core rejects anything else at load
+/// time, and [`assert_routes_gate_declared`](crate::perms::assert_routes_gate_declared)
+/// makes the same check a failing test instead of a plugin that will not start.
+pub mod perms {
+    adjutant_sdk::permissions! {
+        /// Read greetings.
+        READ = "hello:read" => "Read greetings";
+        /// Create greetings.
+        WRITE = "hello:write" => "Create greetings";
+    }
+}
+
+/// The migrations, with their SQL in `migrations/*.sql` rather than in Rust string
+/// literals. Version, name and file are bound together here, and the macro refuses
+/// to build on a duplicate version, a missing file, a version below 1, or a name
+/// declared twice.
+pub mod migrations {
+    adjutant_sdk::migrations! {
+        1 => "create_greetings" => "../migrations/001_create_greetings.sql";
+    }
+}
+
 #[async_trait]
 impl AdjutantPlugin for HelloPlugin {
     fn id(&self) -> &str {
@@ -57,28 +80,11 @@ impl AdjutantPlugin for HelloPlugin {
     }
 
     fn permissions_granted(&self) -> Vec<Permission> {
-        vec![
-            Permission::new("hello:read", "Read greetings"),
-            Permission::new("hello:write", "Create greetings"),
-        ]
+        perms::granted()
     }
 
     fn migrations(&self) -> Vec<Migration> {
-        vec![Migration::new(
-            1,
-            "create_greetings",
-            "CREATE TABLE IF NOT EXISTS greetings (\
-                 id BIGSERIAL PRIMARY KEY, \
-                 message TEXT NOT NULL, \
-                 created_at TIMESTAMPTZ NOT NULL DEFAULT now()\
-             );\
-             CREATE TABLE IF NOT EXISTS events_received (\
-                 id BIGSERIAL PRIMARY KEY, \
-                 event_type TEXT NOT NULL, \
-                 payload TEXT, \
-                 received_at TIMESTAMPTZ NOT NULL DEFAULT now()\
-             );",
-        )]
+        migrations::all()
     }
 
     fn schedules(&self) -> Vec<Schedule> {
