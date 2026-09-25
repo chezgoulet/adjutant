@@ -76,14 +76,44 @@ the app at its own box without a rebuild.
 ## Building
 
 ```bash
-# Web — prefer WASM. Flutter serves main.dart.wasm to browsers that support it
-# and falls back to main.dart.js automatically, so there is no downside.
-flutter build web --release --wasm       # build/web
-
+flutter build web --release --wasm       # build/web  (see the caveats below)
+flutter build web --release              # build/web  (JS/CanvasKit)
 flutter build linux --release        # build/linux/x64/release/bundle
 flutter build apk --release          # needs Android SDK
 flutter build ipa --release          # macOS only
 ```
+
+### Web: WASM is a conditional win, not a free one
+
+Flutter emits **both** `main.dart.wasm` and `main.dart.js` and picks at runtime by
+detecting WasmGC support, so the app runs everywhere either way. But WASM is only
+*better* in some places, and the difference is not cosmetic:
+
+- **iOS browsers get no WASM at all.** Every browser on iOS is required to use
+  WebKit, and Flutter's WASM renderer cannot run there. An iPhone user runs the
+  JS build regardless. Ship WASM for desktop and Android Chromium; do not expect
+  it to change anything on iOS.
+- **Multi-threading needs HTTP headers, or the main win is lost.** WASM uses
+  multiple threads to render faster — but only if the server sends:
+
+  | Header | Value |
+  |---|---|
+  | `Cross-Origin-Embedder-Policy` | `credentialless` (or `require-corp`) |
+  | `Cross-Origin-Opener-Policy` | `same-origin` |
+
+  Without them the app still runs, single-threaded, and much of the performance
+  argument evaporates. **Whoever serves this must set those headers** or the WASM
+  build is a bigger download for no gain.
+- **Firefox and Safari currently fall back** to JS because of known bugs in
+  Flutter's WASM renderer.
+- **Deferred loading is experimental** under WASM (`--enable-wasm-deferred-loading`).
+
+Verified here: the WASM build compiles and renders the login screen identically
+to the JS build. That confirms it is not broken — it does not by itself confirm
+it is faster on any given deployment, which depends on the headers above.
+
+If the headers cannot be set, build without `--wasm` and take the JS path
+knowingly.
 
 ## Offline behaviour
 
