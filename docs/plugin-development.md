@@ -34,7 +34,11 @@ ADJUTANT_PLUGIN_DIR=plugins-built cargo run -p adjutant-server
 ```
 
 The scaffold is a compiling plugin: a manifest (the trait impl), two
-permissions, one migration, and an open + a protected route. Start there.
+permissions, one migration, and an open + a protected route. Start there. (It
+declares its permissions and its migration with `Permission::new` /
+`Migration::new`; `permissions!` and `migrations!` declare the same things with
+each id and each `.sql` file written once — see
+[Declaring permissions once](#declaring-permissions-once).)
 
 ## What a plugin is
 
@@ -56,6 +60,14 @@ and migrations are declared in code the compiler checks. (SPEC §5.2's
 use std::sync::OnceLock;
 use adjutant_sdk::prelude::*;
 
+/// The permission vocabulary, declared once (see
+/// [Declaring permissions once](#declaring-permissions-once)).
+pub mod perms {
+    adjutant_sdk::permissions! {
+        READ = "gear_locker:read" => "Read items from the gear locker";
+    }
+}
+
 pub struct GearLocker { ctx: OnceLock<PluginContext> }
 
 #[async_trait]
@@ -69,9 +81,7 @@ impl AdjutantPlugin for GearLocker {
         Ok(())
     }
 
-    fn permissions_granted(&self) -> Vec<Permission> {
-        vec![Permission::new("gear_locker:read", "Read items")]
-    }
+    fn permissions_granted(&self) -> Vec<Permission> { perms::granted() }
 
     fn routes(&self) -> Vec<RouteDefinition> { /* … */ }
 }
@@ -254,6 +264,66 @@ Return an `SdkError` to short-circuit with the matching status:
 `BadRequest` 400, `Unauthorized` 401, `Forbidden` 403, `NotFound` 404,
 `Conflict` 409, `Db`/`Internal` 500.
 
+## Declaring permissions once
+
+A permission id is doubly load-bearing: it lands in `core.permissions`, and it is
+the string a troop's roles are granted in `core.role_permissions`. Written twice
+per permission — once as a declaration, once in the route gate beside it —
+nothing keeps the two in step. `permissions!` declares each one **once**:
+
+```rust
+use adjutant_sdk::prelude::*;
+
+pub mod perms {
+    adjutant_sdk::permissions! {
+        /// Read items.
+        READ = "gear_locker:read" => "Read items from the gear locker";
+        /// Manage items: check in, check out, retire.
+        MANAGE = "gear_locker:manage" => "Manage gear locker items";
+    }
+}
+
+fn permissions_granted(&self) -> Vec<Permission> { perms::granted() }
+```
+
+The macro generates, in the module that invokes it:
+
+| Generated | What it is |
+|---|---|
+| `READ`, `MANAGE` | `const PermissionDecl` — the id (`perms::READ.id`) and the description, as `&'static str` |
+| `ALL`, `SET` | the whole vocabulary in declaration order (`PermissionSet`) |
+| `granted()` | the value `permissions_granted()` returns |
+| `assert_routes_gate_declared(routes)` | a test that every gated route requires a permission this crate declares |
+
+Gate a route by reading the declaration rather than repeating the literal:
+
+```rust
+RouteDefinition::get_protected("/api/gear_locker/items/{id}", perms::READ.id, handler)
+```
+
+and make "every gate names a declared permission" a **test**:
+
+```rust
+#[test]
+fn routes_gate_on_declared_permissions() {
+    let plugin = GearLocker::new();
+    perms::assert_routes_gate_declared(&plugin.routes());
+}
+```
+
+That is the same check the core's loader makes — a route requiring a permission
+your plugin does not declare is refused at load, and `adjutant validate-plugin`
+reports it — moved into `cargo test`, where the failure names the offending route
+and the whole declared vocabulary. The non-panicking form,
+`adjutant_sdk::testing::undeclared_route_gates(perms::ALL, &routes)`, returns the
+offenders as strings if you want to assert on the list yourself.
+
+The macro fails the **build** on an empty id or description, and on the same id
+declared twice (a stale duplicate: two descriptions of one permission, which a
+load-time check cannot see). Declaring permissions with `Permission::new(...)`
+still works and is not deprecated — but a declaration you can point a test at is
+the reason the macro exists.
+
 ## Scheduled work
 
 A plugin that needs periodic work declares a schedule; the **core** runs it. Do
@@ -398,6 +468,48 @@ Each runs once, in version order, on **your plugin's pool as your role**, inside
 your schema, and is recorded in `core.schema_migrations`. Because the DDL runs
 as your role, it can only touch your own schema.
 
+Write the SQL in `.sql` files under `migrations/` and declare them with
+`migrations!`: the version and name are bound to the file, the SQL is embedded at
+compile time, and the SQL gets a syntax highlighter instead of a Rust string
+literal.
+
+```rust
+pub mod migrations {
+    adjutant_sdk::migrations! {
+        1 => "gear_schema" => "../migrations/001_gear_schema.sql";
+        2 => "gear_index" => "../migrations/002_gear_index.sql";
+    }
+}
+
+fn migrations(&self) -> Vec<Migration> { migrations::all() }
+```
+
+- **The path is relative to the file that invokes the macro.** `include_str!` in
+  a `macro_rules!` expansion is resolved at the *invocation* site, so
+  `../migrations/…` written in `src/lib.rs` is your crate's own `migrations/`
+  directory — the layout `adjutant new-plugin` creates. `src/` and `tests/` sit
+  at the same depth, so the same relative path works from a test too.
+- **A path that does not exist is a compile error naming the file**, not a
+  migration that quietly never runs.
+- **A duplicate version, a version below 1, a duplicate name, or an out-of-order
+  list is a compile error** as well (`error[E0080]: evaluation panicked:
+  migrations!: …`). `core.schema_migrations` is keyed by `(schema, version)`: two
+  migrations claiming one version means one of them never executes and the change
+  never reaches a deployed database.
+- The macro generates `MIGRATIONS` (the declared `MigrationSource`s — version,
+  name and embedded SQL), `all()` (what `migrations()` returns), and
+  `find(version)` for a test that pins the identity a deployed database has
+  recorded:
+  ```rust
+  assert_eq!(migrations::find(1).map(|m| m.name), Some("gear_schema"));
+  ```
+- Editing a `.sql` file rebuilds the plugin: rustc records the included file in
+  the crate's dep-info, so a change to the SQL cannot be stranded in a stale
+  `.so`.
+
+The inline form is still supported for a one-line migration, and is not
+deprecated:
+
 ```rust
 fn migrations(&self) -> Vec<Migration> {
     vec![Migration::new(
@@ -481,6 +593,25 @@ assertion helpers are split the same way (`last_query_params` vs
 `last_execute_params`, `queried_sql` vs `executed_sql`). `MockEvents::assert_published`
 fails with the list of events that *were* published, which turns "my event did
 not fire" into a one-line answer.
+
+The **declaration** is assertable too. `permissions!` generates
+`perms::assert_routes_gate_declared(&routes)`, which fails with the offending
+routes and the whole declared vocabulary when a route gates on a permission the
+plugin does not declare — the load-time error the core would give you, as a test
+result instead:
+
+```rust
+#[test]
+fn routes_gate_on_declared_permissions() {
+    perms::assert_routes_gate_declared(&GearLocker::new().routes());
+}
+```
+
+`adjutant_sdk::testing::undeclared_route_gates(perms::ALL, &routes)` is the same
+check as a list, and `migrations::find(version)` is the migration-declaration
+form of it (see
+[Declaring permissions once](#declaring-permissions-once) and
+[Migrations and schema](#migrations-and-schema)).
 
 ## Packaging, loading, and compatibility
 
@@ -573,8 +704,13 @@ the JSON boundary.
    it.
 6. **Route namespace is enforced** — every path starts with `/api/{id}`.
 7. **Permissions are namespaced and must be granted** — a route requiring a
-   permission the plugin doesn't declare is rejected at load.
-8. **Migration versions start at 1** and must be unique.
+   permission the plugin doesn't declare is rejected at load. `permissions!`
+   generates the assertion that catches the same mistake in `cargo test`, and
+   fails the build on the same id declared twice.
+8. **Migration versions start at 1** and must be unique. With `migrations!` that
+   is a compile error (duplicate version, version 0, duplicate name, or
+   out-of-order declaration), alongside a missing `.sql` file — none of them is
+   left to `validate-plugin` to discover after the build.
 
 ## Command reference
 

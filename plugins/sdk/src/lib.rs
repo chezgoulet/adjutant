@@ -34,6 +34,35 @@
 //! Build as `crate-type = ["cdylib", "rlib"]`, drop the `.so` in the server's
 //! plugin directory, and the core loads it at boot.
 //!
+//! ## Declaring the vocabulary once
+//!
+//! A plugin's permissions and migrations are the parts of its declaration that
+//! reach the database: permission ids end up in `core.permissions` and
+//! `core.role_permissions`, and `(version, name)` ends up in
+//! `core.schema_migrations`. Both macros exist so those strings are written
+//! **once** per crate and everything else is generated from them —
+//! [`permissions!`] builds the constants, `permissions_granted()`, and a test
+//! that every route gate names a declared permission; [`migrations!`] embeds each
+//! `.sql` file at compile time with the version and name bound to it, and fails
+//! the build on a duplicate version or a missing file.
+//!
+//! ```rust,ignore
+//! pub mod perms {
+//!     adjutant_sdk::permissions! {
+//!         READ = "gear:read" => "Read items";
+//!     }
+//! }
+//! pub mod migrations {
+//!     adjutant_sdk::migrations! {
+//!         1 => "gear_schema" => "../migrations/001_gear_schema.sql";
+//!     }
+//! }
+//! ```
+//!
+//! Both are additive to the 0.2.0 surface: `Migration::new` and
+//! `Permission::new` remain, and the ABI is unchanged (see
+//! `docs/sdk-compatibility.md`).
+//!
 //! ## Native-loading caveat (Milestone 1)
 //!
 //! Dynamic loading uses `libloading` + a `#[no_mangle] extern "C"` factory, so
@@ -444,6 +473,267 @@ impl Permission {
     pub fn new(id: &str, description: &str) -> Self {
         Self { id: id.into(), description: description.into() }
     }
+}
+
+/// A permission a plugin declares, as a `const`.
+///
+/// [`Permission`] owns two `String`s, so it cannot be a `const` — which is why a
+/// plugin's vocabulary is otherwise spelled out twice: once as
+/// `Permission::new("x:y", "…")` in `permissions_granted()`, and again as the
+/// `"x:y"` literal its route gates on. Those two can drift. The core's load-time
+/// check catches a gate on a permission *nothing* declares, but it cannot catch a
+/// stale duplicate of a declaration, or a description that no longer describes
+/// what the permission allows.
+///
+/// A `PermissionDecl` borrows the two `&'static str`s the crate wrote, so it can
+/// be a `const`, and the [`permissions!`] macro can generate the vocabulary *and*
+/// the `permissions_granted()` list from one declaration each.
+///
+/// ```
+/// use adjutant_sdk::PermissionDecl;
+///
+/// const FILE: PermissionDecl = PermissionDecl::new("conflicts:file", "File a case");
+/// assert_eq!(FILE.id, "conflicts:file");
+/// assert_eq!(FILE.permission().description, "File a case");
+/// assert_eq!(FILE, PermissionDecl::new("conflicts:file", "File a case"));
+/// ```
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PermissionDecl {
+    /// The permission id (`conflicts:file`) — the string that lands in
+    /// `core.permissions` and that a role is granted in `core.role_permissions`.
+    pub id: &'static str,
+    /// What holding the permission allows, in the words an administrator reads.
+    pub description: &'static str,
+}
+
+impl PermissionDecl {
+    pub const fn new(id: &'static str, description: &'static str) -> Self {
+        Self { id, description }
+    }
+
+    /// The declaration as the core's [`Permission`] — what
+    /// `AdjutantPlugin::permissions_granted` returns.
+    pub fn permission(&self) -> Permission {
+        Permission::new(self.id, self.description)
+    }
+}
+
+impl From<&PermissionDecl> for Permission {
+    fn from(decl: &PermissionDecl) -> Self {
+        decl.permission()
+    }
+}
+
+/// The permission vocabulary a plugin declares with [`permissions!`].
+///
+/// A plugin author rarely names this type: the macro generates a `SET` constant
+/// and the two functions a plugin needs (`granted()` and a route-gate assertion).
+/// It exists so the macro can stay declarative — the invariants and the failure
+/// messages live here, aren't re-expanded into every plugin, and have examples
+/// that run.
+///
+/// ```
+/// use adjutant_sdk::{PermissionDecl, PermissionSet};
+///
+/// const READ: PermissionDecl = PermissionDecl::new("gear:read", "Read items");
+/// const MANAGE: PermissionDecl = PermissionDecl::new("gear:manage", "Manage items");
+/// const SET: PermissionSet = PermissionSet::new(&[READ, MANAGE]);
+///
+/// assert!(SET.has("gear:read"));
+/// assert!(!SET.has("gear:write"));
+/// assert_eq!(SET.ids(), vec!["gear:read", "gear:manage"]);
+/// assert_eq!(SET.permissions().len(), 2);
+/// assert_eq!(SET.find("gear:manage"), Some(&MANAGE));
+/// ```
+#[derive(Debug, Clone, Copy)]
+pub struct PermissionSet {
+    declared: &'static [PermissionDecl],
+}
+
+impl PermissionSet {
+    /// Wrap the declarations of one crate. Takes a `const` slice: the vocabulary
+    /// is what the plugin wrote, not something assembled at runtime.
+    pub const fn new(declared: &'static [PermissionDecl]) -> Self {
+        Self { declared }
+    }
+
+    /// The declarations, in declaration order.
+    pub fn declared(&self) -> &'static [PermissionDecl] {
+        self.declared
+    }
+
+    /// The vocabulary as the core's [`Permission`]s — the value
+    /// `permissions_granted()` returns.
+    pub fn permissions(&self) -> Vec<Permission> {
+        self.declared.iter().map(PermissionDecl::permission).collect()
+    }
+
+    /// Every declared id, in declaration order.
+    pub fn ids(&self) -> Vec<&'static str> {
+        self.declared.iter().map(|decl| decl.id).collect()
+    }
+
+    /// The declaration for `id`, if this crate declares it.
+    pub fn find(&self, id: &str) -> Option<&'static PermissionDecl> {
+        self.declared.iter().find(|decl| decl.id == id)
+    }
+
+    /// Does this crate declare `id`?
+    pub fn has(&self, id: &str) -> bool {
+        self.find(id).is_some()
+    }
+
+    /// The declared ids on one line, for a failure message.
+    pub fn vocabulary(&self) -> String {
+        self.ids().join(", ")
+    }
+}
+
+/// `&str` equality in a `const`. `PartialEq for str` is not a const trait, so the
+/// macros' compile-time uniqueness checks compare bytes.
+///
+/// Exists for the expansions of [`permissions!`] and [`migrations!`]; a plugin
+/// author never calls it.
+#[doc(hidden)]
+pub const fn const_str_eq(a: &str, b: &str) -> bool {
+    let (a, b) = (a.as_bytes(), b.as_bytes());
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut i = 0;
+    while i < a.len() {
+        if a[i] != b[i] {
+            return false;
+        }
+        i += 1;
+    }
+    true
+}
+
+/// Declare a plugin's permission vocabulary once: the constants,
+/// `permissions_granted()`, and the assertion that every route gate is declared.
+///
+/// ```
+/// mod perms {
+///     adjutant_sdk::permissions! {
+///         /// Read items.
+///         READ = "gear:read" => "Read items from the gear locker";
+///         /// Manage items.
+///         MANAGE = "gear:manage" => "Manage gear locker items";
+///     }
+/// }
+///
+/// assert_eq!(perms::READ.id, "gear:read");
+/// assert_eq!(perms::MANAGE.description, "Manage gear locker items");
+/// assert_eq!(perms::SET.ids(), vec!["gear:read", "gear:manage"]);
+/// assert_eq!(perms::granted()[1].id, "gear:manage");
+/// # use adjutant_sdk::prelude::*;
+/// # fn permissions_granted() -> Vec<Permission> { perms::granted() }
+/// # assert_eq!(permissions_granted().len(), 2);
+/// ```
+///
+/// A plugin declares its vocabulary the same way, in a module of its own:
+///
+/// ```rust,ignore
+/// // plugins/conflicts/src/lib.rs
+/// pub mod perms {
+///     adjutant_sdk::permissions! {
+///         /// File a case, and act on a case you are already a party to.
+///         FILE = "conflicts:file" => "File a conflict case, and act on a case you are a party to";
+///         READ_OWN = "conflicts:read_own" => "Read a conflict case you have standing in";
+///     }
+/// }
+///
+/// fn permissions_granted(&self) -> Vec<Permission> { perms::granted() }
+/// ```
+///
+/// Generates, in the module that invokes it:
+///
+/// * one `const` per permission, named as declared ([`PermissionDecl`]) — an id
+///   string is written **once** in the crate, and a route gate reads it from
+///   there (`RouteDefinition::get_protected(path, perms::READ_OWN.id, handler)`);
+/// * `ALL` — every declaration, in order (`PermissionSet` values, not names);
+/// * `SET` — the vocabulary as a [`PermissionSet`];
+/// * `granted()` — the value `AdjutantPlugin::permissions_granted` returns;
+/// * `assert_routes_gate_declared(routes)` — a test that every gated route
+///   requires a permission this crate declares;
+/// * a compile-time check that ids and descriptions are non-empty and that ids
+///   are unique (a stale duplicate is two declarations of one permission).
+///
+/// A route that gates on an id this crate does not declare is refused by the
+/// **core** at load (`validate_declaration`), which is a plugin that will not
+/// start. The generated assertion is the same check as a failing test, so the
+/// plugin is corrected before it is built:
+///
+/// ```rust,ignore
+/// #[test]
+/// fn routes_gate_on_declared_permissions() {
+///     let mut plugin = ConflictsPlugin::new();
+///     perms::assert_routes_gate_declared(&plugin.routes());
+/// }
+/// ```
+///
+/// The declaration order is preserved everywhere (`ALL`, `granted()`), so the
+/// vocabulary reads in the order it is written.
+#[macro_export]
+macro_rules! permissions {
+    (
+        $(
+            $(#[$meta:meta])*
+            $name:ident = $id:literal => $description:literal;
+        )*
+    ) => {
+        $(
+            $(#[$meta])*
+            pub const $name: $crate::PermissionDecl =
+                $crate::PermissionDecl::new($id, $description);
+        )*
+
+        /// Every permission this crate declares, in declaration order.
+        pub const ALL: &[$crate::PermissionDecl] = &[$($name),*];
+
+        /// The vocabulary declared above, as a `PermissionSet`.
+        pub const SET: $crate::PermissionSet = $crate::PermissionSet::new(ALL);
+
+        /// The declaration as `AdjutantPlugin::permissions_granted` expects it.
+        pub fn granted() -> Vec<$crate::Permission> {
+            SET.permissions()
+        }
+
+        /// Assert every gated route requires a permission declared above — the
+        /// one-line test that keeps the route gates and the vocabulary in step.
+        pub fn assert_routes_gate_declared(routes: &[$crate::RouteDefinition]) {
+            $crate::testing::assert_routes_gate_declared(ALL, routes)
+        }
+
+        // Declaring the same id twice is a stale duplicate — one of the two
+        // descriptions is wrong, and which permission a role holds becomes
+        // ambiguous. Caught here rather than at load.
+        const _: () = {
+            const IDS: &[&str] = &[$($id),*];
+            const DESCRIPTIONS: &[&str] = &[$($description),*];
+            let mut i = 0;
+            while i < IDS.len() {
+                assert!(
+                    !IDS[i].is_empty(),
+                    "permissions!: a permission id must not be empty"
+                );
+                assert!(
+                    !DESCRIPTIONS[i].is_empty(),
+                    "permissions!: a permission needs a description — it is what an administrator reads when granting the role"
+                );
+                let mut j = i + 1;
+                while j < IDS.len() {
+                    assert!(
+                        !$crate::const_str_eq(IDS[i], IDS[j]),
+                        "permissions!: the same permission id is declared twice — a stale duplicate"
+                    );
+                    j += 1;
+                }
+                i += 1;
+            }
+        };
+    };
 }
 
 /// Permission checks against `core.role_permissions`. Plugins normally don't
@@ -1451,6 +1741,208 @@ impl Migration {
     }
 }
 
+/// A migration whose SQL lives in a `.sql` file and is embedded at compile time.
+///
+/// [`Migration`] owns a `String`, so a migration is normally written
+/// `Migration::new(1, "conflicts_schema", r#"…2 KB of SQL…"#)`: the version and
+/// name are restated beside the SQL, a stray `"#` anywhere in the SQL closes the
+/// literal early with a confusing parse error, and nothing syntax-highlights what
+/// is inside it.
+///
+/// A `MigrationSource` borrows the three parts instead, so the [`migrations!`]
+/// macro can read the SQL in with `include_str!` and a migration's **identity**
+/// — the `(version, name)` recorded in `core.schema_migrations` — is stated once,
+/// beside the file that holds the SQL:
+///
+/// ```rust,ignore
+/// migrations! {
+///     1 => "conflicts_schema" => "../migrations/001_conflicts_schema.sql";
+/// }
+/// ```
+///
+/// ```
+/// use adjutant_sdk::{Migration, MigrationSource};
+///
+/// const FIRST: MigrationSource =
+///     MigrationSource::new(1, "greetings_schema", "CREATE TABLE greetings (id BIGSERIAL);");
+/// assert_eq!(FIRST.to_migration().name, "greetings_schema");
+/// assert_eq!(MigrationSource::all_migrations(&[FIRST])[0].version, 1);
+/// assert!(MigrationSource::find_migration(&[FIRST], 2).is_none());
+/// let as_migration: Migration = (&FIRST).into();
+/// assert_eq!(as_migration.sql, FIRST.sql);
+/// ```
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MigrationSource {
+    /// The version recorded in `core.schema_migrations`; starts at 1.
+    pub version: i64,
+    /// The name recorded beside the version — the human label of what the
+    /// migration did, and part of the migration's identity.
+    pub name: &'static str,
+    /// The file's contents, embedded at compile time.
+    pub sql: &'static str,
+}
+
+impl MigrationSource {
+    pub const fn new(version: i64, name: &'static str, sql: &'static str) -> Self {
+        Self { version, name, sql }
+    }
+
+    /// The source as the core's [`Migration`].
+    pub fn to_migration(&self) -> Migration {
+        Migration::new(self.version, self.name, self.sql)
+    }
+
+    /// Every source as the core's [`Migration`], in declaration order —
+    /// what `AdjutantPlugin::migrations` returns.
+    pub fn all_migrations(sources: &[MigrationSource]) -> Vec<Migration> {
+        sources.iter().map(MigrationSource::to_migration).collect()
+    }
+
+    /// The source for `version`, if the crate declares one.
+    pub fn find_migration(sources: &[MigrationSource], version: i64) -> Option<&MigrationSource> {
+        sources.iter().find(|source| source.version == version)
+    }
+}
+
+impl From<&MigrationSource> for Migration {
+    fn from(source: &MigrationSource) -> Self {
+        source.to_migration()
+    }
+}
+
+/// Declare a plugin's migrations once: version, name, and the `.sql` file that is
+/// their SQL.
+///
+/// ```
+/// mod migrations {
+///     adjutant_sdk::migrations! {
+///         // A path is relative to the file that invokes the macro; these two read
+///         // this crate's own test fixtures, so the example runs.
+///         1 => "greetings_schema" => "../tests/fixtures/001_greetings_schema.sql";
+///         2 => "greetings_index" => "../tests/fixtures/002_greetings_index.sql";
+///     }
+/// }
+/// # use adjutant_sdk::prelude::*;
+/// let declared: Vec<Migration> = migrations::all();
+/// assert_eq!(declared.len(), 2);
+/// assert_eq!(declared[0].name, "greetings_schema");
+/// assert!(declared[0].sql.contains("CREATE TABLE IF NOT EXISTS greetings"));
+/// assert!(migrations::find(2).unwrap().sql.contains("idx_greetings_message"));
+/// ```
+///
+/// A plugin declares its own the same way:
+///
+/// ```rust,ignore
+/// // plugins/conflicts/src/lib.rs
+/// pub mod migrations {
+///     adjutant_sdk::migrations! {
+///         1 => "conflicts_schema" => "../migrations/001_conflicts_schema.sql";
+///         2 => "stage_log_append_only" => "../migrations/002_stage_log_append_only.sql";
+///     }
+/// }
+///
+/// fn migrations(&self) -> Vec<Migration> { migrations::all() }
+/// ```
+///
+/// Generates, in the module that invokes it:
+///
+/// * `MIGRATIONS` — the declared [`MigrationSource`]s, in declaration order;
+/// * `all()` — the declaration as `AdjutantPlugin::migrations` expects it;
+/// * `find(version)` — one declaration by version, for a test that pins the
+///   identity the database recorded;
+/// * compile-time checks: versions start at 1, are unique and ascending, and
+///   names are non-empty and unique.
+///
+/// **The path is resolved relative to the file that invokes the macro.**
+/// `include_str!` inside a `macro_rules!` expansion is expanded at the
+/// *invocation* site, not where the macro was defined, so `"../migrations/…"`
+/// written in `src/lib.rs` is the crate's own `migrations/` directory — the
+/// layout the plugin scaffold uses, and the reason a helper macro can embed a
+/// `.sql` file at all.
+///
+/// Both failure modes are compile errors, deliberately:
+///
+/// * a path that does not exist is `include_str!`'s own error, which names the
+///   file it looked for;
+/// * a duplicate version is a `const` evaluation failure
+///   (`error[E0080]: evaluation panicked: migrations!: duplicate version …`) —
+///   `core.schema_migrations` is keyed by `(schema, version)`, so two migrations
+///   claiming one version means one of them silently never runs.
+///
+/// Neither is left to the load-time check, which reports it only once the plugin
+/// is built and installed.
+#[macro_export]
+macro_rules! migrations {
+    (
+        $(
+            $version:expr => $name:literal => $path:literal;
+        )*
+    ) => {
+        /// Every migration this crate declares, in declaration order.
+        pub const MIGRATIONS: &[$crate::MigrationSource] = &[
+            $(
+                $crate::MigrationSource {
+                    version: $version,
+                    name: $name,
+                    sql: include_str!($path),
+                },
+            )*
+        ];
+
+        /// The declarations as `AdjutantPlugin::migrations` expects them.
+        pub fn all() -> Vec<$crate::Migration> {
+            $crate::MigrationSource::all_migrations(MIGRATIONS)
+        }
+
+        /// The declaration for `version`, if this crate declares one.
+        pub fn find(version: i64) -> Option<&'static $crate::MigrationSource> {
+            $crate::MigrationSource::find_migration(MIGRATIONS, version)
+        }
+
+        // The invariants the load-time check also enforces — stated here so the
+        // build fails instead of the load. `core.schema_migrations` is keyed by
+        // (schema, version): a duplicate version is a migration that never runs,
+        // and an out-of-order list is one whose intent the reviewer has to
+        // reconstruct.
+        const _: () = {
+            const VERSIONS: &[i64] = &[$($version),*];
+            const NAMES: &[&str] = &[$($name),*];
+            let mut i = 0;
+            while i < VERSIONS.len() {
+                assert!(
+                    VERSIONS[i] >= 1,
+                    "migrations!: versions start at 1 (the core rejects 0)"
+                );
+                assert!(
+                    !NAMES[i].is_empty(),
+                    "migrations!: a migration needs a name — it is what core.schema_migrations records beside the version"
+                );
+                let mut j = i + 1;
+                while j < VERSIONS.len() {
+                    assert!(
+                        VERSIONS[i] != VERSIONS[j],
+                        "migrations!: duplicate version — core.schema_migrations is keyed by version, so one of the two would never run"
+                    );
+                    assert!(
+                        !$crate::const_str_eq(NAMES[i], NAMES[j]),
+                        "migrations!: duplicate migration name"
+                    );
+                    j += 1;
+                }
+                i += 1;
+            }
+            let mut k = 0;
+            while k + 1 < VERSIONS.len() {
+                assert!(
+                    VERSIONS[k] < VERSIONS[k + 1],
+                    "migrations!: declare migrations in ascending version order"
+                );
+                k += 1;
+            }
+        };
+    };
+}
+
 // ---------------------------------------------------------------------------
 // Plugin context & trait
 // ---------------------------------------------------------------------------
@@ -1564,11 +2056,12 @@ macro_rules! export_plugin {
 /// One import for plugin authors: `use adjutant_sdk::prelude::*;`
 pub mod prelude {
     pub use crate::{
-        async_trait, event_handler, event_type, export_plugin, route_handler, schedule_handler,
-        AdjutantPlugin, AuditService, DbHandle, Event, EventBusHandle, EventSubscription, HostDb,
-        HostEvents, HostHttp, HttpResponse, Identity, IdentityProvider, IdentityRegistrar, Method,
-        Migration, MissionCompleted, MotionFailed, MotionPassed, Permission, PermissionScope,
-        PermissionService, PluginContext, PluginRequest, PluginResponse, RoleGrant, RouteDefinition,
+        async_trait, event_handler, event_type, export_plugin, migrations, permissions,
+        route_handler, schedule_handler, AdjutantPlugin, AuditService, DbHandle, Event,
+        EventBusHandle, EventSubscription, HostDb, HostEvents, HostHttp, HttpResponse, Identity,
+        IdentityProvider, IdentityRegistrar, Method, Migration, MigrationSource, MissionCompleted,
+        MotionFailed, MotionPassed, Permission, PermissionDecl, PermissionScope, PermissionService,
+        PermissionSet, PluginContext, PluginRequest, PluginResponse, RoleGrant, RouteDefinition,
         Schedule, ScheduleHandler, Scope, ScopeType, SdkError, SqlValue,
     };
 }
@@ -2021,6 +2514,88 @@ pub mod testing {
     /// Decode a response body as JSON (`Null` when the body is empty or not JSON).
     pub fn response_json(resp: &PluginResponse) -> Value {
         serde_json::from_slice(&resp.body).unwrap_or(Value::Null)
+    }
+
+    // --- declared-vocabulary assertions --------------------------------------
+
+    /// Every route in `routes` that gates on a permission `declared` does not
+    /// contain, as `"GET /api/x requires \"x:y\""` strings — empty when every
+    /// gate is declared.
+    ///
+    /// Routes with no gate at all (`required_permission` is `None`) are **not**
+    /// reported: an open route is a decision, and whether a plugin should gate
+    /// every route is the plugin's business, not this check's.
+    ///
+    /// ```rust
+    /// use adjutant_sdk::prelude::*;
+    /// use adjutant_sdk::testing::undeclared_route_gates;
+    ///
+    /// let declared = [PermissionDecl::new("x:read", "Read x")];
+    /// let handler = route_handler(|_| async {
+    ///     PluginResponse::json(200, &serde_json::json!({}))
+    /// });
+    /// let routes = vec![
+    ///     RouteDefinition::get_protected("/api/x/things", "x:read", handler.clone()),
+    ///     RouteDefinition::get("/api/x/health", handler.clone()),
+    ///     RouteDefinition::post_protected("/api/x/things", "x:write", handler),
+    /// ];
+    /// assert_eq!(
+    ///     undeclared_route_gates(&declared, &routes),
+    ///     vec!["POST /api/x/things requires \"x:write\"".to_string()],
+    /// );
+    /// ```
+    pub fn undeclared_route_gates(
+        declared: &[PermissionDecl],
+        routes: &[RouteDefinition],
+    ) -> Vec<String> {
+        routes
+            .iter()
+            .filter_map(|route| {
+                let required = route.required_permission.as_deref()?;
+                if declared.iter().any(|decl| decl.id == required) {
+                    return None;
+                }
+                Some(format!(
+                    "{} {} requires {required:?}",
+                    route.method.as_str(),
+                    route.path
+                ))
+            })
+            .collect()
+    }
+
+    /// Assert every gated route requires a permission the plugin declared. The
+    /// [`permissions!`](crate::permissions) macro generates a per-crate wrapper
+    /// for this — `perms::assert_routes_gate_declared(&plugin.routes())`.
+    ///
+    /// The core's load-time check (`validate_declaration`) refuses a gate on a
+    /// permission *nothing* grants, so the plugin never starts. This is the same
+    /// check one step earlier, where it is cheap: a route that gates on a copy of
+    /// a declaration — a misspelling the compiler cannot see, or a permission
+    /// that was renamed and a gate that was not — fails the build's test run
+    /// instead of failing to load, and the message names the route and the whole
+    /// vocabulary it was compared against.
+    ///
+    /// ```should_panic
+    /// use adjutant_sdk::prelude::*;
+    /// use adjutant_sdk::testing::assert_routes_gate_declared;
+    ///
+    /// let declared = [PermissionDecl::new("x:read", "Read x")];
+    /// let routes = vec![RouteDefinition::get_protected(
+    ///     "/api/x/things",
+    ///     "x:readd",
+    ///     route_handler(|_| async { PluginResponse::json(200, &serde_json::json!({})) }),
+    /// )];
+    /// assert_routes_gate_declared(&declared, &routes);
+    /// ```
+    pub fn assert_routes_gate_declared(declared: &[PermissionDecl], routes: &[RouteDefinition]) {
+        let undeclared = undeclared_route_gates(declared, routes);
+        assert!(
+            undeclared.is_empty(),
+            "these routes gate on a permission this plugin does not declare, so the core would \
+             refuse to load it: {undeclared:?}; declared: {:?}",
+            declared.iter().map(|decl| decl.id).collect::<Vec<_>>()
+        );
     }
 
     #[cfg(test)]

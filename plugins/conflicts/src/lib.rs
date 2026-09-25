@@ -75,10 +75,19 @@
 //! `conflicts:file` / `conflicts:read_own`, because a facilitator is also a
 //! member; the object checks still confine each route to the cases they carry.
 //!
+//! The four ids are declared **once**, in [`perms`], with these descriptions;
+//! `permissions_granted()` returns that declaration and every route gate reads
+//! its id from it. `perms::assert_routes_gate_declared` — called in this crate's
+//! tests — is what makes "every gate names a declared permission" a test result
+//! rather than a load-time surprise.
+//!
 //! ## Schema
 //!
 //! `conflicts.cases` (the case, its current stage, its visibility lists, its
-//! outcome) and `conflicts.stage_log` (append-only). Vocabulary that reaches a
+//! outcome) and `conflicts.stage_log` (append-only). The DDL lives in
+//! `plugins/conflicts/migrations/*.sql` and is embedded at compile time by
+//! [`migrations!`], which binds each file to the version and name recorded in
+//! `core.schema_migrations`. Vocabulary that reaches a
 //! decision — stages, statuses, log kinds — is constrained in the database,
 //! because a stage code that has reached the log is a record, not a convention.
 //! The filer is constrained to be a party (`cases_filer_is_a_party`), so "I
@@ -102,6 +111,51 @@ use adjutant_sdk::prelude::*;
 use chrono::{DateTime, NaiveDateTime, TimeZone, Utc};
 use serde::Deserialize;
 use serde_json::{json, Value};
+
+// ---------------------------------------------------------------------------
+// The declaration — stated once, and everything else generated from it
+// ---------------------------------------------------------------------------
+
+/// The permission vocabulary, declared once.
+///
+/// The crate docs above say what each permission is and why it is not wider;
+/// this module is where the four id strings live. `permissions_granted()`
+/// returns [`granted`](crate::perms::granted), and every route gate reads its
+/// permission from these declarations (`perms::FILE.id`) instead of repeating the
+/// literal — so a gate cannot drift from the vocabulary it gates on. The tests
+/// call
+/// [`assert_routes_gate_declared`](crate::perms::assert_routes_gate_declared),
+/// which is the same check the core's loader makes, as a failing test rather than
+/// a plugin that will not load.
+pub mod perms {
+    adjutant_sdk::permissions! {
+        /// File a case; and act on a case you are already a party to.
+        FILE = "conflicts:file" => "File a conflict case, and act on a case you are a party to (record your agreement, add a party, withdraw)";
+        /// Read a case you have standing in — a party, or its facilitator.
+        READ_OWN = "conflicts:read_own" => "Read a conflict case you have standing in — you are one of its parties, or a facilitator assigned to it";
+        /// Carry a case you are assigned to.
+        FACILITATE = "conflicts:facilitate" => "Carry a conflict case you are assigned to: advance its stage and record its outcome";
+        /// Administer the pathway (staffing it), never its content.
+        MANAGE = "conflicts:manage" => "Administer the conflict pathway: appoint and release facilitators, and see which cases are stalled and uncarried";
+    }
+}
+
+/// The migrations, with their SQL in `migrations/*.sql`.
+///
+/// The SQL is embedded at compile time (`include_str!`), and the path is relative
+/// to *this* file — so `../migrations/…` is the crate's own directory. The
+/// version and name that `core.schema_migrations` records are bound to the file
+/// here, rather than restated beside a multi-kilobyte string literal, and the
+/// macro refuses to build on a duplicate version, a missing file, a version below
+/// 1, or a name declared twice. **These versions and names must not change:** a
+/// deployed database has them recorded, and the version decides whether a
+/// migration runs.
+pub mod migrations {
+    adjutant_sdk::migrations! {
+        1 => "conflicts_schema" => "../migrations/001_conflicts_schema.sql";
+        2 => "stage_log_append_only" => "../migrations/002_stage_log_append_only.sql";
+    }
+}
 
 // ---------------------------------------------------------------------------
 // The pathway
@@ -806,107 +860,11 @@ impl AdjutantPlugin for ConflictsPlugin {
     }
 
     fn permissions_granted(&self) -> Vec<Permission> {
-        vec![
-            Permission::new(
-                "conflicts:file",
-                "File a conflict case, and act on a case you are a party to \
-                 (record your agreement, add a party, withdraw)",
-            ),
-            Permission::new(
-                "conflicts:read_own",
-                "Read a conflict case you have standing in — you are one of its parties, \
-                 or a facilitator assigned to it",
-            ),
-            Permission::new(
-                "conflicts:facilitate",
-                "Carry a conflict case you are assigned to: advance its stage and record \
-                 its outcome",
-            ),
-            Permission::new(
-                "conflicts:manage",
-                "Administer the conflict pathway: appoint and release facilitators, and \
-                 see which cases are stalled and uncarried",
-            ),
-        ]
+        perms::granted()
     }
 
     fn migrations(&self) -> Vec<Migration> {
-        vec![
-            Migration::new(
-                1,
-                "conflicts_schema",
-                r#"
-CREATE TABLE IF NOT EXISTS cases (
-    id BIGSERIAL PRIMARY KEY,
-    title TEXT NOT NULL,
-    summary TEXT NOT NULL DEFAULT '',
-    stage TEXT NOT NULL DEFAULT 'direct_conversation',
-    status TEXT NOT NULL DEFAULT 'open',
-    filed_by TEXT NOT NULL,
-    party_ids TEXT[] NOT NULL DEFAULT '{}',
-    facilitator_ids TEXT[] NOT NULL DEFAULT '{}',
-    outcome TEXT NOT NULL DEFAULT '',
-    agreement TEXT NOT NULL DEFAULT '',
-    stage_since TIMESTAMPTZ NOT NULL DEFAULT now(),
-    nudge_count INTEGER NOT NULL DEFAULT 0,
-    nudged_at TIMESTAMPTZ,
-    resolved_at TIMESTAMPTZ,
-    resolved_by TEXT,
-    withdrawn_at TIMESTAMPTZ,
-    withdrawn_by TEXT,
-    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-    updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-    CONSTRAINT cases_stage_valid CHECK (stage IN (
-        'direct_conversation', 'facilitation', 'arbitration', 'troop_council')),
-    CONSTRAINT cases_status_valid CHECK (status IN ('open', 'resolved', 'withdrawn')),
-    CONSTRAINT cases_parties_present CHECK (array_length(party_ids, 1) >= 1),
-    CONSTRAINT cases_filer_is_a_party CHECK (filed_by = ANY(party_ids)),
-    CONSTRAINT cases_resolution_recorded CHECK (status <> 'resolved' OR outcome <> ''),
-    CONSTRAINT cases_withdrawal_recorded CHECK (status <> 'withdrawn' OR withdrawn_at IS NOT NULL)
-);
-CREATE INDEX IF NOT EXISTS idx_cases_parties ON cases USING GIN (party_ids);
-CREATE INDEX IF NOT EXISTS idx_cases_facilitators ON cases USING GIN (facilitator_ids);
-CREATE INDEX IF NOT EXISTS idx_cases_stall ON cases (status, stage_since);
-
-CREATE TABLE IF NOT EXISTS stage_log (
-    id BIGSERIAL PRIMARY KEY,
-    case_id BIGINT NOT NULL REFERENCES cases(id) ON DELETE RESTRICT,
-    kind TEXT NOT NULL DEFAULT 'transition',
-    from_stage TEXT NOT NULL DEFAULT '',
-    to_stage TEXT NOT NULL DEFAULT '',
-    actor TEXT NOT NULL,
-    reason TEXT NOT NULL,
-    occurred_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-    CONSTRAINT stage_log_kind_valid CHECK (kind IN (
-        'filed', 'transition', 'resolution', 'agreement', 'withdrawn',
-        'facilitator_assigned', 'facilitator_released', 'party_added', 'nudge')),
-    CONSTRAINT stage_log_reason_present CHECK (btrim(reason) <> '')
-);
-CREATE INDEX IF NOT EXISTS idx_stage_log_case ON stage_log (case_id, occurred_at, id);
-"#,
-            ),
-            // The history is the accountability, so it is not merely written
-            // append-only by convention: the database refuses to rewrite it. The
-            // plugin never issues an UPDATE or DELETE against stage_log, and this
-            // makes that a property of the schema rather than a promise.
-            Migration::new(
-                2,
-                "stage_log_append_only",
-                r#"
-CREATE OR REPLACE FUNCTION conflicts_stage_log_append_only() RETURNS TRIGGER AS $$
-BEGIN
-    RAISE EXCEPTION
-        'conflicts.stage_log is append-only (% refused): the history is the accountability', TG_OP;
-END;
-$$ LANGUAGE plpgsql;
-
-DROP TRIGGER IF EXISTS stage_log_append_only ON stage_log;
-CREATE TRIGGER stage_log_append_only
-    BEFORE UPDATE OR DELETE ON stage_log
-    FOR EACH ROW EXECUTE FUNCTION conflicts_stage_log_append_only();
-"#,
-            ),
-        ]
+        migrations::all()
     }
 
     fn routes(&self) -> Vec<RouteDefinition> {
@@ -962,7 +920,7 @@ fn file_case(ctx: &PluginContext) -> RouteDefinition {
     let c = ctx.clone();
     RouteDefinition::post_protected_any_scope(
         "/api/conflicts/case",
-        "conflicts:file",
+        perms::FILE.id,
         route_handler(move |req| {
             let c = c.clone();
             async move {
@@ -1070,7 +1028,7 @@ fn list_cases(ctx: &PluginContext) -> RouteDefinition {
     let c = ctx.clone();
     RouteDefinition::get_protected_any_scope(
         "/api/conflicts/cases",
-        "conflicts:read_own",
+        perms::READ_OWN.id,
         route_handler(move |req| {
             let c = c.clone();
             async move {
@@ -1152,7 +1110,7 @@ fn get_case(ctx: &PluginContext) -> RouteDefinition {
     let c = ctx.clone();
     RouteDefinition::get_protected_any_scope(
         "/api/conflicts/case/{id}",
-        "conflicts:read_own",
+        perms::READ_OWN.id,
         route_handler(move |req| {
             let c = c.clone();
             async move {
@@ -1208,7 +1166,7 @@ fn case_log(ctx: &PluginContext) -> RouteDefinition {
     let c = ctx.clone();
     RouteDefinition::get_protected_any_scope(
         "/api/conflicts/case/{id}/log",
-        "conflicts:read_own",
+        perms::READ_OWN.id,
         route_handler(move |req| {
             let c = c.clone();
             async move {
@@ -1256,7 +1214,7 @@ fn advance_stage(ctx: &PluginContext) -> RouteDefinition {
     let c = ctx.clone();
     RouteDefinition::post_protected_any_scope(
         "/api/conflicts/case/{id}/stage",
-        "conflicts:facilitate",
+        perms::FACILITATE.id,
         route_handler(move |req| {
             let c = c.clone();
             async move {
@@ -1383,7 +1341,7 @@ fn record_resolution(ctx: &PluginContext) -> RouteDefinition {
     let c = ctx.clone();
     RouteDefinition::post_protected_any_scope(
         "/api/conflicts/case/{id}/resolution",
-        "conflicts:facilitate",
+        perms::FACILITATE.id,
         route_handler(move |req| {
             let c = c.clone();
             async move {
@@ -1477,7 +1435,7 @@ fn record_agreement(ctx: &PluginContext) -> RouteDefinition {
     let c = ctx.clone();
     RouteDefinition::post_protected_any_scope(
         "/api/conflicts/case/{id}/agreement",
-        "conflicts:file",
+        perms::FILE.id,
         route_handler(move |req| {
             let c = c.clone();
             async move {
@@ -1587,7 +1545,7 @@ fn withdraw_case(ctx: &PluginContext) -> RouteDefinition {
     let c = ctx.clone();
     RouteDefinition::post_protected_any_scope(
         "/api/conflicts/case/{id}/withdraw",
-        "conflicts:file",
+        perms::FILE.id,
         route_handler(move |req| {
             let c = c.clone();
             async move {
@@ -1676,7 +1634,7 @@ fn set_facilitator(ctx: &PluginContext) -> RouteDefinition {
     let c = ctx.clone();
     RouteDefinition::post_protected_any_scope(
         "/api/conflicts/case/{id}/facilitator",
-        "conflicts:manage",
+        perms::MANAGE.id,
         route_handler(move |req| {
             let c = c.clone();
             async move {
@@ -1820,7 +1778,7 @@ fn add_party(ctx: &PluginContext) -> RouteDefinition {
     let c = ctx.clone();
     RouteDefinition::post_protected_any_scope(
         "/api/conflicts/case/{id}/party",
-        "conflicts:file",
+        perms::FILE.id,
         route_handler(move |req| {
             let c = c.clone();
             async move {
@@ -1915,7 +1873,7 @@ fn stalled_cases(ctx: &PluginContext) -> RouteDefinition {
     let c = ctx.clone();
     RouteDefinition::get_protected_any_scope(
         "/api/conflicts/stalled",
-        "conflicts:facilitate",
+        perms::FACILITATE.id,
         route_handler(move |req| {
             let c = c.clone();
             async move {
