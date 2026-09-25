@@ -23,7 +23,8 @@ use adjutant_stripe::{
     body_digest, checkout_form, category_for, form_encode_value, forward_headers, parse_amount_to_cents,
     sign, verify_signature, CheckoutRequest, StripePlugin, CATEGORY_DUES, DEFAULT_BASE_URL,
     FINANCE_FUNDS_PATH, FINANCE_TRANSACTION_PATH, LEDGER_BOOKED, LEDGER_DELEGATED_EVENT,
-    LEDGER_REFUSED, MECHANISM_CALLER_FORWARD, PERM_CHECKOUT, PERM_MANAGE, PERM_READ,
+    LEDGER_INTENT_ENQUEUED, LEDGER_REFUSED, LEDGER_UNBOOKED, MECHANISM_CALLER_FORWARD,
+    MECHANISM_OUTBOX, PERM_CHECKOUT, PERM_MANAGE, PERM_READ,
     PERM_READ_ALL, PURPOSE_DONATION, PURPOSE_DUES, PURPOSE_EVENT_FEE, PURPOSES,
     SESSION_COMPLETED, SESSION_FAILED, SIGNATURE_HEADER,
 };
@@ -447,6 +448,13 @@ async fn declared_manifest_satisfies_the_load_rules() {
     versions.dedup();
     assert_eq!(before, versions.len(), "migration versions must be unique");
     assert!(versions.iter().all(|v| *v >= 1), "versions start at 1");
+    assert_eq!(
+        versions,
+        vec![1, 2],
+        "the outbox intent's status had to be a NEW version: an applied migration is skipped \
+         without its SQL being compared, so amending version 1 would be invisible on every \
+         database that already ran it"
+    );
 
     let ddl = &migrations[0].sql;
     for table in ["checkout_sessions", "webhook_events", "payments"] {
@@ -457,9 +465,49 @@ async fn declared_manifest_satisfies_the_load_rules() {
     assert!(ddl.contains("checkout_sessions_purpose_valid"));
     assert!(ddl.contains("payment_id TEXT NOT NULL UNIQUE"));
 
-    // This plugin subscribes to nothing, on purpose: it publishes the fact and
-    // does not react to its own output (plugin-to-plugin.md §3.4).
-    assert!(plugin.subscriptions().is_empty());
+    // Version 1 is byte-identical to what shipped inline: the version and name in
+    // `core.schema_migrations` are unchanged, so nothing re-runs on a deployed
+    // database and the runner's skip is not asked to notice a difference.
+    assert!(
+        !ddl.contains("ledger_intent_id"),
+        "the intent column belongs to version 2, not to an amended version 1"
+    );
+    let second = &migrations[1].sql;
+    assert!(second.contains("ADD COLUMN IF NOT EXISTS ledger_intent_id"));
+    assert!(second.contains("idx_stripe_payments_intent"));
+    // The replaced check admits the new status and keeps every old one.
+    for status in [
+        "unbooked",
+        "intent_enqueued",
+        "delegated_event",
+        "booked",
+        "refused",
+        "failed",
+    ] {
+        assert!(
+            second.contains(&format!("'{status}'")),
+            "version 2's check must name {status}"
+        );
+    }
+    assert_eq!(
+        plugin.migrations()[1].name,
+        "payment_ledger_intent",
+        "the version and name are the migration's identity in core.schema_migrations"
+    );
+
+    // This plugin subscribes to the core's outbox outcome events — a
+    // **notification** that settles its own `ledger_status`, never the mechanism
+    // by which the ledger learns (the intent is). It still does not subscribe to
+    // anything it publishes itself (plugin-to-plugin.md §3.4).
+    let subscriptions = plugin.subscriptions();
+    assert_eq!(subscriptions.len(), 1);
+    assert_eq!(subscriptions[0].filter, adjutant_stripe::OUTBOX_EVENT_PREFIX);
+    assert_eq!(subscriptions[0].filter, "core.outbox.");
+    assert!(
+        subscriptions[0].matches("core.outbox.delivered")
+            && subscriptions[0].matches("core.outbox.exhausted"),
+        "it must take the relay's terminal outcomes"
+    );
     let schedules = plugin.schedules();
     assert_eq!(schedules.len(), 1);
     assert_eq!(schedules[0].name, "unbooked_sweep");
@@ -703,6 +751,299 @@ async fn a_signed_webhook_records_one_payment_and_hands_it_to_finance() {
         .unwrap()
         .contains("no credential to forward"));
 }
+
+#[tokio::test]
+async fn a_confirmed_payment_and_its_ledger_intent_are_one_statement() {
+    let h = Harness::new(config());
+    let routes = h.routes().await;
+    let webhook = route(&routes, "POST", "/api/stripe/webhook");
+
+    // 1. the receipt, 2. the payment the statement returns — and, between them,
+    // the funds read the enqueue-time resolution makes.
+    h.db.push_rows(vec![serde_json::json!({ "id": 1, "redeliveries": 0 })]);
+    h.http.push_json(
+        200,
+        &serde_json::json!({
+            "funds": [
+                { "id": 3, "code": "general", "name": "General Fund", "active": true },
+                { "id": 9, "code": "scholarship", "name": "Scholarship Fund", "active": true },
+            ]
+        }),
+    );
+    let mut recorded = payment_row(LEDGER_INTENT_ENQUEUED);
+    recorded["ledger_intent_id"] = serde_json::json!(77);
+    recorded["ledger_mechanism"] = serde_json::json!(MECHANISM_OUTBOX);
+    h.db.push_rows(vec![recorded]);
+
+    let (status, body) = call(
+        &webhook.handler,
+        signed_webhook(&session_completed_payload(), WEBHOOK_SECRET, now()),
+    )
+    .await;
+    assert_eq!(status, 200, "{body}");
+
+    // The fund id was resolved AT ENQUEUE TIME over finance's own route, which is
+    // the only way the payload can be complete: the relay cannot read at
+    // delivery.
+    let calls = h.http.calls();
+    assert_eq!(
+        calls.len(),
+        1,
+        "one read and no booking call: the relay books it, not this request"
+    );
+    assert_eq!(calls[0].method, "GET");
+    assert!(calls[0]
+        .url
+        .starts_with(&format!("{BASE_URL}{FINANCE_FUNDS_PATH}")));
+    assert!(
+        calls[0].headers.is_empty(),
+        "a Stripe webhook carries no credential to forward, and none is invented: {:?}",
+        calls[0].headers
+    );
+
+    // ONE statement recorded the payment and enqueued the intent: the enqueue is
+    // an expression in the INSERT's own VALUES list, and its idempotency key is
+    // the payment's identifier ($1), so the two commit together or neither does.
+    let inserts: Vec<String> = h
+        .db
+        .queried_sql()
+        .into_iter()
+        .filter(|sql| sql.contains("INSERT INTO \"stripe\".\"payments\""))
+        .collect();
+    assert_eq!(inserts.len(), 1, "exactly one payment insert: {inserts:?}");
+    let sql = &inserts[0];
+    assert!(
+        sql.contains(
+            "core.outbox_enqueue($15, 'POST', '/api/finance/transaction', $16::jsonb, $1)"
+        ),
+        "the intent must be enqueued inside the payment's own insert, keyed on the payment \
+         id: {sql}"
+    );
+    assert!(sql.contains("ledger_intent_id"));
+    assert!(sql.contains("ON CONFLICT (payment_id) DO NOTHING"));
+
+    let params = h
+        .db
+        .last_query_params("core.outbox_enqueue")
+        .expect("the statement's binds");
+    assert_eq!(
+        text_of(&params[14]).as_deref(),
+        Some(adjutant_stripe::LEDGER_PRINCIPAL),
+        "the principal the core declared for this producer, and no other"
+    );
+    let payload = match &params[15] {
+        SqlValue::Json(raw) => serde_json::from_str::<serde_json::Value>(raw).unwrap(),
+        other => panic!("the payload must be JSONB: {other:?}"),
+    };
+    assert_eq!(payload["fund_id"], 3, "resolve at enqueue time, not at delivery");
+    assert_eq!(payload["kind"], "income");
+    assert_eq!(payload["amount_cents"], 2500, "income is a positive magnitude");
+    assert_eq!(payload["category"], CATEGORY_DUES);
+    assert_eq!(
+        payload["external_ref"], "pi_test_1",
+        "finance's unique key is Stripe's payment id, so a redelivery cannot double-book"
+    );
+    assert_eq!(payload["member_id"], "42");
+    assert_eq!(payload["fiscal_year"], 2026);
+    assert!(payload["occurred_on"].is_string());
+
+    // The hand-off is the relay, so no event delegation for this payment: two
+    // mechanisms for one fact is how a double booking gets written.
+    assert!(
+        h.events.payloads("payment.received").is_empty(),
+        "an enqueued intent replaces the event path"
+    );
+    let confirmed = h.events.payloads("stripe.payment.confirmed");
+    assert_eq!(confirmed.len(), 1);
+    assert_eq!(confirmed[0]["ledger_status"], LEDGER_INTENT_ENQUEUED);
+    assert_eq!(confirmed[0]["ledger_intent_id"], 77);
+
+    // And the response states which mechanism carried it, and its intent.
+    assert_eq!(body["ledger"]["path"], "outbox");
+    assert_eq!(body["ledger"]["intent_id"], 77);
+    assert_eq!(
+        body["ledger"]["principal"],
+        adjutant_stripe::LEDGER_PRINCIPAL
+    );
+    assert_eq!(body["ledger"]["synchronous"], false);
+    assert_audited(&h.db, "stripe.payment.recorded");
+}
+
+#[tokio::test]
+async fn a_redelivered_webhook_keeps_one_intent() {
+    let h = Harness::new(config());
+    let routes = h.routes().await;
+    let webhook = route(&routes, "POST", "/api/stripe/webhook");
+
+    // A redelivery: the receipt is already there (counted, not inserted), the
+    // funds read answers again, and the payment insert conflicts — no row.
+    h.db.push_rows(vec![]);
+    h.http.push_json(
+        200,
+        &serde_json::json!({
+            "funds": [{ "id": 3, "code": "general", "name": "General Fund", "active": true }]
+        }),
+    );
+    h.db.push_rows(vec![]);
+    let mut existing = payment_row(LEDGER_INTENT_ENQUEUED);
+    existing["ledger_intent_id"] = serde_json::json!(77);
+    existing["ledger_mechanism"] = serde_json::json!(MECHANISM_OUTBOX);
+    h.db.push_rows(vec![existing]);
+
+    let (status, body) = call(
+        &webhook.handler,
+        signed_webhook(&session_completed_payload(), WEBHOOK_SECRET, now()),
+    )
+    .await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body["duplicate"], true);
+    assert_eq!(body["redelivered"], true);
+
+    // One payment, one intent. The statement that ran carries the SAME key the
+    // first delivery used — the payment's own id — so `core.outbox_enqueue`
+    // returned the intent it already had instead of creating a second.
+    let inserts: Vec<String> = h
+        .db
+        .queried_sql()
+        .into_iter()
+        .filter(|sql| sql.contains("INSERT INTO \"stripe\".\"payments\""))
+        .collect();
+    assert_eq!(inserts.len(), 1);
+    assert!(
+        inserts[0].contains("core.outbox_enqueue($15, 'POST', '/api/finance/transaction', $16::jsonb, $1)"),
+        "the key is the payment's own identifier, on every delivery: {}",
+        inserts[0]
+    );
+    assert_eq!(
+        body["payment"]["ledger_intent_id"], 77,
+        "the payment names the same intent it already had"
+    );
+    assert_eq!(body["ledger"]["intent_id"], 77);
+
+    // Nothing was told twice: no event, no outcome write.
+    assert!(h.events.payloads("payment.received").is_empty());
+    assert!(
+        !h.db
+            .queried_sql()
+            .iter()
+            .any(|sql| sql.contains("ledger_status = $2")),
+        "a duplicate settles nothing: {:?}",
+        h.db.queried_sql()
+    );
+}
+
+#[tokio::test]
+async fn without_a_read_credential_the_payment_is_recorded_unbooked_and_delegated() {
+    let h = Harness::new(config());
+    let routes = h.routes().await;
+    let webhook = route(&routes, "POST", "/api/stripe/webhook");
+
+    h.db.push_rows(vec![serde_json::json!({ "id": 1, "redeliveries": 0 })]);
+    // finance refuses the funds read, as its own gate does for a caller with no
+    // credential — which is every real webhook delivery.
+    h.http.push_json(403, &serde_json::json!({ "error": "authentication required" }));
+    h.db.push_rows(vec![payment_row(LEDGER_UNBOOKED)]);
+    h.db.push_rows(vec![payment_row(LEDGER_DELEGATED_EVENT)]);
+
+    let (status, body) = call(
+        &webhook.handler,
+        signed_webhook(&session_completed_payload(), WEBHOOK_SECRET, now()),
+    )
+    .await;
+    assert_eq!(status, 200, "{body}");
+
+    // No intent was composed, so none was enqueued — an incomplete payload would
+    // be refused by finance at delivery, which is worse than saying so. The
+    // payment is still recorded, truthfully `unbooked`.
+    let inserts: Vec<String> = h
+        .db
+        .queried_sql()
+        .into_iter()
+        .filter(|sql| sql.contains("INSERT INTO \"stripe\".\"payments\""))
+        .collect();
+    assert_eq!(inserts.len(), 1);
+    assert!(
+        !inserts[0].contains("core.outbox_enqueue"),
+        "no intent, so no enqueue expression: {}",
+        inserts[0]
+    );
+    assert!(inserts[0].contains("NULL)"), "ledger_intent_id is null: {}", inserts[0]);
+    let refusal = body["ledger"]["intent_refused"].as_str().unwrap_or_default();
+    assert!(
+        refusal.contains("finance refused the funds read") && refusal.contains("HTTP 403"),
+        "the reason is stated, and it is finance's own: {refusal}"
+    );
+
+    // The fallback carried it, exactly as before.
+    assert_eq!(body["ledger"]["path"], "event");
+    assert_eq!(body["payment"]["ledger_status"], LEDGER_DELEGATED_EVENT);
+    assert_eq!(h.events.payloads("payment.received").len(), 1);
+}
+
+#[tokio::test]
+async fn the_worklist_carries_an_in_flight_payments_intent() {
+    let (host, routes) = plugin_routes(config()).await;
+    let unbooked = route(&routes, "GET", "/api/stripe/unbooked");
+
+    let mut in_flight = payment_row(LEDGER_INTENT_ENQUEUED);
+    in_flight["ledger_intent_id"] = serde_json::json!(77);
+    in_flight["ledger_mechanism"] = serde_json::json!(MECHANISM_OUTBOX);
+    in_flight["intent_state"] = serde_json::json!("attempting");
+    in_flight["intent_attempts"] = serde_json::json!(1);
+    in_flight["intent_max_attempts"] = serde_json::json!(6);
+    in_flight["intent_answer_status"] = serde_json::Value::Null;
+    in_flight["intent_last_error"] = serde_json::json!("the ledger is down");
+    in_flight["intent_delivered_at"] = serde_json::Value::Null;
+    in_flight["total_unbooked"] = serde_json::json!(2);
+    // The pre-existing case: recorded before the outbox existed, or with a fund
+    // that could not be resolved — no intent, and the worklist's remaining job.
+    let mut legacy = payment_row(LEDGER_UNBOOKED);
+    legacy["id"] = serde_json::json!(6);
+    legacy["payment_id"] = serde_json::json!("pi_test_2");
+    legacy["total_unbooked"] = serde_json::json!(2);
+    host.db.push_rows(vec![in_flight, legacy]);
+
+    let (status, body) = call(
+        &unbooked.handler,
+        TestRequest::get("/api/stripe/unbooked").identity("bea", &["treasurer"]).build(),
+    )
+    .await;
+    assert_eq!(status, 200, "{body}");
+
+    // The in-flight payment is neither booked nor unbooked, and it is listed
+    // explicitly — with its intent id and the intent's own state — rather than
+    // counted as either.
+    assert_eq!(body["in_flight"], 1);
+    assert_eq!(body["by_status"][LEDGER_INTENT_ENQUEUED], 1);
+    assert_eq!(body["by_status"][LEDGER_UNBOOKED], 1);
+    assert_eq!(body["payments"][0]["ledger_intent_id"], 77);
+    assert_eq!(body["payments"][0]["intent_state"], "attempting");
+    assert_eq!(body["payments"][0]["intent_last_error"], "the ledger is down");
+    // The payment with no intent stays the worklist's job.
+    assert!(body["payments"][1]["ledger_intent_id"].is_null());
+    assert_eq!(body["payments"][1]["intent_state"], serde_json::Value::Null);
+
+    // The query states the in-flight case in SQL, not prose: the payment's intent
+    // is joined from the producer's own view, and an intent that landed is not a
+    // worklist item.
+    let sql = host.db.queried_sql();
+    let worklist = sql
+        .iter()
+        .find(|sql| sql.contains("total_unbooked"))
+        .expect("the worklist query");
+    assert!(
+        worklist.contains("LEFT JOIN core.outbox_producer_view() v ON v.id = p.ledger_intent_id"),
+        "{worklist}"
+    );
+    assert!(
+        worklist.contains("v.state IS DISTINCT FROM 'delivered'"),
+        "a delivered intent leaves the list: {worklist}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// The webhook's refusals
+// ---------------------------------------------------------------------------
 
 #[tokio::test]
 async fn an_unsigned_or_badly_signed_body_is_refused_before_any_query() {
@@ -1224,7 +1565,31 @@ async fn the_unbooked_worklist_separates_a_delegation_from_a_refusal() {
     );
     assert_eq!(body["by_status"][LEDGER_DELEGATED_EVENT], 1);
     assert_eq!(body["by_status"][LEDGER_REFUSED], 1);
-    assert!(body["note"].as_str().unwrap().contains("cannot be told from a failed delegation"));
+    assert_eq!(
+        body["in_flight"], 0,
+        "neither of these payments has an intent, so neither is in flight"
+    );
+    assert!(body["note"]
+        .as_str()
+        .unwrap()
+        .contains("'unbooked' with no intent is the real job"));
+    // The query itself states the in-flight case, in SQL rather than prose: the
+    // payment's intent is joined in, a delivered one is gone from the list, and
+    // the intent's own state rides with the row.
+    let sql = host.db.queried_sql();
+    let worklist = sql
+        .iter()
+        .find(|s| s.contains("total_unbooked"))
+        .expect("the worklist query");
+    assert!(
+        worklist.contains("core.outbox_producer_view() v ON v.id = p.ledger_intent_id"),
+        "the worklist reads the payment's intent: {worklist}"
+    );
+    assert!(
+        worklist.contains("v.state IS DISTINCT FROM 'delivered'"),
+        "an intent that landed is not a worklist item: {worklist}"
+    );
+    assert!(worklist.contains("intent_state"));
 }
 
 // ---------------------------------------------------------------------------
@@ -1607,13 +1972,28 @@ async fn health_names_the_blocker_it_cannot_fix() {
     )
     .await;
     assert_eq!(status, 200);
-    assert_eq!(body["ledger"]["path"], "event");
+    // The mechanism that carries a confirmation: an outbox intent the core's
+    // relay delivers as the declared service principal — not an event, and not
+    // synchronous.
+    assert_eq!(body["ledger"]["path"], "outbox");
     assert_eq!(body["ledger"]["synchronous"], false);
-    assert!(body["ledger"]["why"].as_str().unwrap().contains("no Adjutant caller"));
-    assert!(body["ledger"]["blocked_on"]
+    assert_eq!(body["ledger"]["principal"], adjutant_stripe::LEDGER_PRINCIPAL);
+    assert_eq!(
+        body["ledger"]["target_route"],
+        format!("POST {FINANCE_TRANSACTION_PATH}")
+    );
+    assert!(body["ledger"]["intent"]
         .as_str()
         .unwrap()
-        .contains("§3.2"));
+        .contains("one statement"));
+    assert!(body["ledger"]["why"].as_str().unwrap().contains("no Adjutant caller"));
+    // The residual, named: finance takes only a fund id on write paths, and the
+    // callerless path holds no read credential — issue #60.
+    assert!(body["ledger"]["blocked_on"].as_str().unwrap().contains("#60"));
+    assert!(body["ledger"]["fallback"]
+        .as_str()
+        .unwrap()
+        .contains("payment.received"));
     assert_eq!(body["config"]["funds"][PURPOSE_DUES], "general");
     assert_eq!(body["config"]["funds"][PURPOSE_DONATION], "general");
 }

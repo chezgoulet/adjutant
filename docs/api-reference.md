@@ -740,34 +740,50 @@ never answered leaves a visible `failed` attempt rather than a mystery — and t
 Stripe's servers, so there is no Adjutant session to require. The credential is
 the HMAC signature over the raw body (`Stripe-Signature: t=…,v1=…`, a 300-second
 replay window, `v0` refused), and an unverified delivery is a `400` that writes
-nothing. Two keys make redelivery safe at two layers:
+nothing. Three keys make redelivery safe at three layers:
 `stripe.webhook_events.event_id` (one row per distinct delivery, with a
-`redeliveries` counter) and `stripe.payments.payment_id` — Stripe's `pi_…`,
-which is also the ledger's `external_ref`. A redelivery is therefore a no-op,
-and a payment that somehow reached the ledger by both paths is still one entry.
-A redelivery is also *self-healing*: the handler checks the payment's
-`ledger_status`, not the receipt, so a delivery whose hand-off never fired
-retries it.
+`redeliveries` counter), `stripe.payments.payment_id` — Stripe's `pi_…`,
+which is also the ledger's `external_ref` — and that same `payment_id` as the
+**outbox intent's idempotency key**, so a redelivery is handed back the intent it
+already has rather than enqueuing a second. A redelivery is also *self-healing*:
+the handler checks the payment's `ledger_status`, not the receipt, so a delivery
+whose hand-off never fired retries it.
 
-**How a confirmed payment reaches the ledger — and the limit of it.** Finance
-subscribes to `payment.received` (SPEC §5.4) and books an income entry keyed on
-the provider's payment id, so a webhook-confirmed payment *does* reach
-`finance.transactions` idempotently. But a webhook carries no caller, so there
-is no credential to forward to finance's API: the second permitted mechanism
-(`plugin-to-plugin.md` §2(b), "as the caller") cannot be used on that path, and
-minting a credential is the one shortcut that document refuses. The event is
-therefore the mechanism on the webhook path, and the plugin is honest that it is
-a **fire-and-forget** one: no answer comes back, so it cannot tell whether the
-ledger write happened (a failed subscriber is a `tracing::warn!` and nothing
-more; a lagged subscriber drops events). Every confirmed payment carries a
-`ledger_status` (`unbooked`, `delegated_event`, `booked`, `refused`, `failed`),
-`GET /api/stripe/unbooked` is the worklist of payments with no *confirmed*
-ledger entry, a six-hourly sweep publishes `stripe.ledger.unbooked` when there
-are any, and **`POST /api/stripe/payment/{id}/book` makes the write
-synchronous** by forwarding the caller's own credential to finance and letting
-finance's gate re-decide `finance:write`. A treasurer can close the gap by hand
-today; closing it structurally is a decision `plugin-to-plugin.md` §3.2 leaves
-open.
+**How a confirmed payment reaches the ledger — and the limit of it.** The
+mechanism is the **outbox** (Core section, above). A webhook-confirmed payment
+and its ledger booking are written by **one statement**: `core.outbox_enqueue(…)`
+runs as an expression in the plugin's own `INSERT` into `stripe.payments`, so the
+fact and its intent commit together or neither does, and the core's relay
+delivers the intent to `POST /api/finance/transaction` as the declared service
+principal `svc.stripe.ledger` (grant `finance:write`), retrying with backoff and
+recording finance's own answer on the intent row. The plugin subscribes to
+`core.outbox.*` for **notification only** — the intent row, not the event,
+decides what is known. The payload is composed **at enqueue time** and must be
+complete, because the relay cannot read-then-write at delivery: the fund *code*
+the payment names is resolved into finance's fund *id* through
+`GET /api/finance/funds`, exactly as `/book` resolves it — a §2(b) call carrying
+the caller's credential, which a webhook does not have. Where that read cannot be
+made (or finance has no such fund), **no intent is composed**: the payment is still
+recorded, `unbooked`, and handed to finance through finance's idempotent
+`payment.received` subscriber (SPEC §5.4), whose answer is never seen. That
+residual is [issue #60](https://github.com/chezgoulet/adjutant/issues/60):
+finance's write paths take only a fund **id**, so a producer without a read
+credential cannot compose a complete payload.
+
+Every confirmed payment carries a `ledger_status` — `unbooked` (no intent: the
+worklist's remaining job), `intent_enqueued` (an intent is enqueued and the relay
+will deliver it: **neither booked nor unbooked**), `delegated_event` (the
+fallback hand-off, no answer), `booked` (finance answered 2xx, with its
+transaction id), `refused`, or `failed` (every attempt spent). The relay's own
+outcome events settle `intent_enqueued` into `booked`/`refused`/`failed`;
+`GET /api/stripe/unbooked` lists everything without a *confirmed* ledger entry,
+naming each in-flight payment's intent and its state, and drops it once that
+intent's durable state is `delivered`; a six-hourly sweep publishes
+`stripe.ledger.unbooked` when any remain. **`POST
+/api/stripe/payment/{id}/book` still makes the write synchronous** by forwarding
+the caller's own credential to finance and letting finance's gate re-decide
+`finance:write` — the route a treasurer uses for a payment with no intent, or to
+close a stalled one.
 
 Config lives in the `stripe` row's `core.plugins.config`:
 
@@ -787,24 +803,28 @@ Config lives in the `stripe` row's `core.plugins.config`:
 
 | Method | Path | Permission | Body / notes |
 |---|---|---|---|
-| GET | `/api/stripe/health` | `stripe:read` | What is configured (presence, never a value), `key_mode` (`live`/`test`/`unconfigured`), the fund codes, and the `ledger` block: which path a confirmation takes, that it is not synchronous, and what it is blocked on. No database |
+| GET | `/api/stripe/health` | `stripe:read` | What is configured (presence, never a value), `key_mode` (`live`/`test`/`unconfigured`), the fund codes, and the `ledger` block: the mechanism a confirmation takes (the outbox intent, delivered as `svc.stripe.ledger`), that it is not synchronous, the fallback when no intent can be composed, and issue #60 as what it is blocked on. No database |
 | POST | `/api/stripe/checkout` | `stripe:checkout` (any scope) | `{purpose: dues\|donation\|event_fee, amount_cents\|amount, currency?, member_id?, fund_code?, category?, description?, related_event_id?, dues_year?, success_url?, cancel_url?}` → `201` + `Location` + `{session, checkout_url, checkout, ledger}`. `amount_cents` is an integer count of cents and `amount` a dollars string (`"12.50"`); a JSON float is refused, as is a value finer than a cent. Naming somebody else's `member_id` needs `stripe:manage` (troop). Without a `secret_key` it is a `503` and Stripe is never called |
 | GET | `/api/stripe/sessions?id=&purpose=&status=&member_id=&before_id=&limit=` | `stripe:read` (any scope) | Newest first, one row more than asked for so `has_more` needs no `COUNT(*)`. A caller without `stripe:read_all` is narrowed to the sessions they opened or that name them (`narrowed_to_caller: true`); the two answers are `403`-shaped the same way as their absence |
 | GET | `/api/stripe/session/{id}` | `stripe:read` (any scope) | The session, the payment it produced (if any) and that payment's ledger state. Somebody else's session is a `403` that reads `"no such checkout session"` |
-| POST | `/api/stripe/webhook` | — (open; the signature is the credential) | Stripe's delivery. `200` `{received, duplicate, redelivered, redeliveries, event_id, event_type, payment, ledger}`. `400` on a bad/unsigned/stale signature or a payload with no event id; `503` when no `webhook_secret` is configured (the endpoint refuses every delivery rather than accepting an unverified one); `500` when the hand-off failed, so Stripe retries. An unreadable payment event is a `200` with `unusable` (retrying would not make it readable) and is audited |
-| GET | `/api/stripe/payments?purpose=&ledger_status=&payment_id=&member_id=&before_id=&limit=` | `stripe:read_all` (troop) | Every confirmed payment with its ledger status, mechanism, finance's own error text and whether an attempt was made |
+| POST | `/api/stripe/webhook` | — (open; the signature is the credential) | Stripe's delivery. `200` `{received, duplicate, redelivered, redeliveries, event_id, event_type, payment, ledger}`; the `ledger` block says `path: "outbox"` with the intent's id when an intent was enqueued, and `path: "event"` with `intent_refused` when none could be composed. `400` on a bad/unsigned/stale signature or a payload with no event id; `503` when no `webhook_secret` is configured (the endpoint refuses every delivery rather than accepting an unverified one); `500` when the statement failed — the payment *and* its intent are both unwritten, so Stripe retries. An unreadable payment event is a `200` with `unusable` (retrying would not make it readable) and is audited |
+| GET | `/api/stripe/payments?purpose=&ledger_status=&payment_id=&member_id=&before_id=&limit=` | `stripe:read_all` (troop) | Every confirmed payment with its ledger status, mechanism, its `ledger_intent_id` when it has one, finance's own error text and whether an attempt was made |
 | GET | `/api/stripe/payment/{id}` | `stripe:read_all` (troop) | One payment plus the `ledger` block: what is known, and what to do about it |
-| GET | `/api/stripe/unbooked?older_than_minutes=&limit=` | `stripe:read_all` (troop) | The payments with no *confirmed* ledger entry: `{payments, count, total_unbooked, by_status, note}`. `delegated_event` (finance was told, no answer) and `refused`/`failed` are listed together and separated by status, because from here a completed delegation and a failed one look alike |
+| GET | `/api/stripe/unbooked?older_than_minutes=&limit=` | `stripe:read_all` (troop) | The payments with no *confirmed* ledger entry: `{payments, count, total_unbooked, in_flight, by_status, note}`. An in-flight payment is listed explicitly with its `ledger_intent_id` and the intent's own state (`intent_state`, `intent_attempts`, `intent_last_error`), and drops out once that state is `delivered`; `unbooked` with no intent is the real job (`/book` closes it); `delegated_event` (finance was told, no answer) and `refused`/`failed` are listed together and separated by status |
 | POST | `/api/stripe/payment/{id}/book` | `stripe:manage` (troop) | Ask finance to book a confirmed payment **as the caller**: resolves the fund code through `GET /api/finance/funds` and posts one income entry with `external_ref` = Stripe's payment id, both carrying the caller's `authorization`/`cookie`. Finance's status is passed through (`403` when the caller lacks `finance:write`, `409` when finance already has that `external_ref`), and a request with no credential is refused here before anything is called |
 
-**Events:** `payment.received` (SPEC §5.4 and finance's contract — the
-hand-off), `stripe.checkout.created`, `stripe.payment.confirmed`,
-`stripe.payment.booked`, `stripe.webhook.unusable`,
+**Events:** `payment.received` (SPEC §5.4 and finance's contract — the *fallback*
+hand-off, published only when no intent could be composed), `stripe.checkout.created`,
+`stripe.payment.confirmed`, `stripe.payment.booked`, `stripe.webhook.unusable`,
 `stripe.ledger.unbooked` (the sweep's notice). No payload carries a secret or a
 card detail.
 
-**Subscribes to:** nothing, on purpose — the fact is this plugin's output, and a
-subscriber must not publish into the cycle it consumes (`plugin-to-plugin.md`
+**Subscribes to:** `core.outbox.*` — the core relay's terminal outcomes
+(`delivered`, `refused`, `exhausted`), which settle this plugin's own
+`ledger_status` from finance's answer. A **notification**: the intent row is the
+durable record, and the worklist reads that, so a dropped event can neither hide
+a booking nor invent one. Nothing this plugin publishes itself is subscribed to
+(a subscriber must not publish into the cycle it consumes, `plugin-to-plugin.md`
 §3.4).
 
 **Permissions this plugin defines:** `stripe:read` (your own sessions),

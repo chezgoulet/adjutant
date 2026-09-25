@@ -33,15 +33,57 @@
 //! (a service token, a dev header, a "trusted internal call") is the one thing
 //! §3.1 refuses outright, and this crate does not do it.
 //!
-//! So a webhook-confirmed payment reaches `finance.transactions` through the
-//! mechanism that does exist — `payment.received` (SPEC §5.4), which finance
-//! subscribes to and books **idempotently, keyed on the provider's payment id**
-//! (`finance.transactions.external_ref`, unique). That is §2(a): a fact that has
-//! already happened, broadcast, with subscribers that tolerate replay. It works,
-//! and it is deliberately *not* claimed to be the synchronous, compensatable
-//! flow §3.2 requires, because **no answer comes back**: this plugin cannot tell
-//! whether the ledger write happened. Three properties of the core make that
-//! concrete, and they are the evidence for the blocker:
+//! So a webhook-confirmed payment reaches `finance.transactions` by **enqueuing its
+//! ledger booking as a durable intent** — the mechanism `plugin-to-plugin.md` §3.2
+//! decided, built in the core as the `core.outbox` table, a draining relay, and a
+//! registry of declared service principals. The intent is written by
+//! `core.outbox_enqueue(…)` **as an expression inside this plugin's own `INSERT`**
+//! into `stripe.payments`, so the confirmed payment and its ledger booking commit
+//! together or neither does: there is no window in which the charge is recorded and
+//! its booking is not. The relay then delivers it to finance's
+//! `POST /api/finance/transaction` as the declared service principal
+//! `svc.stripe.ledger` — grant `finance:write`, declared in the core's
+//! `SERVICE_PRINCIPALS` for the `stripe` producer only — retries a retryable
+//! failure with exponential backoff, and writes the target's own answer onto the
+//! intent row. The failure the event path could not see is therefore a failure the
+//! relay retries, and its exhaustion lands **in the data** as `exhausted`.
+//!
+//! Three limits of that are load-bearing, so they are stated here rather than
+//! discovered later.
+//!
+//! 1. **The payload is complete before the statement runs.** The relay cannot
+//!    read-then-write at delivery, so the fund *code* the payment names is resolved
+//!    into finance's fund *id* **at enqueue time**, over `GET /api/finance/funds`,
+//!    exactly as `POST /api/stripe/payment/{id}/book` resolves it. That read is a
+//!    §2(b) call and carries the caller's credential — which a webhook does not
+//!    have. Where the read cannot be made (there is no credential to forward, or
+//!    finance has no such fund), **no intent is composed**: the payment is still
+//!    recorded, `unbooked`, and handed to finance through `payment.received` as
+//!    before, with the reason in the response and the audit. That residual is issue
+//!    #60: finance accepts only a fund **id** on its write paths (`fund_id: i64`),
+//!    so a producer that cannot read funds cannot compose a complete payload, and
+//!    fixing it belongs to finance.
+//! 2. **`ledger_status` says which of those happened.** `intent_enqueued` means an
+//!    intent is enqueued and the relay will deliver it — neither booked nor
+//!    unbooked. The relay's own outcome events settle it to `booked` (finance
+//!    answered 2xx and its transaction id is recorded), `refused` (the target or its
+//!    gate said no) or `failed` (the attempts ran out). `booked` keeps exactly its
+//!    old meaning: finance confirmed the entry.
+//! 3. **`GET /api/stripe/unbooked` keeps the in-flight case visible.** A payment
+//!    whose intent is in flight is neither booked nor unbooked, so it is listed
+//!    explicitly with its `ledger_intent_id` and the intent's own state (read
+//!    through `core.outbox_producer_view()`, which is the producer's only way to
+//!    read its intents). It leaves the worklist when the intent's durable state is
+//!    `delivered` — the intent, not the notification, is what decides that, so a
+//!    dropped event cannot hide a booking or invent one.
+//!
+//! `payment.received` (SPEC §5.4) is still published — but only when no intent could
+//! be composed, and as the fallback it always was: finance subscribes to it and
+//! books idempotently, keyed on the provider's payment id
+//! (`finance.transactions.external_ref`, unique). It is deliberately *not* claimed
+//! to be the synchronous, compensatable flow §3.2 requires, because **no answer
+//! comes back**. Three properties of the core make that concrete, and they are why
+//! the outbox is the mechanism and this is not:
 //!
 //! 1. A failed subscriber is a log line. `server/src/events.rs` calls the
 //!    handler and, on `Err`, only `tracing::warn!("event handler failed")` — no
@@ -56,32 +98,28 @@
 //! daily `ledger_audit` would not catch it: books that never recorded a payment
 //! still add up.
 //!
-//! This crate therefore does three things about it, and stops there:
+//! This crate therefore does three things about the money path, and stops there:
 //!
 //! * **It records the truth.** Every confirmed payment carries a
-//!   `ledger_status` and, when a booking was attempted, finance's own answer.
-//!   `GET /api/stripe/unbooked` is the worklist of payments with no *confirmed*
-//!   ledger entry, and a `stripe.ledger.unbooked` event notices them (a
-//!   notification; never the mechanism by which the ledger learns).
+//!   `ledger_status`, the mechanism that carried it, its intent when it has one, and
+//!   finance's own answer when one came back. `GET /api/stripe/unbooked` is the
+//!   worklist of payments with no *confirmed* ledger entry, and a
+//!   `stripe.ledger.unbooked` event notices them (a notification; never the
+//!   mechanism by which the ledger learns).
 //! * **It offers the synchronous path where a caller genuinely exists.**
 //!   `POST /api/stripe/payment/{id}/book` is a real §2(b) call: it forwards the
 //!   caller's `authorization`/`cookie` to finance over `ctx.http` and finance's
 //!   own gate re-decides. A treasurer who holds `finance:write` can therefore
 //!   close the gap by hand, today, with their own authority and nothing added.
 //! * **It never invents an authority it does not have.** The plugin holds two
-//!   secrets, and neither is ever used as an Adjutant credential.
-//!
-//! What would close the gap properly is a decision this crate cannot make alone:
-//! `plugin-to-plugin.md` §3.2 leaves the pattern open deliberately ("single-
-//! transaction ownership, or an outbox with retry"), to be settled with the
-//! payments plugin against the real shape of Stripe's webhooks. Until it is
-//! settled there is no way for a machine-originated confirmation to obtain a
-//! bounded Adjutant authorization, and the event path is what a troop has.
+//!   secrets, and neither is ever used as an Adjutant credential. The only identity
+//!   a delivery as this plugin carries is `svc.stripe.ledger`, which the core
+//!   attests from the intent row and which this plugin cannot name, mint or widen.
 //!
 //! ## Idempotency, twice over
 //!
 //! A redelivered webhook must not double-count, and it must not *lose* a payment
-//! either. Two keys do that, at two layers:
+//! either. Three keys do that, at three layers:
 //!
 //! * `stripe.webhook_events.event_id` (Stripe's `evt_…`, unique) is the receipt
 //!   ledger: one row per distinct delivery, with a `redeliveries` counter.
@@ -89,6 +127,13 @@
 //!   record, and it is the **same key finance holds** — `external_ref`. A
 //!   payment that reaches the ledger by both paths is still one entry, because
 //!   finance's unique index refuses the second.
+//! * The **intent's idempotency key is that same `payment_id`**, so a
+//!   redelivered webhook calls `core.outbox_enqueue` with the key it already
+//!   used and gets **the intent it already has** rather than a second one
+//!   (`core.outbox` is unique on `(producer_plugin, idempotency_key)`, and the
+//!   function returns the existing id). One payment, one intent — the statement
+//!   that records the payment carries `ledger_intent_id`, and a unique index
+//!   refuses a second payment claiming one intent.
 //!
 //! A redelivery is *self-healing*, not merely tolerated: the handler checks the
 //! payment's `ledger_status` rather than the event receipt, so a delivery whose
@@ -101,7 +146,8 @@
 //! inserted `pending` *before* Stripe is called and settled afterwards, so a
 //! call that never answered is a visible `failed` attempt rather than a
 //! mystery. `stripe.webhook_events` — the raw receipt ledger.
-//! `stripe.payments` — the confirmed payments, with the ledger outcome.
+//! `stripe.payments` — the confirmed payments, with the ledger outcome and
+//! `ledger_intent_id`, the intent its booking rides on when it has one.
 //!
 //! ## Configuration
 //!
@@ -195,27 +241,42 @@ pub const SESSION_STATUSES: [&str; 5] = [
     SESSION_FAILED,
 ];
 
-/// A confirmed payment this plugin has not seen a ledger entry for.
+/// A confirmed payment this plugin has not seen a ledger entry for, and whose
+/// booking no intent carries: the pre-existing case (a row written before the
+/// outbox existed, or a payment whose fund could not be resolved at enqueue
+/// time). This is the worklist's remaining job — `POST
+/// /api/stripe/payment/{id}/book` as a caller holding `finance:write`.
 pub const LEDGER_UNBOOKED: &str = "unbooked";
+/// An outbox intent is enqueued and the core's relay will deliver it to finance.
+/// **Neither booked nor unbooked**: the fact and the intent committed together,
+/// the ledger entry does not exist yet, and the relay's answer — read from the
+/// intent's own durable state — decides what happens next.
+pub const LEDGER_INTENT_ENQUEUED: &str = "intent_enqueued";
 /// Confirmed, and handed to finance through `payment.received`. **Finance's
 /// answer is unknown** — see the module docs. The usual outcome is that
 /// finance's subscriber books it within the same second; this plugin cannot see
-/// that, and does not claim it.
+/// that, and does not claim it. Published only when no intent could be composed.
 pub const LEDGER_DELEGATED_EVENT: &str = "delegated_event";
-/// Finance answered `2xx` to a booking **made as the caller** — the ledger
-/// entry is confirmed to exist.
+/// Finance answered `2xx` — to a booking **made as the caller**, or to a
+/// delivery of this payment's outbox intent. Either way the ledger entry is
+/// confirmed to exist.
 pub const LEDGER_BOOKED: &str = "booked";
-/// Finance answered a non-2xx to a booking made as the caller. Its own message
-/// is recorded verbatim in `ledger_error`. A repeat of its `external_ref`
-/// uniqueness check lands here too, and that is informative, not a bug.
+/// Finance answered a non-2xx to a booking made as the caller, or to a delivery
+/// of the payment's intent. Its own message is recorded verbatim in
+/// `ledger_error`. A repeat of its `external_ref` uniqueness check lands here
+/// too, and that is informative, not a bug.
 pub const LEDGER_REFUSED: &str = "refused";
 /// The booking could not be attempted or did not complete as a call (no
-/// credential to forward, or the host HTTP call failed).
+/// credential to forward, or the host HTTP call failed) — or the relay spent
+/// every attempt on the payment's intent without it landing. The money path's
+/// visible failure: the fact is real and the ledger entry is not there.
 pub const LEDGER_FAILED: &str = "failed";
 
-/// Every ledger status, constrained in the database.
-pub const LEDGER_STATUSES: [&str; 5] = [
+/// Every ledger status, constrained in the database (migration 2 replaced the
+/// check when `intent_enqueued` was added).
+pub const LEDGER_STATUSES: [&str; 6] = [
     LEDGER_UNBOOKED,
+    LEDGER_INTENT_ENQUEUED,
     LEDGER_DELEGATED_EVENT,
     LEDGER_BOOKED,
     LEDGER_REFUSED,
@@ -226,6 +287,33 @@ pub const LEDGER_STATUSES: [&str; 5] = [
 pub const MECHANISM_EVENT: &str = "event:payment.received";
 /// The mechanism recorded when a payment was booked as the caller.
 pub const MECHANISM_CALLER_FORWARD: &str = "caller-forward:POST /api/finance/transaction";
+/// The mechanism recorded when the payment's ledger booking is an outbox intent.
+pub const MECHANISM_OUTBOX: &str = "outbox:POST /api/finance/transaction";
+
+/// The service principal the core declares for this producer, and the only
+/// identity a delivery as this plugin can carry. **Not a credential this plugin
+/// holds**: the core builds it from the intent row
+/// (`core::outbox::identity_for`), and this plugin cannot name, mint or widen
+/// it. Named here so the intent it enqueues and the core's declaration can be
+/// checked against each other in a test.
+pub const LEDGER_PRINCIPAL: &str = "svc.stripe.ledger";
+
+/// The prefix of the core's outbox outcome events this plugin subscribes to, to
+/// settle its own `ledger_status` from the relay's terminal answer.
+pub const OUTBOX_EVENT_PREFIX: &str = "core.outbox.";
+
+// The relay's intent states, as this plugin reads them (mirrors
+// `adjutant_server::outbox`, which is core code this plugin cannot import).
+// Read through `core.outbox_producer_view()`: its answer is the durable record,
+// where the `core.outbox.*` events are only a notification.
+/// The target answered 2xx: the ledger entry is confirmed. One intent, one
+/// delivery.
+pub const OUTBOX_DELIVERED: &str = "delivered";
+/// The target — or its gate — said no. Terminal.
+pub const OUTBOX_REFUSED: &str = "refused";
+/// Every attempt was spent and the intent still did not land: the money path's
+/// visible failure.
+pub const OUTBOX_EXHAUSTED: &str = "exhausted";
 
 /// `stripe:read` — see the troop's checkout sessions. A caller without
 /// [`PERM_READ_ALL`] sees only the sessions they opened or that name them.
@@ -1202,6 +1290,157 @@ fn message_of(body: &[u8], status: u16) -> String {
         .unwrap_or_else(|| format!("the request answered {status}"))
 }
 
+/// What `GET /api/finance/funds` answered.
+///
+/// Shared by the two places this plugin needs finance's fund list: the caller's
+/// booking (`POST /api/stripe/payment/{id}/book`) and the **enqueue-time**
+/// resolution the webhook does so its intent payload can be complete. Neither
+/// call carries a credential of this plugin's own — neither invents one.
+enum FundsRead {
+    /// The list, and the status it came back with.
+    Listed { status: u16, funds: Vec<Value> },
+    /// finance refused the read, in its own words.
+    Refused { status: u16, message: String },
+    /// The call did not complete.
+    Unreachable(String),
+}
+
+/// Read finance's funds, forwarding exactly the headers given: the caller's
+/// credential where there is a caller, and nothing at all where there is not —
+/// finance's own gate decides either way.
+async fn read_funds(
+    c: &PluginContext,
+    cfg: &StripeConfig,
+    headers: &[(String, String)],
+) -> FundsRead {
+    let url = format!("{}{FINANCE_FUNDS_PATH}?include_inactive=1", cfg.base_url());
+    match c
+        .http
+        .request("GET".to_string(), url, headers.to_vec(), None)
+        .await
+    {
+        Ok(response) if (200..300).contains(&response.status) => FundsRead::Listed {
+            status: response.status,
+            funds: response
+                .json::<Value>()
+                .ok()
+                .and_then(|value| value.get("funds").and_then(Value::as_array).cloned())
+                .unwrap_or_default(),
+        },
+        Ok(response) => FundsRead::Refused {
+            status: response.status,
+            message: message_of(&response.body, response.status),
+        },
+        Err(e) => FundsRead::Unreachable(format!("could not reach finance's funds route: {e}")),
+    }
+}
+
+/// Why a fund code is not finance's fund id.
+enum FundResolution {
+    /// finance's primary key for the fund.
+    Id(i64),
+    /// No fund with that code is visible.
+    Missing,
+    /// The fund exists and is inactive.
+    Inactive,
+    /// A fund row without an id, which cannot be used as one.
+    NoId,
+}
+
+/// The code → id step, and nothing else: pure, so both callers resolve a fund
+/// identically. Resolved rather than configured because finance owns its ids,
+/// and a configured primary key is exactly the stale copy
+/// `plugin-to-plugin.md` §3.5 warns about.
+fn resolve_fund(funds: &[Value], code: &str) -> FundResolution {
+    let Some(fund) = funds
+        .iter()
+        .find(|fund| fund["code"].as_str() == Some(code))
+    else {
+        return FundResolution::Missing;
+    };
+    if fund["active"].as_bool() == Some(false) {
+        return FundResolution::Inactive;
+    }
+    match fund["id"].as_i64() {
+        Some(id) => FundResolution::Id(id),
+        None => FundResolution::NoId,
+    }
+}
+
+/// Resolve the fund **at enqueue time**, for a complete intent payload.
+///
+/// The relay cannot read-then-write at delivery, so the payload has to be
+/// complete before the statement runs: finance's write route takes a fund
+/// **id**, not the code the payment names. Where it cannot be resolved — no
+/// credential to forward (a webhook has none), no such fund, an inactive fund,
+/// finance unreachable — the caller records the payment *without* an intent and
+/// says why, rather than enqueuing a payload finance would refuse. Issue #60 is
+/// why a read is needed at all: finance's write paths accept only an id.
+async fn resolve_fund_id_for_intent(
+    c: &PluginContext,
+    cfg: &StripeConfig,
+    headers: &[(String, String)],
+    fund_code: &str,
+) -> Result<i64, String> {
+    if fund_code.trim().is_empty() {
+        return Err("the payment names no fund code".to_string());
+    }
+    match read_funds(c, cfg, headers).await {
+        FundsRead::Listed { funds, .. } => match resolve_fund(&funds, fund_code) {
+            FundResolution::Id(id) => Ok(id),
+            FundResolution::Missing => Err(format!(
+                "finance has no fund with code {fund_code:?} visible to this caller, so no \
+                 complete intent payload could be composed"
+            )),
+            FundResolution::Inactive => {
+                Err(format!("finance's fund {fund_code:?} is inactive"))
+            }
+            FundResolution::NoId => Err(format!(
+                "finance's fund {fund_code:?} came back without an id, so no complete intent \
+                 payload could be composed"
+            )),
+        },
+        FundsRead::Refused { status, message } => Err(format!(
+            "finance refused the funds read (HTTP {status}): {message}; a complete intent payload \
+             needs the fund id, and the relay cannot resolve a code at delivery"
+        )),
+        FundsRead::Unreachable(message) => Err(message),
+    }
+}
+
+/// The intent payload: finance's `POST /api/finance/transaction` body, complete
+/// and self-contained, in finance's own field names.
+///
+/// * `kind: "income"` and a **positive** `amount_cents` — finance takes a
+///   magnitude and lets the kind carry the sign, so income is positive.
+/// * `category` is finance's own vocabulary for the purpose (`dues`,
+///   `donation`, `event_fee`), which is what its dues-standing view sums.
+/// * `external_ref` is Stripe's payment id, so finance's unique index makes a
+///   second delivery a no-op instead of a second entry.
+/// * `fund_id` is the id resolved above — never a configured copy.
+fn ledger_intent_payload(fact: &PaymentFact, category: &str, fund_id: i64) -> Value {
+    let description = match fact.description.trim() {
+        "" => format!("Stripe {} {}", fact.purpose, fact.payment_id),
+        text => format!("Stripe {} {} — {text}", fact.purpose, fact.payment_id),
+    };
+    let mut payload = json!({
+        "fund_id": fund_id,
+        "kind": "income",
+        "amount_cents": fact.amount_cents,
+        "category": category,
+        "member_id": fact.member_id,
+        "description": description,
+        "external_ref": fact.payment_id,
+        // The booking is dated when the payment was confirmed: this statement
+        // writes the row that sets `confirmed_at` to now().
+        "occurred_on": Utc::now().date_naive().to_string(),
+    });
+    if let Some(year) = fact.dues_year {
+        payload["fiscal_year"] = json!(year);
+    }
+    payload
+}
+
 /// Ask finance to book a payment, **as the caller**.
 ///
 /// Two calls, both with the caller's credential forwarded and neither with a
@@ -1257,66 +1496,39 @@ async fn ask_finance_to_book(
     let base = cfg.base_url();
 
     // 1. The fund code → id, as the caller.
-    let funds_url = format!(
-        "{base}{FINANCE_FUNDS_PATH}?include_inactive=1",
-    );
-    let funds = match c
-        .http
-        .request("GET".to_string(), funds_url, headers.clone(), None)
-        .await
-    {
-        Ok(response) if (200..300).contains(&response.status) => response,
-        Ok(response) => {
-            let message = format!(
-                "reading finance's funds was refused: {}",
-                message_of(&response.body, response.status)
-            );
+    let (funds_status, funds) = match read_funds(c, cfg, &headers).await {
+        FundsRead::Listed { status, funds } => (status, funds),
+        FundsRead::Refused { status, message } => {
             return refused(
-                message,
-                Some(response.status),
-                pass_through_status(response.status),
-            );
+                format!("reading finance's funds was refused: {message}"),
+                Some(status),
+                pass_through_status(status),
+            )
         }
-        Err(e) => {
+        FundsRead::Unreachable(message) => return unbookable(message, 502),
+    };
+    let fund_id = match resolve_fund(&funds, &fund_code) {
+        FundResolution::Id(id) => id,
+        FundResolution::Missing => {
+            return refused(
+                format!("finance has no fund with code {fund_code:?} visible to this caller"),
+                Some(funds_status),
+                400,
+            )
+        }
+        FundResolution::Inactive => {
+            return refused(
+                format!("finance's fund {fund_code:?} is inactive"),
+                Some(funds_status),
+                400,
+            )
+        }
+        FundResolution::NoId => {
             return unbookable(
-                format!("could not reach finance's funds route: {e}"),
+                format!("finance's fund {fund_code:?} came back without an id"),
                 502,
             )
         }
-    };
-    let fund = funds
-        .json::<Value>()
-        .ok()
-        .and_then(|value| {
-            value
-                .get("funds")
-                .and_then(Value::as_array)
-                .and_then(|funds| {
-                    funds
-                        .iter()
-                        .find(|fund| fund["code"].as_str() == Some(fund_code.as_str()))
-                        .cloned()
-                })
-        });
-    let Some(fund) = fund else {
-        return refused(
-            format!("finance has no fund with code {fund_code:?} visible to this caller"),
-            Some(funds.status),
-            400,
-        );
-    };
-    if fund["active"].as_bool() == Some(false) {
-        return refused(
-            format!("finance's fund {fund_code:?} is inactive"),
-            Some(funds.status),
-            400,
-        );
-    }
-    let Some(fund_id) = fund["id"].as_i64() else {
-        return unbookable(
-            format!("finance's fund {fund_code:?} came back without an id"),
-            502,
-        );
     };
 
     // 2. The entry, as the caller.
@@ -1408,15 +1620,26 @@ const SESSION_FIELDS: &str = r#"
 const PAYMENT_FIELDS: &str = r#"
     p.id, p.payment_id, p.event_id, p.session_id, p.purpose, p.amount_cents, p.currency,
     p.member_id, p.fund_code, p.category, p.description, p.dues_year, p.livemode,
-    p.ledger_status, p.ledger_mechanism, p.ledger_transaction_id, p.ledger_error,
-    p.confirmed_at::text AS confirmed_at, p.ledger_attempted_at::text AS ledger_attempted_at
+    p.ledger_status, p.ledger_mechanism, p.ledger_intent_id, p.ledger_transaction_id,
+    p.ledger_error, p.confirmed_at::text AS confirmed_at,
+    p.ledger_attempted_at::text AS ledger_attempted_at
 "#;
 
 /// The payment columns the sweep and the worklist need — narrower than
 /// [`PAYMENT_FIELDS`] because a notification should not carry a whole record.
+///
+/// The `v.*` columns are the payment's intent, read through
+/// `core.outbox_producer_view()`: the producer's own intents, without a grant on
+/// `core.outbox`, scoped to the plugin role by the function itself. They are
+/// `NULL` for a payment with no intent. Both it and `core.outbox_enqueue` are
+/// core migration 9; a core older than that cannot serve this worklist (or accept
+/// this plugin's enqueue), and the mechanism depends on that migration.
 const SWEEP_FIELDS: &str = r#"
     p.id, p.payment_id, p.purpose, p.amount_cents, p.currency, p.member_id,
     p.ledger_status, p.ledger_mechanism, p.ledger_error, p.confirmed_at::text AS confirmed_at,
+    p.ledger_intent_id, v.state AS intent_state, v.attempts AS intent_attempts,
+    v.max_attempts AS intent_max_attempts, v.answer_status AS intent_answer_status,
+    v.last_error AS intent_last_error, v.delivered_at::text AS intent_delivered_at,
     COUNT(*) OVER () AS total_unbooked
 "#;
 
@@ -1438,13 +1661,107 @@ fn sql_bump_redeliveries(c: &PluginContext) -> String {
     )
 }
 
-fn sql_insert_payment(c: &PluginContext) -> String {
+/// Record a confirmed payment, **and enqueue its ledger booking as an intent in
+/// the same statement**.
+///
+/// That is the whole design of the money path: `core.outbox_enqueue` returns a
+/// scalar, so it fits as the last expression in `VALUES`, and PostgreSQL runs
+/// the statement in one implicit transaction — the payment row and its intent
+/// commit together or neither does. There is no window in which a charge is
+/// recorded and its booking is not, and no transaction API is added to the SDK
+/// to get it (the plugin holds no `BEGIN`).
+///
+/// Two shapes of the *same* statement, because they bind a different number of
+/// parameters:
+///
+/// * `intent`: `ledger_intent_id` is `core.outbox_enqueue($15, 'POST',
+///   '/api/finance/transaction', $16::jsonb, $1)` — the **idempotency key is the
+///   payment's own `payment_id`**, so a redelivered webhook calls it with the
+///   key it already used and is handed back the intent it already has. The
+///   function derives the producer from `session_user` (this plugin's own role)
+///   and refuses any principal not declared for it; it takes no identity
+///   parameter, so this plugin cannot enqueue as anything but itself.
+/// * no intent: `ledger_intent_id` is `NULL`, for a payment whose fund could not
+///   be resolved at enqueue time (the residual named in the module docs) or for
+///   the pre-existing rows this plugin still books as the caller.
+///
+/// `ON CONFLICT (payment_id) DO NOTHING` keeps the *payment* unique. Note what
+/// the `VALUES` expression means for a redelivery: PostgreSQL evaluates it
+/// before the conflict is detected, so `core.outbox_enqueue` **is** called again
+/// — and returns the same intent id, because the key is the same. One payment,
+/// one intent, on every delivery.
+fn sql_insert_payment(c: &PluginContext, intent: bool) -> String {
+    let ledger_intent_id = if intent {
+        // $15 the principal, $16 the payload. The route is a literal: it is a
+        // contract with finance, not a request value.
+        format!(
+            "core.outbox_enqueue($15, 'POST', '{FINANCE_TRANSACTION_PATH}', $16::jsonb, $1)"
+        )
+    } else {
+        "NULL".to_string()
+    };
     format!(
         "INSERT INTO {payments} AS p \
            (payment_id, event_id, session_id, purpose, amount_cents, currency, member_id, \
-            fund_code, category, description, dues_year, livemode, ledger_status) \
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13) \
+            fund_code, category, description, dues_year, livemode, ledger_status, \
+            ledger_mechanism, ledger_intent_id) \
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, \
+                 {ledger_intent_id}) \
          ON CONFLICT (payment_id) DO NOTHING \
+         RETURNING {PAYMENT_FIELDS}",
+        payments = c.db.table("payments")
+    )
+}
+
+/// Either variant takes the same first fourteen parameters, in order:
+/// `$1` payment_id, `$2` event_id, `$3` session_id, `$4` purpose, `$5`
+/// amount_cents, `$6` currency, `$7` member_id, `$8` fund_code, `$9` category,
+/// `$10` description, `$11` dues_year, `$12` livemode, `$13` ledger_status,
+/// `$14` ledger_mechanism. The intent variant adds `$15` the principal and `$16`
+/// the payload (JSONB).
+///
+/// Split out so the DB-backed probes can drive the statement the handler drives,
+/// with the same binds, including the count that decides which variant fits.
+fn payment_insert_params(
+    fact: &PaymentFact,
+    envelope: &WebhookEnvelope,
+    fund_code: &str,
+    category: &str,
+    ledger_status: &str,
+    ledger_mechanism: &str,
+) -> Vec<SqlValue> {
+    vec![
+        SqlValue::Text(fact.payment_id.clone()),
+        SqlValue::Text(envelope.event_id.clone()),
+        SqlValue::Text(fact.session_id.clone()),
+        SqlValue::Text(fact.purpose.clone()),
+        SqlValue::Int(fact.amount_cents),
+        SqlValue::Text(fact.currency.clone()),
+        SqlValue::Text(fact.member_id.clone()),
+        SqlValue::Text(fund_code.to_string()),
+        SqlValue::Text(category.to_string()),
+        SqlValue::Text(fact.description.clone()),
+        fact.dues_year
+            .map(|year| SqlValue::Int(i64::from(year)))
+            .unwrap_or(SqlValue::NullInt),
+        SqlValue::Bool(envelope.livemode),
+        SqlValue::Text(ledger_status.to_string()),
+        SqlValue::Text(ledger_mechanism.to_string()),
+    ]
+}
+
+/// Settle a payment from its intent's terminal outcome — what the relay
+/// publishes, read by the producer.
+///
+/// Guarded on `ledger_status = 'intent_enqueued'` and on the intent id, so a
+/// replayed event is a no-op (one intent, one answer) and only the payment that
+/// enqueued *this* intent can be settled by it.
+fn sql_settle_from_intent(c: &PluginContext) -> String {
+    format!(
+        "UPDATE {payments} AS p \
+         SET ledger_status = $2, ledger_mechanism = '{MECHANISM_OUTBOX}', \
+             ledger_transaction_id = $3, ledger_error = $4, ledger_attempted_at = now() \
+         WHERE p.ledger_intent_id = $1 AND p.ledger_status = '{LEDGER_INTENT_ENQUEUED}' \
          RETURNING {PAYMENT_FIELDS}",
         payments = c.db.table("payments")
     )
@@ -1562,13 +1879,38 @@ fn sql_list_payments(c: &PluginContext) -> String {
     )
 }
 
-/// Payments with no *confirmed* ledger entry, older than the threshold.
+/// Payments with no *confirmed* ledger entry, older than the threshold — the
+/// worklist, and what each case in it means.
+///
 /// `$1` minutes (text, an interval), `$2` limit. The window count comes back
 /// with the page so one statement answers both "which" and "how many".
+///
+/// The cases, spelled out because the worklist is only honest if a reader can
+/// tell them apart:
+///
+/// * `intent_enqueued` — an intent is enqueued and the relay will deliver it.
+///   **Neither booked nor unbooked**, so it is listed (not silently counted as
+///   either) carrying its `ledger_intent_id` and the intent's own state, read
+///   through `core.outbox_producer_view()`. The durable intent is what decides
+///   the row's fate: once its state is `delivered` the ledger entry is confirmed
+///   and the row drops out of the worklist, whatever a lost notification did or
+///   did not say.
+/// * `unbooked` with no intent — the pre-existing case, and **the remaining
+///   job**: a row written before the outbox existed, or a payment whose fund
+///   could not be resolved at enqueue time (`ledger_intent_id IS NULL`, with the
+///   reason in the response and the audit of its delivery). A caller holding
+///   `finance:write` books it at `POST /api/stripe/payment/{id}/book`.
+/// * `delegated_event` — handed to finance through `payment.received`, whose
+///   subscriber books it idempotently but returns no answer.
+/// * `refused` / `failed` — a booking as the caller did not land, or the relay
+///   spent its attempts on this payment's intent. The fact is real and the
+///   ledger entry is not there.
 fn sql_unbooked(c: &PluginContext) -> String {
     format!(
         "SELECT {SWEEP_FIELDS} FROM {payments} p \
+         LEFT JOIN core.outbox_producer_view() v ON v.id = p.ledger_intent_id \
          WHERE p.ledger_status <> '{LEDGER_BOOKED}' \
+           AND v.state IS DISTINCT FROM '{OUTBOX_DELIVERED}' \
            AND p.confirmed_at < now() - ($1 || ' minutes')::interval \
          ORDER BY p.id DESC LIMIT $2",
         payments = c.db.table("payments")
@@ -1617,72 +1959,24 @@ impl Default for StripePlugin {
 ///
 /// Vocabulary that a later reader would have to *trust* is a constraint
 /// instead: a purpose, a session status, a ledger status, a positive amount, a
-/// redelivery counter that cannot go backwards.
-const MIGRATION_SCHEMA: &str = r#"
-CREATE TABLE IF NOT EXISTS checkout_sessions (
-    id BIGSERIAL PRIMARY KEY,
-    purpose TEXT NOT NULL,
-    amount_cents BIGINT NOT NULL,
-    currency TEXT NOT NULL DEFAULT 'cad',
-    member_id TEXT NOT NULL DEFAULT '',
-    fund_code TEXT NOT NULL DEFAULT '',
-    category TEXT NOT NULL DEFAULT '',
-    description TEXT NOT NULL DEFAULT '',
-    related_event_id TEXT NOT NULL DEFAULT '',
-    dues_year INTEGER,
-    status TEXT NOT NULL DEFAULT 'pending',
-    stripe_session_id TEXT UNIQUE,
-    checkout_url TEXT NOT NULL DEFAULT '',
-    created_by TEXT NOT NULL DEFAULT '',
-    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-    updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-    CONSTRAINT checkout_sessions_purpose_valid CHECK (purpose IN ('dues', 'donation', 'event_fee')),
-    CONSTRAINT checkout_sessions_amount_positive CHECK (amount_cents > 0),
-    CONSTRAINT checkout_sessions_status_valid CHECK (status IN ('pending', 'created', 'completed', 'expired', 'failed')),
-    CONSTRAINT checkout_sessions_dues_year_valid CHECK (dues_year IS NULL OR dues_year BETWEEN 2000 AND 2200)
-);
-CREATE INDEX IF NOT EXISTS idx_stripe_sessions_status ON checkout_sessions(status, id DESC);
-CREATE INDEX IF NOT EXISTS idx_stripe_sessions_member ON checkout_sessions(member_id);
-CREATE TABLE IF NOT EXISTS webhook_events (
-    id BIGSERIAL PRIMARY KEY,
-    event_id TEXT NOT NULL UNIQUE,
-    event_type TEXT NOT NULL,
-    livemode BOOLEAN NOT NULL DEFAULT false,
-    api_version TEXT NOT NULL DEFAULT '',
-    signature_timestamp BIGINT NOT NULL DEFAULT 0,
-    payload_digest TEXT NOT NULL DEFAULT '',
-    redeliveries INTEGER NOT NULL DEFAULT 0,
-    received_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-    CONSTRAINT webhook_events_redeliveries_valid CHECK (redeliveries >= 0)
-);
-CREATE INDEX IF NOT EXISTS idx_stripe_webhook_events_type ON webhook_events(event_type);
-CREATE TABLE IF NOT EXISTS payments (
-    id BIGSERIAL PRIMARY KEY,
-    payment_id TEXT NOT NULL UNIQUE,
-    event_id TEXT NOT NULL DEFAULT '',
-    session_id TEXT NOT NULL DEFAULT '',
-    purpose TEXT NOT NULL,
-    amount_cents BIGINT NOT NULL,
-    currency TEXT NOT NULL DEFAULT 'cad',
-    member_id TEXT NOT NULL DEFAULT '',
-    fund_code TEXT NOT NULL DEFAULT '',
-    category TEXT NOT NULL DEFAULT '',
-    description TEXT NOT NULL DEFAULT '',
-    dues_year INTEGER,
-    livemode BOOLEAN NOT NULL DEFAULT false,
-    ledger_status TEXT NOT NULL DEFAULT 'unbooked',
-    ledger_mechanism TEXT NOT NULL DEFAULT '',
-    ledger_transaction_id TEXT,
-    ledger_error TEXT,
-    confirmed_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-    ledger_attempted_at TIMESTAMPTZ,
-    CONSTRAINT payments_amount_positive CHECK (amount_cents > 0),
-    CONSTRAINT payments_status_valid CHECK (ledger_status IN ('unbooked', 'delegated_event', 'booked', 'refused', 'failed')),
-    CONSTRAINT payments_dues_year_valid CHECK (dues_year IS NULL OR dues_year BETWEEN 2000 AND 2200)
-);
-CREATE INDEX IF NOT EXISTS idx_stripe_payments_ledger ON payments(ledger_status, confirmed_at);
-CREATE INDEX IF NOT EXISTS idx_stripe_payments_member ON payments(member_id);
-"#;
+/// redelivery counter that cannot go backwards. The SQL lives in
+/// `migrations/*.sql`, one file per version:
+///
+/// * `001_stripe_schema` — the three tables, byte-identical to the SQL that
+///   shipped as `MIGRATION_SCHEMA` (the version and name in
+///   `core.schema_migrations` are unchanged, so no deployed database re-runs
+///   anything).
+/// * `002_payment_ledger_intent` — `payments.ledger_intent_id` and the replaced
+///   `ledger_status` check that admits `intent_enqueued`. A **new version** on
+///   purpose: the runner skips an applied version *without comparing its SQL*,
+///   so amending version 1 would be invisible on every deployed database while
+///   looking correct on a fresh one.
+pub mod migrations {
+    adjutant_sdk::migrations! {
+        1 => "stripe_schema" => "../migrations/001_stripe_schema.sql";
+        2 => "payment_ledger_intent" => "../migrations/002_payment_ledger_intent.sql";
+    }
+}
 
 #[async_trait]
 impl AdjutantPlugin for StripePlugin {
@@ -1743,11 +2037,69 @@ impl AdjutantPlugin for StripePlugin {
     }
 
     fn migrations(&self) -> Vec<Migration> {
-        vec![Migration::new(1, "stripe_schema", MIGRATION_SCHEMA)]
+        migrations::all()
     }
 
     fn routes(&self) -> Vec<RouteDefinition> {
         stripe_routes(self.ctx(), self.config())
+    }
+
+    /// The core's own **notification** that an intent reached a terminal state.
+    ///
+    /// Not how the ledger learns anything — the intent is. This is how this
+    /// plugin settles its own `ledger_status` from finance's answer, which the
+    /// core's docs say a producer should do. The worklist does not depend on it
+    /// (`sql_unbooked` reads the intent's durable state), so a dropped event
+    /// cannot make a booking invisible or invent one.
+    fn subscriptions(&self) -> Vec<EventSubscription> {
+        let ctx = self.ctx().clone();
+        vec![EventSubscription::new(
+            OUTBOX_EVENT_PREFIX,
+            event_handler(move |ev| {
+                let c = ctx.clone();
+                async move {
+                    let intent_id = ev.payload["intent_id"].as_i64().unwrap_or_default();
+                    // The bus is a broadcast: every subscriber sees every
+                    // producer's outcome, so one of them has to be somebody
+                    // else's business and is passed over.
+                    if intent_id == 0 || ev.payload["producer"].as_str() != Some("stripe") {
+                        return Ok(());
+                    }
+                    let (status, transaction_id) = match ev.payload["state"].as_str() {
+                        Some(OUTBOX_DELIVERED) => (
+                            LEDGER_BOOKED,
+                            ev.payload["answer"]["transaction"]["id"]
+                                .as_i64()
+                                .map(|id| id.to_string()),
+                        ),
+                        Some(OUTBOX_REFUSED) => (LEDGER_REFUSED, None),
+                        Some(OUTBOX_EXHAUSTED) => (LEDGER_FAILED, None),
+                        // `pending`/`attempting` are not terminal: the relay is
+                        // still working, and a transient failure is not an
+                        // outcome to write down.
+                        _ => return Ok(()),
+                    };
+                    let error = ev.payload["error"].as_str().map(str::to_string);
+                    c.db.execute(
+                        sql_settle_from_intent(&c),
+                        vec![
+                            SqlValue::Int(intent_id),
+                            SqlValue::Text(status.to_string()),
+                            transaction_id
+                                .map(SqlValue::Text)
+                                .unwrap_or(SqlValue::Null),
+                            error.map(SqlValue::Text).unwrap_or(SqlValue::Null),
+                        ],
+                    )
+                    .await?;
+                    eprintln!(
+                        "[adjutant-stripe] intent {intent_id} {status}: a payment's ledger_status \
+                         settled from its intent's outcome"
+                    );
+                    Ok(())
+                }
+            }),
+        )]
     }
 
     fn schedules(&self) -> Vec<Schedule> {
@@ -1829,23 +2181,36 @@ fn route_health(cfg: &StripeConfig) -> RouteDefinition {
                         "default_urls_configured": cfg.success_url().is_some()
                             && cfg.cancel_url().is_some(),
                         "ledger": {
-                            "path": "event",
-                            "event": event_type::PAYMENT_RECEIVED,
+                            "path": "outbox",
+                            "principal": LEDGER_PRINCIPAL,
+                            "target_route": format!("POST {FINANCE_TRANSACTION_PATH}"),
                             "synchronous": false,
+                            "intent": "a confirmed payment and its ledger intent are written in \
+                                       one statement (core.outbox_enqueue as an expression in this \
+                                       plugin's own INSERT), so neither can exist without the \
+                                       other",
                             "booked_as_the_caller": format!("POST /api/stripe/payment/{{id}}/book"),
                             "why": "a Stripe webhook carries no Adjutant caller, so there is no \
                                     credential to forward and finance's own gate would answer 401 \
-                                    (plugin-to-plugin.md §2(b)); the confirmed payment is handed to \
-                                    finance through payment.received, whose subscriber is idempotent \
-                                    on the payment id",
-                            "unverified": "the event path returns no answer, so this plugin cannot \
-                                           tell whether the ledger write happened; \
-                                           GET /api/stripe/unbooked is the worklist",
-                            "blocked_on": "plugin-to-plugin.md §3.2 leaves the money-path pattern \
-                                           open (single-transaction ownership, or an outbox with \
-                                           retry); until it is decided there is no way for a \
-                                           machine-originated confirmation to hold a bounded \
-                                           Adjutant authorization",
+                                    (plugin-to-plugin.md §2(b)). The core's relay delivers the \
+                                    intent as a declared service principal and records finance's \
+                                    answer on the intent row",
+                            "fallback": "when the fund cannot be resolved at enqueue time (issue \
+                                         #60: finance's write paths take only a fund id, and the \
+                                         funds read needs a credential this path does not have), \
+                                         the payment is recorded with no intent and handed to \
+                                         finance through payment.received, as before — status \
+                                         'delegated_event', no answer",
+                            "unverified": "the relay's delivery is asynchronous: 'intent_enqueued' \
+                                           is neither booked nor unbooked, and GET \
+                                           /api/stripe/unbooked is the worklist of everything \
+                                           without a confirmed ledger entry, with each payment's \
+                                           intent and its state",
+                            "blocked_on": "issue #60: finance's write routes accept only a fund \
+                                           **id**, so a producer with no read credential cannot \
+                                           compose a complete payload; accepting a fund code (or \
+                                           granting svc.stripe.ledger finance:read) is finance's \
+                                           change, not this plugin's",
                         },
                     }),
                 )
@@ -2346,8 +2711,10 @@ fn route_get_session(ctx: &PluginContext) -> RouteDefinition {
 /// signing secret before a byte of the payload is trusted; an unverified
 /// delivery is a `400` and touches no table.
 ///
-/// Queries: the receipt, the payment, and finance's own subscriber do the rest.
-/// A redelivery is self-healing — see the module docs.
+/// Queries: the receipt, the resolution of the fund (over `ctx.http`, at enqueue
+/// time, as a §2(b) call), and the one statement that records the payment and
+/// enqueues its ledger intent together. A redelivery is self-healing — see the
+/// module docs.
 fn route_webhook(ctx: &PluginContext, cfg: &StripeConfig) -> RouteDefinition {
     let c = ctx.clone();
     let cfg = cfg.clone();
@@ -2526,28 +2893,52 @@ pub async fn handle_webhook(
         .clone()
         .unwrap_or_else(|| category_for(&fact.purpose).to_string());
 
+    // The ledger booking, composed **at enqueue time** so the payload can be
+    // complete: the relay cannot read-then-write at delivery, so finance's fund
+    // *id* is resolved here, exactly as `POST /api/stripe/payment/{id}/book`
+    // resolves it — with the credential this request carried, which for a Stripe
+    // webhook is none, and that is the limit the module docs state (issue #60).
+    //
+    // What cannot be resolved yields **no intent** rather than an incomplete one:
+    // the payment is still recorded, truthfully `unbooked`, and handed to finance
+    // through `payment.received`, with the reason in the response and the audit.
+    let (intent, intent_refusal) =
+        match resolve_fund_id_for_intent(c, cfg, &forward_headers(req), &fund_code).await {
+            Ok(fund_id) => (
+                Some(ledger_intent_payload(&fact, &category, fund_id)),
+                None::<String>,
+            ),
+            Err(reason) => (None, Some(reason)),
+        };
+
+    // One statement, two shapes: with the intent, `ledger_intent_id` is the
+    // scalar `core.outbox_enqueue(...)` returns — so the payment row and its
+    // intent commit together or neither does. See `sql_insert_payment`.
+    let ledger_status = if intent.is_some() {
+        LEDGER_INTENT_ENQUEUED
+    } else {
+        LEDGER_UNBOOKED
+    };
+    let ledger_mechanism = if intent.is_some() { MECHANISM_OUTBOX } else { "" };
+    let mut params = payment_insert_params(
+        &fact,
+        &envelope,
+        &fund_code,
+        &category,
+        ledger_status,
+        ledger_mechanism,
+    );
+    if let Some(payload) = &intent {
+        // $15 the principal, $16 the payload. The principal is not a credential
+        // this plugin holds: the core checks it against its own declaration for
+        // this producer, and a refusal is an error in this transaction — the
+        // payment is not written either, which is the point of one statement.
+        params.push(SqlValue::Text(LEDGER_PRINCIPAL.to_string()));
+        params.push(SqlValue::Json(payload.to_string()));
+    }
     let inserted = c
         .db
-        .query_one(
-            sql_insert_payment(c),
-            vec![
-                SqlValue::Text(fact.payment_id.clone()),
-                SqlValue::Text(envelope.event_id.clone()),
-                SqlValue::Text(fact.session_id.clone()),
-                SqlValue::Text(fact.purpose.clone()),
-                SqlValue::Int(fact.amount_cents),
-                SqlValue::Text(fact.currency.clone()),
-                SqlValue::Text(fact.member_id.clone()),
-                SqlValue::Text(fund_code.clone()),
-                SqlValue::Text(category.clone()),
-                SqlValue::Text(fact.description.clone()),
-                fact.dues_year
-                    .map(|year| SqlValue::Int(i64::from(year)))
-                    .unwrap_or(SqlValue::NullInt),
-                SqlValue::Bool(envelope.livemode),
-                SqlValue::Text(LEDGER_UNBOOKED.to_string()),
-            ],
-        )
+        .query_one(sql_insert_payment(c, intent.is_some()), params)
         .await?;
 
     let (payment, newly_recorded) = match inserted {
@@ -2574,9 +2965,15 @@ pub async fn handle_webhook(
         }
     };
     let payment_id = payment["id"].as_i64().unwrap_or_default();
-    let already_delegated = payment["ledger_status"].as_str() == Some(LEDGER_DELEGATED_EVENT);
-    // The payment as returned: the pre-hand-off row until the hand-off settles
-    // it, then the settled row.
+    let ledger_status = payment["ledger_status"]
+        .as_str()
+        .unwrap_or(LEDGER_UNBOOKED);
+    let already_delegated = matches!(
+        ledger_status,
+        LEDGER_DELEGATED_EVENT | LEDGER_INTENT_ENQUEUED
+    );
+    // The payment as returned: the row as inserted (or as already recorded)
+    // until the hand-off settles it, then the settled row.
     let mut delegated = payment.clone();
 
     if newly_recorded {
@@ -2610,10 +3007,13 @@ pub async fn handle_webhook(
         }
     }
 
-    // The ledger hand-off, through the only mechanism available to a callerless
-    // request. `payment.received` is finance's documented contract (SPEC §5.4),
-    // and its subscriber keys on `payment_id`, so re-publishing after a failed
-    // attempt cannot double-count.
+    // The ledger hand-off, for a payment whose booking is **not** an intent.
+    // `payment.received` is finance's documented contract (SPEC §5.4), and its
+    // subscriber keys on `payment_id`, so re-publishing after a failed attempt
+    // cannot double-count. A payment whose booking *is* an intent is handed off
+    // by the relay instead: publishing both would be two mechanisms for one
+    // fact, and the second one to arrive would be refused for a duplicate
+    // `external_ref`.
     if !already_delegated {
         c.events
             .publish(
@@ -2634,7 +3034,7 @@ pub async fn handle_webhook(
                 ],
             )
             .await?
-            .unwrap_or(payment);
+            .unwrap_or_else(|| payment.clone());
         if newly_recorded {
             c.events
                 .publish(
@@ -2654,6 +3054,28 @@ pub async fn handle_webhook(
                 )
                 .await?;
         }
+    } else if newly_recorded {
+        // The intent path: the payment and its intent are already committed, and
+        // finance will answer through the relay. The notification says which
+        // mechanism carried it and which intent to watch.
+        c.events
+            .publish(
+                "stripe.payment.confirmed",
+                json!({
+                    "payment_id": fact.payment_id,
+                    "amount_cents": fact.amount_cents,
+                    "currency": fact.currency,
+                    "purpose": fact.purpose,
+                    "member_id": fact.member_id,
+                    "fund_code": fund_code,
+                    "category": category,
+                    "session_id": fact.session_id,
+                    "livemode": envelope.livemode,
+                    "ledger_status": ledger_status,
+                    "ledger_intent_id": payment["ledger_intent_id"],
+                }),
+            )
+            .await?;
     }
 
     if newly_recorded {
@@ -2673,7 +3095,13 @@ pub async fn handle_webhook(
                     "fund_code": fund_code,
                     "category": category,
                     "livemode": envelope.livemode,
-                    "ledger_status": LEDGER_DELEGATED_EVENT,
+                    "ledger_status": ledger_status,
+                    "ledger_intent_id": payment["ledger_intent_id"],
+                    // Why no intent was enqueued, when that is what happened: the
+                    // fund could not be resolved at enqueue time, so the payload
+                    // could not be completed (issue #60). The payment is recorded
+                    // either way — this is the reason on the record.
+                    "intent_refused": intent_refusal,
                     "signature_timestamp": stamp.timestamp,
                 }),
             )
@@ -2681,6 +3109,7 @@ pub async fn handle_webhook(
     }
 
     let duplicate = !newly_recorded && already_delegated;
+    let ledger = webhook_ledger_block(&delegated, intent_refusal.as_deref());
     PluginResponse::json(
         200,
         &json!({
@@ -2691,20 +3120,55 @@ pub async fn handle_webhook(
             "event_id": envelope.event_id,
             "event_type": envelope.event_type,
             "payment": delegated,
-            "ledger": {
-                "path": "event",
-                "event": event_type::PAYMENT_RECEIVED,
-                "synchronous": false,
-                "status": LEDGER_DELEGATED_EVENT,
-                "why": "a Stripe webhook carries no Adjutant caller, so there is no credential to \
-                        forward and finance's own gate would answer 401 (plugin-to-plugin.md \
-                        §2(b)); the payment is handed to finance through payment.received, whose \
-                        subscriber is idempotent on the payment id",
-                "verify": "POST /api/stripe/payment/{id}/book, as a caller holding finance:write, \
-                           makes the ledger write synchronous",
-            },
+            "ledger": ledger,
         }),
     )
+}
+
+/// The ledger block a webhook's response carries: which mechanism this delivery
+/// used, and what is still not known about it.
+///
+/// Two shapes, because the two are not the same thing and a caller must be able
+/// to tell them apart: an intent is enqueued (the relay will deliver it, and its
+/// state is readable), or no intent could be composed and the event carried the
+/// payment with the reason it was not.
+fn webhook_ledger_block(payment: &Value, intent_refusal: Option<&str>) -> Value {
+    let status = payment["ledger_status"]
+        .as_str()
+        .unwrap_or(LEDGER_UNBOOKED);
+    if status == LEDGER_INTENT_ENQUEUED {
+        return json!({
+            "path": "outbox",
+            "principal": LEDGER_PRINCIPAL,
+            "target_route": format!("POST {FINANCE_TRANSACTION_PATH}"),
+            "intent_id": payment["ledger_intent_id"],
+            "synchronous": false,
+            "status": status,
+            "why": "a Stripe webhook carries no Adjutant caller, so there is no credential to \
+                    forward (plugin-to-plugin.md §2(b)). The booking is an outbox intent written \
+                    in the same statement as the payment, and the core's relay delivers it as the \
+                    declared service principal svc.stripe.ledger, retrying with backoff and \
+                    recording finance's own answer on the intent row",
+            "verify": "GET /api/stripe/unbooked lists it while the intent is in flight, with the \
+                       intent's own state; the relay's outcome settles ledger_status",
+        });
+    }
+    json!({
+        "path": "event",
+        "event": event_type::PAYMENT_RECEIVED,
+        "synchronous": false,
+        "status": status,
+        "why": "no intent was enqueued for this payment, so the fallback mechanism carried it: a \
+                Stripe webhook carries no Adjutant caller, so there is no credential to forward \
+                and finance's own gate would answer 401 (plugin-to-plugin.md §2(b)); the payment \
+                is handed to finance through payment.received, whose subscriber is idempotent on \
+                the payment id",
+        // Null unless the intent could not be composed — in which case this is
+        // the reason, and the payment is on the worklist as `unbooked`.
+        "intent_refused": intent_refusal,
+        "verify": "POST /api/stripe/payment/{id}/book, as a caller holding finance:write, makes \
+                   the ledger write synchronous",
+    })
 }
 
 /// The `payment.received` payload (SPEC §5.4) — the shape finance's subscriber
@@ -2822,9 +3286,12 @@ fn route_list_payments(ctx: &PluginContext) -> RouteDefinition {
                         "next_before_id": next_before_id,
                         "unbooked_in_page": unbooked,
                         "note": "ledger_status is what this plugin knows: 'booked' means finance \
-                                 answered 2xx to a booking made as the caller; \
-                                 'delegated_event' means the payment was handed to finance through \
-                                 payment.received and no answer came back",
+                                 confirmed the entry (to a booking made as the caller, or to the \
+                                 delivery of the payment's intent); 'intent_enqueued' means the \
+                                 booking is an outbox intent the relay is delivering, with \
+                                 `ledger_intent_id` naming it; 'delegated_event' means the \
+                                 payment was handed to finance through payment.received and no \
+                                 answer came back",
                     }),
                 )
             }
@@ -2870,32 +3337,49 @@ fn ledger_block(payment: &Value) -> Value {
         "status": status,
         "booked": status == LEDGER_BOOKED,
         "mechanism": payment["ledger_mechanism"],
+        "intent_id": payment["ledger_intent_id"],
         "transaction_id": payment["ledger_transaction_id"],
         "error": payment["ledger_error"],
         "attempted_at": payment["ledger_attempted_at"],
         "next": match status {
             LEDGER_BOOKED => "nothing: finance confirmed the entry",
+            LEDGER_INTENT_ENQUEUED => "nothing, yet: the payment and its ledger intent committed \
+                                       together, and the core's relay will deliver the intent to \
+                                       finance as svc.stripe.ledger, retrying with backoff. \
+                                       `intent_id` names it; GET /api/stripe/unbooked shows the \
+                                       intent's state while it is in flight, and an operator can \
+                                       see it in GET /api/outbox/intents (core:admin). The \
+                                       relay's answer sets this to booked, refused or failed",
             LEDGER_DELEGATED_EVENT => "the payment was handed to finance through payment.received \
                                        and finance's subscriber books it idempotently; this plugin \
                                        cannot see the answer. POST /api/stripe/payment/{id}/book \
                                        as a caller holding finance:write makes it synchronous \
                                        (finance will refuse a duplicate external_ref)",
-            LEDGER_UNBOOKED => "POST /api/stripe/payment/{id}/book, as a caller holding \
-                                finance:write",
-            LEDGER_REFUSED => "finance refused the booking; its message is in `error`. If it names \
-                               external_ref, the payment.received subscriber already booked it — \
-                               check finance's own transactions with finance:read_all",
-            _ => "the booking call did not complete; the next unbooked_sweep will notice it again",
+            LEDGER_UNBOOKED => "no intent was enqueued for this payment (its fund could not be \
+                                resolved at enqueue time, or it predates the outbox); POST \
+                                /api/stripe/payment/{id}/book as a caller holding finance:write",
+            LEDGER_REFUSED => "finance or its gate said no — to the booking as the caller, or to \
+                               the intent's delivery. Its message is in `error`. If it names \
+                               external_ref, the entry is already there: check finance's own \
+                               transactions with finance:read_all",
+            _ => "the booking did not land: the call did not complete, or the relay spent every \
+                  attempt on the intent. The next unbooked_sweep will notice it again",
         },
     })
 }
 
-/// `GET /api/stripe/unbooked` — the payments with no *confirmed* ledger entry.
+/// `GET /api/stripe/unbooked` — the payments with no *confirmed* ledger entry,
+/// and **the in-flight case stated rather than hidden**.
 ///
-/// This is the honest answer to "is every charged card on the books?": a
-/// payment whose `payment.received` publish never reached finance looks like
-/// every other delegation from here, so the two are reported together and
-/// separated by status rather than assumed to be fine.
+/// This is the honest answer to "is every charged card on the books?". A payment
+/// whose ledger booking is an outbox intent is neither booked nor unbooked, so it
+/// is listed with its `ledger_intent_id` and the intent's own state
+/// (`intent_state`, `intent_attempts`, `intent_last_error`, read through
+/// `core.outbox_producer_view()`), while a payment with no intent at all is the
+/// older job — the one `POST /api/stripe/payment/{id}/book` closes. The two are
+/// kept visible together and separated by status rather than assumed to be fine,
+/// and a payment whose intent is `delivered` is gone from here: the durable
+/// intent says the ledger entry exists, whatever a lost notification said.
 ///
 /// One query.
 fn route_unbooked(ctx: &PluginContext, cfg: &StripeConfig) -> RouteDefinition {
@@ -2934,6 +3418,14 @@ fn route_unbooked(ctx: &PluginContext, cfg: &StripeConfig) -> RouteDefinition {
                         by_status.insert(status.to_string(), json!(count));
                     }
                 }
+                // The in-flight case is counted apart from the rest, because it
+                // is the one an operator should *not* act on by hand: the relay
+                // is already delivering it, and `intent_state` says what it is
+                // doing.
+                let in_flight = rows
+                    .iter()
+                    .filter(|row| row["ledger_status"].as_str() == Some(LEDGER_INTENT_ENQUEUED))
+                    .count();
                 PluginResponse::json(
                     200,
                     &json!({
@@ -2942,11 +3434,17 @@ fn route_unbooked(ctx: &PluginContext, cfg: &StripeConfig) -> RouteDefinition {
                         "total_unbooked": total,
                         "older_than_minutes": older_than,
                         "by_status": Value::Object(by_status),
-                        "note": "a delegation cannot be told from a failed delegation from here, \
-                                 so both appear: 'delegated_event' means finance was told and did \
-                                 not answer; 'refused'/'failed' mean a booking as the caller did \
-                                 not land. Book each as a caller holding finance:write from \
-                                 POST /api/stripe/payment/{id}/book",
+                        "in_flight": in_flight,
+                        "note": "each row says which case it is. 'intent_enqueued' means the \
+                                 booking is an outbox intent the relay is delivering — neither \
+                                 booked nor unbooked: `ledger_intent_id` names it and the intent_* \
+                                 columns carry its own state, and the row leaves this list once \
+                                 that state is 'delivered'. 'unbooked' with no intent is the real \
+                                 job (the fund could not be resolved at enqueue time, or the row \
+                                 predates the outbox): book it as a caller holding finance:write \
+                                 from POST /api/stripe/payment/{id}/book. 'delegated_event' means \
+                                 finance was told through payment.received and did not answer; \
+                                 'refused'/'failed' mean the booking did not land",
                     }),
                 )
             }
@@ -3081,13 +3579,17 @@ fn route_book(ctx: &PluginContext, cfg: &StripeConfig) -> RouteDefinition {
 // The sweep — a notification, never a mechanism
 // ---------------------------------------------------------------------------
 
-/// Every six hours, notice the confirmed payments with no *booked* ledger entry.
+/// Every six hours, notice the confirmed payments with no *booked* ledger entry
+/// — including the ones whose intent is still in flight.
 ///
 /// **It notifies; it does not write.** Writing here would be the plugin
 /// reaching into another plugin's domain on a timer, which is the same
 /// privileged-shortcut problem as the webhook, and it would need a credential
-/// nobody has. A silent sweep is a healthy one; when something is unbooked, one
-/// event names the payments so a treasurer can act with their own authority.
+/// nobody has. Nor does it deliver an intent: the core's relay does that, with
+/// backoff and a recorded answer. What the sweep adds is the *threshold*: an
+/// intent still not delivered after `unbooked_after_minutes` is a stalled money
+/// path, and one event names those payments so a treasurer can act with their
+/// own authority.
 ///
 /// One query.
 async fn unbooked_sweep(c: &PluginContext, cfg: &StripeConfig) -> Result<(), SdkError> {
@@ -3131,13 +3633,20 @@ async fn unbooked_sweep(c: &PluginContext, cfg: &StripeConfig) -> Result<(), Sdk
             json!({
                 "unbooked": rows.len(),
                 "total_unbooked": total,
+                "in_flight": rows
+                    .iter()
+                    .filter(|row| row["ledger_status"].as_str() == Some(LEDGER_INTENT_ENQUEUED))
+                    .count(),
                 "older_than_minutes": minutes,
                 "oldest_confirmed_at": oldest,
                 "by_status": Value::Object(by_status),
                 "payments": rows,
-                "next": "a caller holding finance:write can book each with \
-                         POST /api/stripe/payment/{id}/book; the notification is not the ledger \
-                         write (plugin-to-plugin.md §3.2)",
+                "next": "a row with 'intent_enqueued' is not a hand-job: the core's relay is \
+                         delivering it, its state is in the intent_* fields, and a stalled one \
+                         belongs to the operator (GET /api/outbox/intents, core:admin). A row \
+                         with no intent at all is the real work — a caller holding finance:write \
+                         books it with POST /api/stripe/payment/{id}/book. This notification is \
+                         never the ledger write (plugin-to-plugin.md §3.2)",
             }),
         )
         .await
