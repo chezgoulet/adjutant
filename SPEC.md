@@ -546,6 +546,7 @@ Adjutant can act as an identity provider for other troop systems. A separate plu
 - Sliding scale dues administration
 - **The Scholarship fund as the funding source for anything free, deducted or waived.** A comp, a sliding-scale reduction, a scholarship award or a waived due is *drawn from* `scholarship` — recorded as a balanced transfer into the fund that would otherwise have received the money — so the subsidy is visible in the ledger and the Annual Financial Report instead of being expressed as a price of zero. A zero price hides who paid; a draw names them.
 - **Donations and allocations addressed to a named fund** — a scout or troop management may give to the troop, or direct money into a fund (Scholarship above all), and the gift is income to that fund like any other
+- **A receipt for any money received** — a donation, a dues payment, a shop purchase, an event fee. The receipt is issued from the **ledger record** (finance owns the money, so finance owns the receipt), it is **numbered and immutable** — a correction is a new receipt that references the one it supersedes, never an edit — and it is re-issuable and printable. It carries **no tax-deductibility language unless the troop has declared that status**, because a receipt claiming a deduction the troop cannot substantiate is a liability for the troop rather than a courtesy to the giver; where a status is declared, the wording is the troop's own and configurable, never invented by the software.
 - Annual Financial Report generation
 - Lodge dues tracking
 
