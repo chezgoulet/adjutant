@@ -1,0 +1,19 @@
+[package]
+name = "adjutant-calendar"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Calendar: events, iCal recurrence, RSVPs, and Congress quorum projection (SPEC 7.7)."
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+adjutant-sdk.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+chrono.workspace = true
+
+[dev-dependencies]
+tokio.workspace = true

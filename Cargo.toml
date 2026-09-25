@@ -9,6 +9,7 @@ members = [
     "plugins/membership",
     "plugins/missions",
     "plugins/governance",
+    "plugins/calendar",
     "plugins/mcp",
     "plugins/examples/hello",
     "server",

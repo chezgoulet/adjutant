@@ -167,6 +167,71 @@ INSERT INTO core.role_permissions (role_id, permission_id) VALUES
 ON CONFLICT DO NOTHING;
 ```
 
+### Calendar (SPEC §7.7)
+
+Events at troop or Lodge scope, with iCal `RRULE` recurrence, RSVPs (per
+occurrence for a recurring event, `EXDATE` for a cancelled meeting), and the
+Congress quorum projection.
+
+**Every timestamp on this API is a wall clock** — `YYYY-MM-DD`,
+`YYYY-MM-DDTHH:MM` or `YYYY-MM-DDTHH:MM:SS`, never a UTC designator — and the
+event's `timezone` (an IANA name PostgreSQL knows, e.g. `America/New_York`)
+goes with it. That is what "Tuesdays at 7pm" means to a troop: the local time is
+fixed and its UTC offset moves with DST. Occurrence times come back as wall
+clock too, beside the base occurrence's absolute `starts_at`.
+
+| Method | Path | Permission | Body / notes |
+|---|---|---|---|
+| POST | `/api/calendar/event` | `calendar:create` at the event's scope | `{title, starts_at, scope_type?: troop\|lodge, scope_id?, category?, body?, meeting_id?, description?, location?, timezone?, all_day?, ends_at?, rrule?, exdates?, quorum_basis?, expected_voters?, quorum_required?}` |
+| GET | `/api/calendar/events?status=&scope_type=&scope_id=&body=&category=&from=&to=&limit=` | `calendar:read` | Narrowed to the scopes the caller covers. `status` defaults to `scheduled`; `all` includes cancelled |
+| GET | `/api/calendar/upcoming?days=&category=&scope_type=&scope_id=&limit=&total=&from=` | `calendar:read` | The home screen: the next occurrences across every visible event, **plus the seasonal prompts** due in the same window |
+| GET | `/api/calendar/season?on=&days=` | `calendar:read` (troop) | `on=2026-10` for a month view, `on=2026-10-01&days=90` for a window |
+| GET | `/api/calendar/event/{id}` | `calendar:read` | Event + RSVPs + counts + quorum |
+| GET | `/api/calendar/event/{id}/occurrences?from=&limit=` | `calendar:read` | The expanded series, `EXDATE`s removed |
+| GET | `/api/calendar/event/{id}/quorum?occurrence=` | `calendar:read` | The quorum projection for one occurrence |
+| POST | `/api/calendar/event/{id}/rsvp` | `calendar:rsvp` at the event's scope | `{response: going\|not_going\|maybe\|pending, occurrence?, note?}` — omitted `occurrence` answers for the whole series; a re-answer updates |
+| POST | `/api/calendar/event/{id}/rsvp/{member}` | `calendar:manage` | The same body, recorded for another member (the phoned-in RSVP) |
+| GET | `/api/calendar/event/{id}/rsvps` | `calendar:read` | Every answer, plus the counts for the next occurrence |
+| PATCH | `/api/calendar/event/{id}` | `calendar:manage` at the event's scope | Any subset of the create body; validated against the whole event |
+| POST | `/api/calendar/event/{id}/cancel` | `calendar:manage` at the event's scope | Cancels the series, keeping its RSVPs and the record |
+| POST | `/api/calendar/event/{id}/occurrence/cancel` | `calendar:manage` at the event's scope | `{occurrence, reason?}` — an `EXDATE`; the rest of the series stands |
+| DELETE | `/api/calendar/event/{id}` | `calendar:manage`, **troop-covering** | Destructive routes are never available from a Lodge grant (§8 #3) — cancel instead |
+
+**Events:** `event.created` (the SPEC §5.4 type), plus `event.updated`,
+`event.cancelled`, `event.occurrence.cancelled`, `event.rsvp`, `event.deleted`,
+`event.season.upcoming` (the weekly seasonal reminder).
+
+**Subscribes to:** `mission.completed` → a provisional debrief event one week
+later at 6pm, in the mission's Lodge. `source_mission_id` is unique, so a
+replayed event does not create a second debrief.
+
+**Quorum.** `quorum_basis` reuses governance's vocabulary (`one_third_registered`
+— the Congress rule the 3rd Congress locked, `ceil(expected/3)`;
+`majority_members`; `fixed`) and adds `none` for an ordinary event. The arithmetic
+is governance's, so the two plugins cannot disagree about what "one-third of
+registered scouts" is; what differs is the input. Calendar counts **intent**
+(RSVPs marked `going` for one occurrence, with series-level answers counting for
+every occurrence and an occurrence-specific answer overriding them) and names it
+a projection; governance counts **attendance**, which is the number that decides
+a motion. A Congress event carries governance's `meeting_id`, and the quorum
+response returns `governance_quorum`
+(`/api/governance/meeting/{id}/quorum`) so a client shows both. Registered-scout
+counts are recorded on the event (`expected_voters`) because a plugin role can
+only read its own schema; an unconfigured rule fails closed.
+
+**Role grants.** `chief` is seeded with every permission the core finds; the rest
+is the operator's, as for the other plugins:
+
+```sql
+INSERT INTO core.role_permissions (role_id, permission_id) VALUES
+  ('lodge_commander', 'calendar:read'),
+  ('lodge_commander', 'calendar:create'),
+  ('lodge_commander', 'calendar:manage'),
+  ('scout',           'calendar:read'),
+  ('scout',           'calendar:rsvp')
+ON CONFLICT DO NOTHING;
+```
+
 ## Hermes MCP plugin (SPEC §7.10)
 
 The permissions-aware MCP surface Hermes connects to. Every tool **is** an
