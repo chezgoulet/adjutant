@@ -77,6 +77,30 @@ first-party plugin to pick the helpers up.
   `tools.disable` in the plugin's config retarget or extend it without a
   rebuild.
 
+- **`adjutant-stripe`** (SPEC §7.13): the payment path — Checkout session
+  creation for dues, fundraising donations and event fees; `POST
+  /api/stripe/webhook`, which verifies Stripe's HMAC signature over the raw body
+  (300s replay window, `v0` refused) before it trusts a byte and writes nothing
+  when the signature does not check out; idempotent recording at two layers
+  (`stripe.webhook_events.event_id`, and `stripe.payments.payment_id` — the same
+  key finance holds as `external_ref`, so a redelivery is a no-op and a double
+  booking is impossible, and a delivery whose hand-off failed is retried by the
+  next one); `stripe.checkout_sessions`, `stripe.webhook_events` and
+  `stripe.payments` in its own schema; and `stripe:read` / `stripe:read_all` /
+  `stripe:checkout` / `stripe:manage`. **The money path is where the boundary
+  bites, and this plugin reports it rather than papering over it:** a webhook
+  carries no Adjutant caller, so there is no credential to forward and the
+  §2(b) "call its API as the caller" mechanism cannot be used on that path;
+  finance's `payment.received` subscriber is therefore the mechanism (idempotent
+  on the payment id), and it returns no answer. Every payment carries a
+  `ledger_status`, `GET /api/stripe/unbooked` is the worklist of payments with
+  no *confirmed* ledger entry, a six-hourly sweep publishes
+  `stripe.ledger.unbooked` (a notice, never the write), and `POST
+  /api/stripe/payment/{id}/book` makes the ledger write synchronous by
+  forwarding the caller's own credential so finance's gate re-decides
+  `finance:write`. Closing it structurally needs the pattern
+  `docs/design/plugin-to-plugin.md` §3.2 deliberately leaves open.
+
 ### Notes for plugin authors
 
 - Both plugins touch **no** `core.*` table: they keep to their own schema, so

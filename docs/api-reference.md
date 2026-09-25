@@ -683,6 +683,120 @@ Tools (path and permission mirror the owning plugin's route exactly):
 
 Permissions this plugin defines: `mcp:connect`, `mcp:invoke`, `mcp:audit`.
 
+### Stripe (SPEC §7.13)
+
+Payments for a troop's own things: dues collection, fundraising donations, event
+fees, and the webhook that confirms a payment happened. It is the only place a
+card is ever charged, and it keeps to its own schema — **finance owns the
+ledger** and this plugin never writes `finance.*`.
+
+Checkout sessions are opened through Stripe's API over the core's mediated HTTP
+client, with the `secret_key` from the plugin's config. The key is never logged,
+never returned by any route (health reports `"configured"`, not a value) and
+never placed in an event payload or an audit detail. A session row is written
+`pending` **before** Stripe is called and settled afterwards, so a call that
+never answered leaves a visible `failed` attempt rather than a mystery — and the
+`client_reference_id` Stripe echoes back names a row that already exists.
+
+`POST /api/stripe/webhook` is **open, on purpose**: the delivery comes from
+Stripe's servers, so there is no Adjutant session to require. The credential is
+the HMAC signature over the raw body (`Stripe-Signature: t=…,v1=…`, a 300-second
+replay window, `v0` refused), and an unverified delivery is a `400` that writes
+nothing. Two keys make redelivery safe at two layers:
+`stripe.webhook_events.event_id` (one row per distinct delivery, with a
+`redeliveries` counter) and `stripe.payments.payment_id` — Stripe's `pi_…`,
+which is also the ledger's `external_ref`. A redelivery is therefore a no-op,
+and a payment that somehow reached the ledger by both paths is still one entry.
+A redelivery is also *self-healing*: the handler checks the payment's
+`ledger_status`, not the receipt, so a delivery whose hand-off never fired
+retries it.
+
+**How a confirmed payment reaches the ledger — and the limit of it.** Finance
+subscribes to `payment.received` (SPEC §5.4) and books an income entry keyed on
+the provider's payment id, so a webhook-confirmed payment *does* reach
+`finance.transactions` idempotently. But a webhook carries no caller, so there
+is no credential to forward to finance's API: the second permitted mechanism
+(`plugin-to-plugin.md` §2(b), "as the caller") cannot be used on that path, and
+minting a credential is the one shortcut that document refuses. The event is
+therefore the mechanism on the webhook path, and the plugin is honest that it is
+a **fire-and-forget** one: no answer comes back, so it cannot tell whether the
+ledger write happened (a failed subscriber is a `tracing::warn!` and nothing
+more; a lagged subscriber drops events). Every confirmed payment carries a
+`ledger_status` (`unbooked`, `delegated_event`, `booked`, `refused`, `failed`),
+`GET /api/stripe/unbooked` is the worklist of payments with no *confirmed*
+ledger entry, a six-hourly sweep publishes `stripe.ledger.unbooked` when there
+are any, and **`POST /api/stripe/payment/{id}/book` makes the write
+synchronous** by forwarding the caller's own credential to finance and letting
+finance's gate re-decide `finance:write`. A treasurer can close the gap by hand
+today; closing it structurally is a decision `plugin-to-plugin.md` §3.2 leaves
+open.
+
+Config lives in the `stripe` row's `core.plugins.config`:
+
+```json
+{
+  "secret_key": "sk_live_…", "webhook_secret": "whsec_…",
+  "base_url": "http://127.0.0.1:8787", "api_base": "https://api.stripe.com",
+  "currency": "cad", "success_url": "https://troop.example/paid",
+  "cancel_url": "https://troop.example/dues", "webhook_tolerance_seconds": 300,
+  "dues_fund_code": "general", "donation_fund_code": "general",
+  "event_fund_code": "general", "unbooked_after_minutes": 30
+}
+```
+
+`base_url` is *this* Adjutant instance — the address the ledger call dials, as
+`mcp` dials it.
+
+| Method | Path | Permission | Body / notes |
+|---|---|---|---|
+| GET | `/api/stripe/health` | `stripe:read` | What is configured (presence, never a value), `key_mode` (`live`/`test`/`unconfigured`), the fund codes, and the `ledger` block: which path a confirmation takes, that it is not synchronous, and what it is blocked on. No database |
+| POST | `/api/stripe/checkout` | `stripe:checkout` (any scope) | `{purpose: dues\|donation\|event_fee, amount_cents\|amount, currency?, member_id?, fund_code?, category?, description?, related_event_id?, dues_year?, success_url?, cancel_url?}` → `201` + `Location` + `{session, checkout_url, checkout, ledger}`. `amount_cents` is an integer count of cents and `amount` a dollars string (`"12.50"`); a JSON float is refused, as is a value finer than a cent. Naming somebody else's `member_id` needs `stripe:manage` (troop). Without a `secret_key` it is a `503` and Stripe is never called |
+| GET | `/api/stripe/sessions?id=&purpose=&status=&member_id=&before_id=&limit=` | `stripe:read` (any scope) | Newest first, one row more than asked for so `has_more` needs no `COUNT(*)`. A caller without `stripe:read_all` is narrowed to the sessions they opened or that name them (`narrowed_to_caller: true`); the two answers are `403`-shaped the same way as their absence |
+| GET | `/api/stripe/session/{id}` | `stripe:read` (any scope) | The session, the payment it produced (if any) and that payment's ledger state. Somebody else's session is a `403` that reads `"no such checkout session"` |
+| POST | `/api/stripe/webhook` | — (open; the signature is the credential) | Stripe's delivery. `200` `{received, duplicate, redelivered, redeliveries, event_id, event_type, payment, ledger}`. `400` on a bad/unsigned/stale signature or a payload with no event id; `503` when no `webhook_secret` is configured (the endpoint refuses every delivery rather than accepting an unverified one); `500` when the hand-off failed, so Stripe retries. An unreadable payment event is a `200` with `unusable` (retrying would not make it readable) and is audited |
+| GET | `/api/stripe/payments?purpose=&ledger_status=&payment_id=&member_id=&before_id=&limit=` | `stripe:read_all` (troop) | Every confirmed payment with its ledger status, mechanism, finance's own error text and whether an attempt was made |
+| GET | `/api/stripe/payment/{id}` | `stripe:read_all` (troop) | One payment plus the `ledger` block: what is known, and what to do about it |
+| GET | `/api/stripe/unbooked?older_than_minutes=&limit=` | `stripe:read_all` (troop) | The payments with no *confirmed* ledger entry: `{payments, count, total_unbooked, by_status, note}`. `delegated_event` (finance was told, no answer) and `refused`/`failed` are listed together and separated by status, because from here a completed delegation and a failed one look alike |
+| POST | `/api/stripe/payment/{id}/book` | `stripe:manage` (troop) | Ask finance to book a confirmed payment **as the caller**: resolves the fund code through `GET /api/finance/funds` and posts one income entry with `external_ref` = Stripe's payment id, both carrying the caller's `authorization`/`cookie`. Finance's status is passed through (`403` when the caller lacks `finance:write`, `409` when finance already has that `external_ref`), and a request with no credential is refused here before anything is called |
+
+**Events:** `payment.received` (SPEC §5.4 and finance's contract — the
+hand-off), `stripe.checkout.created`, `stripe.payment.confirmed`,
+`stripe.payment.booked`, `stripe.webhook.unusable`,
+`stripe.ledger.unbooked` (the sweep's notice). No payload carries a secret or a
+card detail.
+
+**Subscribes to:** nothing, on purpose — the fact is this plugin's output, and a
+subscriber must not publish into the cycle it consumes (`plugin-to-plugin.md`
+§3.4).
+
+**Permissions this plugin defines:** `stripe:read` (your own sessions),
+`stripe:read_all` (every session and payment, with ledger state),
+`stripe:checkout` (open a session), `stripe:manage` (open one for another
+member, and book the ledger as you).
+
+**Role grants.** `chief` is seeded with every permission the core finds; the
+rest is the operator's, as for the other plugins. A treasurer needs
+`finance:write` as well to make the ledger write synchronous — a permission this
+plugin never declares, because it does not gate on it: finance does.
+
+```sql
+INSERT INTO core.role_permissions (role_id, permission_id) VALUES
+  ('treasurer',      'stripe:read_all'),
+  ('treasurer',      'stripe:checkout'),
+  ('treasurer',      'stripe:manage'),
+  ('treasurer',      'finance:write'),
+  ('scout',          'stripe:read'),
+  ('scout',          'stripe:checkout')
+ON CONFLICT DO NOTHING;
+```
+
+**What is deliberately not here.** The storefront (uniforms, patches),
+equipment rentals with a troop-set fee, sliding-scale pricing across the
+storefront, and free/comp sales for commanders and above were specified by the
+owner and have no SPEC section yet; where they live is not decided, so nothing
+here anticipates it. Refunds are absent too (SPEC §7.13 does not ask for them):
+a refund is an *expense* in finance's vocabulary and belongs to finance's routes.
+
 ### Announcements (SPEC §7.14)
 
 Troop and Lodge notices in the troop's three categories — `urgent`,

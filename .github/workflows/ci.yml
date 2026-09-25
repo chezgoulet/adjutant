@@ -107,7 +107,8 @@ jobs:
              target/debug/libadjutant_archive.so \
              target/debug/libadjutant_conflicts.so \
              target/debug/libadjutant_announcements.so \
-             target/debug/libadjutant_finance.so plugins-built/
+             target/debug/libadjutant_finance.so \
+             target/debug/libadjutant_stripe.so plugins-built/
 
       # Route/registry smoke ladder against a pristine test database.
       - name: test-plugin harness
@@ -160,6 +161,7 @@ jobs:
           ./target/debug/adjutant validate-plugin target/debug/libadjutant_conflicts.so
           ./target/debug/adjutant validate-plugin target/debug/libadjutant_announcements.so
           ./target/debug/adjutant validate-plugin target/debug/libadjutant_finance.so
+          ./target/debug/adjutant validate-plugin target/debug/libadjutant_stripe.so
           ./target/debug/adjutant validate-plugin target/debug/libadjutant_gear_locker.so
 
       - name: End-to-end harness (dev headers OFF)
