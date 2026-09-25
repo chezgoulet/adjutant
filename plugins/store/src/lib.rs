@@ -83,37 +83,42 @@
 //!   so the order's completion and the ledger write land in one flow with
 //!   answers (§3.2).
 //! * `POST /api/store/order/{id}/comp` — a commander comps an order: the comp is
-//!   recorded with its reason and authority, and the **draw it produces is booked
-//!   in the same call** by asking finance to transfer the price out of
-//!   `scholarship` as the caller, so finance's gate re-decides `finance:write`.
+//!   recorded with its reason and authority, and the **draw it produces is
+//!   enqueued as an outbox intent in that same statement** (below), so the comp
+//!   and the scholarship transfer finance will make are one act.
 //!
-//! **One path has no caller, and this crate says so rather than pretending
-//! otherwise.** A sliding-scale reduction is applied at checkout *by the shop*,
-//! and the draw it produces needs `finance:write` — which the member placing the
-//! order does not hold and must not be given. Neither can a machine-originated
-//! confirmation (a Stripe webhook saying an order is paid) obtain a bounded
-//! Adjutant authorization: §3.2 decided the pattern that solves this — a core
-//! transactional outbox with an idempotent consumer, delivery authorised by a
-//! declared service principal — and **that is not built yet**. Minting a
-//! credential, or calling finance with a credential that is not the caller's, is
-//! the one thing §3.1 refuses, and this crate does not do it. Muting the
-//! reduction into a cheaper price is the other refusal: it would hide the
-//! subsidy.
+//! **One path has no caller, and the outbox is the answer to it.** A sliding-scale
+//! reduction is applied at checkout *by the shop*, and the draw it produces needs
+//! `finance:write` — which the member placing the order does not hold and must not
+//! be given. Neither can a machine-originated confirmation (a Stripe webhook saying
+//! an order is paid) obtain a bounded Adjutant authorization. So the draw is a
+//! **durable outbox intent**: the statement that completes (or comps) the order
+//! writes `core.outbox_enqueue(…)` beside its own transition, and the core's relay
+//! delivers it to `POST /api/finance/transfer` as the declared `svc.store.draw`
+//! principal — grant `finance:write`, declared for the `store` producer alone, and
+//! revocable by an operator like any other identity. Minting a credential, or
+//! calling finance with a credential that is not the caller's, is the one thing
+//! §3.1 refuses, and this crate does not do it. Muting the reduction into a cheaper
+//! price is the other refusal: it would hide the subsidy.
 //!
 //! So this crate does four things about it, and stops there:
 //!
-//! * **It records the truth.** Every order carries `funded_cents` and a
-//!   `draw_status` (`unbooked`, `attempting`, `booked`, `refused`, `failed`), and
-//!   a reduction's draw is left `unbooked` with the amount visible from the
-//!   moment the order is placed.
+//! * **It records the truth.** Every order carries `funded_cents`, a `draw_status`
+//!   (`none`, `unbooked`, `intent_enqueued`, `attempting`, `booked`, `refused`,
+//!   `failed`) and the `draw_intent_id` of the outbox intent when there is one.
+//!   `intent_enqueued` means precisely what it says: an intent exists and the relay
+//!   will deliver it — **neither booked nor unbooked** — and it is the intent's
+//!   durable state, not a notification, that decides the draw's fate.
 //! * **It offers a worklist.** `GET /api/store/orders/unsettled` lists the orders
-//!   awaiting payment and the completed orders whose draw or ledger entry is not
-//!   confirmed, and a six-hourly sweep publishes `store.orders.unsettled` (a
-//!   notice; never the mechanism by which the ledger learns).
+//!   awaiting payment, the orders whose draw intent is in flight (with its id and
+//!   the intent's own state), and the completed orders whose draw or ledger entry is
+//!   not confirmed; a six-hourly sweep publishes `store.orders.unsettled` (a notice;
+//!   never the mechanism by which the ledger learns).
 //! * **It offers the synchronous path where a caller genuinely exists.**
-//!   `POST /api/store/order/{id}/draw` books an outstanding draw **as the
-//!   caller** — a treasurer holding `finance:write` can close the gap by hand,
-//!   today, with their own authority and nothing added.
+//!   `POST /api/store/order/{id}/draw` books an outstanding draw **as the caller**
+//!   — a treasurer holding `finance:write` can close what no intent owns, with
+//!   their own authority and nothing added — and refuses a `409` naming the
+//!   intent when one is already in flight.
 //! * **It never fakes a completion.** An order is `paid` only after stripe's own
 //!   record confirms the payment, and `comped` only with a grant and a reason.
 //!
@@ -177,9 +182,10 @@
 //! plugin defines `store:comp` and nothing else; which roles hold it is the
 //! troop's business, recorded in `core.role_permissions` by an operator, exactly
 //! as every other permission in Adjutant is. The software has no rank concept and
-//! this crate does not invent one. A comping caller is expected to hold
-//! `finance:write` as well, because the draw its comp produces is a finance
-//! transfer and finance's own gate decides it.
+//! this crate does not invent one. A comp needs **no** `finance:write`: its draw
+//! is delivered by the core's relay as the declared machine principal, not
+//! forwarded from the caller. A treasurer booking an outstanding draw by hand does
+//! need their own `finance:write`, because finance's gate decides that one.
 //!
 //! ## What is deliberately not here
 //!
@@ -196,8 +202,10 @@
 //!   crates: stripe's purpose vocabulary has no `purchase`, so a store sale is
 //!   sent with `purpose: "donation"` (the only shape its route accepts) while
 //!   `category: "store"` and the order's `fund_code` carry the truth into the
-//!   ledger; and finance's write routes take a fund **id**, so addressing a fund
-//!   by **code** is a read (`GET /api/finance/funds`) followed by the write.
+//!   ledger. Finance's write routes take a fund **id or a code**, resolved inside
+//!   the statement that writes the entry, so the gap that used to sit here — a
+//!   code needing a read of finance first — is closed for both the
+//!   caller-forwarding path and the intent.
 
 use std::collections::BTreeMap;
 use std::sync::OnceLock;
