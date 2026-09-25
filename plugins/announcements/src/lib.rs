@@ -52,9 +52,10 @@
 //! A caller also always sees their own drafts (`created_by = caller`), so a
 //! scribe who may write in a scope is not blind to what they wrote.
 //!
-//! The audience is resolved in **one** query: the caller's grants are zipped
-//! against `core.role_permissions` for this plugin's read/manage permissions, so
-//! a caller with twelve lodge grants costs one round trip, not twelve
+//! The audience is resolved in **one** query: the caller's grants are asked of
+//! the core's permission service in a single batched lookup
+//! (`PermissionService::scopes_for`) for this plugin's read/manage permissions,
+//! so a caller with twelve lodge grants costs one round trip, not twelve
 //! (`resolve_audience`). The resulting predicate is one function
 //! (`Audience::sql`) spliced into every visibility query, so the list, the
 //! detail, the receipt write and the unread count cannot drift apart.
@@ -441,15 +442,6 @@ fn require_caller(req: &PluginRequest) -> Result<String, SdkError> {
         })
 }
 
-/// One scope type's code, as the database and the API spell it.
-fn scope_type_code(scope_type: ScopeType) -> &'static str {
-    match scope_type {
-        ScopeType::Troop => SCOPE_TROOP,
-        ScopeType::Lodge => SCOPE_LODGE,
-        ScopeType::Patrol => "patrol",
-    }
-}
-
 // ---------------------------------------------------------------------------
 // Audience — who is addressed by what (the read side of the scope model)
 // ---------------------------------------------------------------------------
@@ -518,14 +510,19 @@ impl Audience {
     }
 }
 
-/// Resolve the caller's addressing in **one** query: the grants they hold,
-/// zipped against `core.role_permissions` for this plugin's read/manage
-/// permissions.
+/// Resolve the caller's addressing in **one** query: the permissions they hold,
+/// at every scope they hold them, asked of the core's permission service
+/// ([`PermissionService::scopes_for`]).
 ///
 /// One round trip regardless of how many grants the caller has, and no query at
 /// all for an anonymous caller or one with no grants (the core's gate has
 /// already refused those, and a query that cannot match anything is not worth a
 /// round trip).
+///
+/// This **asks** rather than reads: a plugin role has no privileges on
+/// `core.role_permissions`, and does not need any, because the service answers
+/// from the grants it was handed — on the core's connection, and only ever as a
+/// subset of what the caller already holds.
 async fn resolve_audience(
     c: &PluginContext,
     identity: Option<&Identity>,
@@ -538,48 +535,24 @@ async fn resolve_audience(
     if identity.grants.is_empty() {
         return Ok(audience);
     }
-    let mut roles = Vec::with_capacity(identity.grants.len());
-    let mut scope_types = Vec::with_capacity(identity.grants.len());
-    let mut scope_ids = Vec::with_capacity(identity.grants.len());
-    for grant in &identity.grants {
-        roles.push(grant.role_id.clone());
-        scope_types.push(scope_type_code(grant.scope.scope_type).to_string());
-        scope_ids.push(grant.scope.scope_id.clone().unwrap_or_default());
-    }
-    let rows = c
-        .db
-        .query(
-            "SELECT DISTINCT rp.permission_id AS permission, \
-                    g.scope_type AS scope_type, COALESCE(g.scope_id, '') AS scope_id \
-             FROM unnest($1::text[], $2::text[], $3::text[]) AS g(role_id, scope_type, scope_id) \
-             JOIN core.role_permissions rp \
-               ON rp.role_id = g.role_id AND rp.permission_id = ANY($4::text[])"
-                .to_string(),
-            vec![
-                roles.into(),
-                scope_types.into(),
-                scope_ids.into(),
-                AUDIENCE_PERMISSIONS
-                    .iter()
-                    .map(|p| p.to_string())
-                    .collect::<Vec<String>>()
-                    .into(),
-            ],
-        )
-        .await?;
 
-    for row in rows {
-        let permission = row["permission"].as_str().unwrap_or_default();
-        let scope_type = row["scope_type"].as_str().unwrap_or_default();
-        let scope_id = row["scope_id"].as_str().unwrap_or_default();
-        match (permission, scope_type) {
-            (PERM_READ, SCOPE_TROOP) => audience.troop_read = true,
-            (PERM_READ, SCOPE_LODGE) if !scope_id.is_empty() => {
-                audience.read_lodges.push(scope_id.to_string())
+    let held = c
+        .permissions
+        .scopes_for(Some(identity), &AUDIENCE_PERMISSIONS)
+        .await?;
+    for entry in held {
+        match (entry.permission.as_str(), entry.scope.scope_type) {
+            (PERM_READ, ScopeType::Troop) => audience.troop_read = true,
+            (PERM_READ, ScopeType::Lodge) => {
+                if let Some(lodge) = entry.scope.scope_id {
+                    audience.read_lodges.push(lodge);
+                }
             }
-            (PERM_MANAGE, SCOPE_TROOP) => audience.troop_manage = true,
-            (PERM_MANAGE, SCOPE_LODGE) if !scope_id.is_empty() => {
-                audience.manage_lodges.push(scope_id.to_string())
+            (PERM_MANAGE, ScopeType::Troop) => audience.troop_manage = true,
+            (PERM_MANAGE, ScopeType::Lodge) => {
+                if let Some(lodge) = entry.scope.scope_id {
+                    audience.manage_lodges.push(lodge);
+                }
             }
             _ => {}
         }

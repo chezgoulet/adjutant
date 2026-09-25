@@ -34,6 +34,14 @@ first-party plugin to pick the helpers up.
   `last_query_params` (an `INSERT … RETURNING` is a *query* on this host);
   `MockEvents` gains `payloads`, `assert_published`, and `assert_none`, whose
   failures list what *was* published.
+- **SDK v0.2 batched permission lookup.** `PermissionService::scopes_for`
+  answers "which of these permissions does this caller hold, and at which
+  scopes?" in **one** round trip, returning `PermissionScope` pairs. It is the
+  batched form of `has_in_scope`, for a handler that must resolve a whole
+  **audience** rather than check a single object — announcements resolves its
+  read/manage audience with it, where one query replaces one per grant. It is
+  additive (no ABI change), and because the answer is derived from the grants the
+  caller already holds, asking cannot widen reach.
 - **`adjutant-missions`** (SPEC §7.3, Accords Art 8): the six-stage lifecycle
   (`request → review → approval → execution → debrief → report`) as routes, each
   guarded by the stage the mission is actually in and each written to a stage

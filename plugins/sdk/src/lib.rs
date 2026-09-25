@@ -361,6 +361,21 @@ pub struct RoleGrant {
     pub scope: Scope,
 }
 
+/// One `(permission, scope)` pair an identity holds — what a **batched**
+/// permission check returns.
+///
+/// The unit of [`PermissionService::scopes_for`]: one entry per permission per
+/// scope the caller's grants resolve to, all in a single round trip. A plugin
+/// that must decide "what may this caller see, at every scope they hold?" — an
+/// audience — asks once instead of once per (permission, scope) pair.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PermissionScope {
+    /// The permission id (`missions:approve`).
+    pub permission: String,
+    /// The scope at which the caller holds it.
+    pub scope: Scope,
+}
+
 /// The authenticated caller. Produced by an [`IdentityProvider`] (the auth
 /// plugin) or the gated dev-header stub.
 ///
@@ -500,6 +515,126 @@ impl PermissionService {
                 "requires {permission} at scope {scope:?}"
             )))
         }
+    }
+
+    /// Every `(permission, scope)` pair the identity holds for `permissions`, in
+    /// **one** round trip.
+    ///
+    /// The batched form of [`has_in_scope`](Self::has_in_scope). A plugin that
+    /// must decide "what may this caller see, at every scope they hold?" — an
+    /// audience — otherwise pays one query per (permission, scope) pair: four
+    /// for a scout with a single lodge grant, two dozen or more for someone
+    /// holding a grant in every lodge. This asks once.
+    ///
+    /// ```rust,ignore
+    /// let held = ctx
+    ///     .permissions
+    ///     .scopes_for(req.identity.as_ref(), &["announcement:read", "announcement:manage"])
+    ///     .await?;
+    /// let reads_somewhere = held.iter().any(|p| p.permission == "announcement:read");
+    /// ```
+    ///
+    /// **Asking cannot widen reach.** The query joins *the grants it was handed*
+    /// (`Identity::grants`) against `core.role_permissions`, so the answer is
+    /// always a subset of what the caller already holds at the scopes they
+    /// already hold it — the same answer `has_in_scope` gives, batched. It runs
+    /// on the connection the core injected here, which is the core's own: a
+    /// plugin role may not read `core.role_permissions` itself, and does not
+    /// need to.
+    ///
+    /// Scopes **fail closed**, as the auth plugin's grant loader does: a
+    /// non-troop grant with no scope id is dropped (with a warning) rather than
+    /// widened to the troop, and a scope code that is not
+    /// `troop`/`lodge`/`patrol` is dropped rather than guessed at.
+    ///
+    /// An absent identity, or one with no grants, is answered without a query —
+    /// an unauthenticated caller holds nothing, and asking the database to
+    /// confirm it is a round trip spent to learn nothing.
+    pub async fn scopes_for(
+        &self,
+        identity: Option<&Identity>,
+        permissions: &[&str],
+    ) -> Result<Vec<PermissionScope>, SdkError> {
+        let Some(identity) = identity else {
+            return Ok(Vec::new());
+        };
+        if identity.grants.is_empty() || permissions.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let mut roles: Vec<String> = Vec::with_capacity(identity.grants.len());
+        let mut scope_types: Vec<String> = Vec::with_capacity(identity.grants.len());
+        let mut scope_ids: Vec<String> = Vec::with_capacity(identity.grants.len());
+        let mut dropped = 0usize;
+        for grant in &identity.grants {
+            let scope_id = grant.scope.scope_id.clone().unwrap_or_default();
+            let scope_type = match grant.scope.scope_type {
+                ScopeType::Troop => "troop",
+                ScopeType::Lodge => "lodge",
+                ScopeType::Patrol => "patrol",
+            };
+            if grant.scope.scope_type != ScopeType::Troop && scope_id.trim().is_empty() {
+                // Fail closed rather than widen: a lodge/patrol grant with no id
+                // names no place, so it names nowhere the caller may act.
+                dropped += 1;
+                continue;
+            }
+            roles.push(grant.role_id.clone());
+            scope_types.push(scope_type.to_string());
+            scope_ids.push(scope_id);
+        }
+        if dropped > 0 {
+            tracing_warn(&format!(
+                "scopes_for dropped {dropped} grant(s) with no scope id (scopes fail closed)"
+            ));
+        }
+        if roles.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let wanted: Vec<String> = permissions.iter().map(|p| p.to_string()).collect();
+        let rows = self
+            .db
+            .query(
+                "SELECT DISTINCT rp.permission_id AS permission, \
+                        g.scope_type AS scope_type, COALESCE(g.scope_id, '') AS scope_id \
+                 FROM unnest($1::text[], $2::text[], $3::text[]) AS g(role_id, scope_type, scope_id) \
+                 JOIN core.role_permissions rp \
+                   ON rp.role_id = g.role_id AND rp.permission_id = ANY($4::text[]) \
+                 ORDER BY permission, scope_type, scope_id"
+                    .to_string(),
+                vec![
+                    roles.into(),
+                    scope_types.into(),
+                    scope_ids.into(),
+                    wanted.into(),
+                ],
+            )
+            .await?;
+
+        let mut held = Vec::with_capacity(rows.len());
+        for row in rows {
+            let Some(permission) = row.get("permission").and_then(|v| v.as_str()) else {
+                continue;
+            };
+            let Some(scope_type) = row.get("scope_type").and_then(|v| v.as_str()) else {
+                continue;
+            };
+            let scope_id = row.get("scope_id").and_then(|v| v.as_str()).unwrap_or_default();
+            let scope = match scope_type {
+                "troop" => Scope::troop(),
+                "lodge" if !scope_id.trim().is_empty() => Scope::lodge(scope_id),
+                "patrol" if !scope_id.trim().is_empty() => Scope::patrol(scope_id),
+                other => {
+                    tracing_warn(&format!(
+                        "scopes_for dropped a row with scope_type {other:?} (scopes fail closed)"
+                    ));
+                    continue;
+                }
+            };
+            held.push(PermissionScope { permission: permission.to_string(), scope });
+        }
+        Ok(held)
     }
 
     async fn roles_have(&self, roles: Vec<String>, permission: &str) -> bool {
@@ -1432,9 +1567,9 @@ pub mod prelude {
         async_trait, event_handler, event_type, export_plugin, route_handler, schedule_handler,
         AdjutantPlugin, AuditService, DbHandle, Event, EventBusHandle, EventSubscription, HostDb,
         HostEvents, HostHttp, HttpResponse, Identity, IdentityProvider, IdentityRegistrar, Method,
-        Migration, MissionCompleted, MotionFailed, MotionPassed, Permission, PermissionService,
-        PluginContext, PluginRequest, PluginResponse, RoleGrant, RouteDefinition, Schedule,
-        ScheduleHandler, Scope, ScopeType, SdkError, SqlValue,
+        Migration, MissionCompleted, MotionFailed, MotionPassed, Permission, PermissionScope,
+        PermissionService, PluginContext, PluginRequest, PluginResponse, RoleGrant, RouteDefinition,
+        Schedule, ScheduleHandler, Scope, ScopeType, SdkError, SqlValue,
     };
 }
 
@@ -2065,6 +2200,116 @@ mod tests {
         // no identity → false without touching the host
         assert!(!svc.has_any_scope(None, "hello:read").await);
         assert_eq!(db.calls.lock().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn scopes_for_batches_the_permission_lookup() {
+        let db = Arc::new(StubDb {
+            calls: Mutex::new(vec![]),
+            rows: vec![
+                serde_json::json!({
+                    "permission": "missions:approve", "scope_type": "troop", "scope_id": ""
+                }),
+                serde_json::json!({
+                    "permission": "missions:read", "scope_type": "lodge", "scope_id": "l1"
+                }),
+            ],
+        });
+        let svc = PermissionService::new(db.clone());
+        let id = Identity::from_grants(
+            "bea",
+            vec![
+                RoleGrant { role_id: "chief".into(), scope: Scope::troop() },
+                RoleGrant { role_id: "lodge_commander".into(), scope: Scope::lodge("l1") },
+            ],
+        );
+
+        let held = svc
+            .scopes_for(Some(&id), &["missions:read", "missions:approve"])
+            .await
+            .unwrap();
+
+        assert_eq!(
+            held,
+            vec![
+                PermissionScope {
+                    permission: "missions:approve".into(),
+                    scope: Scope::troop()
+                },
+                PermissionScope {
+                    permission: "missions:read".into(),
+                    scope: Scope::lodge("l1")
+                },
+            ]
+        );
+
+        // One query for two permissions across two grants — the whole point.
+        let calls = db.calls.lock().unwrap();
+        assert_eq!(calls.len(), 1);
+        let (sql, params) = &calls[0];
+        assert!(sql.contains("core.role_permissions"), "{sql}");
+        assert!(sql.contains("ORDER BY"), "the answer is deterministic: {sql}");
+        assert_eq!(
+            params.len(),
+            4,
+            "roles, scope types, scope ids, and the permissions asked about"
+        );
+    }
+
+    #[tokio::test]
+    async fn scopes_for_spends_no_query_when_there_is_nothing_to_ask() {
+        let db = Arc::new(StubDb { calls: Mutex::new(vec![]), rows: vec![] });
+        let svc = PermissionService::new(db.clone());
+
+        // No identity at all.
+        assert!(svc.scopes_for(None, &["missions:read"]).await.unwrap().is_empty());
+        // An identity that holds nothing.
+        let bare = Identity::from_grants("bea", vec![]);
+        assert!(svc
+            .scopes_for(Some(&bare), &["missions:read"])
+            .await
+            .unwrap()
+            .is_empty());
+        // Nothing asked about.
+        let id = Identity::new("bea", vec!["chief".into()]);
+        assert!(svc.scopes_for(Some(&id), &[]).await.unwrap().is_empty());
+
+        assert_eq!(
+            db.calls.lock().unwrap().len(),
+            0,
+            "an unauthenticated caller holds nothing; confirming that costs a round trip and buys none"
+        );
+    }
+
+    #[tokio::test]
+    async fn scopes_for_fails_closed_on_a_grant_with_no_scope_id() {
+        let db = Arc::new(StubDb { calls: Mutex::new(vec![]), rows: vec![] });
+        let svc = PermissionService::new(db.clone());
+        let id = Identity::from_grants(
+            "bea",
+            vec![
+                // A lodge grant that names no lodge: dropped rather than widened.
+                RoleGrant { role_id: "lodge_commander".into(), scope: Scope::lodge("") },
+                RoleGrant { role_id: "chief".into(), scope: Scope::troop() },
+            ],
+        );
+
+        assert!(svc
+            .scopes_for(Some(&id), &["missions:read"])
+            .await
+            .unwrap()
+            .is_empty());
+
+        let calls = db.calls.lock().unwrap();
+        assert_eq!(calls.len(), 1);
+        match &calls[0].1[0] {
+            SqlValue::TextArray(roles) => assert_eq!(
+                roles,
+                &vec!["chief".to_string()],
+                "only the grant that names a scope reached the database"
+            ),
+            other => panic!("expected the roles as a text array, got {other:?}"),
+        }
     }
 
     #[test]

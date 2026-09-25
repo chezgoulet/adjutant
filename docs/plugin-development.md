@@ -322,6 +322,17 @@ async fn approve(ctx: &PluginContext, req: &PluginRequest, lodge_id: &str) -> Re
 }
 ```
 
+The batched form is `PermissionService::scopes_for(identity, &[permission, …])`:
+it answers "which of these permissions does this caller hold, and at which
+scopes?" in **one** round trip, returning `PermissionScope` pairs. Reach for it
+when a handler must resolve an **audience** — what may this caller see, at every
+scope they hold — rather than check a single object; the per-pair form costs one
+query per grant (four for a scout with one lodge grant, two dozen for someone
+holding a grant in every lodge). Announcements resolves its read/manage audience
+this way. Like every other method here it runs on the core's connection and
+answers only from the grants the caller already holds, so asking cannot widen
+reach.
+
 - `Identity` carries `grants` (`RoleGrant { role_id, scope }`); `roles()` is
   derived from them, not a second field. Build a troop-wide identity with
   `Identity::new(user_id, roles)`, or scoped ones with
