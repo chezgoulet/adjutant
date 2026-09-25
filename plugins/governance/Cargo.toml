@@ -1,0 +1,19 @@
+[package]
+name = "adjutant-governance"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Governance: motions, votes, amendments, quorum, minutes, Accords versioning (SPEC 7.4)."
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+adjutant-sdk.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+chrono.workspace = true
+
+[dev-dependencies]
+tokio.workspace = true

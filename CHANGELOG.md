@@ -9,6 +9,62 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ---
 
+## [Unreleased] — Missions + Governance + SDK v0.2
+
+The SDK stays **0.2.0** and `SDK_ABI_VERSION` stays **4**: every addition below
+is additive, so a plugin built against ABI 4 keeps loading unchanged. Rebuild a
+first-party plugin to pick the helpers up.
+
+### Added
+
+- **SDK v0.2 route helpers.** `PluginRequest::int_param` (a whole-segment
+  capture as an integer, with a missing capture reported as a plugin bug and a
+  bad value as a client error), `query_required`, `query_int`, `query_bool`;
+  `DbHandle::query_one` (the "fetch one or 404" path) and `DbHandle::exists`.
+- **SDK v0.2 event helpers.** `adjutant_sdk::event_type` names the vocabulary
+  SPEC §5.4 documents, so a publisher and a subscriber cannot disagree about a
+  string; `MissionCompleted`, `MotionPassed`, and `MotionFailed` are the typed
+  payloads, and `EventBusHandle::publish_mission_completed` /
+  `publish_motion_passed` / `publish_motion_failed` publish them. A payload that
+  will not serialize is an error, not a silently dropped event.
+- **SDK v0.2 test-harness improvements.** `TestRequest::identity_grants` builds
+  a caller with scoped grants — the shape every object route's handler checks and
+  the troop-wide `identity` builder could not express. `MockDb` gains
+  `queried_sql`, `assert_executed`, `last_execute_params`, and
+  `last_query_params` (an `INSERT … RETURNING` is a *query* on this host);
+  `MockEvents` gains `payloads`, `assert_published`, and `assert_none`, whose
+  failures list what *was* published.
+- **`adjutant-missions`** (SPEC §7.3, Accords Art 8): the six-stage lifecycle
+  (`request → review → approval → execution → debrief → report`) as routes, each
+  guarded by the stage the mission is actually in and each written to a stage
+  trail and the audit log; the structured proposal form; mentor matching ranked
+  on expertise and spare capacity; Lodge Commander approval with guidance,
+  rejection, and the Article 8 appeal (a seconding Council member required,
+  overturning returns the mission to execution); milestones, execution progress
+  notes, debrief, report; and the cumulative Impact Report. Publishes
+  `mission.created`, `mission.approved`, and `mission.completed`.
+- **`adjutant-governance`** (SPEC §7.4, Accords Art 5/9/12/17): motions through
+  `proposed → seconded → debate → voting → decided → implemented`; per-voter
+  votes recorded once (the database enforces it) with the method the room used;
+  friendly amendments accepted by the mover and formal ones tallied and applied
+  to the motion text; meetings with attendance and a **fail-closed** quorum
+  (one-third of registered scouts for a Congress, a majority of members for the
+  Troop Council, or an explicit number) that a motion cannot be decided without;
+  minutes drafted from the motion record; and Accords versions created only by a
+  **passed Congress motion**, superseding the previous adopted one. Publishes
+  `motion.proposed`, `motion.passed`, `motion.failed`, and `accords.adopted`.
+
+### Notes for plugin authors
+
+- Both plugins touch **no** `core.*` table: they keep to their own schema, so
+  neither appears in `core_grants`. Display names are the client's business; the
+  plugins store opaque member ids.
+- `governance:manage` and `missions:mentor` extend SPEC §9.1's taxonomy — see
+  their doc comments for why running a meeting is not the same authority as
+  proposing a motion.
+
+---
+
 ## [Unreleased] — Core scheduler
 
 **Breaking:** `SDK_ABI_VERSION` is bumped to **4**. A plugin built against ABI 3

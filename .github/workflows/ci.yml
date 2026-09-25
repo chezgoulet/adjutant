@@ -98,7 +98,9 @@ jobs:
           mkdir -p plugins-built
           cp target/debug/libadjutant_hello.so \
              target/debug/libadjutant_auth.so \
-             target/debug/libadjutant_membership.so plugins-built/
+             target/debug/libadjutant_membership.so \
+             target/debug/libadjutant_missions.so \
+             target/debug/libadjutant_governance.so plugins-built/
 
       # Route/registry smoke ladder against a pristine test database.
       - name: test-plugin harness
@@ -142,6 +144,8 @@ jobs:
           ./target/debug/adjutant validate-plugin target/debug/libadjutant_hello.so
           ./target/debug/adjutant validate-plugin target/debug/libadjutant_auth.so
           ./target/debug/adjutant validate-plugin target/debug/libadjutant_membership.so
+          ./target/debug/adjutant validate-plugin target/debug/libadjutant_missions.so
+          ./target/debug/adjutant validate-plugin target/debug/libadjutant_governance.so
           ./target/debug/adjutant validate-plugin target/debug/libadjutant_gear_locker.so
 
       - name: End-to-end harness (dev headers OFF)
@@ -164,6 +168,29 @@ jobs:
             sleep 0.2
           done
           python3 docs/e2e_m3.py
+
+      # The domain lifecycle, live: six-stage missions (Art 8), motions and
+      # votes, quorum, minutes, and Accords versioning (Art 5/9/17). A second
+      # server on 8788 because these are *domain* flows — the dev-header stub is
+      # the cheapest way to hold a `chief` identity for them, and M3's harness
+      # above is the identity proof. Both servers share the test database; the
+      # first has already applied every migration by the time this one boots.
+      - name: End-to-end mission + governance lifecycle (dev headers ON)
+        env:
+          ADJUTANT_DATABASE_URL: postgres://adjutant:***@127.0.0.1:5432/adjutant_dev_test
+        run: |
+          ADJUTANT_PLUGIN_DIR=plugins-built \
+          ADJUTANT_DEV_HEADERS=true \
+          ADJUTANT_ALLOW_SUPERUSER=true \
+          ADJUTANT_RATE_MAX=0 \
+          ADJUTANT_LOG=warn \
+          ADJUTANT_BIND=127.0.0.1:8788 \
+            ./target/debug/adjutant &
+          for _ in $(seq 1 100); do
+            if python3 -c "import socket,sys; socket.create_connection(('127.0.0.1',8788),1); sys.exit(0)" 2>/dev/null; then break; fi
+            sleep 0.2
+          done
+          ADJUTANT_E2E_BASE=http://127.0.0.1:8788 python3 docs/e2e_m4.py
 
   # The declared MSRV (workspace rust-version). RUSTUP_TOOLCHAIN overrides the
   # pinned rust-toolchain.toml channel so this job actually uses 1.96.

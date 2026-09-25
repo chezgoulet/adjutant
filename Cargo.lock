@@ -29,6 +29,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "adjutant-governance"
+version = "0.2.0"
+dependencies = [
+ "adjutant-sdk",
+ "chrono",
+ "serde",
+ "serde_json",
+ "tokio",
+]
+
+[[package]]
 name = "adjutant-hello"
 version = "0.2.0"
 dependencies = [
@@ -42,6 +53,17 @@ name = "adjutant-membership"
 version = "0.2.0"
 dependencies = [
  "adjutant-sdk",
+ "serde",
+ "serde_json",
+ "tokio",
+]
+
+[[package]]
+name = "adjutant-missions"
+version = "0.2.0"
+dependencies = [
+ "adjutant-sdk",
+ "chrono",
  "serde",
  "serde_json",
  "tokio",

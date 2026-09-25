@@ -59,17 +59,113 @@ Config lives in the `auth` row's `core.plugins.config` (`{"oidc": {…},
 | Method | Path | Permission | Body / notes |
 |---|---|---|---|
 | GET | `/api/membership/members` | `membership:read_all` | Roster |
-| GET | `/api/membership/member?username=<u>` | `membership:read` | One member (query param) |
+| GET | `/api/membership/member?id=<id>` | `membership:read` | One member (query param); `read_all` reaches any, `read_lodge` reaches its lodge, `read` only your own |
 | POST | `/api/membership/member` | `membership:manage` | `{username, email?, display_name, trail_name?, osg_id?, bg_check?, patrol?, is_active?}` |
 | POST | `/api/membership/import` | `membership:manage` | OSG CSV (see plugin docs); upsert by username |
-| GET | `/api/membership/lodges` | `membership:read` | Lodges |
+| GET | `/api/membership/lodges` | `membership:read_lodge` | Lodges |
 | POST | `/api/membership/lodge` | `membership:manage` | `{name}` |
 | POST | `/api/membership/patrol` | `membership:manage` | `{name, lodge?}` |
-| GET | `/api/membership/proficiencies` | `membership:read` | Proficiencies |
+| GET | `/api/membership/proficiencies` | `membership:read_lodge` | Proficiencies |
 | POST | `/api/membership/proficiency` | `membership:manage` | `{code, title, domain?}` |
 | POST | `/api/membership/proficiency/complete` | `membership:manage` | `{member_id, proficiency_id, signed_off_by?}` |
-| GET | `/api/membership/stewards` | `membership:read` | Stewards |
+| GET | `/api/membership/stewards` | `membership:read_lodge` | Stewards |
 | POST | `/api/membership/steward` | `membership:manage` | `{member_id, position, lodge?}` |
+
+### Missions (SPEC §7.3, Accords Art 8)
+
+Config lives in the `missions` row's `core.plugins.config` (unused today).
+
+The six stages are `request → review → approval → execution → debrief → report`;
+`state` is `open`, `rejected`, or `completed`. A rejected mission can be appealed
+to the Troop Council, which decides it once one other Council member seconds it.
+
+| Method | Path | Permission | Body / notes |
+|---|---|---|---|
+| GET | `/api/missions/missions?stage=&state=&category=&lodge=&limit=` | `missions:read` | Narrowed to the caller's lodge scopes and their own proposals unless they read troop-wide |
+| GET | `/api/missions/mission/{id}` | `missions:read` | The mission + milestones, mentorships, progress, stage trail, appeals |
+| POST | `/api/missions/mission` | `missions:create` | `{title, purpose, objectives, expected_impact, category?, lodge_id?, lodge_name?, tags?, location?, starts_on?, ends_on?, resources_needed?, risk_notes?, youth_safety_notes?, participant_count?}` — the structured proposal form |
+| PATCH | `/api/missions/mission/{id}` | `missions:update` | Any subset of the proposal fields, while the mission is in `request` or `review` |
+| POST | `/api/missions/mission/{id}/submit` | `missions:update` | `request → review` |
+| POST | `/api/missions/mission/{id}/review` | `missions:approve` | `{success_criteria, scope_notes?, mentor?, recommendation?(advance\|return), guidance?}` → `review → approval` |
+| POST | `/api/missions/mission/{id}/decision` | `missions:approve` | `{decision: approved\|rejected, guidance?}` (guidance required on rejection) → `approval → execution` |
+| POST | `/api/missions/mission/{id}/appeal` | `missions:appeal` | `{reason}` — the mission must be `rejected` |
+| POST | `/api/missions/appeal/{id}/decide` | `missions:approve` (troop) | `{seconded_by, outcome: overturned\|upheld, votes_for?, votes_against?, note?}` — overturning puts the mission into `execution` |
+| POST | `/api/missions/mission/{id}/milestone` | `missions:update` | `{title, detail?, due_on?, position?}` |
+| PATCH | `/api/missions/milestone/{id}` | `missions:update` | `{title?, detail?, status?, progress_pct?, due_on?}` (`done` implies 100%) |
+| DELETE | `/api/missions/milestone/{id}` | `missions:approve` (troop) | Destructive: troop-covering grant only |
+| POST | `/api/missions/mission/{id}/progress` | `missions:update` | `{note, progress_pct?, service_hours?, participant_count?}` — execution only |
+| POST | `/api/missions/mission/{id}/debrief` | `missions:update` | `{notes, goals_met?, lessons?, service_hours?, participant_count?}` → `execution → debrief` |
+| POST | `/api/missions/mission/{id}/report` | `missions:update` | `{summary, impact_metrics?, service_hours?, participant_count?}` → `debrief → report` |
+| POST | `/api/missions/mission/{id}/complete` | `missions:approve` | `report → completed`; publishes `mission.completed` |
+| POST | `/api/missions/mentor/profile` | `missions:mentor` | `{member_id, display_name?, affiliation?, expertise?, capacity?, is_active?, notes?}` |
+| GET | `/api/missions/mission/{id}/mentor/suggestions` | `missions:approve` | Ranked mentors: expertise overlap, then spare capacity |
+| POST | `/api/missions/mission/{id}/mentor` | `missions:approve` | `{mentor_member, mentee_member?, role?, notes?}` |
+| POST | `/api/missions/mentorship/{id}/close` | `missions:update` | `{status?: completed\|ended, notes?}` |
+| GET | `/api/missions/mentorships?member=&mission=` | `missions:read` | Scoped to the caller unless they read troop-wide |
+| GET | `/api/missions/impact?lodge=` | `missions:read` (troop) | Cumulative Impact Report: totals, by category, by year, by lodge |
+
+**Events:** `mission.created` (propose), `mission.approved` (approve),
+`mission.completed` (complete, payload `MissionCompleted`).
+
+### Governance (SPEC §7.4, Accords Art 5/9/12/17)
+
+Motion lifecycle: `proposed → seconded → debate → voting → decided →
+implemented` (or `withdrawn`). Thresholds: `simple_majority` (default),
+`two_thirds`, `unanimous`. Vote methods: `voice`, `show_of_hands`, `ballot`,
+`roll_call`. Quorum bases: `one_third_registered` (Congress), `majority_members`
+(Troop Council, default), `fixed`.
+
+| Method | Path | Permission | Body / notes |
+|---|---|---|---|
+| POST | `/api/governance/meeting` | `governance:manage` | `{body: congress\|tc\|lodge\|committee, title, scheduled_for?, lodge_id?, location?, quorum_basis?, expected_voters?, quorum_required?}` |
+| GET | `/api/governance/meetings?body=&status=&lodge=&limit=` | `governance:read` | Meetings with present count and motion count |
+| GET | `/api/governance/meeting/{id}` | `governance:read` | Meeting + live quorum + motions |
+| PATCH | `/api/governance/meeting/{id}` | `governance:manage` | `{title?, scheduled_for?, location?, quorum_basis?, expected_voters?, quorum_required?}` |
+| POST | `/api/governance/meeting/{id}/open` | `governance:manage` | Opens the meeting and reports quorum |
+| POST | `/api/governance/meeting/{id}/close` | `governance:manage` | Closes it; reports any undecided motions |
+| POST | `/api/governance/meeting/{id}/attendance` | `governance:manage` | `{member_id, present?, method?: present\|remote\|proxy\|absent}` (upsert) |
+| GET | `/api/governance/meeting/{id}/quorum` | `governance:read` | Real-time display: required, present, met, short by |
+| POST | `/api/governance/meeting/{id}/minutes/draft` | `governance:manage` | Auto-drafts minutes from the motion record |
+| POST | `/api/governance/meeting/{id}/minutes/adopt` | `governance:manage` | `{minutes?}` — adopts (and stores) the minutes of record |
+| GET | `/api/governance/meeting/{id}/minutes` | `governance:read` | The stored minutes and their status |
+| POST | `/api/governance/motion` | `governance:propose` | `{title, text, body, meeting_id?, lodge_id?, category?, threshold?, amends_accords?}` |
+| GET | `/api/governance/motions?meeting=&body=&stage=&result=&category=&limit=` | `governance:read` | Motion list |
+| GET | `/api/governance/motion/{id}` | `governance:read` | Motion + votes + amendments + the tally a close would produce now |
+| POST | `/api/governance/motion/{id}/second` | `governance:vote` | A second member seconds it; the mover cannot second their own |
+| POST | `/api/governance/motion/{id}/debate` | `governance:manage` | `{open: bool, note?}` — opens debate (`seconded → debate`) or closes it (`debate → voting`) |
+| POST | `/api/governance/motion/{id}/vote` | `governance:vote` | `{choice: yes\|no\|abstain, method?, note?}` — one vote per member; a re-vote is `409` |
+| POST | `/api/governance/motion/{id}/close` | `governance:manage` | Tallies; requires quorum when the motion is in a meeting; publishes `motion.passed` / `motion.failed` |
+| POST | `/api/governance/motion/{id}/implement` | `governance:manage` | `{note?}` — a passed motion only |
+| POST | `/api/governance/motion/{id}/withdraw` | `governance:propose` | `{note?}` — the mover, or a chair |
+| POST | `/api/governance/motion/{id}/amendment` | `governance:amend` | `{kind: friendly\|formal, text, rationale?}` |
+| POST | `/api/governance/amendment/{id}/accept` | `governance:amend` | Friendly only; the mover (or a chair) accepts, and the text is appended to the motion |
+| POST | `/api/governance/amendment/{id}/reject` | `governance:manage` | `{note?}` |
+| POST | `/api/governance/amendment/{id}/vote` | `governance:vote` | `{choice, method?, note?}` — formal only |
+| POST | `/api/governance/amendment/{id}/close` | `governance:manage` | Tallies a formal amendment; a passing one is applied to the motion text |
+| POST | `/api/governance/accords/adopt` | `governance:manage` | `{motion_id, title, summary?, body_md?, adopted_on?, congress?}` — the motion must have **passed in a Congress**; creates the next version and supersedes the previous adopted one |
+| GET | `/api/governance/accords?status=` | `governance:read` | Version list |
+| GET | `/api/governance/accords/{version}` | `governance:read` | One version, including its text |
+
+**Events:** `motion.proposed`, `motion.passed`, `motion.failed` (the SPEC §5.4
+trio), plus `accords.adopted` for the archive.
+
+**Role grants are the operator's, not the plugin's.** The core seeds `chief`
+with every permission it finds after load; other roles are mapped through
+`core.role_permissions`. For the Accords' own pathway, `lodge_commander` needs
+`missions:approve` (scoped to their lodge) and `tc`-equivalent roles need
+`missions:approve` at troop scope plus `governance:manage` for the chair:
+
+```sql
+INSERT INTO core.role_permissions (role_id, permission_id) VALUES
+  ('lodge_commander', 'missions:approve'),
+  ('lodge_commander', 'missions:read'),
+  ('scout',           'missions:read'),
+  ('scout',           'missions:create'),
+  ('scout',           'governance:read'),
+  ('scout',           'governance:propose'),
+  ('scout',           'governance:vote')
+ON CONFLICT DO NOTHING;
+```
 
 ## Example plugins
 

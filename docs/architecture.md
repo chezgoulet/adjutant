@@ -28,6 +28,8 @@ to build one and [`SPEC.md`](../SPEC.md) for the full design.
 │    plugins/sdk           adjutant-sdk — the contract                              │
 │    plugins/auth          sessions, argon2, OIDC, roles                            │
 │    plugins/membership    roster, patrols, lodges, proficiencies, CSV import       │
+│    plugins/missions      mission lifecycle, mentors, milestones, impact report    │
+│    plugins/governance    motions, votes, amendments, quorum, minutes, Accords     │
 │    plugins/examples/hello        native reference                                 │
 │    wasm/examples/hello           sandboxed reference                              │
 └───────────────────────────────────────────────────────────────────────────────────┘

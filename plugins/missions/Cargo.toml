@@ -1,0 +1,22 @@
+[package]
+name = "adjutant-missions"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Missions: six-stage lifecycle, mentor matching, Lodge Commander approval (SPEC 7.3 / Accords Art 8)."
+
+[lib]
+# cdylib so the core loads it dynamically; rlib so it also links as a test fixture.
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+adjutant-sdk.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+# Timestamps for the `mission.completed` payload. Pure CPU — no runtime, no I/O,
+# so it is safe to link into a plugin (see the SDK's host-mediated I/O rule).
+chrono.workspace = true
+
+[dev-dependencies]
+tokio.workspace = true

@@ -75,8 +75,8 @@ so that the v0.2.0 evidence trail keeps its existing name.
 |---|---|---|---|---|
 | `auth` | §7.1 | Authentication, sessions, roles, OIDC | M3 | **Shipped** (v0.2.0) |
 | `membership` | §7.2 | Roster, lodges, patrols, proficiency, OSG import | M3 | **Shipped** (v0.2.0) |
-| `missions` | §7.3 | Six-stage mission lifecycle, mentor matching, Lodge Commander approval | M4 | Planned |
-| `governance` | §7.4 | Motion lifecycle, voting, amendments, Accords versioning | M4 | Planned |
+| `missions` | §7.3 | Six-stage mission lifecycle, mentor matching, Lodge Commander approval | M4 | **Shipped** (v0.2.0) |
+| `governance` | §7.4 | Motion lifecycle, voting, amendments, Accords versioning | M4 | **Shipped** (v0.2.0) |
 | `calendar` | §7.7 | Events, RSVPs, recurrence, quorum tracking | M5 | Planned |
 | `mcp` | §7.10 | Permissions-aware MCP server for Hermes | M5 | Planned |
 | `finance` | §7.5 | Funds, transactions, budget vs. actuals, sliding-scale dues | M6 | Planned |
@@ -84,6 +84,12 @@ so that the v0.2.0 evidence trail keeps its existing name.
 | `archive` | §7.8 | Congress proceedings, minutes, full-text search, timeline | M6 | Planned |
 | `conflicts` | §7.9 | Conflict-resolution pathway, stage tracking, anti-dropout | M6 | Planned |
 | `announcements` | §7.14 | Troop communication, read receipts, categories, push | M6 | Planned |
+
+> **"Shipped" vs the v1.0 gate.** `missions` and `governance` load through the
+> blessed path, are covered by tests against `adjutant_sdk::testing`, and their
+> routes and permissions are in `api-reference.md`. The §1 gate's third test
+> ("usable by a scout without SQL or curl") needs the Flutter client and the M5
+> fresh-machine harness, and is **not** met by this milestone.
 
 ### Tier B — per-troop integrations
 

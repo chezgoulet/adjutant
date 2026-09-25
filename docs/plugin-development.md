@@ -174,6 +174,24 @@ in-process subscribers. Subscribe with a **prefix filter** (`"gear."`) or `"*"`
 by returning `EventSubscription`s from `subscriptions()`. Subscriptions are
 bound after `init`, so a handler may capture the context stored there.
 
+Use the constants in `adjutant_sdk::event_type` rather than literals for the
+documented events — the bus does not validate names, so a misspelling is a
+handler that silently never runs. The cross-plugin contracts have typed payloads
+and publishers:
+
+```rust
+ctx.events
+    .publish_mission_completed(&MissionCompleted {
+        mission_id: id,
+        title: title.clone(),
+        lodge_id: Some("3".into()),
+        stage: "report".into(),
+        completed_at: chrono::Utc::now(),
+        impact: serde_json::json!({ "service_hours": 18.5 }),
+    })
+    .await?;
+```
+
 ### Audit
 
 ```rust
@@ -393,7 +411,8 @@ gets a `LOGIN` role `adjutant_plugin_<id>` that owns its PostgreSQL schema, and
 - you own your schema and everything in it;
 - you can touch only an explicit allowlist of `core.*` tables (see
   `core_grants` in `server/src/schema.rs` — auth and membership have entries;
-  other plugins get none);
+  other plugins get none, and missions/governance need none because they keep to
+  their own schema);
 - reaching into **another plugin's** schema fails with `permission denied`;
 - `SET ROLE`/`RESET ROLE` cannot lift you out: the session user *is* your role
   and it is a member of nothing, so the old `DO`-block escape is inert.
@@ -439,8 +458,18 @@ async fn list_returns_rows() {
 ```
 
 `TestRequest` builds requests (method, `json` body, `param`, `query_param`,
-`header`, `identity`). `MockHttp` replays queued responses and fails on an
-unexpected network call. `MockIdentity` records registered providers.
+`header`, `identity`). Use `identity_grants(user, vec![RoleGrant { … }])` to test
+an object route as a **scoped** caller (a lodge grant behaves differently from a
+troop-wide one, and that difference is usually the point). `MockHttp` replays
+queued responses and fails on an unexpected network call. `MockIdentity` records
+registered providers.
+
+Remember the host's two shapes: a statement that returns rows
+(`INSERT … RETURNING`) is a **query**, everything else is an **execute** — the
+assertion helpers are split the same way (`last_query_params` vs
+`last_execute_params`, `queried_sql` vs `executed_sql`). `MockEvents::assert_published`
+fails with the list of events that *were* published, which turns "my event did
+not fire" into a one-line answer.
 
 ## Packaging, loading, and compatibility
 

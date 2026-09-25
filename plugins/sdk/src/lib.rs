@@ -581,6 +581,157 @@ impl EventBusHandle {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Event vocabulary & typed payloads (SDK v0.2)
+// ---------------------------------------------------------------------------
+
+/// The event types the core documents (SPEC §5.4), plus the M4 lifecycle events
+/// the missions and governance plugins publish.
+///
+/// The bus deliberately does **not** validate event type names (SPEC §5.4), so
+/// these constants are the only thing keeping a publisher and a subscriber
+/// spelling `mission.completed` identically. Prefer a constant over a literal;
+/// a subscription filter stays a prefix literal (`"mission."`).
+pub mod event_type {
+    /// `user.registered` — new user created (auth).
+    pub const USER_REGISTERED: &str = "user.registered";
+    /// `user.role_changed` — a user's role or scope changed (auth).
+    pub const USER_ROLE_CHANGED: &str = "user.role_changed";
+    /// `mission.created` — new mission proposed (missions).
+    pub const MISSION_CREATED: &str = "mission.created";
+    /// `mission.approved` — mission approved by the Lodge Commander (missions).
+    pub const MISSION_APPROVED: &str = "mission.approved";
+    /// `mission.completed` — mission closed out after its debrief and report
+    /// (missions). Payload: [`crate::MissionCompleted`].
+    pub const MISSION_COMPLETED: &str = "mission.completed";
+    /// `motion.proposed` — new motion proposed (governance).
+    pub const MOTION_PROPOSED: &str = "motion.proposed";
+    /// `motion.passed` — motion approved by vote (governance). Payload:
+    /// [`crate::MotionPassed`].
+    pub const MOTION_PASSED: &str = "motion.passed";
+    /// `motion.failed` — motion rejected by vote (governance). Payload:
+    /// [`crate::MotionFailed`].
+    pub const MOTION_FAILED: &str = "motion.failed";
+    /// `conflict.escalated` — conflict moved to the next stage (conflicts).
+    pub const CONFLICT_ESCALATED: &str = "conflict.escalated";
+    /// `payment.received` — Stripe payment confirmed (stripe).
+    pub const PAYMENT_RECEIVED: &str = "payment.received";
+    /// `member.joined` — new member registered (membership).
+    pub const MEMBER_JOINED: &str = "member.joined";
+    /// `member.left` — member departed (membership).
+    pub const MEMBER_LEFT: &str = "member.left";
+    /// `event.created` — new calendar event (calendar).
+    pub const EVENT_CREATED: &str = "event.created";
+}
+
+/// Payload of `mission.completed` (SPEC §5.4) — the contract between missions
+/// and every consumer of a closed mission (archive, finance's impact fund,
+/// the client's activity feed).
+///
+/// ```rust,ignore
+/// ctx.events
+///     .publish_mission_completed(&MissionCompleted {
+///         mission_id: 12,
+///         title: "Coyote survey".into(),
+///         lodge_id: Some("3".into()),
+///         stage: "report".into(),
+///         completed_at: chrono::Utc::now(),
+///         impact: serde_json::json!({ "service_hours": 18.5, "participants": 6 }),
+///     })
+///     .await?;
+/// ```
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MissionCompleted {
+    pub mission_id: i64,
+    pub title: String,
+    /// The owning lodge's opaque id (`None` for a troop-wide mission).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lodge_id: Option<String>,
+    /// The lifecycle stage the mission finished in — `report` for a mission
+    /// completed through the six-stage path.
+    pub stage: String,
+    pub completed_at: DateTime<Utc>,
+    /// The impact the mission reported (service hours, participants, goals met).
+    #[serde(default)]
+    pub impact: Value,
+}
+
+/// Payload of `motion.passed` (SPEC §5.4) — the contract between governance and
+/// every consumer of a decided motion (archive, the client's meeting view).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MotionPassed {
+    pub motion_id: i64,
+    pub title: String,
+    /// The governing body the motion was decided in — a stable code
+    /// (`congress`, `tc`, `lodge`, `committee`), never a display string.
+    pub body: String,
+    /// The meeting the motion was decided at, when it was tied to one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub meeting_id: Option<i64>,
+    pub votes_yes: i64,
+    pub votes_no: i64,
+    pub votes_abstain: i64,
+    /// The threshold that was applied: `simple_majority`, `two_thirds`,
+    /// `unanimous`.
+    pub threshold: String,
+    pub passed_at: DateTime<Utc>,
+    /// Whether this motion amends the Accords — a passed one is what creates a
+    /// new `accords_versions` row.
+    #[serde(default)]
+    pub amends_accords: bool,
+}
+
+/// Payload of `motion.failed` (SPEC §5.4) — the same tally shape as
+/// [`MotionPassed`], named for the outcome so a consumer never has to read a
+/// `passed_at` field on a motion that failed.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MotionFailed {
+    pub motion_id: i64,
+    pub title: String,
+    /// The governing body the motion was decided in (a stable code).
+    pub body: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub meeting_id: Option<i64>,
+    pub votes_yes: i64,
+    pub votes_no: i64,
+    pub votes_abstain: i64,
+    pub threshold: String,
+    pub failed_at: DateTime<Utc>,
+    #[serde(default)]
+    pub amends_accords: bool,
+}
+
+/// Serialize a typed payload; a value that cannot be serialized is an internal
+/// error rather than a silently dropped event.
+fn payload<T: Serialize>(value: &T) -> Result<Value, SdkError> {
+    serde_json::to_value(value)
+        .map_err(|e| SdkError::Internal(format!("event payload serialization failed: {e}")))
+}
+
+/// Typed event publishers (SDK v0.2). The generic
+/// [`publish`](EventBusHandle::publish) remains the escape hatch for custom
+/// event types; these two wrap the M4 contracts so a publisher cannot drift
+/// from the documented payload shape.
+impl EventBusHandle {
+    /// Publish `mission.completed` with the [`MissionCompleted`] payload.
+    pub async fn publish_mission_completed(
+        &self,
+        event: &MissionCompleted,
+    ) -> Result<(), SdkError> {
+        self.publish(event_type::MISSION_COMPLETED, payload(event)?).await
+    }
+
+    /// Publish `motion.passed` with the [`MotionPassed`] payload.
+    pub async fn publish_motion_passed(&self, event: &MotionPassed) -> Result<(), SdkError> {
+        self.publish(event_type::MOTION_PASSED, payload(event)?).await
+    }
+
+    /// Publish `motion.failed` with the [`MotionFailed`] payload.
+    pub async fn publish_motion_failed(&self, event: &MotionFailed) -> Result<(), SdkError> {
+        self.publish(event_type::MOTION_FAILED, payload(event)?).await
+    }
+}
+
 /// Plugin-side event handler: `Fn(Event) -> Future<Result<(), SdkError>>`.
 pub type EventHandler = Arc<dyn Fn(Event) -> BoxFuture<'static, Result<(), SdkError>> + Send + Sync>;
 
@@ -704,6 +855,36 @@ impl DbHandle {
         params: Vec<SqlValue>,
     ) -> Result<Vec<Value>, SdkError> {
         self.db.query(sql.into(), params).await
+    }
+
+    // --- query helpers (SDK v0.2) -------------------------------------------
+
+    /// The first row of a query, or `None` when it returns no rows.
+    ///
+    /// The "fetch one or 404" path is in every plugin; this keeps it one line:
+    ///
+    /// ```rust
+    /// # use adjutant_sdk::prelude::*;
+    /// # async fn f(ctx: &PluginContext, id: i64) -> Result<PluginResponse, SdkError> {
+    /// let sql = format!("SELECT id, title FROM {} WHERE id = $1", ctx.db.table("missions"));
+    /// let row = ctx.db.query_one(sql, vec![SqlValue::Int(id)]).await?;
+    /// match row {
+    ///     Some(row) => PluginResponse::json(200, &serde_json::json!({ "mission": row })),
+    ///     None => PluginResponse::error(404, "no such mission"),
+    /// }
+    /// # }
+    /// ```
+    pub async fn query_one(
+        &self,
+        sql: impl Into<String>,
+        params: Vec<SqlValue>,
+    ) -> Result<Option<Value>, SdkError> {
+        Ok(self.db.query(sql.into(), params).await?.into_iter().next())
+    }
+
+    /// Whether a query returns any row (`SELECT 1 … WHERE …`, `COUNT(*) …`).
+    pub async fn exists(&self, sql: impl Into<String>, params: Vec<SqlValue>) -> Result<bool, SdkError> {
+        Ok(!self.db.query(sql.into(), params).await?.is_empty())
     }
 }
 
@@ -855,6 +1036,54 @@ impl PluginRequest {
     pub fn json<T: for<'de> Deserialize<'de>>(&self) -> Result<T, SdkError> {
         serde_json::from_slice(&self.body)
             .map_err(|e| SdkError::BadRequest(format!("invalid JSON body: {e}")))
+    }
+
+    // --- route helpers (SDK v0.2) -------------------------------------------
+
+    /// A path capture parsed as an integer.
+    ///
+    /// The capture is delivered by the core, so a missing one is a route
+    /// declaration bug (`Internal`), while an unparsable one is the caller's
+    /// input (`BadRequest`) — the two cases are kept apart on purpose, so a
+    /// handler can't accidentally answer 400 for its own mistake.
+    pub fn int_param(&self, key: &str) -> Result<i64, SdkError> {
+        let Some(raw) = self.params.get(key) else {
+            return Err(SdkError::Internal(format!(
+                "route {} has no {{{key}}} capture — declare it in RouteDefinition::path",
+                self.path
+            )));
+        };
+        raw.parse::<i64>().map_err(|_| {
+            SdkError::BadRequest(format!("path parameter {key} must be a number, got {raw:?}"))
+        })
+    }
+
+    /// A query parameter that must be present and non-blank.
+    pub fn query_required(&self, key: &str) -> Result<&str, SdkError> {
+        self.query_param(key)
+            .map(str::trim)
+            .filter(|v| !v.is_empty())
+            .ok_or_else(|| SdkError::BadRequest(format!("{key} query parameter is required")))
+    }
+
+    /// An integer query parameter; `None` when absent or unparsable.
+    ///
+    /// Unparsable is `None` rather than an error: query parameters are filters,
+    /// and a filter that cannot be read selects nothing. Use
+    /// [`query_required`](Self::query_required) plus `str::parse` when a bad
+    /// value must be a 400.
+    pub fn query_int(&self, key: &str) -> Option<i64> {
+        self.query_param(key).and_then(|v| v.trim().parse::<i64>().ok())
+    }
+
+    /// A truthy query parameter (`1`, `true`, `yes`, `on`, case-insensitive).
+    ///
+    /// `?include_inactive=0` and `?include_inactive=false` are both false — a
+    /// bare `is_some()` is the trap this closes.
+    pub fn query_bool(&self, key: &str) -> bool {
+        self.query_param(key).is_some_and(|v| {
+            matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on")
+        })
     }
 }
 
@@ -1200,11 +1429,12 @@ macro_rules! export_plugin {
 /// One import for plugin authors: `use adjutant_sdk::prelude::*;`
 pub mod prelude {
     pub use crate::{
-        async_trait, export_plugin, event_handler, route_handler, schedule_handler, AdjutantPlugin,
-        AuditService, DbHandle, EventBusHandle, Event, EventSubscription, HostDb, HostEvents,
-        HostHttp, HttpResponse, Identity, IdentityProvider, IdentityRegistrar, Method, Migration,
-        Permission, PermissionService, PluginContext, PluginRequest, PluginResponse, RoleGrant,
-        RouteDefinition, Schedule, ScheduleHandler, Scope, ScopeType, SdkError, SqlValue,
+        async_trait, event_handler, event_type, export_plugin, route_handler, schedule_handler,
+        AdjutantPlugin, AuditService, DbHandle, Event, EventBusHandle, EventSubscription, HostDb,
+        HostEvents, HostHttp, HttpResponse, Identity, IdentityProvider, IdentityRegistrar, Method,
+        Migration, MissionCompleted, MotionFailed, MotionPassed, Permission, PermissionService,
+        PluginContext, PluginRequest, PluginResponse, RoleGrant, RouteDefinition, Schedule,
+        ScheduleHandler, Scope, ScopeType, SdkError, SqlValue,
     };
 }
 
@@ -1298,6 +1528,50 @@ pub mod testing {
         pub fn query_count(&self) -> usize {
             self.queried.lock().unwrap().len()
         }
+
+        /// Every `query` SQL string, in order.
+        pub fn queried_sql(&self) -> Vec<String> {
+            self.queried.lock().unwrap().iter().map(|c| c.sql.clone()).collect()
+        }
+
+        /// Assert some executed statement contains every needle, failing with
+        /// the statements that did run — the "the UPDATE never fired" check.
+        pub fn assert_executed(&self, needles: &[&str]) {
+            let calls = self.executed.lock().unwrap();
+            let hit = calls.iter().any(|c| c.sql_contains(needles));
+            assert!(
+                hit,
+                "no executed statement contained {needles:?}; executed: {:#?}",
+                calls.iter().map(|c| c.sql.clone()).collect::<Vec<_>>()
+            );
+        }
+
+        /// The bind parameters of the last `execute` whose SQL contains
+        /// `needle` (a shortcut for asserting a typed null or a uuid binding).
+        pub fn last_execute_params(&self, needle: &str) -> Option<Vec<SqlValue>> {
+            self.executed
+                .lock()
+                .unwrap()
+                .iter()
+                .rev()
+                .find(|c| c.sql.contains(needle))
+                .map(|c| c.params.clone())
+        }
+
+        /// The bind parameters of the last `query` whose SQL contains `needle`.
+        ///
+        /// `INSERT … RETURNING` is a **query** on this host (it returns rows),
+        /// which is exactly the kind of thing a test should not have to
+        /// remember: reach for the SQL that matches what the handler does.
+        pub fn last_query_params(&self, needle: &str) -> Option<Vec<SqlValue>> {
+            self.queried
+                .lock()
+                .unwrap()
+                .iter()
+                .rev()
+                .find(|c| c.sql.contains(needle))
+                .map(|c| c.params.clone())
+        }
     }
 
     #[async_trait]
@@ -1340,6 +1614,36 @@ pub mod testing {
         /// Queue events for the next `replay` call.
         pub fn push_replay(&self, events: Vec<Event>) {
             self.replay.lock().unwrap().extend(events);
+        }
+
+        /// The payload of every event published with `event_type`, in order.
+        pub fn payloads(&self, event_type: &str) -> Vec<Value> {
+            self.published
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|p| p.event_type == event_type)
+                .map(|p| p.payload.clone())
+                .collect()
+        }
+
+        /// Assert at least one `event_type` was published, failing with the
+        /// types that *were* published (the usual "why did my event not fire?").
+        pub fn assert_published(&self, event_type: &str) {
+            assert!(
+                !self.payloads(event_type).is_empty(),
+                "expected a {event_type:?} event; published: {:?}",
+                self.published_types()
+            );
+        }
+
+        /// Assert nothing was published at all.
+        pub fn assert_none(&self) {
+            assert!(
+                self.published.lock().unwrap().is_empty(),
+                "expected no events; published: {:?}",
+                self.published_types()
+            );
         }
     }
 
@@ -1549,6 +1853,28 @@ pub mod testing {
                 user_id,
                 roles.iter().map(|r| r.to_string()).collect(),
             ));
+            self
+        }
+
+        /// Attach an authenticated caller with explicit scoped grants.
+        ///
+        /// The troop-wide [`identity`](Self::identity) builder cannot express a
+        /// lodge- or patrol-scoped grant, which is exactly what an object route's
+        /// handler checks — so scoped tests use this:
+        ///
+        /// ```
+        /// # use adjutant_sdk::prelude::*;
+        /// # use adjutant_sdk::testing::TestRequest;
+        /// let req = TestRequest::post("/api/missions/mission/7/decision")
+        ///     .identity_grants(
+        ///         "bea",
+        ///         vec![RoleGrant { role_id: "lodge_commander".into(), scope: Scope::lodge("3") }],
+        ///     )
+        ///     .build();
+        /// assert_eq!(req.identity.unwrap().roles(), vec!["lodge_commander".to_string()]);
+        /// ```
+        pub fn identity_grants(mut self, user_id: &str, grants: Vec<RoleGrant>) -> Self {
+            self.req.identity = Some(Identity::from_grants(user_id, grants));
             self
         }
 
@@ -1973,5 +2299,154 @@ mod tests {
             other => panic!("expected JSON details, got {other:?}"),
         };
         assert_eq!(details["user_id"], serde_json::json!("beatrice"));
+    }
+
+    // --- SDK v0.2 route helpers ---------------------------------------------
+
+    /// A missing capture is the plugin's own declaration bug (500); a bad value
+    /// is the caller's (400). Conflating them would hide a broken route behind a
+    /// client error.
+    #[test]
+    fn int_param_separates_a_missing_capture_from_a_bad_value() {
+        let req = crate::testing::TestRequest::get("/api/x/7").param("id", "7").build();
+        assert_eq!(req.int_param("id").unwrap(), 7);
+
+        let bad = crate::testing::TestRequest::get("/api/x/nope").param("id", "nope").build();
+        let err = bad.int_param("id").unwrap_err();
+        assert_eq!(err.status(), 400);
+        assert!(err.to_string().contains("nope"), "got: {err}");
+
+        let missing = crate::testing::TestRequest::get("/api/x").build();
+        let err = missing.int_param("id").unwrap_err();
+        assert_eq!(err.status(), 500);
+        assert!(err.to_string().contains("capture"), "got: {err}");
+    }
+
+    #[test]
+    fn query_helpers_read_filters() {
+        let req = crate::testing::TestRequest::get("/api/x")
+            .query_param("lodge", "windsor")
+            .query_param("limit", "12")
+            .query_param("include_inactive", "TRUE")
+            .query_param("empty", "   ")
+            .build();
+        assert_eq!(req.query_required("lodge").unwrap(), "windsor");
+        assert_eq!(req.query_int("limit"), Some(12));
+        assert_eq!(req.query_int("lodge"), None, "a non-numeric filter selects nothing");
+        assert!(req.query_bool("include_inactive"));
+        assert!(!req.query_bool("empty"), "a blank value is not truthy");
+        assert!(!req.query_bool("absent"));
+        assert_eq!(req.query_required("empty").unwrap_err().status(), 400);
+        assert_eq!(req.query_required("absent").unwrap_err().status(), 400);
+    }
+
+    // --- SDK v0.2 event helpers --------------------------------------------
+
+    /// The typed publishers must use the documented event names with the
+    /// documented payload shape — that is the whole point of them existing.
+    #[tokio::test]
+    async fn typed_event_publishers_match_the_documented_contract() {
+        let host = crate::testing::TestHost::new();
+        let ctx = host.context("missions");
+
+        ctx.events
+            .publish_mission_completed(&MissionCompleted {
+                mission_id: 12,
+                title: "Coyote survey".into(),
+                lodge_id: Some("3".into()),
+                stage: "report".into(),
+                completed_at: Utc::now(),
+                impact: serde_json::json!({ "service_hours": 18.5 }),
+            })
+            .await
+            .unwrap();
+        ctx.events
+            .publish_motion_passed(&MotionPassed {
+                motion_id: 4,
+                title: "Adopt the 3rd Accords".into(),
+                body: "congress".into(),
+                meeting_id: Some(2),
+                votes_yes: 12,
+                votes_no: 3,
+                votes_abstain: 1,
+                threshold: "two_thirds".into(),
+                passed_at: Utc::now(),
+                amends_accords: true,
+            })
+            .await
+            .unwrap();
+
+        host.events.assert_published(event_type::MISSION_COMPLETED);
+        host.events.assert_published(event_type::MOTION_PASSED);
+        let completed = &host.events.payloads("mission.completed")[0];
+        assert_eq!(completed["mission_id"], serde_json::json!(12));
+        assert_eq!(completed["stage"], serde_json::json!("report"));
+        assert_eq!(completed["impact"]["service_hours"], serde_json::json!(18.5));
+        // A troop-wide mission omits the lodge rather than publishing null.
+        let troop = serde_json::to_value(MissionCompleted {
+            mission_id: 1,
+            title: "Troop clean-up".into(),
+            lodge_id: None,
+            stage: "report".into(),
+            completed_at: Utc::now(),
+            impact: Value::Null,
+        })
+        .unwrap();
+        assert!(troop.get("lodge_id").is_none());
+
+        let passed = &host.events.payloads("motion.passed")[0];
+        assert_eq!(passed["threshold"], serde_json::json!("two_thirds"));
+        assert_eq!(passed["amends_accords"], serde_json::json!(true));
+        let round_trip: MotionPassed =
+            serde_json::from_value(passed.clone()).expect("payload deserializes for consumers");
+        assert_eq!(round_trip.motion_id, 4);
+    }
+
+    // --- SDK v0.2 query helpers --------------------------------------------
+
+    #[tokio::test]
+    async fn query_one_and_exists_read_the_host() {
+        let host = crate::testing::TestHost::new();
+        let ctx = host.context("missions");
+        host.db.push_rows(vec![serde_json::json!({ "id": 7, "title": "Survey" })]);
+        host.db.push_rows(vec![]);
+
+        let one = ctx.db.query_one("SELECT 1", vec![]).await.unwrap();
+        assert_eq!(one.unwrap()["id"], serde_json::json!(7));
+        assert!(!ctx.db.exists("SELECT 1", vec![]).await.unwrap());
+        assert!(ctx.db.query_one("SELECT 1", vec![]).await.unwrap().is_none());
+    }
+
+    // --- SDK v0.2 test-harness assertions ----------------------------------
+
+    #[tokio::test]
+    async fn mock_assertions_describe_what_happened() {
+        let host = crate::testing::TestHost::new();
+        let ctx = host.context("missions");
+        ctx.db
+            .execute(
+                format!("UPDATE {} SET stage = $1 WHERE id = $2", ctx.db.table("missions")),
+                vec![SqlValue::Text("execution".into()), SqlValue::Int(3)],
+            )
+            .await
+            .unwrap();
+        ctx.events.publish("mission.approved", serde_json::json!({"n": 1})).await.unwrap();
+
+        host.db.assert_executed(&["UPDATE", "missions", "stage"]);
+        let params = host.db.last_execute_params("UPDATE").expect("params");
+        assert!(matches!(params[0], SqlValue::Text(ref s) if s == "execution"));
+        assert_eq!(host.db.queried_sql(), Vec::<String>::new());
+        host.events.assert_published("mission.approved");
+        assert_eq!(host.events.payloads("mission.approved")[0]["n"], serde_json::json!(1));
+        assert!(host.events.payloads("mission.completed").is_empty());
+    }
+
+    /// The failure names the event that was expected *and* what was published,
+    /// so a wrong event name is one read away instead of a trial-and-error loop.
+    #[test]
+    #[should_panic(expected = "expected a \"mission.completed\" event")]
+    fn assert_published_names_what_was_published_instead() {
+        let events = crate::testing::MockEvents::new();
+        events.assert_published("mission.completed");
     }
 }

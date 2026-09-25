@@ -19,6 +19,8 @@ server/                     Core server (library + binary `adjutant`)
 plugins/sdk/                adjutant-sdk — the plugin contract
 plugins/auth/               auth plugin (argon2, sessions, roles, OIDC)
 plugins/membership/         membership plugin (roster, lodges, patrols, OSGi CSV)
+plugins/missions/           missions plugin (6-stage lifecycle, mentors, impact report)
+plugins/governance/         governance plugin (motions, votes, quorum, minutes, Accords)
 plugins/examples/hello/     Prototype plugin proving the SDK end to end
 scripts/probes.py           Committed M1+M2 probe harness (live server)
 docs/e2e_m3.py              Committed M3 end-to-end harness (live server)
