@@ -167,6 +167,50 @@ INSERT INTO core.role_permissions (role_id, permission_id) VALUES
 ON CONFLICT DO NOTHING;
 ```
 
+## Hermes MCP plugin (SPEC §7.10)
+
+The permissions-aware MCP surface Hermes connects to. Every tool **is** an
+Adjutant API call: the plugin checks the permission the tool's route requires,
+then calls the route over the core's mediated HTTP client with the caller's own
+`authorization`/`cookie` headers forwarded — so the core's route gate checks the
+same permission a second time, and the agent path and the UI path meet at one
+authorization decision. The plugin holds no credentials of its own, so an
+invocation can never exceed the calling user's authority.
+
+`GET /api/mcp/tools` lists only the tools the caller may invoke (a tool whose
+plugin is not installed is invisible: no role holds its permission). Every
+invocation — including every refusal — is recorded in `mcp.invocations` and in
+`core.audit_log`.
+
+Config lives in the `mcp` row's `core.plugins.config`:
+`{"base_url": "http://127.0.0.1:8787", "connection_ttl_hours": 24, "max_result_bytes": 65536,
+"tools": {"disable": [], "override": {}, "add": []}}`.
+
+| Method | Path | Permission | Body / notes |
+|---|---|---|---|
+| POST | `/api/mcp/connect` | `mcp:connect` | `{client?, client_version?, protocolVersion?, capabilities?}` → `{connection_id, token, expires_at, protocolVersion, server, capabilities}`. Only the token's SHA-256 is stored; the token is returned once |
+| GET | `/api/mcp/tools` | `mcp:connect` | The filtered catalogue: `{name, description, inputSchema, requiredPermission, scope}` per tool, plus `warnings` |
+| POST | `/api/mcp/invoke` | `mcp:invoke` | `{tool, arguments, connection_id?}` or a connection token in `connection_token` / the `mcp-session-id` header → `{tool, status: ok\|denied\|error, http_status?, result?, error?, duration_ms, invocation_id}`. The tool's own permission is re-checked, arguments are strictly validated against the tool's schema, and the API's status is passed through |
+| GET | `/api/mcp/invocations?tool=&status=&limit=` | `mcp:connect` (own rows) / `mcp:audit` (troop) | The audit trail: user, connection, tool, arguments, the downstream request, status, HTTP status, duration |
+
+Tools (path and permission mirror the owning plugin's route exactly):
+
+| Tool | Route | Permission |
+|---|---|---|
+| `membership_list_members` | `GET /api/membership/members` | `membership:read_all` (troop) |
+| `membership_get_member` | `GET /api/membership/member` | `membership:read` (object scope) |
+| `missions_list_missions` | `GET /api/missions/missions` | `missions:read` (object scope) |
+| `missions_get_mission` | `GET /api/missions/mission/{id}` | `missions:read` (object scope) |
+| `missions_create_mission` | `POST /api/missions/mission` | `missions:create` (object scope) |
+| `governance_list_motions` | `GET /api/governance/motions` | `governance:read` (troop) |
+| `governance_get_motion` | `GET /api/governance/motion/{id}` | `governance:read` (troop) |
+| `governance_create_motion` | `POST /api/governance/motion` | `governance:propose` (troop) |
+| `calendar_list_events` | `GET /api/calendar/events` | `calendar:read` (object scope) |
+| `calendar_get_event` | `GET /api/calendar/event/{id}` | `calendar:read` (object scope) |
+| `calendar_create_event` | `POST /api/calendar/event` | `calendar:create` (object scope) |
+
+Permissions this plugin defines: `mcp:connect`, `mcp:invoke`, `mcp:audit`.
+
 ## Example plugins
 
 `hello` (native) and `hello_wasm` (sandboxed) both expose:

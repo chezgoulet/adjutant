@@ -53,6 +53,21 @@ first-party plugin to pick the helpers up.
   minutes drafted from the motion record; and Accords versions created only by a
   **passed Congress motion**, superseding the previous adopted one. Publishes
   `motion.proposed`, `motion.passed`, `motion.failed`, and `accords.adopted`.
+- **`adjutant-mcp`** (SPEC §7.10): the permissions-aware MCP server Hermes
+  connects to. `POST /api/mcp/connect` mints an audit-tracked session (only the
+  token's SHA-256 is stored), `GET /api/mcp/tools` lists **only** the tools the
+  caller's role and scope already reach, and `POST /api/mcp/invoke` re-checks
+  the tool's own permission before calling the API route it names — with the
+  caller's own credentials forwarded, so the core's gate decides a second time
+  and the plugin can never exceed the invoking user's authority. Arguments are
+  validated against each tool's published JSON Schema (unknown arguments are
+  refused), and every invocation — `ok`, `error`, and every `denied` — is
+  recorded in `mcp.invocations` and in `core.audit_log`;
+  `GET /api/mcp/invocations` reads the trail back (own rows, or troop-wide with
+  `mcp:audit`). Eleven tools cover membership, missions, governance, and
+  calendar, and the catalogue is data: `tools.add` / `tools.override` /
+  `tools.disable` in the plugin's config retarget or extend it without a
+  rebuild.
 
 ### Notes for plugin authors
 

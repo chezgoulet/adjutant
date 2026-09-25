@@ -78,7 +78,7 @@ so that the v0.2.0 evidence trail keeps its existing name.
 | `missions` | §7.3 | Six-stage mission lifecycle, mentor matching, Lodge Commander approval | M4 | **Shipped** (v0.2.0) |
 | `governance` | §7.4 | Motion lifecycle, voting, amendments, Accords versioning | M4 | **Shipped** (v0.2.0) |
 | `calendar` | §7.7 | Events, RSVPs, recurrence, quorum tracking | M5 | Planned |
-| `mcp` | §7.10 | Permissions-aware MCP server for Hermes | M5 | Planned |
+| `mcp` | §7.10 | Permissions-aware MCP server for Hermes | M5 | **Built** (loading, tested; M5 client exit criteria pending) |
 | `finance` | §7.5 | Funds, transactions, budget vs. actuals, sliding-scale dues | M6 | Planned |
 | `equipment` | §7.6 | Inventory, checkout/checkin, maintenance | M6 | Planned |
 | `archive` | §7.8 | Congress proceedings, minutes, full-text search, timeline | M6 | Planned |

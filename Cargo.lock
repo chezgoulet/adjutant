@@ -49,6 +49,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "adjutant-mcp"
+version = "0.2.0"
+dependencies = [
+ "adjutant-sdk",
+ "hex",
+ "rand 0.8.8",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tokio",
+]
+
+[[package]]
 name = "adjutant-membership"
 version = "0.2.0"
 dependencies = [

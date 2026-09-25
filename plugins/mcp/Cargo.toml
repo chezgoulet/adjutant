@@ -1,0 +1,25 @@
+[package]
+name = "adjutant-mcp"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Hermes MCP plugin: permissions-aware MCP server for agent integration (SPEC 7.10)."
+
+[lib]
+# cdylib so the core loads it dynamically; rlib so it also links as a test fixture.
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+adjutant-sdk.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+# Connection tokens are minted and hashed with pure-CPU crates (the same pair
+# the auth plugin uses for sessions) — no runtime, no I/O, so they are safe to
+# link into a plugin (see the SDK's host-mediated I/O rule).
+rand = "0.8"
+sha2 = "0.10"
+hex = "0.4"
+
+[dev-dependencies]
+tokio.workspace = true
