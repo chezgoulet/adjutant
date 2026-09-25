@@ -17,6 +17,7 @@ members = [
     "plugins/conflicts",
     "plugins/announcements",
     "plugins/stripe",
+    "plugins/store",
     "plugins/examples/hello",
     "server",
 ]

@@ -108,6 +108,7 @@ recorded in this document saying it is deferred and why.
 | Meshcore (LoRa) | §7.11 | Field comms; hardware-dependent |
 | ATAK | §7.12 | Situational awareness; hardware-dependent |
 | Stripe | §7.13 | Payments; only for troops that take money online |
+| Store | §7.16 | The troop's shop — catalogue, sliding scale, rentals, comp sales; needs `stripe` |
 | Community suites | §7.15 | Google, Apple, Microsoft, Nextcloud, Proton — explicitly optional per troop |
 
 ---

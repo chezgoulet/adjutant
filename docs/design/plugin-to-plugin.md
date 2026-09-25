@@ -85,10 +85,46 @@ write. Concretely, one plugin owns the completion of a paid order and is respons
 ledger entry within the same flow, so a failure is either rolled back or compensated — not
 silently orphaned.
 
-The specific pattern (single-transaction ownership, or an outbox with retry) is left open here
-deliberately; it should be decided with the payments plugin, against the real shape of Stripe's
-webhooks. What is decided now is the constraint: **no money event without a matching ledger
-outcome**.
+**Decided 2026-09-25, with the payments plugin in front of us: a transactional
+outbox with an idempotent consumer, authorising delivery by a declared service
+principal, with reconciliation against the provider as the control of last
+resort.** This is the standard shape for "a payment must never exist without its
+ledger entry", and it is the one that satisfies the rule above without pretending
+a webhook has a caller — it does not, so §2(b) is unavailable on this path.
+
+* **The intent is recorded with the fact.** The producer writes the ledger intent
+  into its own schema in the same local step as the payment it describes
+  (`stripe.payments.ledger_status`), so a crash between the charge and the write
+  cannot lose it.
+* **A relay delivers that intent at least once, with backoff**, and the delivery
+  carries an answer — so the failure the old event path could not see becomes a
+  failure the relay can retry.
+* **The consumer is idempotent.** Finance keys on the payment id
+  (`finance.transactions.external_ref`, unique) and probes before writing, so a
+  redelivery cannot double-count in either direction.
+* **Reconciliation is the last resort, not the plan.** A pass compares the
+  provider's confirmed payments against the ledger and raises a mismatch. It
+  catches what no relay can: an intent that was never recorded at all.
+* **Delivery is authorised by a declared service principal**, never by a forwarded
+  human credential and never by a shared secret — see below.
+
+**Why a service principal is not the §3.1 hole.** §3.1 refuses *amplification*:
+turning a caller's authority into a broader one, or minting something that stands
+in for a person. A service principal is the opposite of both — a first-class,
+non-human identity with its own declared grant, narrower than any operator's,
+evaluated by the target's own gate exactly as a member's is, visible in
+`core.role_permissions` so an operator can see it and revoke it, and **attested by
+the core rather than asserted by the caller**. A relay cannot forge it, because it
+does not present it: the core delivers the entry and names the principal. What
+stays refused, unchanged: a plugin saying "trust me", a credential outliving its
+request, and any path where the target skips its own authorization because the
+caller is internal.
+
+**This is a deliberate scope extension, and it is core infrastructure, not payments
+code.** `core.outbox`, the relay and the service-principal registry land in the
+core because `store` orders and equipment rentals have the identical problem — a
+machine-originated confirmation with no caller — and solving it once is the only
+version of this that does not need solving three times.
 
 ### 3.3 The ledger stays single-source
 
@@ -123,8 +159,13 @@ Stated so nobody assumes otherwise:
   design note. Until it lands, a plugin's `ctx.http` is not yet fenced to declared hosts, and
   the safety of §2(b) rests on forwarding the caller's credential rather than on the allowlist.
 - **No plugin currently calls another plugin as the caller except `mcp`.**
-- **The payments plugin does not exist**, so §3.2's pattern is a constraint rather than an
-  implementation.
+- **The payments plugin exists** (`stripe`, SPEC §7.13) and §3.2 is decided — the
+  outbox, the relay and the service-principal registry are **not built yet**. Until
+  they are, a webhook-confirmed payment books through finance's idempotent
+  `payment.received` subscriber, carries a truthful `ledger_status`, and appears in
+  `GET /api/stripe/unbooked` if no ledger entry confirms it. That is a named,
+  visible gap rather than a silent one, and it is the first thing the relay
+  replaces.
 
 ---
 

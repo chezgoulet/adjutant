@@ -679,6 +679,25 @@ Adjutant can act as an identity provider for other troop systems. A separate plu
 
 These are optional — troops choose which integrations they need.
 
+### 7.16 Store Plugin
+
+**Purpose:** The troop's shop — what it sells, to whom, and at what price.
+
+**Responsibilities:**
+- A catalogue of what a troop sells: uniforms, patches, insignia, camp gear, event merchandise
+- Prices per item, with a **sliding scale** — the same principle as dues, so cost never decides who belongs
+- **Equipment rentals** as a priced product: the fee is the shop's, the custody and condition stay `equipment`'s (§7.6)
+- Order placement and completion, with the record of what was sold and to whom
+- **Comp sales** — a commander-and-above authority to complete an order at no charge, with the reason and the authority recorded, and the zero amount visible in the ledger and the Annual Financial Report
+
+**Depends on:** `stripe` (§7.13) to take money and `finance` (§7.5) to record it.
+The shop holds no money and keeps no books of its own: a paid order is completed by
+calling `stripe` as the caller, and the ledger entry remains finance's (§3.3 of
+`docs/design/plugin-to-plugin.md`).
+
+**Not in scope:** payment processing (§7.13), equipment custody and its checkout
+state machine (§7.6), and dues (§7.5).
+
 ---
 
 ## 8. Database Schema
