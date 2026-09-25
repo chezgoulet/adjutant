@@ -49,15 +49,15 @@
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
-use sqlx::PgPool;
+use sqlx::{PgPool, Row};
 use tokio::task::JoinHandle;
 
 use adjutant_sdk::{
-    event_handler, EventSubscription, HostEvents, Identity, PluginRequest, RoleGrant, Scope, SqlValue,
+    event_handler, EventSubscription, HostEvents, Identity, PluginRequest, RoleGrant, Scope,
 };
 
 use crate::permissions::authorize;
-use crate::plugin_runtime::{PluginRegistry, RouteLookup};
+use crate::plugin_runtime::RouteLookup;
 use crate::server::AppState;
 
 // ---------------------------------------------------------------------------
@@ -332,7 +332,7 @@ impl Relay {
                     Err(e) => tracing::error!(error = %e, "outbox relay pass failed"),
                 }
                 pass += 1;
-                if pass % RECONCILE_EVERY == 0 {
+                if pass.is_multiple_of(RECONCILE_EVERY) {
                     if let Err(e) = reconcile_and_raise(&state).await {
                         tracing::error!(error = %e, "outbox reconciliation pass failed");
                     }
@@ -431,8 +431,8 @@ impl Delivery {
     }
 }
 
-/// The backoff before attempt `n + 1`, doubling from [`BACKOFF_BASE_SECS`] and
-/// capped at [`BACKOFF_MAX_SECS`].
+/// The backoff before attempt `n + 1`, doubling from `BACKOFF_BASE_SECS` (15s)
+/// and capped at `BACKOFF_MAX_SECS` (1h).
 pub fn backoff_secs(attempts: i32) -> i64 {
     let n = attempts.clamp(1, 32) - 1;
     BACKOFF_BASE_SECS
@@ -506,7 +506,7 @@ pub async fn record(pool: &PgPool, id: i64, attempts: i32, d: &Delivery) -> Resu
     Ok(())
 }
 
-/// Drain up to [`BATCH`] due intents. Returns how many were attempted.
+/// Drain up to `BATCH` (32) due intents. Returns how many were attempted.
 pub async fn drain(state: &Arc<AppState>) -> Result<usize, sqlx::Error> {
     reclaim_stale(state.pool.as_ref()).await?;
     let mut attempted = 0;
@@ -601,7 +601,7 @@ pub async fn deliver(state: &Arc<AppState>, intent: &Intent) -> Delivery {
             ),
         );
     }
-    if !crate::outbox::declared_for(&principal.producer_plugin, &intent.principal).is_some() {
+    if crate::outbox::declared_for(&principal.producer_plugin, &intent.principal).is_none() {
         return Delivery::refused(
             Some(403),
             None,
@@ -677,7 +677,8 @@ pub async fn deliver(state: &Arc<AppState>, intent: &Intent) -> Delivery {
         method: intent.target_method.clone(),
         path: intent.target_route.clone(),
         params,
-        query: HashMap::new(),
+        // The core builds the request: no query string, and **no headers at all**.
+        query: Vec::new(),
         headers: HashMap::new(),
         body,
         identity: Some(identity),
@@ -1092,6 +1093,15 @@ pub async fn reconciliation_route(
     }
 }
 
+/// The owner id the core's **own** subscription is bound under.
+///
+/// `core.outbox.` is the first subscription the core owns rather than a plugin,
+/// and a reload's sweep clears every subscriber id it finds — so the core's
+/// subscription is bound under this id and `server::clear_plugin_subscriptions`
+/// skips it, while still clearing every plugin generation. (`core` is a
+/// reserved plugin id, so no plugin can collide with it.)
+pub const SUBSCRIBER_OWNER: &str = "core";
+
 /// One subscription for the relay's terminal-outcome events, so the core's own
 /// audit surface sees them. Producers bind their own (`core.outbox.` prefix).
 /// Used by [`crate::server::build_app`]; a producer's own subscription is its
@@ -1102,9 +1112,9 @@ pub fn outcome_subscription() -> EventSubscription {
         event_handler(|ev| async move {
             tracing::info!(
                 event = %ev.event_type,
-                intent = ev.payload["intent_id"],
-                producer = ev.payload["producer"],
-                state = ev.payload["state"],
+                intent = %ev.payload["intent_id"],
+                producer = %ev.payload["producer"],
+                state = %ev.payload["state"],
                 "outbox outcome"
             );
             Ok(())
@@ -1139,4 +1149,1233 @@ fn error(status: u16, message: impl Into<String>) -> axum::response::Response {
 
 fn internal_error(what: &str, err: &dyn std::fmt::Display) -> axum::response::Response {
     crate::server::internal_error(what, err)
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+//
+// The four security probes are the argument for this feature; the relay's
+// mechanics follow them. Every database-backed probe is `#[ignore]`d (the
+// repository's convention, issue #25) so a bare `cargo test --workspace`
+// reports it as ignored rather than passed, and under `--ignored` a missing or
+// unreachable database is a hard failure, never a skip:
+//
+// ```text
+// ADJUTANT_TEST_DATABASE_URL=postgres://…/adjutant_dev_test \
+//   cargo test -p adjutant-server --lib -- --ignored
+// ```
+//
+// The delivery probes act as the **declared** pair the design describes — the
+// `stripe` producer and its principal `svc.stripe.ledger`, whose grant is
+// `finance:write` — because the relay checks the principal against the core's
+// compiled declaration before it delivers anything (see `deliver`, which calls
+// `declared_for`). Two fixtures are declared per probe instead where only the
+// *enqueue* path is under test (probe 2), where that check does not run.
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use adjutant_sdk::{
+        async_trait, route_handler, AdjutantPlugin, AuditService, Event, Migration, Permission,
+        PermissionService, PluginContext, PluginResponse, RouteDefinition, RouteHandler, SdkError,
+    };
+    use axum::body::to_bytes;
+    use axum::extract::State as AxumState;
+    use sqlx::PgPool;
+
+    use crate::config::Config;
+    use crate::events::EventBus;
+    use crate::host::CoreDb;
+    use crate::identity::IdentityHub;
+    use crate::plugin_runtime::{LoadedPlugin, PluginInfo, PluginRegistry};
+    use crate::scheduler::Scheduler;
+    use crate::scope_hierarchy::ScopeHierarchy;
+
+    // -----------------------------------------------------------------------
+    // Fixtures
+    // -----------------------------------------------------------------------
+
+    /// The producer and principal a delivery probe acts as: the core's own
+    /// declared pair (`SERVICE_PRINCIPALS`), so the probe exercises the shape
+    /// the money path will actually have.
+    const DELIVERY_PRODUCER: &str = "stripe";
+    const DELIVERY_PRINCIPAL: &str = "svc.stripe.ledger";
+    const DELIVERY_PERMISSION: &str = "finance:write";
+    /// The route the principal's declaration describes, protected by
+    /// `finance:write` — the gate a delivery must not be able to skip.
+    const GATE_ROUTE: &str = "/api/finance/transaction";
+    /// A route whose handler always fails, so retry/exhaustion can be driven.
+    const BOOM_ROUTE: &str = "/api/probe/boom";
+    /// A route whose consumer records one row per idempotency key.
+    const LEDGER_ROUTE: &str = "/api/probe/ledger";
+
+    /// Producers used only where the *enqueue* path is under test (probe 2),
+    /// declared by the fixture in `core.service_principals`.
+    const PROBE_PLUGIN: &str = "outbox_probe";
+    const OTHER_PLUGIN: &str = "outbox_probe_other";
+    const PROBE_PRINCIPAL: &str = "svc.outbox_probe.ledger";
+    const OTHER_PRINCIPAL: &str = "svc.outbox_probe.other";
+
+    /// Every intent these probes write carries this key prefix, so cleanup can
+    /// name exactly what it owns and nothing else.
+    const KEY_PREFIX: &str = "probe-";
+
+    /// Serialises the DB probes: `claim_next` claims the queue's oldest due
+    /// intent, so they must not interleave.
+    static DB: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+    fn test_database_url() -> String {
+        let url = std::env::var("ADJUTANT_TEST_DATABASE_URL")
+            .or_else(|_| std::env::var("ADJUTANT_DATABASE_URL"))
+            .unwrap_or_else(|_| {
+                panic!(
+                    "the outbox probes are DB-gated: set ADJUTANT_TEST_DATABASE_URL \
+                     (they are #[ignore]d; run with `-- --ignored`)"
+                )
+            });
+        assert!(
+            !url.trim().is_empty(),
+            "the database URL is set but empty; set it to a _test database or unset it"
+        );
+        let name = url
+            .rsplit('/')
+            .next()
+            .unwrap_or("")
+            .split('?')
+            .next()
+            .unwrap_or("");
+        if !name.ends_with("_test") {
+            println!(
+                "[outbox probe] WARNING: running against {name:?}, which does not end in `_test`"
+            );
+        }
+        url
+    }
+
+    async fn pool_from(url: &str) -> Arc<PgPool> {
+        Arc::new(
+            sqlx::postgres::PgPoolOptions::new()
+                .max_connections(5)
+                .connect(url)
+                .await
+                .expect("the database URL is set but unreachable"),
+        )
+    }
+
+    async fn pool() -> (String, Arc<PgPool>) {
+        let url = test_database_url();
+        let pool = pool_from(&url).await;
+        (url, pool)
+    }
+
+    /// Migrate `core`, stand in for what a real boot writes (the finance
+    /// plugin's `finance:write` permission, the `chief` bootstrap grant and the
+    /// core's declared service principals), and leave the queue holding nothing
+    /// but what the probes own.
+    async fn provision(pool: &PgPool) {
+        crate::db::migrate_core(pool).await.expect("core migrations");
+        // The permission the *finance plugin* registers when it loads. A real
+        // boot has already written it; asserted here so the probe stands alone.
+        sqlx::query(
+            "INSERT INTO core.permissions (id, description) \
+             VALUES ('finance:write', 'probe fixture (the finance plugin declares this)') \
+             ON CONFLICT (id) DO NOTHING",
+        )
+        .execute(pool)
+        .await
+        .expect("finance:write permission");
+        // `build_app` writes this at boot; the operator routes' admin gate needs
+        // it to be drivable here.
+        sqlx::query(
+            "INSERT INTO core.role_permissions (role_id, permission_id) \
+             SELECT 'chief', id FROM core.permissions ON CONFLICT DO NOTHING",
+        )
+        .execute(pool)
+        .await
+        .expect("chief bootstrap grant");
+        seed_service_principals(pool).await.expect("declared principals");
+        // The declared pair exists, with the narrow grant the design states —
+        // and no admin authority.
+        let (producer, granted): (String, i64) = sqlx::query_as(
+            "SELECT sp.producer_plugin, \
+                    (SELECT count(*)::bigint FROM core.role_permissions rp \
+                      WHERE rp.role_id = sp.principal AND rp.permission_id = 'finance:write') \
+               FROM core.service_principals sp WHERE sp.principal = $1",
+        )
+        .bind(DELIVERY_PRINCIPAL)
+        .fetch_one(pool)
+        .await
+        .expect("the core declares stripe's principal");
+        assert_eq!(producer, DELIVERY_PRODUCER);
+        assert_eq!(granted, 1, "seeded with its narrow grant");
+
+        // Only the probes' own rows are cleared, then the queue must be empty:
+        // the claim is global, so anything else queued would break the probes'
+        // id assertions. Better to say so than to fail obscurely.
+        sqlx::query("DELETE FROM core.outbox WHERE idempotency_key LIKE $1")
+            .bind(format!("{KEY_PREFIX}%"))
+            .execute(pool)
+            .await
+            .expect("clear probe intents");
+        sqlx::query("DELETE FROM core.outbox WHERE producer_plugin LIKE 'outbox_probe%'")
+            .execute(pool)
+            .await
+            .expect("clear fixture intents");
+        let foreign: Option<String> =
+            sqlx::query_scalar("SELECT producer_plugin FROM core.outbox LIMIT 1")
+                .fetch_optional(pool)
+                .await
+                .expect("inspect the queue");
+        assert!(
+            foreign.is_none(),
+            "these probes need an otherwise-empty core.outbox (the claim is global); \
+             an intent from {foreign:?} is queued"
+        );
+    }
+
+    /// Declare a principal for a producer, with an optional grant, the way
+    /// `core.service_principals` + `core.roles` + `core.role_permissions` hold it.
+    async fn declare(pool: &PgPool, principal: &str, producer: &str, grants: &[&str]) {
+        sqlx::query(
+            "INSERT INTO core.roles (id, display_name, description) \
+             VALUES ($1, $1, 'probe fixture') ON CONFLICT (id) DO NOTHING",
+        )
+        .bind(principal)
+        .execute(pool)
+        .await
+        .expect("probe role");
+        sqlx::query(
+            "INSERT INTO core.service_principals (principal, producer_plugin, description) \
+             VALUES ($1, $2, 'probe fixture') ON CONFLICT (principal) DO NOTHING",
+        )
+        .bind(principal)
+        .bind(producer)
+        .execute(pool)
+        .await
+        .expect("probe declaration");
+        for grant in grants {
+            sqlx::query(
+                "INSERT INTO core.role_permissions (role_id, permission_id) \
+                 SELECT $1, id FROM core.permissions WHERE id = $2 ON CONFLICT DO NOTHING",
+            )
+            .bind(principal)
+            .bind(*grant)
+            .execute(pool)
+            .await
+            .expect("probe grant");
+        }
+    }
+
+    /// Grant one permission to a role (what an operator does when the money path
+    /// should run again).
+    async fn grant(pool: &PgPool, principal: &str, permission: &str) {
+        sqlx::query(
+            "INSERT INTO core.role_permissions (role_id, permission_id) \
+             SELECT $1, id FROM core.permissions WHERE id = $2 ON CONFLICT DO NOTHING",
+        )
+        .bind(principal)
+        .bind(permission)
+        .execute(pool)
+        .await
+        .expect("grant");
+    }
+
+    /// Revoke a principal's grant, leaving the declaration in place.
+    async fn revoke_grant(pool: &PgPool, principal: &str, permission: &str) {
+        sqlx::query("DELETE FROM core.role_permissions WHERE role_id = $1 AND permission_id = $2")
+            .bind(principal)
+            .bind(permission)
+            .execute(pool)
+            .await
+            .expect("revoke");
+    }
+
+    /// Remove the fixture's intents, declaration and role. The *declared* pair
+    /// is left alone: probe 1 restores it through `seed_service_principals`.
+    async fn forget(pool: &PgPool, principal: &str, producer: &str) {
+        let _ = sqlx::query("DELETE FROM core.outbox WHERE producer_plugin = $1")
+            .bind(producer)
+            .execute(pool)
+            .await;
+        let _ = sqlx::query("DELETE FROM core.role_permissions WHERE role_id = $1")
+            .bind(principal)
+            .execute(pool)
+            .await;
+        let _ = sqlx::query("DELETE FROM core.service_principals WHERE principal = $1")
+            .bind(principal)
+            .execute(pool)
+            .await;
+        let _ = sqlx::query("DELETE FROM core.roles WHERE id = $1")
+            .bind(principal)
+            .execute(pool)
+            .await;
+    }
+
+    /// Remove only the intents these probes wrote (they are named by key
+    /// prefix), leaving the **declared** principal and its grant alone.
+    async fn drop_probe_intents(pool: &PgPool) {
+        let _ = sqlx::query("DELETE FROM core.outbox WHERE idempotency_key LIKE $1")
+            .bind(format!("{KEY_PREFIX}%"))
+            .execute(pool)
+            .await;
+    }
+
+    /// Write the intent a producer would have written in its own transaction.
+    async fn insert_intent(
+        pool: &PgPool,
+        producer: &str,
+        principal: &str,
+        route: &str,
+        key: &str,
+        max_attempts: i32,
+    ) -> i64 {
+        sqlx::query_scalar(
+            "INSERT INTO core.outbox \
+               (producer_plugin, principal, target_method, target_route, idempotency_key, \
+                payload, max_attempts) \
+             VALUES ($1, $2, 'POST', $3, $4, '{\"amount\": 4200}'::jsonb, $5) \
+             RETURNING id",
+        )
+        .bind(producer)
+        .bind(principal)
+        .bind(route)
+        .bind(key)
+        .bind(max_attempts)
+        .fetch_one(pool)
+        .await
+        .expect("intent row")
+    }
+
+    /// Enqueue as a **plugin role** through the real function. The core's own
+    /// pool never calls this: `core.outbox_enqueue` is for `adjutant_plugin_*`
+    /// sessions and refuses anything else.
+    async fn plugin_enqueue(
+        plugin: &PgPool,
+        principal: &str,
+        route: &str,
+        key: &str,
+    ) -> Result<i64, sqlx::Error> {
+        sqlx::query_scalar(
+            "SELECT core.outbox_enqueue($1, 'POST', $2, '{\"amount\": 4200}'::jsonb, $3)",
+        )
+        .bind(principal)
+        .bind(route)
+        .bind(key)
+        .fetch_one(plugin)
+        .await
+    }
+
+    async fn intent_state(pool: &PgPool, id: i64) -> (String, i32, Option<String>) {
+        sqlx::query_as("SELECT state, attempts, last_error FROM core.outbox WHERE id = $1")
+            .bind(id)
+            .fetch_one(pool)
+            .await
+            .expect("intent state")
+    }
+
+    // -----------------------------------------------------------------------
+    // A fixture plugin: a route the relay can resolve, and a handler the probe
+    // observes.
+    // -----------------------------------------------------------------------
+
+    struct ProbePlugin;
+
+    #[async_trait]
+    impl AdjutantPlugin for ProbePlugin {
+        fn id(&self) -> &str {
+            PROBE_PLUGIN
+        }
+        fn name(&self) -> &str {
+            "Outbox probe"
+        }
+        fn version(&self) -> &str {
+            "0.0.1"
+        }
+        async fn init(&mut self, _ctx: PluginContext) -> Result<(), SdkError> {
+            Ok(())
+        }
+        // The registry resolves against `LoadedPlugin::routes`, not this.
+        fn routes(&self) -> Vec<RouteDefinition> {
+            Vec::new()
+        }
+        fn migrations(&self) -> Vec<Migration> {
+            Vec::new()
+        }
+        fn permissions_granted(&self) -> Vec<Permission> {
+            Vec::new()
+        }
+        fn subscriptions(&self) -> Vec<EventSubscription> {
+            Vec::new()
+        }
+    }
+
+    fn probe_state(pool: Arc<PgPool>, routes: Vec<RouteDefinition>) -> Arc<AppState> {
+        let config = Config {
+            allow_dev_headers: true,
+            ..Config::default()
+        };
+        Arc::new(AppState {
+            pool: pool.clone(),
+            permissions: PermissionService::new(CoreDb::new(pool.clone())),
+            audit: AuditService::new(CoreDb::new(pool.clone()), "core".into()),
+            registry: tokio::sync::RwLock::new(PluginRegistry {
+                plugins: vec![LoadedPlugin {
+                    plugin: Box::new(ProbePlugin),
+                    library: None,
+                    pool: None,
+                    routes,
+                    enabled: true,
+                    info: PluginInfo {
+                        id: PROBE_PLUGIN.into(),
+                        name: "Outbox probe".into(),
+                        version: "0.0.1".into(),
+                        enabled: true,
+                        routes: 0,
+                        kind: "native".into(),
+                        isolated: true,
+                        permissions: Vec::new(),
+                        schedules: Vec::new(),
+                        route_list: Vec::new(),
+                    },
+                }],
+                retired: Vec::new(),
+            }),
+            bus: EventBus::new(),
+            config: Arc::new(config),
+            identity: IdentityHub::new(),
+            http: crate::host::CoreHttp::new(),
+            hierarchy: tokio::sync::RwLock::new(ScopeHierarchy::default()),
+            scheduler: Scheduler::new(),
+            outbox_mismatches: Mutex::new(0),
+            relay: Relay::new(),
+        })
+    }
+
+    /// A handler that counts its calls, records the identity it was handed, and
+    /// answers 200. It also asserts the core forwarded **no headers**: there is
+    /// no credential for the relay to forward or mint.
+    fn gate_handler(calls: Arc<AtomicUsize>, seen: Arc<Mutex<Option<String>>>) -> RouteHandler {
+        route_handler(move |req: PluginRequest| {
+            let calls = calls.clone();
+            let seen = seen.clone();
+            async move {
+                assert!(
+                    req.headers.is_empty(),
+                    "a delivered request carries no headers: {:?}",
+                    req.headers
+                );
+                calls.fetch_add(1, Ordering::SeqCst);
+                if let Some(identity) = &req.identity {
+                    *seen.lock().expect("seen mutex") = Some(identity.user_id.clone());
+                }
+                PluginResponse::json(200, &serde_json::json!({ "ok": true }))
+            }
+        })
+    }
+
+    /// A handler that always fails the way an unreachable target does.
+    fn boom_handler() -> RouteHandler {
+        route_handler(|_req: PluginRequest| async move {
+            Err::<PluginResponse, _>(SdkError::Internal("the ledger is down".into()))
+        })
+    }
+
+    /// A handler that is an **idempotent consumer**: one row per idempotency
+    /// key, so a redelivery writes nothing a second time. It uses the admin pool
+    /// as a fixture convenience; a real consumer writes on its own plugin pool.
+    fn ledger_handler(pool: Arc<PgPool>) -> RouteHandler {
+        route_handler(move |_req: PluginRequest| {
+            let pool = pool.clone();
+            async move {
+                sqlx::query(
+                    "INSERT INTO outbox_probe.ledger (idempotency_key) VALUES ($1) \
+                     ON CONFLICT (idempotency_key) DO NOTHING",
+                )
+                .bind(format!("{KEY_PREFIX}redeliver-1"))
+                .execute(pool.as_ref())
+                .await
+                .map_err(|e| SdkError::Db(e.to_string()))?;
+                PluginResponse::json(200, &serde_json::json!({ "booked": true }))
+            }
+        })
+    }
+
+    /// One relay pass for **one** intent, made deterministic: make it due, claim
+    /// it (the claim is global, so asserting the id is what keeps the probe
+    /// honest), deliver, record.
+    async fn attempt_once(state: &Arc<AppState>, id: i64) -> Delivery {
+        sqlx::query("UPDATE core.outbox SET next_attempt_at = now() WHERE id = $1")
+            .bind(id)
+            .execute(state.pool.as_ref())
+            .await
+            .expect("make due");
+        let intent = claim_next(state.pool.as_ref())
+            .await
+            .expect("claim")
+            .expect("an intent to claim");
+        assert_eq!(intent.id, id, "the probe's own intent must be the one claimed");
+        let outcome = deliver(state, &intent).await;
+        record(state.pool.as_ref(), intent.id, intent.attempts, &outcome)
+            .await
+            .expect("record");
+        outcome
+    }
+
+    fn admin_request() -> axum::extract::Request {
+        axum::http::Request::builder()
+            .header("x-dev-user", "christopher")
+            .header("x-dev-role", "chief")
+            .body(axum::body::Body::empty())
+            .expect("request builds")
+    }
+
+    async fn body_json(resp: axum::response::Response) -> serde_json::Value {
+        let bytes = to_bytes(resp.into_body(), 1 << 20).await.expect("body");
+        serde_json::from_slice(&bytes).expect("json body")
+    }
+
+    // =======================================================================
+    // The four security probes
+    // =======================================================================
+
+    /// **Security probe 1.** A principal whose grant does not cover the operation
+    /// is refused by the **target's own gate**. The relay runs the same
+    /// `authorize` a member's request runs, against `core.role_permissions`; it
+    /// does not skip the gate because the caller is internal, and it cannot
+    /// widen the principal. The positive control is in the same probe: grant the
+    /// permission and the identical delivery lands, so a refusal can only have
+    /// been the gate's decision.
+    #[tokio::test]
+    #[ignore = "DB-gated: needs ADJUTANT_TEST_DATABASE_URL; run with `-- --ignored`"]
+    async fn principal_without_the_grant_is_refused_by_the_targets_own_gate() {
+        let _guard = DB.lock().await;
+        let (_url, pool) = pool().await;
+        provision(pool.as_ref()).await;
+        // The operator's revocation: the declaration stands, the grant is gone.
+        revoke_grant(pool.as_ref(), DELIVERY_PRINCIPAL, DELIVERY_PERMISSION).await;
+
+        let calls = Arc::new(AtomicUsize::new(0));
+        let seen = Arc::new(Mutex::new(None));
+        let state = probe_state(
+            pool.clone(),
+            vec![RouteDefinition::post_protected(
+                GATE_ROUTE,
+                DELIVERY_PERMISSION,
+                gate_handler(calls.clone(), seen.clone()),
+            )],
+        );
+
+        // --- revoked grant: the target's gate refuses
+        let refused_id = insert_intent(
+            pool.as_ref(),
+            DELIVERY_PRODUCER,
+            DELIVERY_PRINCIPAL,
+            GATE_ROUTE,
+            &format!("{KEY_PREFIX}gate-1"),
+            2,
+        )
+        .await;
+        let refused = attempt_once(&state, refused_id).await;
+        assert_eq!(
+            refused.state, STATE_REFUSED,
+            "the target's gate must refuse the principal: {refused:?}"
+        );
+        assert_eq!(refused.http_status, Some(403));
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            0,
+            "the target's handler must not run when its gate refuses"
+        );
+        let error = refused.error.clone().unwrap_or_default();
+        assert!(
+            error.contains("refused finance:write"),
+            "the refusal must name the operation and the gate: {error}"
+        );
+        let (row_state, attempts, last_error) = intent_state(pool.as_ref(), refused_id).await;
+        assert_eq!(row_state, STATE_REFUSED, "the refusal is in the data, not only a log");
+        assert_eq!(attempts, 1, "the attempt is spent at the claim");
+        assert!(last_error.is_some());
+
+        // --- the control: the same principal, granted the permission
+        grant(pool.as_ref(), DELIVERY_PRINCIPAL, DELIVERY_PERMISSION).await;
+        let delivered_id = insert_intent(
+            pool.as_ref(),
+            DELIVERY_PRODUCER,
+            DELIVERY_PRINCIPAL,
+            GATE_ROUTE,
+            &format!("{KEY_PREFIX}gate-2"),
+            2,
+        )
+        .await;
+        let delivered = attempt_once(&state, delivered_id).await;
+        assert_eq!(
+            delivered.state, STATE_DELIVERED,
+            "with the grant the target serves the same delivery: {delivered:?}"
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 1, "the handler ran exactly once");
+        assert_eq!(
+            seen.lock().expect("seen mutex").clone(),
+            Some(format!("service:{DELIVERY_PRINCIPAL}")),
+            "the identity is the core-built service principal, namespaced as such"
+        );
+
+        // --- revoking it again is a refusal, never a widening
+        revoke_grant(pool.as_ref(), DELIVERY_PRINCIPAL, DELIVERY_PERMISSION).await;
+        let revoked_id = insert_intent(
+            pool.as_ref(),
+            DELIVERY_PRODUCER,
+            DELIVERY_PRINCIPAL,
+            GATE_ROUTE,
+            &format!("{KEY_PREFIX}gate-3"),
+            2,
+        )
+        .await;
+        let revoked = attempt_once(&state, revoked_id).await;
+        assert_eq!(revoked.state, STATE_REFUSED, "a revocation is honoured");
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "the handler must not run again after the grant was revoked"
+        );
+
+        // Leave the database as a boot would: declared, with its narrow grant.
+        seed_service_principals(pool.as_ref()).await.expect("restore the declaration");
+        drop_probe_intents(pool.as_ref()).await;
+    }
+
+    /// **Security probe 2.** A plugin cannot forge or assert a principal: the
+    /// enqueue path takes **no identity parameter at all** (the producer is
+    /// derived from `session_user`), so the only principal a plugin can name is
+    /// its own — and a refused forgery writes nothing. A second real plugin role
+    /// cannot read the first producer's intents either.
+    #[tokio::test]
+    #[ignore = "DB-gated: needs ADJUTANT_TEST_DATABASE_URL + CREATEROLE; run with `-- --ignored`"]
+    async fn a_plugin_cannot_forge_or_assert_a_principal() {
+        let _guard = DB.lock().await;
+        let (url, pool) = pool().await;
+        provision(pool.as_ref()).await;
+        declare(pool.as_ref(), PROBE_PRINCIPAL, PROBE_PLUGIN, &[]).await;
+        declare(pool.as_ref(), OTHER_PRINCIPAL, OTHER_PLUGIN, &[]).await;
+        // `svc.stripe.ledger` is declared — for the `stripe` plugin only.
+        assert!(
+            declared_for("stripe", "svc.stripe.ledger").is_some(),
+            "the core declares stripe's principal"
+        );
+
+        // (a) The signature itself: no parameter names a producer or an actor.
+        let (args, secdef): (String, bool) = sqlx::query_as(
+            "SELECT pg_get_function_arguments(p.oid), p.prosecdef \
+               FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace \
+              WHERE n.nspname = 'core' AND p.proname = 'outbox_enqueue'",
+        )
+        .fetch_one(pool.as_ref())
+        .await
+        .expect("outbox_enqueue exists");
+        assert!(secdef, "outbox_enqueue is SECURITY DEFINER");
+        assert_eq!(
+            args.matches(',').count(),
+            4,
+            "exactly five parameters, none of them an identity: {args}"
+        );
+        for forbidden in ["producer", "identity", "actor", "session", "role", "user"] {
+            assert!(
+                !args.contains(forbidden),
+                "the enqueue path must take no {forbidden:?} parameter: {args}"
+            );
+        }
+        assert!(args.contains("p_principal") && args.contains("p_idempotency_key"));
+
+        // (b) As a real plugin role.
+        let secret = crate::schema::bootstrap_role(pool.as_ref(), PROBE_PLUGIN, None, false)
+            .await
+            .expect("bootstrap plugin role (needs CREATEROLE/superuser)");
+        let plugin = crate::host::plugin_pool(&url, PROBE_PLUGIN, &secret, 2)
+            .await
+            .expect("plugin pool");
+
+        // A principal declared for another producer: refused, and named.
+        let err = plugin_enqueue(&plugin, "svc.stripe.ledger", GATE_ROUTE, &format!("{KEY_PREFIX}forge-1"))
+            .await
+            .expect_err("a plugin must not enqueue as stripe's principal");
+        assert!(
+            err.to_string().contains("may not enqueue as principal"),
+            "the forgery must be refused by name: {err}"
+        );
+        // A principal that is not declared at all: refused.
+        let err = plugin_enqueue(&plugin, "svc.nobody", GATE_ROUTE, &format!("{KEY_PREFIX}forge-2"))
+            .await
+            .expect_err("an undeclared principal must be refused");
+        assert!(
+            err.to_string().contains("no service principal"),
+            "the refusal must name the missing declaration: {err}"
+        );
+        let forged: i64 =
+            sqlx::query_scalar("SELECT count(*)::bigint FROM core.outbox WHERE producer_plugin = $1")
+                .bind(PROBE_PLUGIN)
+                .fetch_one(pool.as_ref())
+                .await
+                .expect("count forged intents");
+        assert_eq!(forged, 0, "a refused forgery must write no intent at all");
+
+        // Its own principal enqueues — and the key is idempotent, so a retry of
+        // its own write returns the intent it already has rather than a second.
+        let first = plugin_enqueue(&plugin, PROBE_PRINCIPAL, GATE_ROUTE, &format!("{KEY_PREFIX}own-1"))
+            .await
+            .expect("its own declared principal");
+        let again = plugin_enqueue(&plugin, PROBE_PRINCIPAL, GATE_ROUTE, &format!("{KEY_PREFIX}own-1"))
+            .await
+            .expect("the same fact again");
+        assert_eq!(first, again, "one fact, one intent: the key is idempotent");
+        let rows: i64 =
+            sqlx::query_scalar("SELECT count(*)::bigint FROM core.outbox WHERE producer_plugin = $1")
+                .bind(PROBE_PLUGIN)
+                .fetch_one(pool.as_ref())
+                .await
+                .expect("count intents");
+        assert_eq!(rows, 1, "no second intent for the same key");
+
+        // (c) Another producer cannot read it, and cannot write as it.
+        let other_secret = crate::schema::bootstrap_role(pool.as_ref(), OTHER_PLUGIN, None, false)
+            .await
+            .expect("bootstrap the second plugin role");
+        let other = crate::host::plugin_pool(&url, OTHER_PLUGIN, &other_secret, 2)
+            .await
+            .expect("second plugin pool");
+        let visible: i64 =
+            sqlx::query_scalar("SELECT count(*)::bigint FROM core.outbox_producer_view()")
+                .fetch_one(other.as_ref())
+                .await
+                .expect("producer view");
+        assert_eq!(visible, 0, "a producer sees only its own intents");
+        let mine: i64 =
+            sqlx::query_scalar("SELECT count(*)::bigint FROM core.outbox_producer_view()")
+                .fetch_one(plugin.as_ref())
+                .await
+                .expect("producer view");
+        assert_eq!(mine, 1, "the producing role sees its own intent");
+        let err = plugin_enqueue(&other, PROBE_PRINCIPAL, GATE_ROUTE, &format!("{KEY_PREFIX}other-1"))
+            .await
+            .expect_err("the second producer may not write as the first's principal");
+        assert!(
+            err.to_string().contains("may not enqueue as principal"),
+            "{err}"
+        );
+
+        forget(pool.as_ref(), PROBE_PRINCIPAL, PROBE_PLUGIN).await;
+        forget(pool.as_ref(), OTHER_PRINCIPAL, OTHER_PLUGIN).await;
+    }
+
+    /// **Security probe 3.** A failed delivery is retried, and its exhaustion is
+    /// **visible in the data**: the intent lands in `exhausted` carrying its last
+    /// error, the reconciliation report names it `unlanded` with both sides of
+    /// the disagreement, the operator route lists it, and that route can re-arm
+    /// it — while a non-admin cannot read it at all.
+    #[tokio::test]
+    #[ignore = "DB-gated: needs ADJUTANT_TEST_DATABASE_URL; run with `-- --ignored`"]
+    async fn a_failed_delivery_is_retried_and_its_exhaustion_is_visible_in_the_data() {
+        let _guard = DB.lock().await;
+        let (_url, pool) = pool().await;
+        provision(pool.as_ref()).await;
+
+        let state = probe_state(
+            pool.clone(),
+            vec![RouteDefinition::post(BOOM_ROUTE, boom_handler())],
+        );
+        let id = insert_intent(
+            pool.as_ref(),
+            DELIVERY_PRODUCER,
+            DELIVERY_PRINCIPAL,
+            BOOM_ROUTE,
+            &format!("{KEY_PREFIX}boom-1"),
+            2,
+        )
+        .await;
+
+        // Attempt 1: retryable, so the intent stays queued with a backoff.
+        let first = attempt_once(&state, id).await;
+        assert_eq!(first.state, STATE_PENDING, "a 5xx is retried: {first:?}");
+        assert!(
+            first.error.as_deref().unwrap_or_default().contains("ledger is down"),
+            "the target's failure is the recorded reason: {first:?}"
+        );
+        let (row_state, attempts, last_error) = intent_state(pool.as_ref(), id).await;
+        assert_eq!(row_state, STATE_PENDING);
+        assert_eq!(attempts, 1, "the attempt is spent at the claim");
+        assert!(last_error.is_some(), "the failure is recorded on the row");
+        let backoff_applied: bool =
+            sqlx::query_scalar("SELECT next_attempt_at > now() FROM core.outbox WHERE id = $1")
+                .bind(id)
+                .fetch_one(pool.as_ref())
+                .await
+                .expect("backoff");
+        assert!(backoff_applied, "a backoff was applied before the next attempt");
+
+        // Attempt 2 (the budget is spent): exhausted, not pending.
+        let second = attempt_once(&state, id).await;
+        assert_eq!(
+            second.state, STATE_EXHAUSTED,
+            "the last attempt exhausts: {second:?}"
+        );
+        assert_eq!(second.event, Some(EVENT_EXHAUSTED));
+        let (row_state, attempts, last_error) = intent_state(pool.as_ref(), id).await;
+        assert_eq!(row_state, STATE_EXHAUSTED);
+        assert_eq!(attempts, 2);
+        assert_eq!(
+            last_error.as_deref(),
+            second.error.as_deref(),
+            "the row carries the last error verbatim"
+        );
+        let answer_status: Option<i32> =
+            sqlx::query_scalar("SELECT answer_status FROM core.outbox WHERE id = $1")
+                .bind(id)
+                .fetch_one(pool.as_ref())
+                .await
+                .expect("answer_status");
+        assert_eq!(answer_status, Some(500), "the target's answer is recorded too");
+
+        // Visible 1: the reconciliation report (the control of last resort).
+        let report = reconciliation(&state).await.expect("reconciliation");
+        assert_eq!(
+            report["ok"],
+            serde_json::json!(false),
+            "the report says not-ok: {report}"
+        );
+        let mismatch = report["mismatches"]
+            .as_array()
+            .expect("mismatches array")
+            .iter()
+            .find(|m| m["intent_id"] == serde_json::json!(id))
+            .expect("the exhausted intent is in the mismatch report");
+        assert_eq!(mismatch["mismatch"], serde_json::json!("unlanded"));
+        assert_eq!(mismatch["state"], serde_json::json!(STATE_EXHAUSTED));
+        assert!(
+            mismatch["last_error"].as_str().unwrap_or_default().contains("ledger is down"),
+            "the report carries the failure: {mismatch}"
+        );
+        assert_eq!(
+            mismatch["intent_payload"]["amount"],
+            serde_json::json!(4200),
+            "both sides of the disagreement are in the row"
+        );
+
+        // Visible 2: the operator route.
+        let resp = list_intents(AxumState(state.clone()), admin_request()).await;
+        assert_eq!(resp.status(), 200);
+        let body = body_json(resp).await;
+        let listed = body["intents"]
+            .as_array()
+            .expect("intents array")
+            .iter()
+            .find(|i| i["id"] == serde_json::json!(id))
+            .expect("the exhausted intent is in the worklist");
+        assert_eq!(listed["state"], serde_json::json!(STATE_EXHAUSTED));
+        assert_eq!(body["by_state"]["exhausted"], serde_json::json!(1));
+
+        // The operator's hand: re-arm it (with the audit row written first).
+        let resp = retry_intent(
+            AxumState(state.clone()),
+            axum::extract::Path(id),
+            admin_request(),
+        )
+        .await;
+        assert_eq!(resp.status(), 200, "the operator route re-arms it");
+        let (row_state, attempts, _) = intent_state(pool.as_ref(), id).await;
+        assert_eq!(row_state, STATE_PENDING);
+        assert_eq!(attempts, 0, "the attempt budget is restored");
+        // Only a refused or exhausted intent may be re-armed.
+        let resp = retry_intent(
+            AxumState(state.clone()),
+            axum::extract::Path(id),
+            admin_request(),
+        )
+        .await;
+        assert_eq!(resp.status(), 409, "a pending intent is already queued");
+
+        // The operator gate is real: no identity is refused.
+        let anon = axum::http::Request::builder()
+            .body(axum::body::Body::empty())
+            .expect("request builds");
+        let resp = list_intents(AxumState(state.clone()), anon).await;
+        assert_eq!(resp.status(), 401, "no identity is refused");
+
+        drop_probe_intents(pool.as_ref()).await;
+    }
+
+    /// **Security probe 4.** A redelivery does not double-write: the consumer is
+    /// idempotent on the intent's idempotency key, the relay never claims an
+    /// intent that reached a terminal state, and re-arming a delivered intent is
+    /// refused outright.
+    #[tokio::test]
+    #[ignore = "DB-gated: needs ADJUTANT_TEST_DATABASE_URL; run with `-- --ignored`"]
+    async fn a_redelivery_does_not_double_write() {
+        let _guard = DB.lock().await;
+        let (_url, pool) = pool().await;
+        provision(pool.as_ref()).await;
+        sqlx::query("CREATE SCHEMA IF NOT EXISTS outbox_probe")
+            .execute(pool.as_ref())
+            .await
+            .expect("fixture schema");
+        sqlx::query(
+            "CREATE TABLE IF NOT EXISTS outbox_probe.ledger (idempotency_key TEXT PRIMARY KEY)",
+        )
+        .execute(pool.as_ref())
+        .await
+        .expect("fixture table");
+        sqlx::query("DELETE FROM outbox_probe.ledger")
+            .execute(pool.as_ref())
+            .await
+            .expect("clear the consumer's table");
+
+        let calls = Arc::new(AtomicUsize::new(0));
+        let counter = calls.clone();
+        let inner = ledger_handler(pool.clone());
+        let handler = route_handler(move |req: PluginRequest| {
+            let inner = inner.clone();
+            let counter = counter.clone();
+            async move {
+                counter.fetch_add(1, Ordering::SeqCst);
+                inner(req).await
+            }
+        });
+        let state = probe_state(
+            pool.clone(),
+            vec![RouteDefinition::post(LEDGER_ROUTE, handler)],
+        );
+
+        let id = insert_intent(
+            pool.as_ref(),
+            DELIVERY_PRODUCER,
+            DELIVERY_PRINCIPAL,
+            LEDGER_ROUTE,
+            &format!("{KEY_PREFIX}redeliver-1"),
+            2,
+        )
+        .await;
+        let first = attempt_once(&state, id).await;
+        assert_eq!(first.state, STATE_DELIVERED, "{first:?}");
+
+        // The redelivery: the relay claims only a *pending* intent.
+        sqlx::query("UPDATE core.outbox SET next_attempt_at = now() WHERE id = $1")
+            .bind(id)
+            .execute(pool.as_ref())
+            .await
+            .expect("make due");
+        let again = claim_next(pool.as_ref()).await.expect("claim");
+        assert!(
+            again.is_none(),
+            "a delivered intent is never claimed again (got {:?})",
+            again.map(|i| i.id)
+        );
+        // And re-arming it is refused: a delivered intent is done.
+        let resp = retry_intent(
+            AxumState(state.clone()),
+            axum::extract::Path(id),
+            admin_request(),
+        )
+        .await;
+        assert_eq!(resp.status(), 409, "a delivered intent is not re-armed");
+
+        // One fact, one write, on both sides of the wire.
+        let written: i64 = sqlx::query_scalar("SELECT count(*)::bigint FROM outbox_probe.ledger")
+            .fetch_one(pool.as_ref())
+            .await
+            .expect("consumer rows");
+        assert_eq!(written, 1, "the consumer wrote once");
+        assert_eq!(calls.load(Ordering::SeqCst), 1, "the handler ran once");
+        let intents: i64 =
+            sqlx::query_scalar("SELECT count(*)::bigint FROM core.outbox WHERE producer_plugin = $1")
+                .bind(DELIVERY_PRODUCER)
+                .fetch_one(pool.as_ref())
+                .await
+                .expect("intent rows");
+        assert_eq!(intents, 1, "one intent was written for the fact");
+
+        drop_probe_intents(pool.as_ref()).await;
+    }
+
+    // =======================================================================
+    // Relay mechanics
+    // =======================================================================
+
+    /// Two passes — or two processes — cannot take one intent.
+    #[tokio::test]
+    #[ignore = "DB-gated: needs ADJUTANT_TEST_DATABASE_URL; run with `-- --ignored`"]
+    async fn two_passes_cannot_take_one_intent() {
+        let _guard = DB.lock().await;
+        let (_url, pool) = pool().await;
+        provision(pool.as_ref()).await;
+        let id = insert_intent(
+            pool.as_ref(),
+            DELIVERY_PRODUCER,
+            DELIVERY_PRINCIPAL,
+            BOOM_ROUTE,
+            &format!("{KEY_PREFIX}claim-1"),
+            2,
+        )
+        .await;
+
+        let (a, b) = tokio::join!(claim_next(pool.as_ref()), claim_next(pool.as_ref()));
+        let claims = [a.expect("claim a"), b.expect("claim b")];
+        let taken: Vec<i64> = claims.iter().flatten().map(|i| i.id).collect();
+        assert_eq!(taken, vec![id], "exactly one pass claimed the one intent");
+        let (row_state, attempts, _) = intent_state(pool.as_ref(), id).await;
+        assert_eq!(row_state, STATE_ATTEMPTING);
+        assert_eq!(attempts, 1, "the attempt is spent at the claim, once");
+
+        drop_probe_intents(pool.as_ref()).await;
+    }
+
+    /// `FOR UPDATE SKIP LOCKED`: a row another session holds is **skipped**, not
+    /// waited for. With a plain `FOR UPDATE` the claim would block here until the
+    /// lock is released; the timeout is what makes that a failure rather than a
+    /// hang.
+    #[tokio::test]
+    #[ignore = "DB-gated: needs ADJUTANT_TEST_DATABASE_URL; run with `-- --ignored`"]
+    async fn claim_skips_a_row_locked_by_another_session() {
+        let _guard = DB.lock().await;
+        let (_url, pool) = pool().await;
+        provision(pool.as_ref()).await;
+        let id = insert_intent(
+            pool.as_ref(),
+            DELIVERY_PRODUCER,
+            DELIVERY_PRINCIPAL,
+            BOOM_ROUTE,
+            &format!("{KEY_PREFIX}skip-1"),
+            2,
+        )
+        .await;
+
+        let mut holder = pool.begin().await.expect("holder transaction");
+        sqlx::query("SELECT id FROM core.outbox WHERE state = 'pending' ORDER BY id FOR UPDATE")
+            .fetch_all(&mut *holder)
+            .await
+            .expect("lock the row");
+
+        let claimed =
+            tokio::time::timeout(std::time::Duration::from_secs(5), claim_next(pool.as_ref()))
+                .await
+                .expect("the claim must skip the locked row, not block on it")
+                .expect("claim");
+        assert!(
+            claimed.is_none(),
+            "the locked row is skipped (got {:?})",
+            claimed.map(|i| i.id)
+        );
+
+        holder.rollback().await.expect("rollback");
+        // Released, it is claimable again.
+        let intent = claim_next(pool.as_ref())
+            .await
+            .expect("claim")
+            .expect("claimable once unlocked");
+        assert_eq!(intent.id, id);
+
+        drop_probe_intents(pool.as_ref()).await;
+    }
+
+    /// An abandoned claim (a crash between claim and record) goes back to
+    /// `pending` with its lease cleared — and keeps the attempt it spent, so a
+    /// row cannot be retried forever.
+    #[tokio::test]
+    #[ignore = "DB-gated: needs ADJUTANT_TEST_DATABASE_URL; run with `-- --ignored`"]
+    async fn reclaim_stale_returns_an_abandoned_claim_to_pending() {
+        let _guard = DB.lock().await;
+        let (_url, pool) = pool().await;
+        provision(pool.as_ref()).await;
+        let id = insert_intent(
+            pool.as_ref(),
+            DELIVERY_PRODUCER,
+            DELIVERY_PRINCIPAL,
+            BOOM_ROUTE,
+            &format!("{KEY_PREFIX}stale-1"),
+            2,
+        )
+        .await;
+
+        let intent = claim_next(pool.as_ref())
+            .await
+            .expect("claim")
+            .expect("one intent");
+        assert_eq!(intent.id, id);
+        let fresh = reclaim_stale(pool.as_ref()).await.expect("reclaim");
+        assert_eq!(fresh, 0, "a live lease is left alone");
+
+        // The relay died holding it.
+        sqlx::query(
+            "UPDATE core.outbox SET claimed_at = now() - make_interval(secs => 600) WHERE id = $1",
+        )
+        .bind(id)
+        .execute(pool.as_ref())
+        .await
+        .expect("age the lease");
+        let reclaimed = reclaim_stale(pool.as_ref()).await.expect("reclaim");
+        assert_eq!(reclaimed, 1, "the abandoned claim is returned");
+        let (row_state, attempts, last_error) = intent_state(pool.as_ref(), id).await;
+        assert_eq!(row_state, STATE_PENDING);
+        assert_eq!(attempts, 1, "the spent attempt is not refunded");
+        assert!(last_error.is_some(), "the abandonment is recorded");
+        let claimed_at: Option<String> =
+            sqlx::query_scalar("SELECT claimed_at::text FROM core.outbox WHERE id = $1")
+                .bind(id)
+                .fetch_one(pool.as_ref())
+                .await
+                .expect("claimed_at");
+        assert!(claimed_at.is_none(), "the lease is cleared");
+        let due: bool =
+            sqlx::query_scalar("SELECT next_attempt_at <= now() FROM core.outbox WHERE id = $1")
+                .bind(id)
+                .fetch_one(pool.as_ref())
+                .await
+                .expect("due");
+        assert!(due, "it is due again");
+
+        drop_probe_intents(pool.as_ref()).await;
+    }
+
+    // =======================================================================
+    // The core's own subscription
+    // =======================================================================
+
+    /// The hazard this closes: `core.outbox.` is the first subscription the
+    /// **core** owns rather than a plugin, and a reload's sweep iterates every
+    /// subscriber id it finds. Clearing the core's own subscription would go
+    /// unnoticed until an outcome event went unheard — so the sweep skips the
+    /// owner id and the core's handler keeps receiving.
+    #[tokio::test]
+    async fn the_cores_own_subscription_survives_a_reload_sweep() {
+        let bus = EventBus::new();
+        let core_seen = Arc::new(AtomicUsize::new(0));
+        let plugin_seen = Arc::new(AtomicUsize::new(0));
+        let counter = |n: Arc<AtomicUsize>| {
+            event_handler(move |_ev| {
+                let n = n.clone();
+                async move {
+                    n.fetch_add(1, Ordering::SeqCst);
+                    Ok(())
+                }
+            })
+        };
+
+        assert_eq!(
+            outcome_subscription().filter,
+            "core.outbox.",
+            "the core's subscription is keyed on the outcome events"
+        );
+        bus.subscribe(
+            SUBSCRIBER_OWNER,
+            EventSubscription::new("core.outbox.", counter(core_seen.clone())),
+        );
+        bus.subscribe(
+            "hello",
+            EventSubscription::new("core.outbox.", counter(plugin_seen.clone())),
+        );
+        bus.subscribe(
+            "membership",
+            EventSubscription::new("core.outbox.", counter(plugin_seen.clone())),
+        );
+
+        crate::server::clear_plugin_subscriptions(&bus).await;
+        let ids = bus.subscriber_ids();
+        assert!(
+            ids.contains(&SUBSCRIBER_OWNER.to_string()),
+            "the core's own subscription must survive the sweep: {ids:?}"
+        );
+        assert!(
+            !ids.contains(&"hello".to_string()) && !ids.contains(&"membership".to_string()),
+            "every plugin generation is cleared: {ids:?}"
+        );
+
+        let event = Event {
+            id: 1,
+            event_type: EVENT_DELIVERED.into(),
+            payload: serde_json::json!({ "intent_id": 7 }),
+            source: "core".into(),
+            timestamp: chrono::Utc::now(),
+        };
+        let _ = bus.sender().send(event);
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        assert_eq!(
+            core_seen.load(Ordering::SeqCst),
+            1,
+            "the core's handler still receives its own outcome events"
+        );
+        assert_eq!(
+            plugin_seen.load(Ordering::SeqCst),
+            0,
+            "no cleared plugin generation receives anything"
+        );
+        bus.shutdown();
+    }
+
+    // =======================================================================
+    // Pure boundaries
+    // =======================================================================
+
+    /// The declaration is scoped to **exactly one producer**, which is what makes
+    /// "a plugin cannot widen its own machine authority" true in the core's
+    /// mirror of the SQL check.
+    #[test]
+    fn a_principal_is_declared_for_exactly_one_producer() {
+        let decl = declared_for("stripe", "svc.stripe.ledger").expect("stripe owns it");
+        assert_eq!(decl.principal, "svc.stripe.ledger");
+        assert_eq!(decl.producer, "stripe");
+        assert!(
+            !decl.grants.iter().any(|p| p.contains("admin")),
+            "a service principal never holds an admin permission: {:?}",
+            decl.grants
+        );
+        assert_eq!(decl.grants, &["finance:write"], "and its grant is narrow");
+        assert!(
+            declared_for("store", "svc.stripe.ledger").is_none(),
+            "another producer may not deliver as it"
+        );
+        assert!(declared_for("stripe", "svc.nobody").is_none());
+    }
+
+    /// The delivered identity is namespaced and carries the principal's own
+    /// role at troop scope, and nothing else.
+    #[test]
+    fn the_delivered_identity_is_the_principal_and_nothing_else() {
+        let identity = identity_for("svc.stripe.ledger");
+        assert_eq!(identity.user_id, "service:svc.stripe.ledger");
+        assert_eq!(identity.roles(), vec!["svc.stripe.ledger".to_string()]);
+        assert_eq!(identity.grants.len(), 1);
+        assert_eq!(identity.grants[0].scope, Scope::troop());
+    }
+
+    /// The backoff grows from the base and caps; the cap is what stops an intent
+    /// from being retried sooner than the queue's slowest consumer can bear.
+    #[test]
+    fn backoff_grows_from_the_base_and_caps() {
+        assert_eq!(backoff_secs(1), BACKOFF_BASE_SECS);
+        assert_eq!(backoff_secs(2), BACKOFF_BASE_SECS * 2);
+        assert_eq!(backoff_secs(3), BACKOFF_BASE_SECS * 4);
+        assert_eq!(backoff_secs(0), BACKOFF_BASE_SECS, "a clamped floor, never zero");
+        let mut previous = 0;
+        for attempts in 1..=40 {
+            let wait = backoff_secs(attempts);
+            assert!(
+                wait >= previous,
+                "monotonic: {attempts} → {wait} after {previous}"
+            );
+            assert!(
+                wait <= BACKOFF_MAX_SECS,
+                "capped at {BACKOFF_MAX_SECS}: got {wait}"
+            );
+            previous = wait;
+        }
+        assert_eq!(
+            backoff_secs(40),
+            BACKOFF_MAX_SECS,
+            "it reaches the ceiling and stays there"
+        );
+        assert_eq!(
+            DEFAULT_MAX_ATTEMPTS, 6,
+            "the attempt budget mirrored by the column default"
+        );
+    }
 }
