@@ -186,6 +186,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "adjutant-stripe"
+version = "0.2.0"
+dependencies = [
+ "adjutant-sdk",
+ "chrono",
+ "hex",
+ "hmac",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tokio",
+]
+
+[[package]]
 name = "aho-corasick"
 version = "1.1.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"

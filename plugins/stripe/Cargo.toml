@@ -1,0 +1,26 @@
+[package]
+name = "adjutant-stripe"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Stripe: dues, donations, event fees, and the payment webhook path (SPEC 7.13)."
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+adjutant-sdk.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+chrono.workspace = true
+# Webhook signature verification is pure CPU — an HMAC over bytes — so it is
+# safe to link into a plugin. Anything that needs a runtime or I/O (sqlx,
+# reqwest, tokio) is not: see the SDK's host-mediated I/O rule. Outbound HTTP
+# goes through `ctx.http`.
+hmac = "0.12"
+sha2 = "0.10"
+hex = "0.4"
+
+[dev-dependencies]
+tokio.workspace = true
