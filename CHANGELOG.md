@@ -195,6 +195,42 @@ first-party plugin to pick the helpers up.
   --ignored`), so the money path's atomicity, idempotency and worklist claims are
   gated by CI rather than by hand.
 
+- **`adjutant-store` is the outbox's second producer: a scholarship draw is
+  enqueued by the same statement that completes (or comps) an order.** The rail
+  was built for one producer; this proves it is infrastructure. Completing a
+  tier-funded order, or comping one, with `funded_cents > 0` now writes the order's
+  transition **and** `core.outbox_enqueue(…)` in **one statement** (an expression
+  in the plugin's own `UPDATE`), keyed deterministically per draw
+  (`store-order-<id>-draw`), so the callerless draw cannot be left owed and
+  unbooked and a replay is handed back the intent it already has — no transaction
+  API added to the SDK (`SDK_ABI_VERSION` stays 4; `plugins/sdk/**` untouched). The
+  intent's payload is complete at enqueue time: both funds by **code**, the funded
+  amount, a description, the completion date and `allow_overdraft: false` (a
+  machine may not authorise an overdraft), with `fiscal_year` omitted because
+  finance derives it. The core declares a second principal, **`svc.store.draw`**
+  (producer `store`, grant `finance:write` alone — a boot still never re-grants a
+  revocation), and the relay delivers the draw to `POST /api/finance/transfer`.
+  `draw_status` gains one value, **`intent_enqueued`** (an intent is enqueued and
+  the relay will deliver it: neither booked nor unbooked), added by a **new plugin
+  migration 2** rather than by editing migration 1, which an applied database skips
+  without comparing its SQL; the order's `draw_intent_id` names the intent, with a
+  partial unique index mirroring stripe's. `GET /api/store/orders/unsettled` lists
+  an in-flight draw explicitly with the intent's own state (through
+  `core.outbox_producer_view()`) and an `in_flight` count, and drops it once that
+  durable state is `delivered` — the durable intent decides, not a notification,
+  which only copies the outcome onto `draw_status` (`delivered` → `booked` with
+  finance's `transfer_group`, `refused` → `refused`, `exhausted` → `failed`). The
+  comp no longer needs a credential to forward, so its `allow_overdraft` request
+  field is gone — a machine may not authorise an overdraft, and a treasurer who
+  decides one books the draw by hand after a refusal — and `POST
+  /api/store/order/{id}/draw` still books as the caller but now refuses a `409`
+  naming the in-flight intent. `finance`'s transfer route takes fund **codes** as
+  alternatives to ids, resolved inside its own statement (the shape
+  `/api/finance/transaction` already had), so a store draw needs no read of finance
+  at all. The plugin's SQL moves to `plugins/store/migrations/*.sql` via the SDK's
+  `migrations!` macro, version 1 byte-identical to what shipped, and CI runs the
+  new store DB probes beside the stripe ones.
+
 ### Notes for plugin authors
 
 - Both plugins touch **no** `core.*` table: they keep to their own schema, so

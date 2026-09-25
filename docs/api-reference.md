@@ -55,9 +55,12 @@ troop-scope role grant — and authorized through the same gate a member's reque
 uses. The target decides, and an operator's revocation bites at delivery time rather
 than only at enqueue.
 
-**The declaration is compiled, not data.** `svc.stripe.ledger` (producer `stripe`,
-grant `finance:write`, and nothing else) is declared in the core's
-`SERVICE_PRINCIPALS` constant, and `core.service_principals` mirrors it so an
+**The declaration is compiled, not data.** One entry per machine-originated
+operation that has no caller, in the core's `SERVICE_PRINCIPALS` constant:
+`svc.stripe.ledger` (producer `stripe`) for a confirmed payment's ledger booking,
+and `svc.store.draw` (producer `store`) for a store order's scholarship draw —
+each with the grant `finance:write` and nothing else. `core.service_principals`
+mirrors them so an
 operator sees it beside a member's grant and can revoke it — `UPDATE
 core.service_principals SET revoked_at = now()`, or remove the row from
 `core.role_permissions`. **A boot never re-grants**, so a revocation is not undone.
@@ -249,7 +252,7 @@ base cost it is a fraction of — that is the treasurer's number.
 | PATCH | `/api/finance/fund/{id}` | `finance:manage` (troop) | Any subset of `{kind?, name?, purpose?, restricted?, active?, target_cents?}`; `code` is immutable, because a config names the fund by it. `400` when no editable field is supplied |
 | GET | `/api/finance/transactions?fund_id=&fiscal_year=&kind=&category=&member_id=&transfer_group=&from=&to=&before_id=&limit=` | `finance:read_all` (troop) | The ledger page, newest first; `limit` defaults to 50 and is capped at 200, `has_more` + `next_before_id` page it, and the unfiltered-by-page total comes back as `filtered_total_cents` |
 | POST | `/api/finance/transaction` | `finance:write` (troop) | `{fund_id\|fund_code, kind: income\|expense, amount_cents\|amount, category?, description?, member_id?, occurred_on?, fiscal_year?, allow_overdraft?, external_ref?}` — the fund is named by finance's id **or by its code** (exactly one), and a code is resolved inside the insert's own statement (`FROM funds f`), so a producer that holds only the code writes without reading finance first; a code it does not have is a `404`. The amount is a **magnitude** and the sign comes from `kind`. `409` on an unauthorised overdraft, `200 {duplicate: true}` for a replayed `external_ref`. Publishes `finance.transaction.recorded` |
-| POST | `/api/finance/transfer` | `finance:write` (troop) | `{from_fund_id, to_fund_id, amount_cents\|amount, description?, occurred_on?, fiscal_year?, allow_overdraft?}` — both legs under one `transfer_group`, or neither. Publishes `finance.transfer.recorded` |
+| POST | `/api/finance/transfer` | `finance:write` (troop) | `{from_fund_id\|from_fund_code, to_fund_id\|to_fund_code, amount_cents\|amount, description?, occurred_on?, fiscal_year?, allow_overdraft?}` — each leg is named by finance's id **or by its code**, exactly one of the two, and a code is resolved inside the transfer's own statement, so a producer that holds only codes moves money without reading finance first. Both legs land under one `transfer_group`, or neither; a fund that cannot be resolved is a `404` naming the reference, the two references resolving to one fund (or two equal ids/codes) is a `400`, and an unauthorised overdraft is a `409`. Publishes `finance.transfer.recorded` |
 | GET | `/api/finance/budgets?fiscal_year=` | `finance:read` (troop) | Budget lines against their ledger actuals, with favourable-positive variances; omitting `fiscal_year` returns every year |
 | POST | `/api/finance/budget` | `finance:manage` (troop) | `{fund_id, direction: income\|expense, amount_cents\|amount, category?, fiscal_year?, note?}` — one fund, one year, one direction, one category, so posting the same line again revises it rather than adding a second. Publishes `finance.budget.set` |
 | GET | `/api/finance/sliding-scale?base_cents=` | `finance:read` (troop) | The whole scale for a base cost (the configured membership cost by default): each tier's share, assessment and description, and the `$0` minimum |
@@ -917,18 +920,33 @@ rather than swallowed:
    got.
 3. `POST /api/store/order/{id}/comp` — a `store:comp` holder comps an order. The
    comp is recorded with its mandatory reason and its authority, and the draw it
-   produces is booked in the same call by asking finance to transfer the whole
-   price out of `scholarship`, as the caller.
+   produces is **enqueued as an outbox intent** by that same statement (below).
 
-**What has no caller, said plainly.** A sliding-scale reduction is applied by the
-shop, and a Stripe webhook confirming a payment carries no Adjutant caller, so
-neither can forward a credential — and minting one is what `§3.1` refuses. So the
-reduction's draw is recorded truthfully and left `unbooked`, a shopkeeper
-completes a paid order by hand, and `GET /api/store/orders/unsettled` is the
-worklist of both. `POST /api/store/order/{id}/draw` lets a treasurer book an
-outstanding draw **as themselves** (which needs their own `finance:write`);
-closing the gap structurally needs the core outbox `§3.2` decided and has not
-built.
+**The draw, where there is no caller.** A reduction is applied by the shop, a
+comp is exercised by a shopkeeper, and a Stripe webhook confirming a payment
+carries no Adjutant caller — so what the scholarship fund owes cannot be booked by
+forwarding anybody's credential, and minting one is what `§3.1` refuses. So the
+draw is a **durable outbox intent**: completing (or comping) an order with
+`funded_cents > 0` writes the order's transition **and** `core.outbox_enqueue(…)`
+in one statement, and the core's relay delivers it to `POST /api/finance/transfer`
+as the declared `svc.store.draw` principal — grant `finance:write`, declared for
+the `store` producer alone. The order's `draw_status` becomes `intent_enqueued`,
+which is **neither booked nor unbooked**: it is listed on the worklist with the
+intent's own state, and the intent's durable state is what decides — `delivered`
+drops the order out of the worklist and settles `draw_status` to `booked` with
+finance's own `transfer_group`; `refused`/`exhausted` are recorded as `refused`/
+`failed`. Nothing is left owed and unbooked, and no notification is the mechanism.
+
+The intent's key is deterministic per draw (`store-order-<id>-draw`), so a
+producer replaying its own write is handed back the intent it already has, and its
+payload is **complete at enqueue time** — both fund **codes**, the funded amount,
+a description, the completion date, `allow_overdraft: false` (a machine may not
+authorise an overdraft), and no `fiscal_year`, which finance derives. `GET
+/api/store/orders/unsettled` is the worklist of an order awaiting payment, an
+in-flight draw, and a draw no intent owns. `POST /api/store/order/{id}/draw` still
+lets a treasurer book an outstanding draw **as themselves** (which needs their own
+`finance:write`) — and refuses with a `409` naming the intent when one is already
+in flight, because a second booking would be a second transfer for one subsidy.
 
 Config lives in the `store` row's `core.plugins.config`:
 
@@ -953,24 +971,30 @@ only payment reference it ever writes is stripe's own opaque `pi_…`/`cs_…`.
 | PATCH | `/api/store/item/{id}` | `store:manage` | `{name?, sku?, category?, description?, base_price_cents?, fund_code?, active?}`. An omitted field is unchanged and an **empty string leaves a text field as it is**; `kind` is immutable |
 | POST | `/api/store/order` | `store:buy` (any scope) | `{lines: [{item_id, quantity}], tier?, member_id?, currency?, note?}` → `201` + `Location` + `{order, lines, draw}`. Priced **from the catalogue**, never from the request. Naming another `member_id` needs `store:manage`; an order whose lines name two funds is a `400` (one payment lands in one fund) |
 | GET | `/api/store/orders?status=&member_id=&before_id=&limit=` | `store:read` (any scope) | Newest first. A caller without `store:read_all` is narrowed to their own orders (`narrowed_to_caller: true`) and somebody else's `member_id` is a `403` |
-| GET | `/api/store/orders/unsettled?older_than_minutes=&limit=` | `store:read_all` | **The worklist**: orders awaiting payment past the threshold, and completed orders whose draw is not `booked` or whose ledger entry stripe did not confirm, with `by_reason` and a note saying a paid-but-unseen order cannot be told from an unpaid one |
+| GET | `/api/store/orders/unsettled?older_than_minutes=&limit=` | `store:read_all` | **The worklist**: orders awaiting payment past the threshold, and completed orders whose draw is not `booked` (including `draw_in_flight`, an outbox intent the relay is delivering — listed with its `draw_intent_id` and the intent's own state through `core.outbox_producer_view()`, and dropped once that state is `delivered`) or whose ledger entry stripe did not confirm, with `by_reason`, an `in_flight` count, and a note saying a paid-but-unseen order cannot be told from an unpaid one |
 | GET | `/api/store/order/{id}` | `store:read` (any scope) | The order, its lines, its `draw`, its `ledger`. Somebody else's order is a `403` that reads `"no such order"` |
 | POST | `/api/store/order/{id}/checkout` | `store:buy` (any scope) | Opens a Stripe Checkout session **as the caller** for `charged_cents` and settles the order to `awaiting_payment`. `403` when the request carries no credential to forward (nothing is called); stripe's own status is passed through otherwise. A zero charge is a `409` pointing at `/comp` — Stripe cannot take zero |
-| POST | `/api/store/order/{id}/complete` | `store:manage` | `{stripe_payment_id}` — verifies the payment with stripe as the caller, asks stripe to book it as the caller, and marks the order `paid` with finance's own answer. A payment that is not this order's is a `409` and nothing is written; a second completion is a `409`. Finance's refusal is passed through with the order paid and its `ledger_status` truthful |
-| POST | `/api/store/order/{id}/comp` | `store:comp` | `{reason, allow_overdraft?}` — completes at no charge with the reason **required** and the authority recorded, and books the draw (the whole price, `scholarship` → the order's fund) as the caller. The comp stands even if the draw does not, and the draw's outcome is recorded beside it. `409` when the order's proceeds already land in `scholarship` (a transfer to itself is not a transfer) |
-| POST | `/api/store/order/{id}/draw` | `store:manage` | `{allow_overdraft?}` — books an outstanding draw **as the caller** (`finance:write` decides). Guarded on the order being `paid` or `comped`: a draw is booked for a sale that happened |
+| POST | `/api/store/order/{id}/complete` | `store:manage` | `{stripe_payment_id}` — verifies the payment with stripe as the caller, asks stripe to book it as the caller, and marks the order `paid` with finance's own answer — **and, when the tier funded any of it, enqueues the draw as an outbox intent in that same statement** (`draw_status` becomes `intent_enqueued`). A payment that is not this order's is a `409` and nothing is written; a second completion is a `409`. Finance's refusal is passed through with the order paid and its `ledger_status` truthful |
+| POST | `/api/store/order/{id}/comp` | `store:comp` | `{reason}` — completes at no charge with the reason **required** and the authority recorded, and enqueues the draw (the whole price, `scholarship` → the order's fund) as an outbox intent **in that same statement**, so the comp and its bookable draw commit together or neither does. The comp needs no credential to forward: the core's relay delivers the intent as `svc.store.draw`. `409` when the order's proceeds already land in `scholarship` (a transfer to itself is not a transfer) |
+| POST | `/api/store/order/{id}/draw` | `store:manage` | `{allow_overdraft?}` — books an outstanding draw **as the caller** (`finance:write` decides). Guarded on the order being `paid` or `comped`: a draw is booked for a sale that happened. A `409` naming the in-flight intent when `draw_status` is already `intent_enqueued`: the core's relay owns that draw, and a second booking would be a second transfer for one subsidy |
 | GET | `/api/store/comps?from=&to=&limit=` | `store:read_all` | Every comp with its reason, its authority, the draw it produced, and the funded total. The ledger shows the draw; this route shows the comp |
 
 **Events:** `store.order.placed`, `store.order.awaiting_payment`,
-`store.order.paid`, `store.order.comped`, `store.order.draw_booked`,
-`store.orders.unsettled` (the six-hourly sweep's notice). No payload carries a
-secret or a card detail; a payment reference is stripe's opaque id.
+`store.order.paid`, `store.order.comped`, `store.order.draw_enqueued`,
+`store.order.draw_booked`, `store.orders.unsettled` (the six-hourly sweep's
+notice). No payload carries a secret or a card detail; a payment reference is
+stripe's opaque id.
 
-**Subscribes to:** nothing, on purpose — a paid order is completed by a caller
-(`§2(b)`), and a subscriber that marked an order paid from a broadcast would be
-exactly the fire-and-forget money path `§3.2` refuses. It could not even
-correlate reliably: `stripe.payment.confirmed` carries the Checkout session id
-only for one of the two event shapes.
+**Subscribes to:** `core.outbox.*` — the core relay's terminal outcomes
+(`delivered` → the draw is `booked` with finance's `transfer_group` as its
+reference, `refused` → `refused`, `exhausted` → `failed`). It is **notification
+only, and narrower than the money path it does not own**: it settles a draw whose
+intent this plugin already enqueued, by the intent id the relay names, and the
+worklist does not depend on it (the intent's durable state is what decides). A paid
+order is still completed by a caller (`§2(b)`) — a subscriber that marked an order
+paid from a broadcast would be exactly the fire-and-forget money path `§3.2`
+refuses, and could not even correlate reliably (stripe's confirmed-payment event
+carries the Checkout session id for only one of its two shapes).
 
 **Permissions this plugin defines:** `store:read` (the catalogue and your own
 orders), `store:read_all` (every order, and the worklists), `store:buy` (place an
@@ -980,8 +1004,11 @@ completion, outstanding draws), `store:comp` (complete an order at no charge).
 **Role grants.** **"Commander and above" is a role grant, not a rank this plugin
 knows**: the plugin defines `store:comp` and nothing else, and which roles hold it
 is the troop's business, recorded in `core.role_permissions` like every other
-permission. A comping or draw-booking caller needs `finance:write` as well —
-finance's own gate decides the money, and the store cannot widen it.
+permission. A comp needs no `finance:write`: its draw is delivered by the core's
+relay as the declared `svc.store.draw` principal, not forwarded from the caller. A
+treasurer booking an outstanding draw by hand **does** need their own
+`finance:write` — finance's own gate decides that money, and the store cannot
+widen it.
 
 ```sql
 INSERT INTO core.role_permissions (role_id, permission_id) VALUES
