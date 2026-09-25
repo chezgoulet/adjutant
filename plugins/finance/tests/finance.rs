@@ -657,7 +657,11 @@ async fn recording_income_takes_the_kinds_sign_and_reports_the_new_balance() {
     assert_eq!(body["overdrawn"], json!(false));
 
     let insert = find_statement(&host, "INSERT INTO");
-    assert!(insert.contains("WHERE EXISTS"), "{insert}");
+    // The fund is the insert's **source**, so the entry's fund is resolved by the
+    // same statement that writes it: `$1` an id, `$12` a code.
+    assert!(insert.contains("FROM"), "{insert}");
+    assert!(insert.contains("f.id = $1"), "{insert}");
+    assert!(insert.contains("f.code = $12"), "{insert}");
     assert!(
         insert.contains("+ $2 >= 0"),
         "the statement guards the overdraft: {insert}"
@@ -673,6 +677,186 @@ async fn recording_income_takes_the_kinds_sign_and_reports_the_new_balance() {
     assert!(insert.contains("$8::date"), "{insert}");
     host.events.assert_published("finance.transaction.recorded");
     assert_audited(&host, "transaction.record");
+}
+
+#[tokio::test]
+async fn a_fund_code_is_resolved_inside_the_insert_without_a_read() {
+    let (host, _plugin, routes) = plugin().await;
+    let record = route(&routes, "POST", "/api/finance/transaction");
+
+    // 1. the guarded insert (which resolved the code itself). 2. the fund's
+    // balance afterwards.
+    host.db
+        .push_rows(vec![transaction_row(13, 1, 25_000, "income")]);
+    host.db.push_rows(vec![json!({ "balance_cents": 25_000 })]);
+
+    let (status, body) = call(
+        &record.handler,
+        TestRequest::post("/api/finance/transaction")
+            .identity("treasurer", &["chief"])
+            .json(&json!({
+                "fund_code": FUND_GENERAL,
+                "kind": "income",
+                "amount_cents": 25_000,
+                "category": CATEGORY_DUES,
+                "member_id": "bea",
+                "description": "Bea's dues",
+                "occurred_on": "2026-02-01",
+                "fiscal_year": 2026,
+                "external_ref": "pi_probe_code",
+            }))
+            .build(),
+    )
+    .await;
+
+    // 201 — one statement, and **no read of finance's funds first**: a producer
+    // that holds only the code can write.
+    assert_eq!(status, 201, "{body}");
+    assert_eq!(
+        host.db.query_count(),
+        2,
+        "the insert and the balance — nothing else: {:?}",
+        host.db.queried_sql()
+    );
+    let params = params_of(&host, "INSERT INTO");
+    assert!(
+        params[0].contains("NullInt"),
+        "no id was given, so $1 is a typed null: {params:?}"
+    );
+    assert!(
+        params.iter().any(|p| p.contains(&format!("Text(\"{FUND_GENERAL}\")"))),
+        "the code rides as $12: {params:?}"
+    );
+    // The answer reports the fund the entry landed in — the id finance resolved.
+    assert_eq!(body["fund_id"], json!(1));
+    assert_eq!(body["transaction"]["fund_id"], json!(1));
+    host.events.assert_published("finance.transaction.recorded");
+    let published = host.events.payloads("finance.transaction.recorded");
+    assert_eq!(
+        published[0]["fund_id"],
+        json!(1),
+        "the event names the resolved id, not the code"
+    );
+    assert_audited(&host, "transaction.record");
+}
+
+#[tokio::test]
+async fn naming_a_fund_twice_or_not_at_all_is_refused_without_a_query() {
+    let (host, _plugin, routes) = plugin().await;
+    let record = route(&routes, "POST", "/api/finance/transaction");
+
+    let (status, body) = call(
+        &record.handler,
+        TestRequest::post("/api/finance/transaction")
+            .identity("treasurer", &["chief"])
+            .json(&json!({
+                "fund_id": 1,
+                "fund_code": FUND_GENERAL,
+                "kind": "income",
+                "amount_cents": 1000,
+            }))
+            .build(),
+    )
+    .await;
+    assert_eq!(status, 400, "{body}");
+    assert!(
+        body["error"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("either fund_id or fund_code, not both"),
+        "{body}"
+    );
+
+    let (status, body) = call(
+        &record.handler,
+        TestRequest::post("/api/finance/transaction")
+            .identity("treasurer", &["chief"])
+            .json(&json!({ "kind": "income", "amount_cents": 1000 }))
+            .build(),
+    )
+    .await;
+    assert_eq!(status, 400, "{body}");
+    assert!(
+        body["error"].as_str().unwrap_or_default().contains("names no fund"),
+        "{body}"
+    );
+    assert_eq!(
+        host.db.query_count(),
+        0,
+        "a body that cannot name one fund touches nothing"
+    );
+}
+
+#[tokio::test]
+async fn a_code_named_income_entry_is_booked_and_replays_idempotently() {
+    // The shape the `stripe` producer composes when it can read nothing (its
+    // callerless webhook): `fund_code` instead of `fund_id`, `kind: income`, a
+    // positive magnitude, finance's own category, Stripe's payment id as the
+    // reference. This test is the finance half of that join — the stripe half is
+    // `plugins/stripe/tests/outbox_intent.rs`, which cannot link this crate (two
+    // plugins in one binary is a duplicate `adjutant_plugin_create`).
+    let (host, _plugin, routes) = plugin().await;
+    let record = route(&routes, "POST", "/api/finance/transaction");
+    let body = json!({
+        "fund_code": FUND_GENERAL,
+        "kind": "income",
+        "amount_cents": 2500,
+        "category": CATEGORY_DUES,
+        "member_id": "42",
+        "description": "Stripe dues pi_probe_callerless",
+        "occurred_on": "2026-02-01",
+        "external_ref": "pi_probe_callerless",
+    });
+
+    // 1. the guarded insert (which resolved the code). 2. the fund's balance.
+    host.db
+        .push_rows(vec![transaction_row(21, 1, 2500, "income")]);
+    host.db.push_rows(vec![json!({ "balance_cents": 2500 })]);
+
+    let (status, answer) = call(
+        &record.handler,
+        TestRequest::post("/api/finance/transaction")
+            .identity("service:svc.stripe.ledger", &["chief"])
+            .json(&body)
+            .build(),
+    )
+    .await;
+    assert_eq!(status, 201, "{answer}");
+    assert_eq!(answer["transaction"]["fund_id"], json!(1));
+
+    let params = params_of(&host, "INSERT INTO");
+    assert!(
+        params[0].contains("NullInt"),
+        "the id is a typed null when the code names the fund: {params:?}"
+    );
+    assert!(
+        params
+            .iter()
+            .any(|p| p.contains(&format!("Text(\"{FUND_GENERAL}\")"))),
+        "the code is bound: {params:?}"
+    );
+    assert!(
+        params.iter().any(|p| p.contains("pi_probe_callerless")),
+        "Stripe's payment id is the reference finance keys on: {params:?}"
+    );
+
+    // The replay — the relay retrying, or a redelivery — is a duplicate, not a
+    // second entry, because finance keys on the payment id.
+    host.db.push_rows(vec![]);
+    host.db.push_rows(vec![fund_row(1, FUND_GENERAL, FUND_GENERAL, 2500)]);
+    host.db
+        .push_rows(vec![transaction_row(21, 1, 2500, "income")]);
+    let (status, answer) = call(
+        &record.handler,
+        TestRequest::post("/api/finance/transaction")
+            .identity("service:svc.stripe.ledger", &["chief"])
+            .json(&body)
+            .build(),
+    )
+    .await;
+    assert_eq!(status, 200, "{answer}");
+    assert_eq!(answer["duplicate"], json!(true));
+    assert_eq!(answer["transaction"]["id"], json!(21));
 }
 
 #[tokio::test]
