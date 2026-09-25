@@ -115,30 +115,37 @@ async fn admin_pool() -> PgPool {
         .expect("the database URL is set but unreachable")
 }
 
-/// The plugin's pool: **its own role**, with the secret a boot stored.
+/// One plugin's pool: **its own role**, with the secret a boot stored.
 ///
 /// No password is written: `bootstrap_role` keeps an existing secret, so a later
 /// boot of this database still authenticates.
-async fn plugin_pool(admin: &PgPool) -> PgPool {
+async fn role_pool(admin: &PgPool, plugin_id: &str) -> PgPool {
     let url = test_database_url();
     let secret: Option<String> =
-        sqlx::query_scalar("SELECT db_secret FROM core.plugins WHERE id = 'stripe'")
+        sqlx::query_scalar("SELECT db_secret FROM core.plugins WHERE id = $1")
+            .bind(plugin_id)
             .fetch_optional(admin)
             .await
-            .expect("read the stripe plugin's stored secret")
+            .expect("read the plugin's stored secret")
             .flatten();
     let Some(secret) = secret else {
         panic!(
-            "this test database has no bootstrapped role for the `stripe` plugin (no \
+            "this test database has no bootstrapped role for the `{plugin_id}` plugin (no \
              core.plugins.db_secret row). Run the live ladder against it first: \
              `ADJUTANT_PLUGIN_DIR=plugins-built ./target/debug/adjutant test-plugin`"
         );
     };
-    PgPool::connect(&with_role(&url, PLUGIN_ROLE, &secret))
+    let role = format!("adjutant_plugin_{plugin_id}");
+    PgPool::connect(&with_role(&url, &role, &secret))
         .await
         .unwrap_or_else(|e| {
-            panic!("could not connect as {PLUGIN_ROLE}: {e}; run the live ladder against this database")
+            panic!("could not connect as {role}: {e}; run the live ladder against this database")
         })
+}
+
+/// This plugin's pool (the producer role).
+async fn plugin_pool(admin: &PgPool) -> PgPool {
+    role_pool(admin, "stripe").await
 }
 
 /// The core's own preconditions, stated rather than assumed.
@@ -361,7 +368,11 @@ impl HostDb for PgDb {
 /// finance's funds route, answered by the probe: the read the enqueue-time
 /// resolution makes. Only the fields the resolution reads are here — the point
 /// is the fund **id** it returns.
-struct FundsStub;
+struct FundsStub {
+    /// The status finance's funds route answers with: `200` for a caller that may
+    /// read, `403` for the callerless webhook path.
+    status: u16,
+}
 
 #[async_trait]
 impl HostHttp for FundsStub {
@@ -372,6 +383,16 @@ impl HostHttp for FundsStub {
         _headers: Vec<(String, String)>,
         _body: Option<(String, Vec<u8>)>,
     ) -> Result<HttpResponse, SdkError> {
+        if self.status != 200 {
+            return Ok(HttpResponse {
+                status: self.status,
+                headers: HashMap::new(),
+                body: serde_json::to_vec(&serde_json::json!({
+                    "error": "authentication required",
+                }))
+                .unwrap_or_default(),
+            });
+        }
         Ok(HttpResponse {
             status: 200,
             headers: HashMap::new(),
@@ -440,6 +461,13 @@ fn config() -> StripeConfig {
 /// that ran everything on one pool would be testing a shape the core never
 /// builds.
 fn context(admin: &PgPool, plugin: &PgPool) -> PluginContext {
+    context_with(admin, plugin, 200)
+}
+
+/// The same context, with the funds read answering `status` — `403` is the
+/// callerless webhook path (no credential to forward), which is what a real
+/// Stripe delivery is.
+fn context_with(admin: &PgPool, plugin: &PgPool, funds_status: u16) -> PluginContext {
     let plugin_db: Arc<dyn HostDb> = Arc::new(PgDb(plugin.clone()));
     let core_db: Arc<dyn HostDb> = Arc::new(PgDb(admin.clone()));
     PluginContext {
@@ -453,7 +481,9 @@ fn context(admin: &PgPool, plugin: &PgPool) -> PluginContext {
         permissions: PermissionService::new(core_db.clone()),
         audit: AuditService::new(core_db, "stripe".to_string()),
         identity: Arc::new(NoIdentity),
-        http: Arc::new(FundsStub),
+        http: Arc::new(FundsStub {
+            status: funds_status,
+        }),
     }
 }
 
@@ -857,6 +887,76 @@ async fn the_worklist_lists_an_in_flight_intent_and_drops_it_once_the_intent_is_
         ledger_status(&admin, payment_id).await.as_deref(),
         Some(LEDGER_BOOKED)
     );
+
+    cleanup(&admin, payment_id, event_id).await;
+}
+
+// ===========================================================================
+// 4. The callerless path: a complete intent with no credential to read with
+// ===========================================================================
+
+/// **The callerless probe.** A webhook carries no credential, so finance refuses
+/// the funds read — and the intent is enqueued anyway, naming the fund by its
+/// **code**, which is what makes the money path real where there is no caller.
+///
+/// It stops at the payload on purpose. This test binary cannot link finance's
+/// crate to deliver it: every plugin exports the same `adjutant_plugin_create`
+/// symbol, so two plugin rlibs in one binary are a duplicate symbol. The other
+/// half of the join — finance accepting **this shape** and booking it into the
+/// fund the code names — is proved from finance's side, in
+/// `plugins/finance/tests/finance.rs::a_code_named_income_entry_is_booked_and_replays_idempotently`.
+#[tokio::test]
+#[ignore = "DB-gated: needs ADJUTANT_TEST_DATABASE_URL + a ladder-bootstrapped test database"]
+async fn the_callerless_webhook_still_composes_a_complete_intent() {
+    let _guard = DB.lock().await;
+    let admin = admin_pool().await;
+    ensure_core_ready(&admin).await;
+    let plugin = plugin_pool(&admin).await;
+    ensure_plugin_schema(&admin, &plugin).await;
+    // The callerless path: there is no credential to forward, so finance refuses
+    // the funds read. This is every real Stripe delivery.
+    let ctx = context_with(&admin, &plugin, 403);
+
+    // The code the payload will name really is a fund finance has: the join that
+    // the finance-side probe completes from its end.
+    let general_id: i64 = sqlx::query_scalar("SELECT id FROM finance.funds WHERE code = $1")
+        .bind("general")
+        .fetch_one(&admin)
+        .await
+        .expect("finance's general fund — finance's schema must be migrated (run the live ladder)");
+
+    let payment_id = "pi_probe_callerless";
+    let event_id = "evt_probe_callerless";
+    cleanup(&admin, payment_id, event_id).await;
+
+    let delivery = deliver(&ctx, &webhook_payload(event_id, payment_id, None))
+        .await
+        .expect("the delivery");
+    assert_eq!(delivery["ledger"]["path"], "outbox", "{delivery}");
+    let intent_id = delivery["payment"]["ledger_intent_id"]
+        .as_i64()
+        .expect("the payment's intent");
+    let payload: Value = sqlx::query_scalar("SELECT payload FROM core.outbox WHERE id = $1")
+        .bind(intent_id)
+        .fetch_one(&admin)
+        .await
+        .expect("the intent payload");
+
+    // A complete instruction, in finance's own vocabulary, naming the fund by its
+    // code — and the payment and that intent committed together.
+    assert_eq!(payload["fund_code"], "general", "{payload}");
+    assert!(payload["fund_id"].is_null(), "{payload}");
+    assert_eq!(payload["kind"], "income");
+    assert_eq!(payload["amount_cents"], 2500, "a positive magnitude");
+    assert_eq!(payload["category"], "dues");
+    assert_eq!(payload["external_ref"], payment_id);
+    assert_eq!(payload["member_id"], "42");
+    assert!(general_id > 0, "the code names a fund finance has (id {general_id})");
+    let note = delivery["ledger"]["fund_note"].as_str().unwrap_or_default();
+    assert!(note.contains("issue #60"), "{note}");
+    assert_eq!(delivery["payment"]["ledger_status"], LEDGER_INTENT_ENQUEUED);
+    assert_eq!(count_intents(&admin, payment_id).await, 1);
+    assert_eq!(count_payments(&admin, payment_id).await, 1);
 
     cleanup(&admin, payment_id, event_id).await;
 }
