@@ -762,16 +762,18 @@ principal `svc.stripe.ledger` (grant `finance:write`), retrying with backoff and
 recording finance's own answer on the intent row. The plugin subscribes to
 `core.outbox.*` for **notification only** — the intent row, not the event,
 decides what is known. The payload is composed **at enqueue time** and must be
-complete, because the relay cannot read-then-write at delivery: the fund *code*
-the payment names is resolved into finance's fund *id* through
-`GET /api/finance/funds`, exactly as `/book` resolves it — a §2(b) call carrying
-the caller's credential, which a webhook does not have. Where that read cannot be
-made (or finance has no such fund), **no intent is composed**: the payment is still
-recorded, `unbooked`, and handed to finance through finance's idempotent
-`payment.received` subscriber (SPEC §5.4), whose answer is never seen. That
-residual is [issue #60](https://github.com/chezgoulet/adjutant/issues/60):
-finance's write paths take only a fund **id**, so a producer without a read
-credential cannot compose a complete payload.
+complete, because the relay cannot read-then-write at delivery: the fund is named
+by finance's fund **id** when the enqueue-time `GET /api/finance/funds` read
+answered (a §2(b) call carrying the caller's credential, exactly as `/book`
+resolves it) and by the fund's **code** when that read could not be made — which
+is every real webhook delivery, since a webhook has no credential to forward.
+Finance's write routes accept either and resolve a code inside their own
+statement, so the intent is real on the callerless path; that is what closed
+[issue #60](https://github.com/chezgoulet/adjutant/issues/60). The residual is
+narrower now: a fund this plugin has *seen* to be missing or inactive yields no
+intent, and then the payment is recorded `unbooked` and handed to finance through
+finance's idempotent `payment.received` subscriber (SPEC §5.4), whose answer is
+never seen.
 
 Every confirmed payment carries a `ledger_status` — `unbooked` (no intent: the
 worklist's remaining job), `intent_enqueued` (an intent is enqueued and the relay
@@ -806,7 +808,7 @@ Config lives in the `stripe` row's `core.plugins.config`:
 
 | Method | Path | Permission | Body / notes |
 |---|---|---|---|
-| GET | `/api/stripe/health` | `stripe:read` | What is configured (presence, never a value), `key_mode` (`live`/`test`/`unconfigured`), the fund codes, and the `ledger` block: the mechanism a confirmation takes (the outbox intent, delivered as `svc.stripe.ledger`), that it is not synchronous, the fallback when no intent can be composed, and issue #60 as what it is blocked on. No database |
+| GET | `/api/stripe/health` | `stripe:read` | What is configured (presence, never a value), `key_mode` (`live`/`test`/`unconfigured`), the fund codes, and the `ledger` block: the mechanism a confirmation takes (the outbox intent, delivered as `svc.stripe.ledger`), that it is not synchronous, how the fund is named (finance's id when the enqueue-time read answered, the fund's code otherwise), the fallback when no intent can be composed, and that nothing blocks this path — what a machine principal still cannot do is read finance. No database |
 | POST | `/api/stripe/checkout` | `stripe:checkout` (any scope) | `{purpose: dues\|donation\|event_fee, amount_cents\|amount, currency?, member_id?, fund_code?, category?, description?, related_event_id?, dues_year?, success_url?, cancel_url?}` → `201` + `Location` + `{session, checkout_url, checkout, ledger}`. `amount_cents` is an integer count of cents and `amount` a dollars string (`"12.50"`); a JSON float is refused, as is a value finer than a cent. Naming somebody else's `member_id` needs `stripe:manage` (troop). Without a `secret_key` it is a `503` and Stripe is never called |
 | GET | `/api/stripe/sessions?id=&purpose=&status=&member_id=&before_id=&limit=` | `stripe:read` (any scope) | Newest first, one row more than asked for so `has_more` needs no `COUNT(*)`. A caller without `stripe:read_all` is narrowed to the sessions they opened or that name them (`narrowed_to_caller: true`); the two answers are `403`-shaped the same way as their absence |
 | GET | `/api/stripe/session/{id}` | `stripe:read` (any scope) | The session, the payment it produced (if any) and that payment's ledger state. Somebody else's session is a `403` that reads `"no such checkout session"` |
@@ -964,7 +966,7 @@ only payment reference it ever writes is stripe's own opaque `pi_…`/`cs_…`.
 
 | Method | Path | Permission | Body / notes |
 |---|---|---|---|
-| GET | `/api/store/health` | `store:read` | What is configured (presence, never a value), the scale, the funds, and the `money_path` block: which path each call takes, that the reduction's draw is not synchronous, and what it is blocked on. No database |
+| GET | `/api/store/health` | `store:read` | What is configured (presence, never a value), the scale, the funds, and the `money_path` block: which path each call takes, that the subsidy is an outbox intent delivered as `svc.store.draw`, that it is not synchronous, and what it is blocked on (`nothing on this path`). No database |
 | GET | `/api/store/items?kind=&category=&include_inactive=&limit=` | `store:read` | The catalogue with each item's whole scale (charge **and** draw per tier). `kind` is `product` or `rental` |
 | POST | `/api/store/item` | `store:manage` | `{kind, name, category, base_price_cents, sku?, description?, currency?, fund_code?, equipment_item_id?}` → `201` + `Location`. `category` is one of `uniform`, `patch`, `insignia`, `gear`, `merch`, `other`; a **rental must name `equipment_item_id`** (the id only — no name, no condition) and a product may not name one: there is one checkout state machine in this system and it is equipment's |
 | GET | `/api/store/item/{id}` | `store:read` | One item, its scale, and — for a rental — a `custody` block naming equipment's own `availability`/`checkout` routes for the item id |
@@ -1030,10 +1032,11 @@ ON CONFLICT DO NOTHING;
 **What is deliberately not here.** A cash sale — SPEC §7.16 gives the shop one
 money path and it is stripe's, so a payment recorded directly in finance does not
 complete a store order; a refund route, which is an *expense* in finance's vocabulary and belongs
-to finance; and any write into `stripe.*` or `finance.*`. Two seams are reported
-rather than patched from here: stripe's purpose vocabulary has no `purchase`, and
-finance's write routes take a fund **id**, so addressing a fund by **code** is a
-read (`GET /api/finance/funds`) followed by the write.
+to finance; and any write into `stripe.*` or `finance.*`. One seam is reported
+rather than patched from here — stripe's purpose vocabulary has no `purchase`, so a
+store sale is sent as a `donation` with `category: "store"` — and the other is
+closed: finance's write routes take a fund **id or a code**, resolved inside the
+statement that writes the entry, so addressing a fund by code costs no read.
 
 **The client surface** is `client/lib/screens/store_screen.dart` (catalogue),
 `store_item_screen.dart`, `store_orders_screen.dart`, `store_order_screen.dart`,
