@@ -94,21 +94,13 @@ jobs:
         run: python3 scripts/probes.py
 
       - name: Stage plugins
-        run: |
-          mkdir -p plugins-built
-          cp target/debug/libadjutant_hello.so \
-             target/debug/libadjutant_auth.so \
-             target/debug/libadjutant_membership.so \
-             target/debug/libadjutant_missions.so \
-             target/debug/libadjutant_governance.so \
-             target/debug/libadjutant_calendar.so \
-             target/debug/libadjutant_mcp.so \
-             target/debug/libadjutant_equipment.so \
-             target/debug/libadjutant_archive.so \
-             target/debug/libadjutant_conflicts.so \
-             target/debug/libadjutant_announcements.so \
-             target/debug/libadjutant_finance.so \
-             target/debug/libadjutant_stripe.so plugins-built/
+        # This list used to be written here by hand, and it fell behind: five
+        # libraries staged against a twelve-crate workspace meant the route ladder
+        # below — the only gate that catches a data-layer fault at request time —
+        # never probed calendar, mcp or the M6 batch, so two routes answered 500 on
+        # `testing` with CI green (#55). The set is derived now: a plugin library
+        # is exactly a workspace crate that builds a cdylib.
+        run: python3 scripts/stage-plugins.py
 
       # Route/registry smoke ladder against a pristine test database.
       - name: test-plugin harness
@@ -149,19 +141,13 @@ jobs:
       # the same gate a third-party plugin would.
       - name: validate-plugin (static, no DB)
         run: |
-          ./target/debug/adjutant validate-plugin target/debug/libadjutant_hello.so
-          ./target/debug/adjutant validate-plugin target/debug/libadjutant_auth.so
-          ./target/debug/adjutant validate-plugin target/debug/libadjutant_membership.so
-          ./target/debug/adjutant validate-plugin target/debug/libadjutant_missions.so
-          ./target/debug/adjutant validate-plugin target/debug/libadjutant_governance.so
-          ./target/debug/adjutant validate-plugin target/debug/libadjutant_calendar.so
-          ./target/debug/adjutant validate-plugin target/debug/libadjutant_mcp.so
-          ./target/debug/adjutant validate-plugin target/debug/libadjutant_equipment.so
-          ./target/debug/adjutant validate-plugin target/debug/libadjutant_archive.so
-          ./target/debug/adjutant validate-plugin target/debug/libadjutant_conflicts.so
-          ./target/debug/adjutant validate-plugin target/debug/libadjutant_announcements.so
-          ./target/debug/adjutant validate-plugin target/debug/libadjutant_finance.so
-          ./target/debug/adjutant validate-plugin target/debug/libadjutant_stripe.so
+          # Every staged library, derived for the same reason the staging is (#55).
+          for so in plugins-built/*.so; do
+            ./target/debug/adjutant validate-plugin "$so"
+          done
+          # `gear_locker` is not a workspace member and is not in `plugins-built`:
+          # the step above scaffolds it at run time, so it is validated here by
+          # name — that is the point of the scaffolder check, not an omission.
           ./target/debug/adjutant validate-plugin target/debug/libadjutant_gear_locker.so
 
       - name: End-to-end harness (dev headers OFF)
