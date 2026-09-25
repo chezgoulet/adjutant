@@ -7,6 +7,7 @@ import 'calendar_screen.dart';
 import 'dashboard_screen.dart';
 import 'members_screen.dart';
 import 'missions_screen.dart';
+import 'settings_screen.dart';
 
 /// The shell every screen lives in.
 ///
@@ -28,13 +29,17 @@ class _HomeShellState extends State<HomeShell> {
     _Destination('Missions', Icons.flag_outlined, Icons.flag),
     _Destination('Calendar', Icons.calendar_month_outlined, Icons.calendar_month),
     _Destination('Members', Icons.groups_outlined, Icons.groups),
+    // Settings last: the daily work comes first, and the drawer behind it is
+    // where you go when something needs changing. Plugins lives inside it.
+    _Destination('Settings', Icons.settings_outlined, Icons.settings),
   ];
 
   Widget _body() => switch (_index) {
         0 => const DashboardScreen(),
         1 => const MissionsScreen(),
         2 => const CalendarScreen(),
-        _ => const MembersScreen(),
+        3 => const MembersScreen(),
+        _ => const SettingsScreen(),
       };
 
   @override

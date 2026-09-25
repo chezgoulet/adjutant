@@ -188,6 +188,31 @@ class ApiClient {
   Future<Map<String, dynamic>> motion(String id) async =>
       _asMap(await _send('GET', '/api/governance/motion/$id'));
 
+  // --- core: plugins (admin) ----------------------------------------------
+
+  /// Every loaded plugin with its runtime state, plus the retired-library count
+  /// and the plugin ids that currently have bound event subscriptions.
+  ///
+  /// `core:admin`, troop scope. The core answers 401/403 to anyone else, and
+  /// that refusal *is* the answer: the client does not guess which roles hold
+  /// the permission, because role → permission lives in `core.role_permissions`
+  /// and only the core reads it (the same reason announcements asks the
+  /// permission service rather than the table).
+  Future<Map<String, dynamic>> plugins() async =>
+      _asMap(await _send('GET', '/api/plugins'));
+
+  /// Enable or disable one plugin by id.
+  ///
+  /// Disabling aborts its routes and its event subscriptions until it is
+  /// enabled again — nothing is deleted. The core refuses with 409 to disable
+  /// the only enabled identity provider, because with the dev-header stub off
+  /// that would make every authenticated route unreachable, including the one
+  /// that would undo it.
+  Future<void> setPluginEnabled(String id, bool enabled) async {
+    final verb = enabled ? 'enable' : 'disable';
+    await _send('POST', '/api/plugins/${Uri.encodeComponent(id)}/$verb');
+  }
+
   void close() => _http.close();
 }
 
