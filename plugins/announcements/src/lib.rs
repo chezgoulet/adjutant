@@ -21,7 +21,7 @@
 //!
 //! A category that can be cried wolf is worthless, so `urgent` is not just a
 //! label: publishing one needs **two** permissions at the announcement's scope —
-//! [`PERM_WRITE`] *and* [`PERM_PUBLISH_URGENT`] ([`require_publish_authority`]).
+//! [`PERM_WRITE`] *and* [`PERM_PUBLISH_URGENT`] (`require_publish_authority`).
 //! The emergency authority is an addition to the ordinary one, never a substitute
 //! for it, and the gate is re-checked when a *published* announcement is edited
 //! **into** the urgent category (the other way to cry wolf). Drafting an urgent
@@ -55,8 +55,8 @@
 //! The audience is resolved in **one** query: the caller's grants are zipped
 //! against `core.role_permissions` for this plugin's read/manage permissions, so
 //! a caller with twelve lodge grants costs one round trip, not twelve
-//! ([`resolve_audience`]). The resulting predicate is one function
-//! ([`Audience::sql`]) spliced into every visibility query, so the list, the
+//! (`resolve_audience`). The resulting predicate is one function
+//! (`Audience::sql`) spliced into every visibility query, so the list, the
 //! detail, the receipt write and the unread count cannot drift apart.
 //!
 //! ## Read receipts are idempotent, and the unread count is not a scan

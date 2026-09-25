@@ -350,7 +350,7 @@ pub fn is_overdue(open: bool, due_on: Option<NaiveDate>, on: NaiveDate) -> bool 
 }
 
 /// The `[start, end)` a checkout row occupies, read from the columns
-/// [`CHECKOUT_FIELDS`] selects. `None` when the row has no parsable start date.
+/// `CHECKOUT_FIELDS` selects. `None` when the row has no parsable start date.
 pub fn checkout_window(row: &Value, on: NaiveDate) -> Option<(NaiveDate, Option<NaiveDate>)> {
     let start = date_field(row, "checked_out_on")?;
     let end = checkout_end(

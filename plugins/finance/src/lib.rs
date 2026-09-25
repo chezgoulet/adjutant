@@ -34,7 +34,7 @@
 //! `gen_random_uuid()` group, guarded so that a missing fund inserts **both
 //! legs or neither**. Conservation of the total is therefore a property of the
 //! statement, not of the handler remembering to compensate afterwards: the two
-//! legs are `-a` and `+a`, and [`ledger_integrity`] re-checks on demand that
+//! legs are `-a` and `+a`, and `ledger_integrity` re-checks on demand that
 //! every group still has exactly two entries summing to zero.
 //!
 //! **The sliding scale is honor-system.** A scout self-reports their tier
