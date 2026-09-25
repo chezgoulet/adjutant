@@ -291,6 +291,206 @@ class ApiClient {
         await _send('POST', '/api/finance/dues/self-report', body: body));
   }
 
+  // --- store: the shop (SPEC §7.16) ---------------------------------------
+
+  /// The catalogue, with each item's whole sliding scale.
+  ///
+  /// Priced by the server, never here: the scale's per-tier charge and draw are
+  /// the server's arithmetic, and `GET /api/store/items` returns both figures
+  /// for every tier so the client copies none of them.
+  Future<List<Map<String, dynamic>>> storeItems({
+    String? kind,
+    String? category,
+    bool includeInactive = false,
+    int? limit,
+  }) async {
+    final query = <String, String>{
+      'kind': ?kind,
+      'category': ?category,
+      if (includeInactive) 'include_inactive': 'true',
+      if (limit != null) 'limit': '$limit',
+    };
+    return _asList(await _send('GET', '/api/store/items',
+        query: query.isEmpty ? null : query));
+  }
+
+  /// One catalogue item, its whole scale, and — for a rental — the `custody`
+  /// block naming equipment's own routes for the item id.
+  Future<Map<String, dynamic>> storeItem(String id) async =>
+      _asMap(_asMap(await _send('GET', '/api/store/item/${Uri.encodeComponent(id)}'))['item']);
+
+  /// Add one thing the shop sells. `store:manage`.
+  ///
+  /// A rental must name `equipment_item_id` (the id only) and a product may not
+  /// name one — the server refuses either way, because there is one checkout
+  /// state machine in this system and it is equipment's.
+  Future<Map<String, dynamic>> createStoreItem({
+    required String kind,
+    required String name,
+    required String category,
+    required int basePriceCents,
+    String? sku,
+    String? description,
+    String? fundCode,
+    int? equipmentItemId,
+  }) async {
+    final body = <String, Object>{
+      'kind': kind,
+      'name': name.trim(),
+      'category': category,
+      'base_price_cents': basePriceCents,
+      if (sku != null && sku.trim().isNotEmpty) 'sku': sku.trim(),
+      if (description != null && description.trim().isNotEmpty)
+        'description': description.trim(),
+      if (fundCode != null && fundCode.trim().isNotEmpty)
+        'fund_code': fundCode.trim(),
+      'equipment_item_id': ?equipmentItemId,
+    };
+    return _asMap(await _send('POST', '/api/store/item', body: body));
+  }
+
+  /// Place an order. `store:buy` at any scope.
+  ///
+  /// The server prices it **from the catalogue**, never from this request: what
+  /// is sent is which item and how many, and optionally the tier whose share of
+  /// the price the member pays. Naming another `member_id` needs `store:manage`.
+  /// The response carries the order, its lines, its `draw`, and the server's own
+  /// `next` sentence saying what step follows.
+  Future<Map<String, dynamic>> placeStoreOrder({
+    required List<Map<String, Object>> lines,
+    String? tier,
+    String? memberId,
+    String? note,
+  }) async {
+    final body = <String, Object>{
+      'lines': lines,
+      'tier': ?tier,
+      'member_id': ?memberId,
+      if (note != null && note.trim().isNotEmpty) 'note': note.trim(),
+    };
+    return _asMap(await _send('POST', '/api/store/order', body: body));
+  }
+
+  /// Orders, newest first — the whole page, not just its rows.
+  ///
+  /// A caller without `store:read_all` is narrowed to their own orders by the
+  /// server (`narrowed_to_caller: true`), and asking for somebody else's
+  /// `member_id` is a `403`: this client filters nothing and is told what it was
+  /// shown.
+  Future<Map<String, dynamic>> storeOrders({
+    String? status,
+    String? memberId,
+    int? beforeId,
+    int? limit,
+  }) async {
+    final query = <String, String>{
+      'status': ?status,
+      'member_id': ?memberId,
+      if (beforeId != null) 'before_id': '$beforeId',
+      if (limit != null) 'limit': '$limit',
+    };
+    return _asMap(await _send('GET', '/api/store/orders',
+        query: query.isEmpty ? null : query));
+  }
+
+  /// One order with its lines, its `draw` and its `ledger`.
+  ///
+  /// Your own order, or anybody's with `store:read_all`. Somebody else's is a
+  /// `403` reading `"no such order"` — the same answer as one that does not
+  /// exist, which is the point.
+  Future<Map<String, dynamic>> storeOrder(String id) async =>
+      _asMap(await _send('GET', '/api/store/order/${Uri.encodeComponent(id)}'));
+
+  /// The operator worklist: orders not settled, and why.
+  ///
+  /// `store:read_all`. An order **awaiting payment** cannot be told from one
+  /// this plugin cannot see paid, so both shapes appear together with the
+  /// server's own `note` saying so. This is the whole `store:read_all` worklist.
+  Future<Map<String, dynamic>> unsettledStoreOrders({
+    int? olderThanMinutes,
+    int? limit,
+  }) async {
+    final query = <String, String>{
+      if (olderThanMinutes != null) 'older_than_minutes': '$olderThanMinutes',
+      if (limit != null) 'limit': '$limit',
+    };
+    return _asMap(await _send('GET', '/api/store/orders/unsettled',
+        query: query.isEmpty ? null : query));
+  }
+
+  /// Open a Stripe Checkout session for the order's **charged** amount.
+  ///
+  /// A real caller-forward: this client's own credential goes to the server,
+  /// which forwards it to stripe, whose gate re-decides. The response carries
+  /// `checkout_url`; a zero charge is a `409` pointing at `/comp`, because
+  /// Stripe cannot take zero.
+  Future<Map<String, dynamic>> checkoutStoreOrder(String id) async =>
+      _asMap(await _send(
+          'POST', '/api/store/order/${Uri.encodeComponent(id)}/checkout'));
+
+  /// Complete a **paid** order against stripe's own record. `store:manage`.
+  ///
+  /// The payment id is required (it is verified against the order before
+  /// anything is written), and finance's answer, whatever it is, comes back in
+  /// `ledger` rather than being swallowed.
+  Future<Map<String, dynamic>> completeStoreOrder(
+    String id, {
+    required int stripePaymentId,
+  }) async =>
+      _asMap(await _send(
+          'POST', '/api/store/order/${Uri.encodeComponent(id)}/complete',
+          body: {'stripe_payment_id': stripePaymentId}));
+
+  /// Complete an order at no charge. `store:comp`, and the reason is mandatory.
+  ///
+  /// A comp is an authority, not a price: the order keeps the shop's price, the
+  /// member is charged nothing, and the whole price is recorded as a **draw on
+  /// the scholarship fund** — never as money from nowhere.
+  Future<Map<String, dynamic>> compStoreOrder(
+    String id, {
+    required String reason,
+    bool allowOverdraft = false,
+  }) async {
+    final body = <String, Object>{
+      'reason': reason.trim(),
+      if (allowOverdraft) 'allow_overdraft': true,
+    };
+    return _asMap(await _send(
+        'POST', '/api/store/order/${Uri.encodeComponent(id)}/comp',
+        body: body));
+  }
+
+  /// Book an outstanding draw **as yourself**. Needs `finance:write`.
+  ///
+  /// The path a sliding-scale reduction cannot take on its own: no caller holds
+  /// `finance:write` at the moment the shop applies the reduction, so a treasurer
+  /// closes it here.
+  Future<Map<String, dynamic>> bookStoreDraw(
+    String id, {
+    bool allowOverdraft = false,
+  }) async =>
+      _asMap(await _send('POST', '/api/store/order/${Uri.encodeComponent(id)}/draw',
+          body: <String, Object>{
+            if (allowOverdraft) 'allow_overdraft': true,
+          }));
+
+  /// Every comp with its reason, its authority, the draw it produced and the
+  /// funded total. `store:read_all` — the ledger shows the draw, this shows the
+  /// comp, and a treasurer reconciles the two by hand.
+  Future<Map<String, dynamic>> storeComps({
+    String? from,
+    String? to,
+    int? limit,
+  }) async {
+    final query = <String, String>{
+      'from': ?from,
+      'to': ?to,
+      if (limit != null) 'limit': '$limit',
+    };
+    return _asMap(await _send('GET', '/api/store/comps',
+        query: query.isEmpty ? null : query));
+  }
+
   // --- governance ---------------------------------------------------------
 
   Future<List<Map<String, dynamic>>> motions() async =>
@@ -351,6 +551,8 @@ List<Map<String, dynamic>> _asList(dynamic value) {
       'events',
       'motions',
       'announcements',
+      'orders',
+      'comps',
     ]) {
       final inner = value[key];
       if (inner is List) {

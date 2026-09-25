@@ -9,6 +9,7 @@ import 'dashboard_screen.dart';
 import 'members_screen.dart';
 import 'missions_screen.dart';
 import 'settings_screen.dart';
+import 'store_screen.dart';
 
 /// The shell every screen lives in.
 ///
@@ -36,6 +37,11 @@ class _HomeShellState extends State<HomeShell> {
     _Destination('Inbox', Icons.inbox_outlined, Icons.inbox),
     _Destination('Missions', Icons.flag_outlined, Icons.flag),
     _Destination('Calendar', Icons.calendar_month_outlined, Icons.calendar_month),
+    // The shop is ordinary troop work, not an administrative setting: a new
+    // scout needs to find the uniform they have just been told to buy the same
+    // week they join. Its operator surfaces (the unsettled worklist, adding an
+    // item, the comp list) live behind Settings instead — see settings_screen.
+    _Destination('Shop', Icons.storefront_outlined, Icons.storefront),
     _Destination('Members', Icons.groups_outlined, Icons.groups),
     // Settings last: the daily work comes first, and the drawer behind it is
     // where you go when something needs changing. Plugins lives inside it.
@@ -56,7 +62,8 @@ class _HomeShellState extends State<HomeShell> {
         1 => const AnnouncementsScreen(),
         2 => const MissionsScreen(),
         3 => const CalendarScreen(),
-        4 => const MembersScreen(),
+        4 => const StoreScreen(),
+        5 => const MembersScreen(),
         _ => const SettingsScreen(),
       };
 

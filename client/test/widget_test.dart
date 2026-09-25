@@ -6,9 +6,15 @@ import 'package:adjutant_client/screens/announcements_screen.dart';
 import 'package:adjutant_client/screens/dues_screen.dart';
 import 'package:adjutant_client/screens/home_shell.dart';
 import 'package:adjutant_client/screens/plugins_screen.dart';
+import 'package:adjutant_client/screens/store_admin_screen.dart';
+import 'package:adjutant_client/screens/store_item_screen.dart';
+import 'package:adjutant_client/screens/store_order_screen.dart';
+import 'package:adjutant_client/screens/store_orders_screen.dart';
+import 'package:adjutant_client/screens/store_screen.dart';
 import 'package:adjutant_client/state/session.dart';
 import 'package:adjutant_client/theme/app_theme.dart';
 import 'package:adjutant_client/widgets/common.dart';
+import 'package:adjutant_client/widgets/store_money.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:http/http.dart' as http;
@@ -26,6 +32,178 @@ http.Response jsonResponse(Object body, [int status = 200]) => http.Response.byt
       status,
       headers: {'content-type': 'application/json; charset=utf-8'},
     );
+
+// ---------------------------------------------------------------------------
+// The shop's fixtures (SPEC §7.16)
+// ---------------------------------------------------------------------------
+
+/// One catalogue item, with a whole sliding scale — the shape
+/// `GET /api/store/items` returns: the price, and for every tier both what it
+/// charges **and** what it draws.
+Map<String, dynamic> storeItemFixture({
+  int id = 1,
+  String name = 'Lodge 3 patch',
+  String kind = 'product',
+  int price = 2500,
+  bool active = true,
+  int? equipmentItemId,
+}) =>
+    {
+      'id': id,
+      'kind': kind,
+      'sku': 'P-001',
+      'name': name,
+      'category': 'patch',
+      'description': 'Embroidered lodge patch',
+      'base_price_cents': price,
+      'base_price_display': formatCents(price),
+      'currency': 'cad',
+      'fund_code': 'general',
+      'equipment_item_id': equipmentItemId,
+      'active': active,
+      'created_by': 'u1',
+      'created_at': '2026-09-01T10:00:00Z',
+      'updated_at': '2026-09-01T10:00:00Z',
+      'scale': [
+        {
+          'tier': 'patron',
+          'label': 'Patron',
+          'share_bps': 20000,
+          'share_percent': '200%',
+          'charged_cents': price,
+          'charged_display': formatCents(price),
+          'funded_cents': 0,
+          'funded_display': r'$0.00',
+          'description': 'Twice the membership cost, capped at the price',
+          'self_reportable': true,
+          'capped_at_price': true,
+        },
+        {
+          'tier': 'standard',
+          'label': 'Standard',
+          'share_bps': 10000,
+          'share_percent': '100%',
+          'charged_cents': price,
+          'charged_display': formatCents(price),
+          'funded_cents': 0,
+          'funded_display': r'$0.00',
+          'description': 'The full membership cost',
+          'self_reportable': true,
+          'capped_at_price': false,
+        },
+        {
+          'tier': 'supported',
+          'label': 'Supported',
+          'share_bps': 5000,
+          'share_percent': '50%',
+          'charged_cents': price ~/ 2,
+          'charged_display': formatCents(price ~/ 2),
+          'funded_cents': price - price ~/ 2,
+          'funded_display': formatCents(price - price ~/ 2),
+          'description': 'Half the membership cost',
+          'self_reportable': true,
+          'capped_at_price': false,
+        },
+        {
+          'tier': 'hardship',
+          'label': 'Hardship',
+          'share_bps': 0,
+          'share_percent': '0%',
+          'charged_cents': 0,
+          'charged_display': r'$0.00',
+          'funded_cents': price,
+          'funded_display': formatCents(price),
+          'description': 'No dues this year',
+          'self_reportable': true,
+          'capped_at_price': false,
+        },
+      ],
+    };
+
+/// An order, with the three figures the money model turns on. Defaults: a
+/// supported-tier purchase — charged half, funded half, draw not yet booked.
+Map<String, dynamic> storeOrderFixture({
+  int id = 7,
+  String status = 'paid',
+  int price = 2500,
+  int charged = 1250,
+  String drawStatus = 'unbooked',
+  String ledgerStatus = 'not_attempted',
+}) =>
+    {
+      'id': id,
+      'member_id': 'u1',
+      'placed_by': 'u1',
+      'status': status,
+      'currency': 'cad',
+      'price_tier': 'supported',
+      'price_cents': price,
+      'charged_cents': charged,
+      'funded_cents': price - charged,
+      'fund_code': 'general',
+      'note': '',
+      'stripe_session_id': charged > 0 ? 'cs_test_123' : null,
+      'checkout_url': null,
+      'payment_ref': charged > 0 ? 'pi_test_123' : null,
+      'ledger_status': ledgerStatus,
+      'ledger_transaction_id': null,
+      'ledger_error': null,
+      'completed_by': status == 'paid' ? 'u2' : null,
+      'completed_at': status == 'paid' ? '2026-09-25T12:00:00Z' : null,
+      'comp_reason': status == 'comped' ? 'hardship, the tent was needed' : null,
+      'comp_by': status == 'comped' ? 'u2' : null,
+      'comp_at': null,
+      'draw_status': drawStatus,
+      'draw_ref': drawStatus == 'booked' ? '9c1e2f00-0001' : null,
+      'draw_error': null,
+      'draw_by': null,
+      'draw_booked_at': drawStatus == 'booked' ? '2026-09-25T12:05:00Z' : null,
+      'created_at': '2026-09-24T09:00:00Z',
+      'updated_at': '2026-09-25T12:00:00Z',
+    };
+
+/// The order's `draw` block, as `draw_block()` builds it server-side.
+Map<String, dynamic> drawFixture(Map<String, dynamic> order) => {
+      'funded_cents': order['funded_cents'],
+      'funded_display': formatCents(order['funded_cents'] as int),
+      'from_fund_code': 'scholarship',
+      'to_fund_code': order['fund_code'],
+      'status': order['draw_status'],
+      'transfer_group': order['draw_ref'],
+      'error': order['draw_error'],
+      'booked_at': order['draw_booked_at'],
+      'mechanism': 'finance_transfer',
+      'how': 'a caller holding finance:write books the draw with POST '
+          '/api/store/order/{id}/draw, as themselves',
+    };
+
+/// The order's `ledger` block, as `ledger_block()` builds it server-side.
+Map<String, dynamic> ledgerFixture(Map<String, dynamic> order) => {
+      'status': (order['ledger_status'] as String?)?.isEmpty ?? true
+          ? 'not_attempted'
+          : order['ledger_status'],
+      'transaction_id': order['ledger_transaction_id'],
+      'error': order['ledger_error'],
+      'payment_ref': order['payment_ref'],
+      'mechanism': 'stripe_book',
+      'note': 'finance owns every entry',
+    };
+
+/// One order line: the shop's price per unit and the charged unit kept apart,
+/// exactly as the lines route returns them.
+Map<String, dynamic> orderLineFixture({int quantity = 1, int listPrice = 2500}) => {
+      'id': 11,
+      'order_id': 7,
+      'catalogue_item_id': 1,
+      'item_name': 'Lodge 3 patch',
+      'item_kind': 'product',
+      'fund_code': 'general',
+      'equipment_item_id': null,
+      'list_price_cents': listPrice,
+      'unit_price_cents': listPrice ~/ 2,
+      'quantity': quantity,
+      'line_total_cents': (listPrice ~/ 2) * quantity,
+    };
 
 /// The tests that earn their place: the pure logic the UI depends on, and the
 /// two widgets whose whole job is to be legible under bad conditions.
@@ -1106,14 +1284,19 @@ void main() {
 
       // Daily work sits in the navigation, not behind Settings.
       expect(find.text('Inbox'), findsOneWidget);
+      expect(find.text('Shop'), findsOneWidget);
       expect(find.text('Settings'), findsOneWidget);
-      // Six destinations rather than the five the design language prefers, so
+      // Seven destinations rather than the five the design language prefers, so
       // each one is still a 48dp-wide target on a 390dp phone: that floor is
-      // the one that matters outdoors, and it is what makes the sixth item
-      // affordable rather than cramped.
+      // the one that matters outdoors, and it is what makes the extra items
+      // affordable rather than cramped. The shop joined it for the same reason
+      // the inbox did — it is ordinary troop work, not a setting.
+      final destinations =
+          tester.widgetList(find.byType(NavigationDestination)).length;
+      expect(destinations, 7);
       final barWidth = tester.getSize(find.byType(NavigationBar)).width;
       expect(
-        barWidth / 6,
+        barWidth / destinations,
         greaterThanOrEqualTo(AppSpacing.touchTargetMin),
         reason: 'each destination must stay a 48dp target on a 390dp phone',
       );
@@ -1126,6 +1309,901 @@ void main() {
 
       // Tapping it opens the inbox itself, with no second tap needed.
       expect(find.text('Meeting moved to Thursday'), findsOneWidget);
+    });
+
+    testWidgets('the shop is a destination, and opens the catalogue',
+        (tester) async {
+      tester.view.physicalSize = const Size(1170, 2532);
+      tester.view.devicePixelRatio = 3.0;
+      addTearDown(tester.view.reset);
+
+      final client = ApiClient(
+        baseUrl: 'http://example.test',
+        httpClient: MockClient((request) async {
+          final path = request.url.path;
+          if (path == '/api/announcements/unread') {
+            return jsonResponse({
+              'member_id': 'u1',
+              'unread': 0,
+              'has_urgent': false,
+              'addressed': {'troop': true, 'lodges': <String>[]},
+            });
+          }
+          if (path == '/api/store/items') {
+            return jsonResponse({
+              'items': [storeItemFixture()],
+              'count': 1,
+            });
+          }
+          return http.Response('[]', 200);
+        }),
+      );
+
+      await tester.pumpWidget(
+        ChangeNotifierProvider<SessionState>(
+          create: (_) => SessionState(client: client)
+            ..user = {'id': 'u1', 'username': 'scout', 'roles': ['scout']},
+          child: const MaterialApp(home: HomeShell()),
+        ),
+      );
+      await tester.pumpAndSettle();
+
+      await tester.tap(find.text('Shop'));
+      await tester.pumpAndSettle();
+
+      expect(find.text('Lodge 3 patch'), findsOneWidget);
+      // The shop's operator surfaces are not in the scout's navigation: they
+      // are behind Settings, where the drawer for things that need changing is.
+      expect(find.text('Unsettled'), findsNothing);
+    });
+  });
+
+  // -------------------------------------------------------------------------
+  // The shop (SPEC §7.16)
+  // -------------------------------------------------------------------------
+
+  group('Store API', () {
+    test('the catalogue read sends only the filters it was given', () async {
+      final calls = <String>[];
+      final client = ApiClient(
+        baseUrl: 'http://example.test',
+        httpClient: MockClient((request) async {
+          calls.add(request.url.toString());
+          return jsonResponse({'items': [], 'count': 0});
+        }),
+      );
+
+      expect(await client.storeItems(), isEmpty);
+      await client.storeItems(kind: 'rental', category: 'gear');
+
+      expect(calls.first, 'http://example.test/api/store/items');
+      expect(calls.last,
+          'http://example.test/api/store/items?kind=rental&category=gear');
+    });
+
+    test('an item is read out of its wrapper', () async {
+      final client = ApiClient(
+        baseUrl: 'http://example.test',
+        httpClient: MockClient(
+          (_) async => jsonResponse({'item': storeItemFixture()}),
+        ),
+      );
+
+      final item = await client.storeItem('1');
+      expect(item['name'], 'Lodge 3 patch');
+      // The whole scale arrives with it: each tier's charge and its draw.
+      final scale = (item['scale'] as List).cast<Map>();
+      expect(scale, hasLength(4));
+      expect(
+        scale.firstWhere((row) => row['tier'] == 'hardship')['funded_cents'],
+        2500,
+      );
+    });
+
+    test('placing an order sends lines and a tier, and never a price',
+        () async {
+      Map<String, dynamic>? body;
+      final client = ApiClient(
+        baseUrl: 'http://example.test',
+        httpClient: MockClient((request) async {
+          body = jsonDecode(request.body) as Map<String, dynamic>;
+          return jsonResponse({'order': storeOrderFixture(status: 'open')});
+        }),
+      );
+
+      await client.placeStoreOrder(
+        lines: [
+          {'item_id': 1, 'quantity': 2},
+        ],
+        tier: 'supported',
+      );
+
+      // The shop prices from its catalogue: no amount the client could send
+      // would be read, and none is sent.
+      expect(body, {
+        'lines': [
+          {'item_id': 1, 'quantity': 2},
+        ],
+        'tier': 'supported',
+      });
+      expect(body!['price_cents'], isNull);
+      expect(body!['charged_cents'], isNull);
+    });
+
+    test('checkout posts to the order, with no body of its own', () async {
+      final calls = <String>[];
+      final client = ApiClient(
+        baseUrl: 'http://example.test',
+        httpClient: MockClient((request) async {
+          calls.add('${request.method} ${request.url.path}');
+          return jsonResponse({
+            'order': storeOrderFixture(status: 'awaiting_payment'),
+            'checkout_url': 'https://checkout.stripe.test/cs_test_123',
+          });
+        }),
+      );
+
+      final response = await client.checkoutStoreOrder('7');
+      expect(calls, ['POST /api/store/order/7/checkout']);
+      expect(response['checkout_url'], 'https://checkout.stripe.test/cs_test_123');
+    });
+
+    test('a comp carries its mandatory reason, and a draw its own verb',
+        () async {
+      final calls = <String>[];
+      final bodies = <String, Map<String, dynamic>>{};
+      final client = ApiClient(
+        baseUrl: 'http://example.test',
+        httpClient: MockClient((request) async {
+          calls.add('${request.method} ${request.url.path}');
+          bodies[request.url.path] =
+              jsonDecode(request.body) as Map<String, dynamic>;
+          return jsonResponse({'order': storeOrderFixture(status: 'comped')});
+        }),
+      );
+
+      await client.compStoreOrder('7', reason: 'hardship');
+      await client.bookStoreDraw('7');
+
+      expect(calls, [
+        'POST /api/store/order/7/comp',
+        'POST /api/store/order/7/draw',
+      ]);
+      // A comp is an authority, not a price: the reason is not optional.
+      expect(bodies['/api/store/order/7/comp'], {'reason': 'hardship'});
+      expect(bodies['/api/store/order/7/draw'], isEmpty);
+    });
+
+    test('completing names the stripe payment it is completed against',
+        () async {
+      Map<String, dynamic>? body;
+      final client = ApiClient(
+        baseUrl: 'http://example.test',
+        httpClient: MockClient((request) async {
+          body = jsonDecode(request.body) as Map<String, dynamic>;
+          return jsonResponse({'order': storeOrderFixture()});
+        }),
+      );
+
+      await client.completeStoreOrder('7', stripePaymentId: 5);
+      expect(body, {'stripe_payment_id': 5});
+    });
+
+    test('the worklist is read whole: its orders, its reasons, its note',
+        () async {
+      final client = ApiClient(
+        baseUrl: 'http://example.test',
+        httpClient: MockClient(
+          (_) async => jsonResponse({
+            'orders': [
+              {...storeOrderFixture(status: 'awaiting_payment'),
+                'unsettled_reason': 'awaiting_payment',
+                'total_unsettled': 1},
+            ],
+            'count': 1,
+            'total_unsettled': 1,
+            'older_than_minutes': 30,
+            'by_reason': {'awaiting_payment': 1},
+            'note': 'an order awaiting payment cannot be told from one this '
+                'plugin cannot see paid',
+          }),
+        ),
+      );
+
+      final page = await client.unsettledStoreOrders();
+      expect(page['total_unsettled'], 1);
+      expect(page['older_than_minutes'], 30);
+      expect((page['by_reason'] as Map)['awaiting_payment'], 1);
+      expect((page['orders'] as List).single['unsettled_reason'],
+          'awaiting_payment');
+    });
+
+    test('the orders page says whether it was narrowed to the caller',
+        () async {
+      final client = ApiClient(
+        baseUrl: 'http://example.test',
+        httpClient: MockClient(
+          (_) async => jsonResponse({
+            'orders': [storeOrderFixture()],
+            'count': 1,
+            'has_more': false,
+            'narrowed_to_caller': true,
+            'note': 'your own orders; anybody else\'s needs store:read_all',
+          }),
+        ),
+      );
+
+      final page = await client.storeOrders();
+      expect(page['narrowed_to_caller'], true);
+      expect((page['orders'] as List).single['price_cents'], 2500);
+    });
+
+    test('a refusal arrives as a status the screen can branch on', () async {
+      final client = ApiClient(
+        baseUrl: 'http://example.test',
+        httpClient: MockClient(
+          (_) async => http.Response(
+            '{"error":"requires store:read_all at scope troop"}',
+            403,
+          ),
+        ),
+      );
+
+      await expectLater(
+        client.unsettledStoreOrders(),
+        throwsA(isA<ApiException>()
+            .having((e) => e.statusCode, 'statusCode', 403)
+            .having((e) => e.message, 'message',
+                'requires store:read_all at scope troop')),
+      );
+    });
+
+    test('accented text and em dashes survive the wire', () async {
+      // The UTF-8 decode is what stops "Procès-verbal" becoming mojibake and
+      // every em dash in a description being mangled.
+      final client = ApiClient(
+        baseUrl: 'http://example.test',
+        httpClient: MockClient(
+          (_) async => jsonResponse({
+            'item': {
+              ...storeItemFixture(name: 'Fanion du Procès-verbal'),
+              'description': 'Écusson brodé — Lodge 3',
+            },
+          }),
+        ),
+      );
+
+      final item = await client.storeItem('1');
+      expect(item['name'], 'Fanion du Procès-verbal');
+      expect(item['description'], 'Écusson brodé — Lodge 3');
+    });
+  });
+
+  group('StoreOrderMoney', () {
+    Widget wrap(Widget child) => MaterialApp(
+          theme: AppTheme.light(),
+          home: Scaffold(body: SingleChildScrollView(child: child)),
+        );
+
+    testWidgets('the three figures are named, and never collapse into one',
+        (tester) async {
+      final order = storeOrderFixture(); // price 2500, charged 1250, funded 1250
+      await tester.pumpWidget(wrap(StoreOrderMoney(order: order)));
+
+      expect(find.text('Price'), findsOneWidget);
+      expect(find.text('Charged'), findsOneWidget);
+      expect(find.text('Funded'), findsOneWidget);
+
+      final price = tester.widget<StoreMoneyRow>(
+        find.ancestor(
+          of: find.text('Price'),
+          matching: find.byType(StoreMoneyRow),
+        ),
+      );
+      final charged = tester.widget<StoreMoneyRow>(
+        find.ancestor(
+          of: find.text('Charged'),
+          matching: find.byType(StoreMoneyRow),
+        ),
+      );
+      final funded = tester.widget<StoreMoneyRow>(
+        find.ancestor(
+          of: find.text('Funded'),
+          matching: find.byType(StoreMoneyRow),
+        ),
+      );
+
+      // The charged amount is not the price, and the funded amount is a draw:
+      // each figure is its own number, read from the server's own field.
+      expect(price.cents, 2500);
+      expect(charged.cents, 1250);
+      expect(funded.cents, 1250);
+      expect(charged.cents, isNot(price.cents));
+      expect(
+        find.textContaining('not a discount off the price'),
+        findsOneWidget,
+      );
+    });
+
+    testWidgets('a comp is stated as a subsidy, never as free money',
+        (tester) async {
+      final order = storeOrderFixture(
+        status: 'comped',
+        charged: 0,
+        drawStatus: 'booked',
+      );
+      await tester.pumpWidget(wrap(StoreOrderMoney(order: order)));
+
+      final charged = tester.widget<StoreMoneyRow>(
+        find.ancestor(
+          of: find.text('Charged'),
+          matching: find.byType(StoreMoneyRow),
+        ),
+      );
+      expect(charged.cents, 0);
+      // The whole price is drawn from a real fund, and the sentence says so.
+      expect(
+        find.textContaining('the whole price is a draw on the scholarship fund'),
+        findsOneWidget,
+      );
+      expect(find.textContaining('free order'), findsOneWidget);
+    });
+
+    testWidgets('a fully paid order funds nothing, and says so', (tester) async {
+      await tester.pumpWidget(
+        wrap(StoreOrderMoney(
+          order: storeOrderFixture(charged: 2500, drawStatus: 'none'),
+        )),
+      );
+
+      expect(find.textContaining('Nothing was funded'), findsOneWidget);
+      expect(find.text(r'$25.00'), findsNWidgets(2)); // price and charged
+      expect(find.text(r'$0.00'), findsOneWidget); // funded
+    });
+  });
+
+  group('StoreDrawSection', () {
+    testWidgets('an unbooked draw is shown as money that has not landed',
+        (tester) async {
+      final order = storeOrderFixture(drawStatus: 'unbooked');
+      await tester.pumpWidget(
+        MaterialApp(
+          theme: AppTheme.light(),
+          home: Scaffold(
+            body: SingleChildScrollView(
+              child: StoreDrawSection(draw: drawFixture(order)),
+            ),
+          ),
+        ),
+      );
+
+      expect(find.text('Scholarship draw'), findsOneWidget);
+      expect(find.text('Not booked yet'), findsOneWidget);
+      expect(
+        find.textContaining('out of the scholarship fund into the general fund'),
+        findsOneWidget,
+      );
+      // It is on the worklist until it lands, and the screen says so rather
+      // than rendering a funded amount as settled.
+      expect(
+        find.textContaining('This draw has not landed'),
+        findsOneWidget,
+      );
+    });
+
+    testWidgets('a booked draw says the transfer was balanced',
+        (tester) async {
+      final order = storeOrderFixture(drawStatus: 'booked');
+      await tester.pumpWidget(
+        MaterialApp(
+          theme: AppTheme.light(),
+          home: Scaffold(
+            body: SingleChildScrollView(
+              child: StoreDrawSection(draw: drawFixture(order)),
+            ),
+          ),
+        ),
+      );
+
+      expect(find.text('Booked'), findsOneWidget);
+      expect(
+        find.textContaining('the sum of every fund is unchanged'),
+        findsOneWidget,
+      );
+      expect(find.textContaining('This draw has not landed'), findsNothing);
+    });
+  });
+
+  group('StoreScreen', () {
+    setUp(() => SharedPreferences.setMockInitialValues({}));
+
+    ApiClient clientWith({required List<String> calls, bool refused = false}) =>
+        ApiClient(
+          baseUrl: 'http://example.test',
+          httpClient: MockClient((request) async {
+            calls.add('${request.method} ${request.url.path}');
+            if (refused) {
+              return http.Response(
+                '{"error":"requires store:read at scope troop"}',
+                403,
+              );
+            }
+            return jsonResponse({
+              'items': [
+                storeItemFixture(),
+                storeItemFixture(
+                  id: 2,
+                  name: 'Camp tent',
+                  kind: 'rental',
+                  price: 4000,
+                  equipmentItemId: 9,
+                ),
+              ],
+              'count': 2,
+            });
+          }),
+        );
+
+    Future<void> pump(WidgetTester tester, ApiClient client) async {
+      await tester.pumpWidget(
+        ChangeNotifierProvider<SessionState>(
+          create: (_) => SessionState(client: client)
+            ..user = {'id': 'u1', 'username': 'scout', 'roles': ['scout']},
+          child: MaterialApp(
+            theme: AppTheme.light(),
+            home: const Scaffold(body: StoreScreen()),
+          ),
+        ),
+      );
+      await tester.pumpAndSettle();
+    }
+
+    testWidgets('lists the catalogue with the shop\'s prices', (tester) async {
+      await pump(tester, clientWith(calls: <String>[]));
+
+      expect(find.text('Lodge 3 patch'), findsOneWidget);
+      expect(find.text('Camp tent'), findsOneWidget);
+      expect(find.text(r'$25.00'), findsOneWidget);
+      expect(find.text(r'$40.00'), findsOneWidget);
+      expect(find.text('2 items for sale'), findsOneWidget);
+      expect(find.text('Rental'), findsOneWidget);
+      // Everyday work: the orders list is one tap away here.
+      expect(find.text('My orders'), findsOneWidget);
+      // And the money model is stated where the prices are.
+      expect(find.textContaining('a subsidy is not free'), findsOneWidget);
+      // No row says "free", because nothing in this shop is priced at nothing.
+      expect(find.text('Free'), findsNothing);
+    });
+
+    testWidgets('a refusal names the permission and keeps the server words',
+        (tester) async {
+      await pump(tester, clientWith(calls: <String>[], refused: true));
+
+      expect(find.text('The catalogue is not yours to read'), findsOneWidget);
+      expect(find.textContaining('store:read'), findsOneWidget);
+      // The server's own message is kept beside the requirement — a bare
+      // "forbidden" was a defect in an earlier screen.
+      expect(find.textContaining('requires store:read at scope troop'),
+          findsOneWidget);
+      expect(find.text('Cannot reach the server'), findsNothing);
+    });
+  });
+
+  group('StoreItemScreen', () {
+    setUp(() => SharedPreferences.setMockInitialValues({}));
+
+    testWidgets('buying places an order priced by the server', (tester) async {
+      // A tall viewport, so the whole item — its scale, its custody and its buy
+      // action — is built without a scroll.
+      tester.view.physicalSize = const Size(1000, 4200);
+      tester.view.devicePixelRatio = 1.0;
+      addTearDown(tester.view.reset);
+
+      final calls = <String>[];
+      Map<String, dynamic>? orderBody;
+
+      final client = ApiClient(
+        baseUrl: 'http://example.test',
+        httpClient: MockClient((request) async {
+          calls.add('${request.method} ${request.url.path}');
+          if (request.method == 'POST' && request.url.path == '/api/store/order') {
+            orderBody = jsonDecode(request.body) as Map<String, dynamic>;
+            return jsonResponse({
+              'order': storeOrderFixture(id: 7, status: 'open'),
+              'lines': [orderLineFixture()],
+              'draw': drawFixture(storeOrderFixture(id: 7, status: 'open')),
+              'next': 'open a Checkout session with POST /api/store/order/7/checkout',
+            });
+          }
+          if (request.url.path == '/api/store/order/7') {
+            final order = storeOrderFixture(status: 'open');
+            return jsonResponse({
+              'order': order,
+              'lines': [orderLineFixture()],
+              'draw': drawFixture(order),
+              'ledger': ledgerFixture(order),
+            });
+          }
+          return jsonResponse({'item': storeItemFixture()});
+        }),
+      );
+
+      await tester.pumpWidget(
+        ChangeNotifierProvider<SessionState>(
+          create: (_) => SessionState(client: client)
+            ..user = {'id': 'u1', 'username': 'scout', 'roles': ['scout']},
+          child: MaterialApp(
+            theme: AppTheme.light(),
+            home: const StoreItemScreen(id: '1'),
+          ),
+        ),
+      );
+      await tester.pumpAndSettle();
+
+      // The whole scale is visible: every tier's charge and its draw.
+      expect(find.text('The sliding scale'), findsOneWidget);
+      expect(find.text('Patron'), findsOneWidget);
+      expect(find.text('pays \$25.00'), findsNWidgets(2)); // patron, standard
+      expect(find.text('pays \$12.50'), findsOneWidget);
+      expect(find.textContaining('drawn from the scholarship fund'),
+          findsWidgets);
+
+      await tester.tap(find.text('Buy'));
+      await tester.pumpAndSettle();
+
+      expect(find.text('Buy Lodge 3 patch'), findsOneWidget);
+      // Nothing in the sheet asks for money: the shop prices from its
+      // catalogue, and the tier only says whose share is charged.
+      expect(find.text('Charged'), findsOneWidget);
+      expect(find.text('Funded'), findsOneWidget);
+
+      await tester.tap(find.text('Place the order'));
+      await tester.pumpAndSettle();
+
+      expect(calls, contains('POST /api/store/order'));
+      expect(orderBody!['lines'], [
+        {'item_id': 1, 'quantity': 1},
+      ]);
+      // The default is the tier that pays the whole price: a reduction is the
+      // buyer's to claim, not this screen's to assume.
+      expect(orderBody!['tier'], 'standard');
+      expect(orderBody!.containsKey('price_cents'), isFalse);
+      // The server's own `next` sentence is what the buyer is told.
+      expect(
+        find.textContaining('open a Checkout session'),
+        findsWidgets,
+      );
+    });
+  });
+
+  group('StoreOrderScreen', () {
+    setUp(() => SharedPreferences.setMockInitialValues({}));
+
+    ApiClient clientFor(Map<String, dynamic> order) => ApiClient(
+          baseUrl: 'http://example.test',
+          httpClient: MockClient((request) async {
+            if (request.url.path == '/api/store/order/7') {
+              return jsonResponse({
+                'order': order,
+                'lines': [orderLineFixture()],
+                'draw': drawFixture(order),
+                'ledger': ledgerFixture(order),
+              });
+            }
+            return http.Response('{}', 200);
+          }),
+        );
+
+    Future<void> pump(WidgetTester tester, ApiClient client) async {
+      // A tall viewport: this screen is a long one, and a lazy ListView does not
+      // build what is below the fold. The assertions are about what the screen
+      // says, not about how far a thumb has scrolled.
+      tester.view.physicalSize = const Size(1000, 4200);
+      tester.view.devicePixelRatio = 1.0;
+      addTearDown(tester.view.reset);
+      await tester.pumpWidget(
+        ChangeNotifierProvider<SessionState>(
+          create: (_) => SessionState(client: client),
+          child: MaterialApp(
+            theme: AppTheme.light(),
+            home: const StoreOrderScreen(id: '7'),
+          ),
+        ),
+      );
+      await tester.pumpAndSettle();
+    }
+
+    testWidgets('shows the price, the charge and the draw, each named',
+        (tester) async {
+      final order = storeOrderFixture(); // price 2500, charged 1250, funded 1250
+      await pump(tester, clientFor(order));
+
+      expect(find.text('Order #7'), findsWidgets); // the app bar and the heading
+      expect(find.text('What this order costs'), findsOneWidget);
+      expect(find.text('Price'), findsOneWidget);
+      expect(find.text('Charged'), findsOneWidget);
+      expect(find.text('Funded'), findsOneWidget);
+      expect(find.textContaining('Paid'), findsWidgets);
+
+      // The line keeps the shop's price and the charged unit apart too.
+      expect(
+        find.textContaining("the shop's price was \$25.00 each"),
+        findsOneWidget,
+      );
+      // The draw is not presented as settled: it is `unbooked`.
+      expect(find.text('Scholarship draw'), findsOneWidget);
+      expect(find.text('Not booked yet'), findsOneWidget);
+      // And the ledger's silence is stated rather than glossed.
+      expect(find.text('Not attempted'), findsOneWidget);
+      expect(
+        find.textContaining('the order stays on the unsettled worklist'),
+        findsOneWidget,
+      );
+    });
+
+    testWidgets('a comped order offers no payment, only the draw',
+        (tester) async {
+      final order = storeOrderFixture(
+        status: 'comped',
+        charged: 0,
+        drawStatus: 'booked',
+      );
+      await pump(tester, clientFor(order));
+
+      expect(
+        find.textContaining('This order charges nothing'),
+        findsOneWidget,
+      );
+      expect(find.textContaining('Stripe cannot take zero'), findsOneWidget);
+      // The draw is settled, so there is nothing left to book.
+      expect(find.textContaining('nothing left to settle for it'),
+          findsOneWidget);
+      expect(find.text('Booked'), findsWidgets);
+    });
+
+    testWidgets('the operator acts name their permissions in words',
+        (tester) async {
+      final order = storeOrderFixture(status: 'open', ledgerStatus: 'unbooked');
+      await pump(tester, clientFor(order));
+
+      // Completing and comping an open order are both offered; neither is
+      // hidden behind a client-side guess at the reader's roles.
+      expect(find.text('Complete against a stripe payment'), findsOneWidget);
+      expect(find.text('Comp this order (no charge)'), findsOneWidget);
+      expect(find.textContaining('store:manage'), findsOneWidget);
+      expect(find.textContaining('store:comp'), findsOneWidget);
+      // The draw section's own sentence names it too — the authority a draw
+      // needs is finance's, not the shop's.
+      expect(find.textContaining('finance:write'), findsWidgets);
+    });
+
+    testWidgets('a refusal repeats the server, and names the permission',
+        (tester) async {
+      final client = ApiClient(
+        baseUrl: 'http://example.test',
+        httpClient: MockClient(
+          (_) async => http.Response('{"error":"no such order"}', 403),
+        ),
+      );
+      await pump(tester, client);
+
+      expect(find.text('Not yours to read'), findsOneWidget);
+      expect(find.textContaining('store:read_all'), findsOneWidget);
+      // The server answers the same way for an order that is not yours and one
+      // that does not exist, so its words are repeated rather than replaced.
+      expect(find.textContaining('no such order'), findsOneWidget);
+    });
+  });
+
+  group('StoreOrdersScreen', () {
+    setUp(() => SharedPreferences.setMockInitialValues({}));
+
+    Future<void> pump(
+      WidgetTester tester, {
+      required bool narrowed,
+      List<Map<String, dynamic>>? orders,
+    }) async {
+      final client = ApiClient(
+        baseUrl: 'http://example.test',
+        httpClient: MockClient(
+          (_) async => jsonResponse({
+            'orders': orders ?? [storeOrderFixture()],
+            'count': (orders ?? [storeOrderFixture()]).length,
+            'narrowed_to_caller': narrowed,
+            'note': narrowed
+                ? 'your own orders; anybody else\'s needs store:read_all'
+                : 'the troop\'s orders: what was sold, to whom, and what it was charged',
+          }),
+        ),
+      );
+      await tester.pumpWidget(
+        ChangeNotifierProvider<SessionState>(
+          create: (_) => SessionState(client: client),
+          child: MaterialApp(
+            theme: AppTheme.light(),
+            home: const StoreOrdersScreen(),
+          ),
+        ),
+      );
+      await tester.pumpAndSettle();
+    }
+
+    testWidgets('renders the three figures on every row', (tester) async {
+      await pump(tester, narrowed: true);
+
+      expect(find.text('Order #7'), findsOneWidget);
+      expect(find.text('Price'), findsOneWidget);
+      expect(find.text('Charged'), findsOneWidget);
+      expect(find.text('Funded'), findsOneWidget);
+      expect(find.text(r'$25.00'), findsOneWidget);
+      expect(find.text(r'$12.50'), findsNWidgets(2)); // charged and funded
+      expect(
+        find.textContaining('a draw, not a price of zero'),
+        findsOneWidget,
+      );
+    });
+
+    testWidgets('the scope of the list is the server\'s answer', (tester) async {
+      await pump(tester, narrowed: true);
+      // Narrowed: the screen says whose orders these are, in the server's terms.
+      expect(find.textContaining('These are your own orders'), findsOneWidget);
+      expect(find.textContaining('store:read_all'), findsWidgets);
+    });
+
+    testWidgets('a widened list says it was widened, not narrowed',
+        (tester) async {
+      await pump(tester, narrowed: false, orders: [storeOrderFixture()]);
+      expect(find.textContaining('This is the troop'), findsOneWidget);
+      expect(find.textContaining('These are your own orders'), findsNothing);
+    });
+  });
+
+  group('StoreAdminScreen', () {
+    setUp(() => SharedPreferences.setMockInitialValues({}));
+
+    ApiClient clientWith({
+      required List<String> calls,
+      bool refused = false,
+      List<Map<String, dynamic>>? unsettled,
+      List<Map<String, dynamic>>? comps,
+    }) =>
+        ApiClient(
+          baseUrl: 'http://example.test',
+          httpClient: MockClient((request) async {
+            final path = request.url.path;
+            calls.add('${request.method} $path');
+            if (refused) {
+              return http.Response(
+                '{"error":"requires store:read_all at scope troop"}',
+                403,
+              );
+            }
+            if (path == '/api/store/orders/unsettled') {
+              return jsonResponse({
+                'orders': unsettled ??
+                    [
+                      {
+                        ...storeOrderFixture(status: 'awaiting_payment'),
+                        'unsettled_reason': 'awaiting_payment',
+                        'total_unsettled': 1,
+                      },
+                    ],
+                'count': 1,
+                'total_unsettled': 1,
+                'older_than_minutes': 30,
+                'by_reason': {'awaiting_payment': 1},
+                'note': 'an order awaiting payment cannot be told from one this '
+                    'plugin cannot see paid, because a Stripe webhook confirms '
+                    'the payment to stripe and carries no Adjutant caller',
+              });
+            }
+            if (path == '/api/store/comps') {
+              return jsonResponse({
+                'comps': comps ??
+                    [
+                      {
+                        ...storeOrderFixture(status: 'comped', charged: 0),
+                        'comp_reason': 'hardship — the tent was needed',
+                      },
+                    ],
+                'count': 1,
+                'funded_total_cents': 2500,
+                'funded_total_display': r'$25.00',
+                'note': 'each comp charged nothing and drew its whole price '
+                    'from the scholarship fund',
+              });
+            }
+            return http.Response('{}', 200);
+          }),
+        );
+
+    Future<void> pump(WidgetTester tester, ApiClient client) async {
+      await tester.pumpWidget(
+        ChangeNotifierProvider<SessionState>(
+          create: (_) => SessionState(client: client),
+          child: MaterialApp(
+            theme: AppTheme.light(),
+            home: const StoreAdminScreen(),
+          ),
+        ),
+      );
+      await tester.pumpAndSettle();
+    }
+
+    testWidgets('the worklist shows what is unsettled, by reason',
+        (tester) async {
+      final calls = <String>[];
+      await pump(tester, clientWith(calls: calls));
+
+      expect(find.text('1 unsettled'), findsOneWidget);
+      expect(find.text('older than 30m'), findsOneWidget);
+      expect(find.text('Awaiting payment'), findsWidgets);
+      expect(find.text('Order #7'), findsOneWidget);
+      // The three figures, and the reason it is on the list.
+      expect(
+        find.textContaining('Price \$25.00 · charged \$12.50 · funded \$12.50'),
+        findsOneWidget,
+      );
+      // The server's own note says why the two shapes are counted together.
+      expect(
+        find.textContaining('cannot be told from one this plugin cannot see paid'),
+        findsOneWidget,
+      );
+      expect(calls, contains('GET /api/store/orders/unsettled'));
+    });
+
+    testWidgets('a refusal states the permission and the server message',
+        (tester) async {
+      await pump(tester, clientWith(calls: <String>[], refused: true));
+
+      expect(find.text('The worklist is for operators'), findsOneWidget);
+      expect(find.textContaining('store:read_all'), findsOneWidget);
+      expect(find.textContaining('requires store:read_all at scope troop'),
+          findsOneWidget);
+      expect(find.text('Cannot reach the server'), findsNothing);
+    });
+
+    testWidgets('the comps tab shows the reason, the authority and the total',
+        (tester) async {
+      final calls = <String>[];
+      await pump(tester, clientWith(calls: calls));
+
+      await tester.tap(find.text('Comps'));
+      await tester.pumpAndSettle();
+
+      expect(calls, contains('GET /api/store/comps'));
+      expect(find.text('Funded \$25.00'), findsOneWidget);
+      expect(
+        find.textContaining('hardship — the tent was needed'),
+        findsOneWidget,
+      );
+      expect(
+        find.textContaining('By u2'),
+        findsOneWidget,
+      );
+      // The ledger shows the draw; this shows the comp, and it says so.
+      expect(
+        find.textContaining('The ledger shows the draw; this shows the comp'),
+        findsOneWidget,
+      );
+    });
+
+    testWidgets('adding an item names the permission it needs',
+        (tester) async {
+      await pump(tester, clientWith(calls: <String>[]));
+
+      await tester.tap(find.text('New item'));
+      await tester.pumpAndSettle();
+
+      expect(find.textContaining('Adding an item needs store:manage'),
+          findsOneWidget);
+      expect(find.text('Add the item'), findsOneWidget);
+      // No amount field invites a "free" item: a zero price and a comp are
+      // different things, and the helper text says which is which.
+      expect(
+        find.textContaining("never a member's charge"),
+        findsOneWidget,
+      );
     });
   });
 }

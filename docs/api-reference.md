@@ -942,14 +942,21 @@ INSERT INTO core.role_permissions (role_id, permission_id) VALUES
 ON CONFLICT DO NOTHING;
 ```
 
-**What is deliberately not here.** The client screens for the shop (a separate
-parity workstream); a cash sale — SPEC §7.16 gives the shop one money path and it
-is stripe's, so a payment recorded directly in finance does not complete a store
-order; a refund route, which is an *expense* in finance's vocabulary and belongs
+**What is deliberately not here.** A cash sale — SPEC §7.16 gives the shop one
+money path and it is stripe's, so a payment recorded directly in finance does not
+complete a store order; a refund route, which is an *expense* in finance's vocabulary and belongs
 to finance; and any write into `stripe.*` or `finance.*`. Two seams are reported
 rather than patched from here: stripe's purpose vocabulary has no `purchase`, and
 finance's write routes take a fund **id**, so addressing a fund by **code** is a
 read (`GET /api/finance/funds`) followed by the write.
+
+**The client surface** is `client/lib/screens/store_screen.dart` (catalogue),
+`store_item_screen.dart`, `store_orders_screen.dart`, `store_order_screen.dart`,
+and `store_admin_screen.dart` (the operator tabs: the unsettled worklist, adding an
+item, comps). An order is rendered as three separately labelled figures — the shop's
+price, what the member was charged, and what the scholarship fund funded — because
+the charge is not the price and a draw is not a discount; a funded order that has
+not landed says so rather than reading as settled (`client/lib/widgets/store_money.dart`).
 
 ### Announcements (SPEC §7.14)
 
