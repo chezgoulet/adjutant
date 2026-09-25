@@ -76,7 +76,10 @@ the app at its own box without a rebuild.
 ## Building
 
 ```bash
-flutter build web --release          # build/web
+# Web — prefer WASM. Flutter serves main.dart.wasm to browsers that support it
+# and falls back to main.dart.js automatically, so there is no downside.
+flutter build web --release --wasm       # build/web
+
 flutter build linux --release        # build/linux/x64/release/bundle
 flutter build apk --release          # needs Android SDK
 flutter build ipa --release          # macOS only
