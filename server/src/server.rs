@@ -14,7 +14,7 @@
 //! a slow plugin must never block a reload).
 
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use axum::body::to_bytes;
 use axum::extract::{Path, Request, State};
@@ -57,6 +57,14 @@ pub struct AppState {
     /// Runs plugin-declared schedules (#45): started on load, aborted on
     /// disable/uninstall/reload.
     pub scheduler: Arc<crate::scheduler::Scheduler>,
+    /// The last mismatch count the outbox reconciliation pass published, so a
+    /// `core.outbox.mismatch` event is raised only when the set *changes* and is
+    /// not empty (see `outbox::reconcile_and_raise`). Plain `Mutex`: `AppState`
+    /// is already inside an `Arc`.
+    pub outbox_mismatches: Mutex<i64>,
+    /// The outbox relay: one drain loop per process, held here (like
+    /// `scheduler`) so `shutdown()` can stop it.
+    pub relay: Arc<crate::outbox::Relay>,
 }
 
 impl AppState {
@@ -66,7 +74,7 @@ impl AppState {
     /// must use this — reading dev headers directly meant admin routes 401'd
     /// for real sessions once `allow_dev_headers=false`, and audit rows lost
     /// their actor entirely.
-    async fn resolve_identity(&self, headers: &axum::http::HeaderMap) -> Option<adjutant_sdk::Identity> {
+    pub(crate) async fn resolve_identity(&self, headers: &axum::http::HeaderMap) -> Option<adjutant_sdk::Identity> {
         let map: HashMap<String, String> = headers
             .iter()
             .filter_map(|(k, v)| Some((k.as_str().to_string(), v.to_str().ok()?.to_string())))
@@ -91,6 +99,9 @@ impl AppState {
     pub async fn shutdown(&self) {
         self.bus.shutdown();
         self.scheduler.stop_all();
+        // The outbox relay is a core task, like the scheduler's: stop it before
+        // the plugins it delivers to are torn down.
+        self.relay.stop();
         let mut reg = self.registry.write().await;
         // Destructure the guard so the two vecs borrow independently.
         let PluginRegistry { plugins, retired } = &mut *reg;
@@ -104,7 +115,7 @@ impl AppState {
 
     /// Admin gate: `core:admin` permission. Returns a ready 401/403 response
     /// when the caller isn't allowed, `None` when allowed.
-    async fn require_admin(&self, headers: &axum::http::HeaderMap) -> Option<Response> {
+    pub(crate) async fn require_admin(&self, headers: &axum::http::HeaderMap) -> Option<Response> {
         let identity = self.resolve_identity(headers).await;
         match authorize(identity.as_ref(), &self.permissions, "core:admin", Some(&adjutant_sdk::Scope::troop())).await {
             Ok(()) => None,
@@ -201,6 +212,14 @@ pub async fn build_app(cfg: &Config) -> Result<(Router, Arc<AppState>), BuildErr
     .await
     .map_err(BuildError::Db)?;
 
+    // Declare the core's service principals (the money path's machine
+    // identities) right beside that grant: `finance:write` exists now that the
+    // finance plugin has loaded and registered its permissions, and nothing is
+    // ever re-granted, so an operator's revocation is not undone by a boot.
+    crate::outbox::seed_service_principals(pool.as_ref())
+        .await
+        .map_err(BuildError::Db)?;
+
     let permissions = PermissionService::new(crate::host::CoreDb::new(pool.clone()));
     let audit = AuditService::new(crate::host::CoreDb::new(pool.clone()), "core".into());
 
@@ -209,6 +228,8 @@ pub async fn build_app(cfg: &Config) -> Result<(Router, Arc<AppState>), BuildErr
     let hierarchy = crate::scope_hierarchy::ScopeHierarchy::load(pool.as_ref())
         .await
         .map_err(BuildError::Db)?;
+
+    let relay = crate::outbox::Relay::new();
 
     let state = Arc::new(AppState {
         pool: pool.clone(),
@@ -221,7 +242,18 @@ pub async fn build_app(cfg: &Config) -> Result<(Router, Arc<AppState>), BuildErr
         http,
         hierarchy: RwLock::new(hierarchy),
         scheduler,
+        outbox_mismatches: Mutex::new(0),
+        relay: relay.clone(),
     });
+
+    // The core's own subscription to the relay's terminal-outcome events, bound
+    // under `outbox::SUBSCRIBER_OWNER` so a reload's sweep (which clears every
+    // *plugin* generation) leaves it alone. Started after the state exists:
+    // `start` takes a `Weak` to it.
+    state
+        .bus
+        .subscribe(crate::outbox::SUBSCRIBER_OWNER, crate::outbox::outcome_subscription());
+    relay.start(&state);
 
     let cors = cfg.cors_origins.first().map(|_| {
         let layer = CorsLayer::new();
@@ -249,6 +281,17 @@ pub async fn build_app(cfg: &Config) -> Result<(Router, Arc<AppState>), BuildErr
         .route("/api/plugins/reload", post(reload_plugins))
         .route("/api/events/recent", get(recent_events))
         .route("/api/audit/verify", get(audit_verify))
+        // The outbox operator surface: the queue and its states, reconciliation
+        // (the control of last resort), and the hand that re-arms an intent.
+        .route("/api/outbox/intents", get(crate::outbox::list_intents))
+        .route(
+            "/api/outbox/reconciliation",
+            get(crate::outbox::reconciliation_route),
+        )
+        .route(
+            "/api/outbox/intent/{id}/retry",
+            post(crate::outbox::retry_intent),
+        )
         // Every other METHOD path resolves against the live plugin registry.
         .fallback(dynamic_dispatch)
         .with_state(state.clone());
@@ -271,6 +314,24 @@ pub async fn build_app(cfg: &Config) -> Result<(Router, Arc<AppState>), BuildErr
     Ok((app, state))
 }
 
+/// Clear every **plugin's** event subscriptions before rebinding the new
+/// generation after a reload (or an uninstall): without it both generations
+/// handle the same event.
+///
+/// **The core's own subscription is skipped.** `core.outbox.` is the first
+/// subscription the core owns rather than a plugin, and it is registered under
+/// [`crate::outbox::SUBSCRIBER_OWNER`]. A sweep that cleared it would delete the
+/// core's own handler on the very first reload, and nothing would notice until
+/// an outcome event went unheard.
+pub(crate) async fn clear_plugin_subscriptions(bus: &EventBus) {
+    for old_id in bus.subscriber_ids() {
+        if old_id == crate::outbox::SUBSCRIBER_OWNER {
+            continue;
+        }
+        bus.clear_plugin(&old_id).await;
+    }
+}
+
 /// from_fn wrapper over the testable `rate_limit_inner`.
 async fn rate_limit_layer(
     State(limiter): State<RateLimiter>,
@@ -287,13 +348,13 @@ async fn rate_limit_layer(
 /// The one error envelope every core and plugin error uses: `{"error": "..."}`.
 /// Keeping construction in one place means clients can rely on the shape, and
 /// it is the single spot to change if the envelope evolves.
-fn error_response(status: StatusCode, message: impl Into<String>) -> Response {
+pub(crate) fn error_response(status: StatusCode, message: impl Into<String>) -> Response {
     (status, Json(json!({ "error": message.into() }))).into_response()
 }
 
 /// 5xx responses must not leak internals (SQL, paths, driver messages) to
 /// clients. The detail is logged; the client gets a generic message.
-fn internal_error(what: &str, err: &dyn std::fmt::Display) -> Response {
+pub(crate) fn internal_error(what: &str, err: &dyn std::fmt::Display) -> Response {
     tracing::error!(operation = what, error = %err, "internal error");
     error_response(StatusCode::INTERNAL_SERVER_ERROR, "internal error")
 }
@@ -316,7 +377,7 @@ fn internal_error(what: &str, err: &dyn std::fmt::Display) -> Response {
 /// error). The log then records an attempt whose effect did not land. Attempts
 /// are auditable; unaudited changes are not acceptable. There is no
 /// compensation/rollback for the in-memory registry by design.
-async fn audit_state_change(
+pub(crate) async fn audit_state_change(
     audit: &AuditService,
     identity: Option<&Identity>,
     action: &str,
@@ -952,9 +1013,7 @@ async fn reload_plugins(State(state): State<Arc<AppState>>, req: Request) -> Res
             reg.plugins.iter().map(|p| p.info.id.clone()).collect();
         state.identity.retain(&live);
     }
-    for old_id in state.bus.subscriber_ids() {
-        state.bus.clear_plugin(&old_id).await;
-    }
+    clear_plugin_subscriptions(&state.bus).await;
     {
         let reg = state.registry.read().await;
         for lp in &reg.plugins {
@@ -985,7 +1044,7 @@ mod tests {
     };
     use axum::extract::{Path, State};
     use axum::http::StatusCode;
-    use std::sync::Arc;
+    use std::sync::{Arc, Mutex};
     use tokio::sync::RwLock;
 
     use crate::config::Config;
@@ -1108,7 +1167,7 @@ mod tests {
     fn failing_audit_state() -> Arc<AppState> {
         let pool = Arc::new(
             sqlx::postgres::PgPoolOptions::new()
-                .connect_lazy("postgres://adjutant:adjutant@127.0.0.1:1/adjutant_test")
+                .connect_lazy("postgres://adjutant:***@127.0.0.1:1/adjutant_test")
                 .expect("lazy pool URL parses"),
         );
         let config = Config {
@@ -1129,6 +1188,8 @@ mod tests {
             http: crate::host::CoreHttp::new(),
             hierarchy: RwLock::new(crate::scope_hierarchy::ScopeHierarchy::default()),
             scheduler: crate::scheduler::Scheduler::new(),
+            outbox_mismatches: Mutex::new(0),
+            relay: crate::outbox::Relay::new(),
         })
     }
 

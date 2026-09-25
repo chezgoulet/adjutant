@@ -35,6 +35,44 @@ Adjutant's HTTP API is JSON over HTTP. Plugin routes live under
 | POST | `/api/plugins/reload` | `core:admin` | Rescan the plugin dir and hot-swap |
 | GET | `/api/events/recent?since=<id>&limit=<1..500>` | `core:admin` | Event replay with cursor |
 | GET | `/api/audit/verify` | `core:admin` | Verify the audit hash chain |
+| GET | `/api/outbox/intents?state=&producer=&limit=` | `core:admin` | The queue: every intent, and the state it is in |
+| GET | `/api/outbox/reconciliation` | `core:admin` | Classify every intent and report the ones that did not land, with both sides of the disagreement |
+| POST | `/api/outbox/intent/{id}/retry` | `core:admin` | Re-arm an exhausted or refused intent (`409` unless it is terminal) |
+
+### The outbox (`core.outbox`)
+
+The money path for a fact that has **no caller to forward a credential from** — a
+Stripe webhook is a server-to-server POST, and a scholarship draw is applied by the
+shop on a member's behalf. A plugin writes the intent in the **same statement** as
+the fact it describes (`core.outbox_enqueue` returns a scalar, so it fits inside the
+plugin's own `INSERT`), and the core's relay delivers it to the target route with
+retries and exponential backoff. Design and the decision behind it:
+`docs/design/plugin-to-plugin.md` §3.2.
+
+**A delivered request carries no headers.** There is no token to steal or replay:
+the identity is built by the core from the intent row — `service:<principal>` with a
+troop-scope role grant — and authorized through the same gate a member's request
+uses. The target decides, and an operator's revocation bites at delivery time rather
+than only at enqueue.
+
+**The declaration is compiled, not data.** `svc.stripe.ledger` (producer `stripe`,
+grant `finance:write`, and nothing else) is declared in the core's
+`SERVICE_PRINCIPALS` constant, and `core.service_principals` mirrors it so an
+operator sees it beside a member's grant and can revoke it — `UPDATE
+core.service_principals SET revoked_at = now()`, or remove the row from
+`core.role_permissions`. **A boot never re-grants**, so a revocation is not undone.
+A row the core never declared cannot enqueue (`declared_by_core` is written only by
+the core's own seeding), so an intent that could never be delivered cannot be
+created in the first place — the producer is told at its own write, in its own
+transaction.
+
+**State is visible in the data, not only in a log.** An intent is `pending`,
+`attempting`, `delivered`, `refused`, or `exhausted`; an attempt is spent at the
+claim, so a crash mid-delivery still spends one; exhaustion carries its last error
+and appears in reconciliation as unlanded. A producer reads **its own** intents
+through `core.outbox_producer_view()` without holding any grant on the table, and a
+production plugin holds no grant on `core.outbox` at all — in either direction.
+
 
 ## Auth plugin
 

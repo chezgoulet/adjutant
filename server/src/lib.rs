@@ -8,6 +8,7 @@ pub mod events;
 pub mod host;
 pub mod identity;
 pub mod middleware;
+pub mod outbox;
 pub mod permissions;
 pub mod plugin_runtime;
 pub mod schema;

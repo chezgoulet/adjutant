@@ -377,7 +377,230 @@ CREATE TABLE IF NOT EXISTS core.scheduled_runs (
 );
 CREATE INDEX IF NOT EXISTS idx_scheduled_runs_recent
   ON core.scheduled_runs (plugin_id, schedule, finished_at DESC);
-")];
+"),
+    (
+        9,
+        "outbox",
+        "-- Why this is a new version rather than more DDL in 1: an applied version
+-- is skipped by number and its SQL is never re-run or compared, so anything
+-- added to an earlier version would exist on a fresh database and be absent on
+-- every deployed one. Same reason `finance` cannot edit its version 1.
+-- Numbered 9 because 1-8 are already applied in the field; the next core
+-- migration takes 10.
+--
+-- The money path (docs/design/plugin-to-plugin.md §3.2): a durable intent for a
+-- machine-originated fact that has no caller to forward a credential from.
+
+-- A declared service principal: a first-class, non-human identity. The role and
+-- its grant live in core.roles / core.role_permissions so an operator sees it
+-- beside a member's and can revoke it; this table records which plugin may
+-- enqueue a delivery *as* it, and enforces producer uniqueness there.
+CREATE TABLE IF NOT EXISTS core.service_principals (
+    principal       TEXT PRIMARY KEY REFERENCES core.roles(id) ON DELETE CASCADE,
+    producer_plugin TEXT NOT NULL,
+    description     TEXT NOT NULL,
+    declared_at     TIMESTAMPTZ NOT NULL DEFAULT now(),
+    revoked_at      TIMESTAMPTZ,
+    -- Set by the core's own seeding from SERVICE_PRINCIPALS, never by an operator:
+    -- the compiled declaration is what authorizes a delivery, so a row the core
+    -- never declared may not enqueue an intent that could never be delivered.
+    declared_by_core BOOLEAN NOT NULL DEFAULT false,
+    CONSTRAINT service_principals_producer_is_named CHECK (length(producer_plugin) > 0),
+    CONSTRAINT service_principals_revoked_after_declaration
+        CHECK (revoked_at IS NULL OR revoked_at >= declared_at)
+);
+CREATE INDEX IF NOT EXISTS idx_service_principals_producer
+  ON core.service_principals (producer_plugin);
+-- One principal per (producer, operation) is the declaration's contract; two
+-- rows for the same producer would leave 'which one authorised this?' unanswerable.
+CREATE UNIQUE INDEX IF NOT EXISTS idx_service_principals_one_per_producer
+  ON core.service_principals (principal, producer_plugin);
+
+-- (Deliberately no ALTER TABLE here. It would be inert: a migration whose version is
+-- already recorded is skipped whole, so an ALTER added to this file never executes on
+-- a database that applied the earlier shape of it — which is the only case it would
+-- be written for. This migration has never been applied outside development, so its
+-- shape was amended in place; had it reached a real deployment, the column would need
+-- its own version. A database still carrying the earlier shape needs re-provisioning.)
+
+-- The durable intent. Written in the same statement as the fact it describes, so
+-- the two commit together or neither does: there is no window in which a payment
+-- is recorded and its ledger booking is not.
+CREATE TABLE IF NOT EXISTS core.outbox (
+    id              BIGSERIAL PRIMARY KEY,
+    producer_plugin TEXT NOT NULL,
+    principal       TEXT NOT NULL REFERENCES core.service_principals(principal),
+    target_method   TEXT NOT NULL DEFAULT 'POST',
+    target_route    TEXT NOT NULL,
+    idempotency_key TEXT NOT NULL,
+    payload         JSONB NOT NULL,
+    state           TEXT NOT NULL DEFAULT 'pending',
+    attempts        INTEGER NOT NULL DEFAULT 0,
+    max_attempts    INTEGER NOT NULL DEFAULT 6,
+    answer_status   INTEGER,
+    answer          JSONB,
+    last_error      TEXT,
+    created_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
+    claimed_at      TIMESTAMPTZ,
+    last_attempt_at TIMESTAMPTZ,
+    next_attempt_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    delivered_at    TIMESTAMPTZ,
+    CONSTRAINT outbox_state_known
+        CHECK (state IN ('pending', 'attempting', 'delivered', 'refused', 'exhausted')),
+    -- No upper bound on `attempts`: it is spent at the claim, so a crash between
+    -- claim and record would otherwise hit a constraint on the reclaim instead of
+    -- spending its last attempt -- the row would wedge and the relay would fail
+    -- on it forever. Exhaustion is the relay's decision (attempts >= max_attempts),
+    -- not a constraint's.
+    CONSTRAINT outbox_attempts_are_sane CHECK (attempts >= 0 AND max_attempts >= 1),
+    CONSTRAINT outbox_target_is_a_route CHECK (target_route LIKE '/%'),
+    CONSTRAINT outbox_key_is_not_empty CHECK (length(idempotency_key) > 0),
+    -- One intent per producer per key: a producer retrying its own write cannot
+    -- produce a second delivery of the same fact.
+    CONSTRAINT outbox_one_intent_per_key UNIQUE (producer_plugin, idempotency_key),
+    -- Terminal states are recorded with their evidence, not inferred.
+    CONSTRAINT outbox_delivered_was_at_a_time CHECK (state <> 'delivered' OR delivered_at IS NOT NULL),
+    CONSTRAINT outbox_answer_is_not_a_delivery CHECK (state <> 'delivered' OR answer_status IS NOT NULL)
+);
+CREATE INDEX IF NOT EXISTS idx_outbox_due
+  ON core.outbox (next_attempt_at) WHERE state IN ('pending', 'attempting');
+CREATE INDEX IF NOT EXISTS idx_outbox_producer
+  ON core.outbox (producer_plugin, id DESC);
+CREATE INDEX IF NOT EXISTS idx_outbox_reconcile
+  ON core.outbox (state, created_at);
+
+-- No plugin reads or writes the table directly; both directions go through the
+-- two functions below. Stated as a REVOKE rather than left implied, so a future
+-- blanket GRANT on the core schema cannot quietly open it.
+REVOKE ALL ON core.outbox FROM PUBLIC;
+REVOKE ALL ON core.service_principals FROM PUBLIC;
+
+-- Enqueue an intent.
+--
+-- SECURITY DEFINER so a plugin needs no grant on the table, and **there is no
+-- identity parameter at all**: the producer is derived from session_user, and the
+-- principal is refused unless it is declared for that producer. So a plugin
+-- cannot assert an identity -- the only one it can name is its own. This is the
+-- §3.1 refusal made mechanical rather than a convention.
+CREATE OR REPLACE FUNCTION core.outbox_enqueue(
+    p_principal       TEXT,
+    p_target_method   TEXT,
+    p_target_route    TEXT,
+    p_payload         JSONB,
+    p_idempotency_key TEXT
+) RETURNS BIGINT
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = core, pg_temp
+AS $fn$
+DECLARE
+    caller_role TEXT := session_user;
+    producer    TEXT;
+    declared    RECORD;
+    existing    BIGINT;
+    new_id      BIGINT;
+BEGIN
+    IF caller_role NOT LIKE 'adjutant_plugin_%' THEN
+        RAISE EXCEPTION 'core.outbox_enqueue is for plugin roles; % may not enqueue an intent',
+            caller_role;
+    END IF;
+    producer := substring(caller_role FROM length('adjutant_plugin_') + 1);
+
+    -- No declaration, or a revoked one, is not a delivery: it is an error the
+    -- producer sees now, in its own transaction, rather than an intent that
+    -- cannot be delivered later.
+    SELECT sp.producer_plugin, sp.revoked_at, sp.declared_by_core INTO declared
+      FROM core.service_principals sp
+     WHERE sp.principal = p_principal;
+    IF NOT FOUND THEN
+        RAISE EXCEPTION 'no service principal % is declared for this core', p_principal;
+    END IF;
+    IF declared.revoked_at IS NOT NULL THEN
+        RAISE EXCEPTION 'service principal % was revoked at % and may not enqueue',
+            p_principal, declared.revoked_at;
+    END IF;
+    IF declared.producer_plugin <> producer THEN
+        RAISE EXCEPTION 'plugin % may not enqueue as principal % (declared for %)',
+            producer, p_principal, declared.producer_plugin;
+    END IF;
+    -- The declaration that authorizes a delivery is the core's compiled
+    -- SERVICE_PRINCIPALS; this row is its mirror. Without this check the two could
+    -- disagree, and a row the core never declared would enqueue an intent that
+    -- could never be delivered -- a producer would inherit a stuck intent instead
+    -- of being told now, in its own transaction.
+    IF NOT declared.declared_by_core THEN
+        RAISE EXCEPTION 'service principal % is not declared by this core, so no intent enqueued as it could be delivered',
+            p_principal;
+    END IF;
+
+    -- Idempotent: the same fact enqueued twice (a producer retrying its own write,
+    -- a redelivered webhook) returns the intent it already has.
+    SELECT o.id INTO existing
+      FROM core.outbox o
+     WHERE o.producer_plugin = producer AND o.idempotency_key = p_idempotency_key;
+    IF existing IS NOT NULL THEN
+        RETURN existing;
+    END IF;
+
+    INSERT INTO core.outbox
+        (producer_plugin, principal, target_method, target_route, payload, idempotency_key)
+    VALUES
+        (producer, p_principal, upper(p_target_method), p_target_route, p_payload, p_idempotency_key)
+    RETURNING id INTO new_id;
+    RETURN new_id;
+END
+$fn$;
+-- EXECUTE on the *function*, never on the table: that is the whole design.
+GRANT EXECUTE ON FUNCTION core.outbox_enqueue(TEXT, TEXT, TEXT, JSONB, TEXT) TO PUBLIC;
+
+-- A producer reads the state of its own intents (and its own only) without a
+-- grant on core.outbox. Scoped by session_user, the same derivation as enqueue.
+CREATE OR REPLACE FUNCTION core.outbox_producer_view()
+RETURNS TABLE (
+    id              BIGINT,
+    principal       TEXT,
+    target_method   TEXT,
+    target_route    TEXT,
+    idempotency_key TEXT,
+    state           TEXT,
+    attempts        INTEGER,
+    max_attempts    INTEGER,
+    answer_status   INTEGER,
+    last_error      TEXT,
+    payload         JSONB,
+    answer          JSONB,
+    created_at      TIMESTAMPTZ,
+    last_attempt_at TIMESTAMPTZ,
+    delivered_at    TIMESTAMPTZ,
+    next_attempt_at TIMESTAMPTZ
+)
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = core, pg_temp
+AS $fn$
+DECLARE
+    caller_role TEXT := session_user;
+    producer    TEXT;
+BEGIN
+    IF caller_role NOT LIKE 'adjutant_plugin_%' THEN
+        RAISE EXCEPTION 'core.outbox_producer_view is for plugin roles; % may not read it',
+            caller_role;
+    END IF;
+    producer := substring(caller_role FROM length('adjutant_plugin_') + 1);
+    RETURN QUERY
+        SELECT o.id, o.principal, o.target_method, o.target_route, o.idempotency_key,
+               o.state, o.attempts, o.max_attempts, o.answer_status, o.last_error,
+               o.payload, o.answer, o.created_at, o.last_attempt_at, o.delivered_at,
+               o.next_attempt_at
+          FROM core.outbox o
+         WHERE o.producer_plugin = producer
+         ORDER BY o.id DESC;
+END
+$fn$;
+GRANT EXECUTE ON FUNCTION core.outbox_producer_view() TO PUBLIC;
+"
+    ),
+];
 
 /// Bootstrap roles + permissions grants. `chief` gets everything (SPEC §9 —
 /// real role management arrives with the auth plugin in Milestone 2; this is
