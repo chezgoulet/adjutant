@@ -401,6 +401,10 @@ CREATE TABLE IF NOT EXISTS core.service_principals (
     description     TEXT NOT NULL,
     declared_at     TIMESTAMPTZ NOT NULL DEFAULT now(),
     revoked_at      TIMESTAMPTZ,
+    -- Set by the core's own seeding from SERVICE_PRINCIPALS, never by an operator:
+    -- the compiled declaration is what authorizes a delivery, so a row the core
+    -- never declared may not enqueue an intent that could never be delivered.
+    declared_by_core BOOLEAN NOT NULL DEFAULT false,
     CONSTRAINT service_principals_producer_is_named CHECK (length(producer_plugin) > 0),
     CONSTRAINT service_principals_revoked_after_declaration
         CHECK (revoked_at IS NULL OR revoked_at >= declared_at)
@@ -411,6 +415,13 @@ CREATE INDEX IF NOT EXISTS idx_service_principals_producer
 -- rows for the same producer would leave 'which one authorised this?' unanswerable.
 CREATE UNIQUE INDEX IF NOT EXISTS idx_service_principals_one_per_producer
   ON core.service_principals (principal, producer_plugin);
+
+-- (Deliberately no ALTER TABLE here. It would be inert: a migration whose version is
+-- already recorded is skipped whole, so an ALTER added to this file never executes on
+-- a database that applied the earlier shape of it — which is the only case it would
+-- be written for. This migration has never been applied outside development, so its
+-- shape was amended in place; had it reached a real deployment, the column would need
+-- its own version. A database still carrying the earlier shape needs re-provisioning.)
 
 -- The durable intent. Written in the same statement as the fact it describes, so
 -- the two commit together or neither does: there is no window in which a payment
@@ -498,7 +509,7 @@ BEGIN
     -- No declaration, or a revoked one, is not a delivery: it is an error the
     -- producer sees now, in its own transaction, rather than an intent that
     -- cannot be delivered later.
-    SELECT sp.producer_plugin, sp.revoked_at INTO declared
+    SELECT sp.producer_plugin, sp.revoked_at, sp.declared_by_core INTO declared
       FROM core.service_principals sp
      WHERE sp.principal = p_principal;
     IF NOT FOUND THEN
@@ -511,6 +522,15 @@ BEGIN
     IF declared.producer_plugin <> producer THEN
         RAISE EXCEPTION 'plugin % may not enqueue as principal % (declared for %)',
             producer, p_principal, declared.producer_plugin;
+    END IF;
+    -- The declaration that authorizes a delivery is the core's compiled
+    -- SERVICE_PRINCIPALS; this row is its mirror. Without this check the two could
+    -- disagree, and a row the core never declared would enqueue an intent that
+    -- could never be delivered -- a producer would inherit a stuck intent instead
+    -- of being told now, in its own transaction.
+    IF NOT declared.declared_by_core THEN
+        RAISE EXCEPTION 'service principal % is not declared by this core, so no intent enqueued as it could be delivered',
+            p_principal;
     END IF;
 
     -- Idempotent: the same fact enqueued twice (a producer retrying its own write,

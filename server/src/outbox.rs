@@ -211,9 +211,18 @@ pub async fn seed_service_principals(pool: &PgPool) -> Result<(), sqlx::Error> {
         .bind(d.description)
         .execute(pool)
         .await?;
+        // `declared_by_core` is what keeps the two ends agreeing: the compiled
+        // constant is the declaration and this row is its mirror, and
+        // `core.outbox_enqueue` refuses a principal the core never declared, so an
+        // intent that could never be delivered cannot be created in the first place.
+        // On conflict the flag is re-asserted but the revocation is left alone — a
+        // boot must never undo an operator's revocation.
         sqlx::query(
-            "INSERT INTO core.service_principals (principal, producer_plugin, description) \
-             VALUES ($1, $2, $3) ON CONFLICT (principal) DO NOTHING",
+            "INSERT INTO core.service_principals \
+                 (principal, producer_plugin, description, declared_by_core) \
+             VALUES ($1, $2, $3, true) \
+             ON CONFLICT (principal) DO UPDATE \
+                SET declared_by_core = true, producer_plugin = EXCLUDED.producer_plugin",
         )
         .bind(d.principal)
         .bind(d.producer)
@@ -1218,6 +1227,10 @@ mod tests {
     const PROBE_PLUGIN: &str = "outbox_probe";
     const OTHER_PLUGIN: &str = "outbox_probe_other";
     const PROBE_PRINCIPAL: &str = "svc.outbox_probe.ledger";
+    /// A principal row that exists in the data but that the core's compiled
+    /// declaration does not name: it must not be able to enqueue an intent that
+    /// could never be delivered.
+    const UNOWNED_PRINCIPAL: &str = "svc.outbox_probe.unowned";
     const OTHER_PRINCIPAL: &str = "svc.outbox_probe.other";
 
     /// Every intent these probes write carries this key prefix, so cleanup can
@@ -1348,9 +1361,14 @@ mod tests {
         .execute(pool)
         .await
         .expect("probe role");
+        // `declared_by_core = true` because this helper stands in for the core's own
+        // seeding: the compiled SERVICE_PRINCIPALS is the declaration, and
+        // `core.outbox_enqueue` refuses a principal the core never declared. A probe
+        // that skipped this flag would be testing a row that can never enqueue.
         sqlx::query(
-            "INSERT INTO core.service_principals (principal, producer_plugin, description) \
-             VALUES ($1, $2, 'probe fixture') ON CONFLICT (principal) DO NOTHING",
+            "INSERT INTO core.service_principals \
+                 (principal, producer_plugin, description, declared_by_core) \
+             VALUES ($1, $2, 'probe fixture', true) ON CONFLICT (principal) DO NOTHING",
         )
         .bind(principal)
         .bind(producer)
@@ -1813,6 +1831,40 @@ mod tests {
             err.to_string().contains("no service principal"),
             "the refusal must name the missing declaration: {err}"
         );
+        // A row that exists but that the core never declared: the compiled
+        // SERVICE_PRINCIPALS is what authorizes a delivery, so this must be refused
+        // *at enqueue* rather than becoming an intent that can never be delivered.
+        sqlx::query(
+            "INSERT INTO core.roles (id, display_name) VALUES ($1, $1) ON CONFLICT (id) DO NOTHING",
+        )
+        .bind(UNOWNED_PRINCIPAL)
+        .execute(pool.as_ref())
+        .await
+        .expect("unowned role");
+        sqlx::query(
+            "INSERT INTO core.service_principals \
+                 (principal, producer_plugin, description, declared_by_core) \
+             VALUES ($1, $2, 'a row the core never declared', false) \
+             ON CONFLICT (principal) DO NOTHING",
+        )
+        .bind(UNOWNED_PRINCIPAL)
+        .bind(PROBE_PLUGIN)
+        .execute(pool.as_ref())
+        .await
+        .expect("unowned declaration");
+        let err = plugin_enqueue(
+            &plugin,
+            UNOWNED_PRINCIPAL,
+            GATE_ROUTE,
+            &format!("{KEY_PREFIX}forge-3"),
+        )
+        .await
+        .expect_err("a principal the core never declared must not enqueue");
+        assert!(
+            err.to_string().contains("is not declared by this core"),
+            "the refusal must say the core does not declare it: {err}"
+        );
+
         let forged: i64 =
             sqlx::query_scalar("SELECT count(*)::bigint FROM core.outbox WHERE producer_plugin = $1")
                 .bind(PROBE_PLUGIN)
@@ -1866,6 +1918,7 @@ mod tests {
         );
 
         forget(pool.as_ref(), PROBE_PRINCIPAL, PROBE_PLUGIN).await;
+        forget(pool.as_ref(), UNOWNED_PRINCIPAL, PROBE_PLUGIN).await;
         forget(pool.as_ref(), OTHER_PRINCIPAL, OTHER_PLUGIN).await;
     }
 
