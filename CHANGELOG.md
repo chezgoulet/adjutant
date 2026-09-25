@@ -142,6 +142,39 @@ first-party plugin to pick the helpers up.
   and no rank in the software: commander-and-above is a `core.role_permissions`
   row the troop writes.
 
+### Changed
+
+- **`adjutant-stripe` enqueues its ledger booking as an outbox intent, in the
+  same statement that records a confirmed payment.** The core had the outbox, the
+  relay and the declared `svc.stripe.ledger` principal, and **no producer** —
+  that named gap is what this closes. `stripe`'s webhook now writes the payment
+  and its ledger intent with **one statement** — `core.outbox_enqueue(…)` as an
+  expression in the plugin's own `INSERT`, keyed on the payment's own `payment_id`
+  — so the fact and its intent commit together or neither does, a redelivered
+  webhook is handed back the intent it already has, and no transaction API had to
+  be added to the SDK to get it (`SDK_ABI_VERSION` stays 4; `plugins/sdk/**`
+  untouched). The intent's payload is composed **at enqueue time** and complete —
+  finance's fund *id* (resolved through `GET /api/finance/funds` exactly as
+  `/book` resolves it), `kind: income` with a positive magnitude, finance's
+  category, Stripe's payment id as `external_ref` — because the relay cannot
+  read-then-write at delivery. `ledger_status` gains one value,
+  **`intent_enqueued`** (an intent is enqueued and the relay will deliver it:
+  neither booked nor unbooked), added by a **new plugin migration 2** rather than
+  by editing migration 1, which an applied database skips without comparing its
+  SQL; the relay's outcome events then settle it to `booked`/`refused`/`failed`.
+  `GET /api/stripe/unbooked` lists an in-flight payment explicitly with its
+  `ledger_intent_id` and the intent's own state (through
+  `core.outbox_producer_view()`), and drops it once that durable state is
+  `delivered` — so the worklist's honesty does not depend on a notification
+  arriving. `payment.received` remains, as the fallback when no intent can be
+  composed. **What this does not close, stated rather than implied:** the
+  enqueue-time fund read is a §2(b) call carrying the caller's credential, and a
+  webhook has none, so where finance refuses that read no intent is composed and
+  the payment is recorded `unbooked` and delegated as before — that residual is
+  issue #60 (finance's write paths accept only a fund id). The plugin now
+  subscribes to `core.outbox.*` for that settlement (a notification; the intent
+  row is the durable record).
+
 ### Notes for plugin authors
 
 - Both plugins touch **no** `core.*` table: they keep to their own schema, so
