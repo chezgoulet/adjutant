@@ -11,6 +11,11 @@ members = [
     "plugins/governance",
     "plugins/calendar",
     "plugins/mcp",
+    "plugins/finance",
+    "plugins/equipment",
+    "plugins/archive",
+    "plugins/conflicts",
+    "plugins/announcements",
     "plugins/examples/hello",
     "server",
 ]

@@ -1,0 +1,19 @@
+[package]
+name = "adjutant-conflicts"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Conflicts: the staged resolution pathway and case management (SPEC 7.9)."
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+adjutant-sdk.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+chrono.workspace = true
+
+[dev-dependencies]
+tokio.workspace = true

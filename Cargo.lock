@@ -12,6 +12,28 @@ dependencies = [
 ]
 
 [[package]]
+name = "adjutant-announcements"
+version = "0.2.0"
+dependencies = [
+ "adjutant-sdk",
+ "chrono",
+ "serde",
+ "serde_json",
+ "tokio",
+]
+
+[[package]]
+name = "adjutant-archive"
+version = "0.2.0"
+dependencies = [
+ "adjutant-sdk",
+ "chrono",
+ "serde",
+ "serde_json",
+ "tokio",
+]
+
+[[package]]
 name = "adjutant-auth"
 version = "0.2.0"
 dependencies = [
@@ -30,6 +52,39 @@ dependencies = [
 
 [[package]]
 name = "adjutant-calendar"
+version = "0.2.0"
+dependencies = [
+ "adjutant-sdk",
+ "chrono",
+ "serde",
+ "serde_json",
+ "tokio",
+]
+
+[[package]]
+name = "adjutant-conflicts"
+version = "0.2.0"
+dependencies = [
+ "adjutant-sdk",
+ "chrono",
+ "serde",
+ "serde_json",
+ "tokio",
+]
+
+[[package]]
+name = "adjutant-equipment"
+version = "0.2.0"
+dependencies = [
+ "adjutant-sdk",
+ "chrono",
+ "serde",
+ "serde_json",
+ "tokio",
+]
+
+[[package]]
+name = "adjutant-finance"
 version = "0.2.0"
 dependencies = [
  "adjutant-sdk",
