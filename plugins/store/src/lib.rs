@@ -203,7 +203,7 @@ use std::collections::BTreeMap;
 use std::sync::OnceLock;
 
 use adjutant_sdk::prelude::*;
-use chrono::NaiveDate;
+use chrono::{NaiveDate, Utc};
 use serde::Deserialize;
 use serde_json::{json, Value};
 
@@ -274,11 +274,18 @@ pub const DRAW_BOOKED: &str = "booked";
 pub const DRAW_REFUSED: &str = "refused";
 /// The call failed or finance answered a server error.
 pub const DRAW_FAILED: &str = "failed";
+/// An outbox intent is enqueued and the core's relay will deliver it: the order
+/// and its draw intent committed **in one statement**, and the money is
+/// **neither booked nor unbooked** until finance answers. The intent's durable
+/// state is what decides — the relay's notification only settles this word.
+pub const DRAW_INTENT_ENQUEUED: &str = "intent_enqueued";
 
-/// The draw states, and the closed set the database constrains.
-pub const DRAW_STATUSES: [&str; 6] = [
+/// The draw states, and the closed set the database constrains. Migration **2**
+/// admits `intent_enqueued`; the original six are migration 1's.
+pub const DRAW_STATUSES: [&str; 7] = [
     DRAW_NONE,
     DRAW_UNBOOKED,
+    DRAW_INTENT_ENQUEUED,
     DRAW_ATTEMPTING,
     DRAW_BOOKED,
     DRAW_REFUSED,
@@ -412,6 +419,9 @@ pub const EVENT_ORDER_PAID: &str = "store.order.paid";
 pub const EVENT_ORDER_COMPED: &str = "store.order.comped";
 /// A draw on the scholarship fund landed in the ledger.
 pub const EVENT_DRAW_BOOKED: &str = "store.order.draw_booked";
+/// A draw was enqueued as an outbox intent, in the same statement that completed
+/// (or comped) the order. The relay will deliver it; nothing is booked yet.
+pub const EVENT_DRAW_ENQUEUED: &str = "store.order.draw_enqueued";
 /// The sweep's notice: orders awaiting payment, or completed with a draw or a
 /// ledger entry that is not confirmed.
 pub const EVENT_ORDERS_UNSETTLED: &str = "store.orders.unsettled";
@@ -426,6 +436,30 @@ pub const MECHANISM_STRIPE_PAYMENT: &str = "caller-forward:GET /api/stripe/payme
 pub const MECHANISM_STRIPE_BOOK: &str = "caller-forward:POST /api/stripe/payment/{id}/book";
 /// The scholarship draw, as finance's balanced transfer.
 pub const MECHANISM_FINANCE_TRANSFER: &str = "caller-forward:POST /api/finance/transfer";
+/// The scholarship draw as the core's relay delivers it: an outbox intent, booked
+/// by the declared `svc.store.draw` principal with no caller anywhere.
+pub const MECHANISM_OUTBOX_DRAW: &str = "outbox:POST /api/finance/transfer";
+
+/// **The machine identity this plugin's draw is delivered as** — declared for the
+/// `store` producer alone, with the one grant finance's transfer route gates on
+/// (`finance:write`). It is named here because the enqueue expression names it:
+/// `core.outbox_enqueue` takes no identity parameter, so the only principal this
+/// plugin can enqueue as is its own, and the core refuses any other.
+pub const DRAW_PRINCIPAL: &str = "svc.store.draw";
+
+/// The core's own notification that an intent reached a terminal state. **Not how
+/// the ledger learns anything** — the intent is. This is how this plugin settles
+/// its `draw_status` from finance's answer, which is what the core's docs say a
+/// producer should do. The worklist does not depend on it (`sql_unsettled` reads
+/// the intent's durable state), so a dropped event cannot make a draw invisible or
+/// invent one.
+pub const OUTBOX_EVENT_PREFIX: &str = "core.outbox.";
+/// Read through `core.outbox_producer_view()`: the durable record decided.
+pub const OUTBOX_DELIVERED: &str = "delivered";
+/// Finance refused the delivery, in its own words.
+pub const OUTBOX_REFUSED: &str = "refused";
+/// The relay spent every attempt on it.
+pub const OUTBOX_EXHAUSTED: &str = "exhausted";
 
 /// Stripe's checkout route.
 pub const STRIPE_CHECKOUT_PATH: &str = "/api/stripe/checkout";
@@ -1142,125 +1176,24 @@ impl Default for StorePlugin {
 /// Vocabulary that reaches a decision is a constraint rather than a convention: a
 /// comp with no reason, a paid order with no payment reference, and money figures
 /// that do not agree are all unrepresentable.
-const MIGRATION_SCHEMA: &str = r#"
-CREATE TABLE IF NOT EXISTS catalogue_items (
-    id BIGSERIAL PRIMARY KEY,
-    kind TEXT NOT NULL DEFAULT 'product',
-    sku TEXT,
-    name TEXT NOT NULL,
-    category TEXT NOT NULL DEFAULT 'other',
-    description TEXT NOT NULL DEFAULT '',
-    base_price_cents BIGINT NOT NULL,
-    currency TEXT NOT NULL DEFAULT 'cad',
-    fund_code TEXT NOT NULL DEFAULT '',
-    equipment_item_id BIGINT,
-    active BOOLEAN NOT NULL DEFAULT true,
-    created_by TEXT NOT NULL DEFAULT '',
-    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-    updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-    CONSTRAINT store_items_kind_valid CHECK (kind IN ('product', 'rental')),
-    CONSTRAINT store_items_name_not_blank CHECK (btrim(name) <> ''),
-    CONSTRAINT store_items_category_valid CHECK (category IN (
-        'uniform', 'patch', 'insignia', 'gear', 'merch', 'other')),
-    CONSTRAINT store_items_price_valid CHECK (
-        base_price_cents >= 0 AND base_price_cents <= 100000000),
-    CONSTRAINT store_items_rental_names_its_item CHECK (
-        (kind = 'rental') = (equipment_item_id IS NOT NULL)),
-    CONSTRAINT store_items_equipment_id_positive CHECK (
-        equipment_item_id IS NULL OR equipment_item_id > 0)
-);
-CREATE UNIQUE INDEX IF NOT EXISTS idx_store_items_sku ON catalogue_items(sku)
-  WHERE sku IS NOT NULL;
-CREATE INDEX IF NOT EXISTS idx_store_items_kind ON catalogue_items(kind, active);
-CREATE INDEX IF NOT EXISTS idx_store_items_category ON catalogue_items(category);
-
-CREATE TABLE IF NOT EXISTS orders (
-    id BIGSERIAL PRIMARY KEY,
-    member_id TEXT NOT NULL,
-    placed_by TEXT NOT NULL DEFAULT '',
-    status TEXT NOT NULL DEFAULT 'open',
-    currency TEXT NOT NULL DEFAULT 'cad',
-    price_tier TEXT NOT NULL DEFAULT 'standard',
-    price_cents BIGINT NOT NULL DEFAULT 0,
-    charged_cents BIGINT NOT NULL DEFAULT 0,
-    funded_cents BIGINT NOT NULL DEFAULT 0,
-    fund_code TEXT NOT NULL DEFAULT '',
-    note TEXT NOT NULL DEFAULT '',
-    stripe_session_row BIGINT,
-    stripe_session_id TEXT NOT NULL DEFAULT '',
-    checkout_url TEXT NOT NULL DEFAULT '',
-    payment_ref TEXT NOT NULL DEFAULT '',
-    ledger_status TEXT NOT NULL DEFAULT '',
-    ledger_transaction_id TEXT,
-    ledger_error TEXT,
-    completed_by TEXT NOT NULL DEFAULT '',
-    completed_at TIMESTAMPTZ,
-    comp_reason TEXT NOT NULL DEFAULT '',
-    comp_by TEXT NOT NULL DEFAULT '',
-    comp_at TIMESTAMPTZ,
-    draw_status TEXT NOT NULL DEFAULT 'none',
-    draw_ref TEXT NOT NULL DEFAULT '',
-    draw_error TEXT,
-    draw_by TEXT NOT NULL DEFAULT '',
-    draw_attempted_at TIMESTAMPTZ,
-    draw_booked_at TIMESTAMPTZ,
-    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-    updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-    CONSTRAINT store_orders_member_present CHECK (btrim(member_id) <> ''),
-    CONSTRAINT store_orders_status_valid CHECK (status IN (
-        'open', 'awaiting_payment', 'paid', 'comped')),
-    CONSTRAINT store_orders_tier_valid CHECK (price_tier IN (
-        'patron', 'standard', 'supported', 'hardship')),
-    CONSTRAINT store_orders_money_not_negative CHECK (
-        price_cents >= 0 AND charged_cents >= 0 AND funded_cents >= 0),
-    CONSTRAINT store_orders_charge_within_price CHECK (charged_cents <= price_cents),
-    CONSTRAINT store_orders_funding_is_the_difference CHECK (
-        funded_cents = price_cents - charged_cents),
-    CONSTRAINT store_orders_draw_status_valid CHECK (draw_status IN (
-        'none', 'unbooked', 'attempting', 'booked', 'refused', 'failed')),
-    CONSTRAINT store_orders_draw_matches_funding CHECK (
-        (funded_cents = 0) = (draw_status = 'none')),
-    CONSTRAINT store_orders_draw_booked_has_reference CHECK (
-        draw_status <> 'booked' OR (btrim(draw_ref) <> '' AND draw_booked_at IS NOT NULL)),
-    CONSTRAINT store_orders_paid_is_charged CHECK (
-        status <> 'paid' OR (charged_cents = price_cents AND charged_cents > 0
-            AND btrim(payment_ref) <> '' AND completed_at IS NOT NULL)),
-    CONSTRAINT store_orders_comp_is_an_authority CHECK (
-        status <> 'comped' OR (charged_cents = 0 AND funded_cents = price_cents
-            AND btrim(comp_reason) <> '' AND btrim(comp_by) <> '' AND comp_at IS NOT NULL)),
-    CONSTRAINT store_orders_awaiting_has_a_session CHECK (
-        status <> 'awaiting_payment' OR btrim(stripe_session_id) <> '')
-);
-CREATE INDEX IF NOT EXISTS idx_store_orders_member ON orders(member_id, id DESC);
-CREATE INDEX IF NOT EXISTS idx_store_orders_status ON orders(status, id DESC);
-CREATE INDEX IF NOT EXISTS idx_store_orders_draw ON orders(draw_status, id DESC);
-CREATE INDEX IF NOT EXISTS idx_store_orders_comp ON orders(comp_at DESC)
-  WHERE status = 'comped';
-
-CREATE TABLE IF NOT EXISTS order_lines (
-    id BIGSERIAL PRIMARY KEY,
-    order_id BIGINT NOT NULL REFERENCES orders(id) ON DELETE CASCADE,
-    catalogue_item_id BIGINT NOT NULL,
-    item_name TEXT NOT NULL,
-    item_kind TEXT NOT NULL DEFAULT 'product',
-    fund_code TEXT NOT NULL DEFAULT '',
-    equipment_item_id BIGINT,
-    list_price_cents BIGINT NOT NULL,
-    unit_price_cents BIGINT NOT NULL,
-    quantity INTEGER NOT NULL,
-    line_total_cents BIGINT NOT NULL,
-    CONSTRAINT store_lines_kind_valid CHECK (item_kind IN ('product', 'rental')),
-    CONSTRAINT store_lines_quantity_range CHECK (quantity > 0 AND quantity <= 100),
-    CONSTRAINT store_lines_prices_valid CHECK (
-        list_price_cents >= 0 AND unit_price_cents >= 0),
-    CONSTRAINT store_lines_charged_within_price CHECK (unit_price_cents <= list_price_cents),
-    CONSTRAINT store_lines_total_matches CHECK (line_total_cents = unit_price_cents * quantity),
-    CONSTRAINT store_lines_rental_names_its_item CHECK (
-        (item_kind = 'rental') = (equipment_item_id IS NOT NULL))
-);
-CREATE INDEX IF NOT EXISTS idx_store_lines_order ON order_lines(order_id);
-CREATE INDEX IF NOT EXISTS idx_store_lines_item ON order_lines(catalogue_item_id);
-"#;
+///
+/// The SQL lives in `migrations/*.sql`, one file per version:
+///
+/// * `001_store_schema` — the three tables, byte-identical to the SQL that
+///   shipped as `MIGRATION_SCHEMA` (the version and name in
+///   `core.schema_migrations` are unchanged, so no deployed database re-runs
+///   anything).
+/// * `002_store_draw_intent` — `orders.draw_intent_id` and the replaced
+///   `draw_status` check that admits `intent_enqueued`. A **new version** on
+///   purpose: the runner skips an applied version *without comparing its SQL*, so
+///   amending version 1 would be invisible on every deployed database while
+///   looking correct on a fresh one.
+pub mod migrations {
+    adjutant_sdk::migrations! {
+        1 => "store_schema" => "../migrations/001_store_schema.sql";
+        2 => "store_draw_intent" => "../migrations/002_store_draw_intent.sql";
+    }
+}
 
 #[async_trait]
 impl AdjutantPlugin for StorePlugin {
@@ -1313,21 +1246,75 @@ impl AdjutantPlugin for StorePlugin {
     }
 
     fn migrations(&self) -> Vec<Migration> {
-        vec![Migration::new(1, "store_schema", MIGRATION_SCHEMA)]
+        migrations::all()
     }
 
     fn routes(&self) -> Vec<RouteDefinition> {
         store_routes(self.ctx(), self.config())
     }
 
-    // No subscriptions, on purpose. A paid order is completed by a caller
-    // (plugin-to-plugin.md §2(b)) — stripe's webhook confirms the *payment* to
-    // stripe, and an event could not carry an answer back here (§3.2). A
-    // subscriber that marked an order paid would be exactly the fire-and-forget
-    // money path that section refuses, and it could not even correlate reliably:
-    // `stripe.payment.confirmed` carries the Checkout session id only for the
-    // `checkout.session.completed` shape, and empty for `payment_intent.succeeded`.
-    // The worklist and a caller-driven completion are the honest mechanism.
+    /// The core's own **notification** that an intent reached a terminal state.
+    ///
+    /// Not how the ledger learns anything — the intent is. This is how this
+    /// plugin settles its own `draw_status` from finance's answer, which the
+    /// core's docs say a producer should do. The worklist does not depend on it
+    /// (`sql_unsettled` reads the intent's durable state), so a dropped event
+    /// cannot make a draw invisible or invent one.
+    ///
+    /// The paid-order path is still a caller's (§2(b)): stripe's webhook confirms
+    /// the *payment* to stripe, and no event could carry an answer back here
+    /// (§3.2), so a subscriber that marked an order paid would be exactly the
+    /// fire-and-forget money path that section refuses. This subscription is
+    /// narrower than that: it settles a draw whose intent **this plugin already
+    /// enqueued**, by the intent id the relay names.
+    fn subscriptions(&self) -> Vec<EventSubscription> {
+        let ctx = self.ctx().clone();
+        vec![EventSubscription::new(
+            OUTBOX_EVENT_PREFIX,
+            event_handler(move |ev| {
+                let c = ctx.clone();
+                async move {
+                    let intent_id = ev.payload["intent_id"].as_i64().unwrap_or_default();
+                    // The bus is a broadcast: every subscriber sees every
+                    // producer's outcome, so one of them has to be somebody
+                    // else's business and is passed over.
+                    if intent_id == 0 || ev.payload["producer"].as_str() != Some("store") {
+                        return Ok(());
+                    }
+                    let (status, draw_ref) = match ev.payload["state"].as_str() {
+                        Some(OUTBOX_DELIVERED) => (
+                            DRAW_BOOKED,
+                            ev.payload["answer"]["transfer_group"]
+                                .as_str()
+                                .map(str::to_string),
+                        ),
+                        Some(OUTBOX_REFUSED) => (DRAW_REFUSED, None),
+                        Some(OUTBOX_EXHAUSTED) => (DRAW_FAILED, None),
+                        // `pending`/`attempting` are not terminal: the relay is
+                        // still working, and a transient failure is not an
+                        // outcome to write down.
+                        _ => return Ok(()),
+                    };
+                    let error = ev.payload["error"].as_str().map(str::to_string);
+                    c.db.execute(
+                        sql_settle_from_intent(&c),
+                        vec![
+                            SqlValue::Int(intent_id),
+                            SqlValue::Text(status.to_string()),
+                            draw_ref.map(SqlValue::Text).unwrap_or(SqlValue::Null),
+                            error.map(SqlValue::Text).unwrap_or(SqlValue::Null),
+                        ],
+                    )
+                    .await?;
+                    eprintln!(
+                        "[adjutant-store] intent {intent_id} {status}: an order's draw_status \
+                         settled from its intent's outcome"
+                    );
+                    Ok(())
+                }
+            }),
+        )]
+    }
 
     fn schedules(&self) -> Vec<Schedule> {
         let ctx = self.ctx().clone(); // owned: the closure must not borrow self
@@ -1360,7 +1347,7 @@ fn store_routes(ctx: &PluginContext, cfg: &StoreConfig) -> Vec<RouteDefinition> 
         route_get_order(ctx),
         route_checkout(ctx, cfg),
         route_complete(ctx, cfg),
-        route_comp(ctx, cfg),
+        route_comp(ctx),
         route_draw(ctx, cfg),
         route_comps(ctx),
     ]
@@ -1382,7 +1369,7 @@ const ORDER_FIELDS: &str = "o.id, o.member_id, o.placed_by, o.status, o.currency
      o.payment_ref, o.ledger_status, o.ledger_transaction_id, o.ledger_error, \
      o.completed_by, o.completed_at, o.comp_reason, o.comp_by, o.comp_at, \
      o.draw_status, o.draw_ref, o.draw_error, o.draw_by, o.draw_attempted_at, \
-     o.draw_booked_at, o.created_at, o.updated_at";
+     o.draw_booked_at, o.draw_intent_id, o.created_at, o.updated_at";
 
 /// The columns an order line is read as.
 const LINE_FIELDS: &str = "l.id, l.order_id, l.catalogue_item_id, l.item_name, l.item_kind, \
@@ -1451,14 +1438,92 @@ fn sql_items_by_ids(c: &PluginContext) -> String {
     )
 }
 
+/// The intent columns the worklist carries: the order's draw intent, read through
+/// `core.outbox_producer_view()` — the producer's own intents, without a grant on
+/// `core.outbox`, scoped to the plugin role by the function itself. They are
+/// `NULL` for an order with no intent. Both that function and
+/// `core.outbox_enqueue` are core migration 9; a core older than that cannot serve
+/// this worklist (or accept this plugin's enqueue).
+const INTENT_FIELDS: &str = "v.id AS intent_id, v.state AS intent_state, \
+     v.attempts AS intent_attempts, v.max_attempts AS intent_max_attempts, \
+     v.answer_status AS intent_answer_status, v.last_error AS intent_last_error, \
+     v.delivered_at::text AS intent_delivered_at";
+
 /// Every completion writes the same guard: the order is still completable, and the
 /// row that comes back is the row the caller will see. A second completion is a
 /// `409` rather than a second write.
 fn sql_complete_order(c: &PluginContext, set: &str, guard: &str) -> String {
     format!(
-        "UPDATE {orders} o SET {set}, o.updated_at = now() \
+        "UPDATE {orders} o SET {set}, updated_at = now() \
          WHERE o.id = $1 AND {guard} RETURNING {ORDER_FIELDS}",
         orders = c.db.table("orders")
+    )
+}
+
+/// The draw's intent, enqueued by the **same statement** that completes (or
+/// comps) the order.
+///
+/// `core.outbox_enqueue` returns a scalar, so it fits as an expression in the
+/// `UPDATE`'s own `SET` clause: PostgreSQL runs that statement in one implicit
+/// transaction, so the order's transition and its intent commit together or
+/// neither does. There is no window in which an order is completed with a
+/// scholarship draw owing and nothing booked, and no transaction API is added to
+/// the SDK to get it (the plugin holds no `BEGIN`).
+///
+/// The idempotency key is **deterministic per draw** — `store-order-<id>-draw`
+/// — so a producer retrying its own write is handed back the intent it already
+/// has, exactly once per order. The function derives the producer from
+/// `session_user` (this plugin's own role) and refuses any principal not declared
+/// for it; it takes no identity parameter, so this plugin cannot enqueue as
+/// anything but itself.
+fn draw_enqueue_expr(payload_param: &str) -> String {
+    format!(
+        "core.outbox_enqueue('{DRAW_PRINCIPAL}', 'POST', '{FINANCE_TRANSFER_PATH}', \
+         {payload_param}::jsonb, 'store-order-' || o.id || '-draw')"
+    )
+}
+
+/// The draw's intent payload — **complete at enqueue time**, because the relay
+/// cannot read for it: the fund codes, the amount, the description and the date
+/// are all here, and `allow_overdraft` is `false` because no human decided an
+/// overdraft (a machine may not).
+///
+/// The funds are named by **code**, which is the reference `plugin-to-plugin.md`
+/// §3.5 asks for and what finance resolves inside its own transfer statement — so
+/// this plugin never has to read finance first. `fiscal_year` is deliberately
+/// omitted: finance derives it from `occurred_on` against its own fiscal calendar,
+/// which is finance's to know.
+fn draw_intent_payload(order_id: i64, funded_cents: i64, to_fund_code: &str) -> Value {
+    json!({
+        "from_fund_code": FUND_SCHOLARSHIP,
+        "to_fund_code": to_fund_code,
+        "amount_cents": funded_cents,
+        "description": format!("Store order {order_id} scholarship draw"),
+        "occurred_on": Utc::now().date_naive().to_string(),
+        "allow_overdraft": false,
+    })
+}
+
+/// Settle an order's draw from its intent's terminal outcome — what the relay
+/// publishes, read by the producer.
+///
+/// Guarded on `draw_status = 'intent_enqueued'` and on the intent id, so a
+/// replayed event is a no-op (one intent, one answer) and only the order that
+/// enqueued *this* intent can be settled by it. `draw_ref` is finance's own
+/// `transfer_group` from the answer; when the answer does not carry one the
+/// order's existing reference stands, and `store_orders_draw_booked_has_reference`
+/// keeps `booked` from meaning two different things.
+fn sql_settle_from_intent(c: &PluginContext) -> String {
+    format!(
+        "UPDATE {orders} o SET draw_status = $2, draw_ref = COALESCE($3, o.draw_ref), \
+         draw_error = $4, \
+         draw_booked_at = CASE WHEN $2 = '{booked}' THEN now() ELSE NULL END, \
+         updated_at = now() \
+         WHERE o.draw_intent_id = $1 AND o.draw_status = '{intent}' \
+         RETURNING {ORDER_FIELDS}",
+        orders = c.db.table("orders"),
+        booked = DRAW_BOOKED,
+        intent = DRAW_INTENT_ENQUEUED,
     )
 }
 
@@ -1515,23 +1580,38 @@ fn route_health(ctx: &PluginContext, cfg: &StoreConfig) -> RouteDefinition {
                         "money_path": {
                             "checkout": format!("caller-forward:POST {STRIPE_CHECKOUT_PATH}"),
                             "completion": format!("caller-forward:POST {STRIPE_PAYMENT_PATH}/{{id}}/book"),
-                            "subsidy": format!("caller-forward:POST {FINANCE_TRANSFER_PATH}"),
+                            "subsidy": MECHANISM_OUTBOX_DRAW,
+                            "subsidy_principal": DRAW_PRINCIPAL,
+                            "subsidy_route": format!("POST {FINANCE_TRANSFER_PATH}"),
                             "member_driven": "a member's own session buys a patch: the shop calls \
                                               stripe as the caller and stripe's gate re-decides",
-                            "reduction_draw": "unbooked",
+                            "reduction_draw": "the draw is enqueued as a durable outbox intent by \
+                                               the same statement that completes (or comps) the \
+                                               order, and the core's relay delivers it as \
+                                               svc.store.draw: neither booked nor unbooked until \
+                                               finance answers",
                             "synchronous": false,
                             "why": "a sliding-scale reduction is applied by the shop, and a Stripe \
                                     webhook confirming a payment carries no Adjutant caller, so \
                                     there is no credential to forward for either; minting one is \
-                                    what plugin-to-plugin.md §3.1 refuses",
-                            "unverified": "no answer comes back on a machine-originated \
-                                           confirmation, so this plugin cannot tell whether the \
-                                           ledger write happened; GET /api/store/orders/unsettled \
-                                           is the worklist",
-                            "blocked_on": "plugin-to-plugin.md §3.2 decided a core transactional \
-                                           outbox with an idempotent consumer, authorised by a \
-                                           declared service principal; the outbox, the relay and \
-                                           the registry are not built yet",
+                                    what plugin-to-plugin.md §3.1 refuses. The intent is the \
+                                    answer instead: the core's relay carries a declared machine \
+                                    identity the operator can revoke",
+                            "intent": "the order's transition and its draw intent are written in \
+                                       one statement (core.outbox_enqueue as an expression in this \
+                                       plugin's own UPDATE), so neither can exist without the \
+                                       other, and the key is deterministic per draw \
+                                       (store-order-<id>-draw)",
+                            "unverified": "the relay's delivery is asynchronous: 'intent_enqueued' \
+                                           is neither booked nor unbooked, and GET \
+                                           /api/store/orders/unsettled is the worklist — with \
+                                           each order's draw_intent_id and the intent's own state, \
+                                           and it drops the order once that state is 'delivered'",
+                            "blocked_on": "nothing on this path: a fund code is a complete answer. \
+                                           What a machine-originated producer still cannot do is \
+                                           READ finance (funds, balances, the ledger) — it can \
+                                           instruct, not ask, because the read is a caller's and \
+                                           it holds no credential",
                             "zero_amount": "a comp is not a zero-amount entry: finance refuses one \
                                             (transactions_amount_nonzero), and it does not need \
                                             one — the subsidy is a positive transfer out of the \
@@ -2329,17 +2409,26 @@ fn route_list_orders(ctx: &PluginContext) -> RouteDefinition {
     )
 }
 
-/// `GET /api/store/orders/unsettled?older_than_minutes=&limit=` — the worklist.
+/// `GET /api/store/orders/unsettled?older_than_minutes=&limit=` — the worklist,
+/// and **the in-flight case stated rather than hidden**.
 ///
-/// Two shapes of "not settled" appear together, because from here they cannot be
+/// The shapes of "not settled" appear together, because from here they cannot be
 /// told apart and pretending otherwise is how a shop starts losing money quietly:
 ///
 /// * an order **awaiting payment** older than the threshold: the member may not
 ///   have paid, or may have paid and this plugin cannot see it — a Stripe webhook
 ///   confirms the payment to *stripe*, and there is no caller for it to reach this
 ///   order;
-/// * an order **completed** whose draw is not `booked`, or whose ledger entry
-///   stripe did not confirm: money moved, the ledger has no record of it yet.
+/// * an order whose draw is an **outbox intent** (`draw_in_flight`): neither
+///   booked nor unbooked, so it is listed with its `draw_intent_id` and the
+///   intent's own state (`intent_state`, `intent_attempts`, `intent_last_error`,
+///   read through `core.outbox_producer_view()`). The durable intent decides the
+///   row's fate: once its state is `delivered` the draw is confirmed and the order
+///   drops out, whatever a lost notification did or did not say;
+/// * an order whose draw is **`unbooked` with no intent** — the pre-existing case,
+///   and the remaining hand-job: a reduction a treasurer books with
+///   `POST /api/store/order/{id}/draw`;
+/// * an order whose ledger entry stripe did not confirm.
 ///
 /// One query.
 fn route_unsettled(ctx: &PluginContext, cfg: &StoreConfig) -> RouteDefinition {
@@ -2381,6 +2470,14 @@ fn route_unsettled(ctx: &PluginContext, cfg: &StoreConfig) -> RouteDefinition {
                         by_reason.insert(reason.to_string(), json!(count));
                     }
                 }
+                // The in-flight case is counted apart from the rest, because it is
+                // the one an operator should *not* act on by hand: the core's relay
+                // is already delivering it, and `intent_state` says what it is
+                // doing.
+                let in_flight = rows
+                    .iter()
+                    .filter(|row| row["draw_status"].as_str() == Some(DRAW_INTENT_ENQUEUED))
+                    .count();
                 PluginResponse::json(
                     200,
                     &json!({
@@ -2389,13 +2486,19 @@ fn route_unsettled(ctx: &PluginContext, cfg: &StoreConfig) -> RouteDefinition {
                         "total_unsettled": total,
                         "older_than_minutes": older_than,
                         "by_reason": Value::Object(by_reason),
-                        "note": "an order awaiting payment cannot be told from one this plugin \
-                                 cannot see paid, because a Stripe webhook confirms the payment to \
-                                 stripe and carries no Adjutant caller (plugin-to-plugin.md §3.2, \
-                                 whose outbox is not built). A shopkeeper confirms one with POST \
-                                 /api/store/order/{id}/complete, verified against stripe's own \
-                                 record; a treasurer books an unbooked draw with POST \
-                                 /api/store/order/{id}/draw",
+                        "in_flight": in_flight,
+                        "note": "each row says which case it is. 'draw_in_flight' means the draw \
+                                 is an outbox intent the core's relay is delivering — neither \
+                                 booked nor unbooked: `draw_intent_id` names it and the intent_* \
+                                 columns carry its own state, and the order leaves this list once \
+                                 that state is 'delivered'. 'draw_unbooked' with no intent is the \
+                                 real hand-job (a reduction): book it as a caller holding \
+                                 finance:write from POST /api/store/order/{id}/draw. An order \
+                                 awaiting payment cannot be told from one this plugin cannot see \
+                                 paid, because a Stripe webhook confirms the payment to stripe \
+                                 and carries no Adjutant caller: a shopkeeper confirms one with \
+                                 POST /api/store/order/{id}/complete, verified against stripe's \
+                                 own record",
                     }),
                 )
             }
@@ -2404,33 +2507,48 @@ fn route_unsettled(ctx: &PluginContext, cfg: &StoreConfig) -> RouteDefinition {
 }
 
 /// The reasons an order appears on the worklist, in the order it is reported.
-pub const UNSETTLED_REASONS: [&str; 3] = [
+pub const UNSETTLED_REASONS: [&str; 4] = [
     "awaiting_payment",
+    "draw_in_flight",
     "draw_unbooked",
     "ledger_unconfirmed",
 ];
 
-/// The worklist statement. One row per unsettled order, with the count of them
-/// all, so one statement answers both "which" and "how many".
+/// The worklist statement. One row per unsettled order — **including an order
+/// whose draw intent is in flight**, listed explicitly with its `draw_intent_id`
+/// and the intent's own state — and the count of them all, so one statement
+/// answers both "which" and "how many".
+///
+/// The intent's durable state, read through `core.outbox_producer_view()`, is what
+/// decides the in-flight case: `intent_enqueued` with an intent that has not
+/// `delivered` is listed, and it **drops out the moment the intent's state is
+/// `delivered`** — before any notification arrives, and whether or not one ever
+/// does (the ledger entry exists either way). An order with no intent at all
+/// (`v.state IS NULL`) is the pre-existing case and stays listed.
 fn sql_unsettled(c: &PluginContext) -> String {
     format!(
-        "SELECT {ORDER_FIELDS}, \
+        "SELECT {ORDER_FIELDS}, {INTENT_FIELDS}, \
                 CASE WHEN o.status = '{awaiting}' THEN 'awaiting_payment' \
+                     WHEN o.funded_cents > 0 AND o.draw_status = '{intent}' THEN 'draw_in_flight' \
                      WHEN o.funded_cents > 0 AND o.draw_status <> '{booked}' THEN 'draw_unbooked' \
                      ELSE 'ledger_unconfirmed' END AS unsettled_reason, \
                 COUNT(*) OVER ()::bigint AS total_unsettled \
          FROM {orders} o \
+         LEFT JOIN core.outbox_producer_view() v ON v.id = o.draw_intent_id \
          WHERE (o.status = '{awaiting}' \
                 AND o.created_at < now() - ($1 || ' minutes')::interval) \
             OR (o.status = '{paid}' AND o.ledger_status <> '{ledger_booked}') \
             OR (o.status IN ('{paid}', '{comped}') AND o.funded_cents > 0 \
-                AND o.draw_status <> '{booked}') \
+                AND o.draw_status <> '{booked}' \
+                AND v.state IS DISTINCT FROM '{delivered}') \
          ORDER BY o.id DESC LIMIT $2",
         orders = c.db.table("orders"),
         awaiting = STATUS_AWAITING_PAYMENT,
         paid = STATUS_PAID,
         comped = STATUS_COMPED,
         booked = DRAW_BOOKED,
+        intent = DRAW_INTENT_ENQUEUED,
+        delivered = OUTBOX_DELIVERED,
         ledger_booked = LEDGER_BOOKED,
     )
 }
@@ -2740,11 +2858,15 @@ fn route_checkout(ctx: &PluginContext, cfg: &StoreConfig) -> RouteDefinition {
 ///    being left to an event nobody can see. Finance's gate re-decides
 ///    `finance:write`, and its refusal is passed through, not flattened.
 /// 3. The order is marked `paid` with stripe's payment id (opaque) and finance's
-///    own answer, and the *draw* is left for a treasurer if the tier funded any
-///    of it — that money is a separate transfer with its own authority.
+///    own answer; a tier-funded order's **draw** is enqueued as an outbox intent
+///    in that same statement — see [`draw_enqueue_expr`] — so the completion and
+///    the scholarship transfer finance will make are one act, and no treasurer has
+///    to be present for the money to reach the ledger.
 ///
 /// A completed order is never completed twice: the update is guarded on the
-/// status, so a second call is a `409` rather than a second record.
+/// status, so a second call is a `409` rather than a second record — and the
+/// intent's key is deterministic per draw, so even a replay that got past the
+/// guard would be handed back the intent the order already has.
 ///
 /// Queries: the order, then the guarded update. Then the audit write.
 fn route_complete(ctx: &PluginContext, cfg: &StoreConfig) -> RouteDefinition {
@@ -2865,8 +2987,38 @@ fn route_complete(ctx: &PluginContext, cfg: &StoreConfig) -> RouteDefinition {
                     .and_then(|finance| finance.get("transaction_id"))
                     .and_then(Value::as_i64);
                 let ledger_error = booking.error.clone();
-                // 3. The order is what the payment says it is.
+                // 3. The order is what the payment says it is — and, when the tier
+                //    funded any of it, so is the draw: the intent is enqueued by
+                //    this **same statement**, so the transition and the intent
+                //    commit together or neither does.
                 let payment_ref = payment["payment_id"].as_str().unwrap_or_default().to_string();
+                let funded = order["funded_cents"].as_i64().unwrap_or(0);
+                let to_fund_code = order["fund_code"].as_str().unwrap_or_default().to_string();
+                let draw_set = if funded > 0 {
+                    format!(
+                        ", draw_status = '{intent}', draw_by = $6, draw_attempted_at = now(), \
+                         draw_intent_id = {enqueue}",
+                        intent = DRAW_INTENT_ENQUEUED,
+                        enqueue = draw_enqueue_expr("$7"),
+                    )
+                } else {
+                    String::new()
+                };
+                let mut complete_params = vec![
+                    SqlValue::Int(id),
+                    SqlValue::Text(payment_ref.clone()),
+                    SqlValue::Text(ledger_status.clone()),
+                    ledger_transaction_id
+                        .map(SqlValue::Int)
+                        .unwrap_or(SqlValue::NullInt),
+                    ledger_error.clone().map(SqlValue::Text).unwrap_or(SqlValue::Null),
+                    SqlValue::Text(caller_of(&req).unwrap_or_default()),
+                ];
+                if funded > 0 {
+                    complete_params.push(SqlValue::Json(
+                        draw_intent_payload(id, funded, &to_fund_code).to_string(),
+                    ));
+                }
                 let Some(updated) = c
                     .db
                     .query_one(
@@ -2875,7 +3027,7 @@ fn route_complete(ctx: &PluginContext, cfg: &StoreConfig) -> RouteDefinition {
                             &format!(
                                 "status = '{STATUS_PAID}', payment_ref = $2, \
                                  ledger_status = $3, ledger_transaction_id = $4, \
-                                 ledger_error = $5, completed_by = $6, completed_at = now()"
+                                 ledger_error = $5, completed_by = $6, completed_at = now(){draw_set}"
                             ),
                             &format!(
                                 "o.status IN ('{open}', '{awaiting}') AND o.charged_cents > 0",
@@ -2883,16 +3035,7 @@ fn route_complete(ctx: &PluginContext, cfg: &StoreConfig) -> RouteDefinition {
                                 awaiting = STATUS_AWAITING_PAYMENT
                             ),
                         ),
-                        vec![
-                            SqlValue::Int(id),
-                            SqlValue::Text(payment_ref.clone()),
-                            SqlValue::Text(ledger_status.clone()),
-                            ledger_transaction_id
-                                .map(SqlValue::Int)
-                                .unwrap_or(SqlValue::NullInt),
-                            ledger_error.clone().map(SqlValue::Text).unwrap_or(SqlValue::Null),
-                            SqlValue::Text(caller_of(&req).unwrap_or_default()),
-                        ],
+                        complete_params,
                     )
                     .await?
                 else {
@@ -2926,9 +3069,28 @@ fn route_complete(ctx: &PluginContext, cfg: &StoreConfig) -> RouteDefinition {
                             "fund_code": updated["fund_code"],
                             "ledger_status": ledger_status,
                             "draw_status": updated["draw_status"],
+                            "draw_intent_id": updated["draw_intent_id"],
                         }),
                     )
                     .await?;
+                if funded > 0 {
+                    c.events
+                        .publish(
+                            EVENT_DRAW_ENQUEUED,
+                            json!({
+                                "order_id": id,
+                                "funded_cents": updated["funded_cents"],
+                                "from_fund_code": FUND_SCHOLARSHIP,
+                                "to_fund_code": updated["fund_code"],
+                                "principal": DRAW_PRINCIPAL,
+                                "draw_intent_id": updated["draw_intent_id"],
+                                "next": "the core's relay delivers the intent to finance as \
+                                         svc.store.draw; it settles this order's draw_status \
+                                         from the answer",
+                            }),
+                        )
+                        .await?;
+                }
                 let payload = json!({
                     "order": updated,
                     "stripe": {
@@ -2965,33 +3127,33 @@ fn route_complete(ctx: &PluginContext, cfg: &StoreConfig) -> RouteDefinition {
 /// reason (mandatory, bounded, recorded on the order and in the audit log), and
 /// it records who exercised it and when. It is not a price of zero: the order
 /// still carries the shop's price, and the money it forgives is a **draw on the
-/// scholarship fund**, booked in this same call by asking finance to transfer the
-/// whole price out of `scholarship` into the fund the order's proceeds land in —
-/// as the caller, so finance's gate re-decides `finance:write`.
+/// scholarship fund**.
 ///
-/// **The comp lands even when the draw does not.** Telling a shopkeeper that a
-/// comp failed because a ledger write did would be a lie about the goods: the
-/// comp is a human act that already happened. So the comp is recorded, and the
-/// draw's outcome is recorded truthfully beside it (`booked`, or `refused`/
-/// `failed` with finance's own words), and finance's status is passed through.
-/// A comp whose draw did not land sits on `GET /api/store/orders/unsettled` until
-/// a treasurer books it with `/draw` — visible, never hidden.
+/// **The comp and its draw are one statement.** The whole price is funded and the
+/// draw is enqueued as an outbox intent by the same `UPDATE` that records the comp
+/// (see [`draw_enqueue_expr`]), so the comp cannot stand with the scholarship
+/// transfer left owed and unbooked — and a failure on either side leaves neither.
+/// The comp no longer needs a credential to forward: the core's relay delivers the
+/// intent as the declared `svc.store.draw` principal, which is what makes a
+/// callerless draw possible at all, and a comp is exercised by a shopkeeper who
+/// need hold no `finance:write` themselves.
 ///
-/// Queries: the order, the attempt write, the outcome write. Then the audit write.
-fn route_comp(ctx: &PluginContext, cfg: &StoreConfig) -> RouteDefinition {
+/// The intent's durable state is what settles the draw: the order sits on
+/// `GET /api/store/orders/unsettled` as `draw_in_flight` until the relay records a
+/// delivery (`delivered` → `booked`, `refused` → `refused`, `exhausted` →
+/// `failed`), and the relay's notification is what copies that word onto
+/// `draw_status`.
+///
+/// Queries: the order, then the one write that records the comp and enqueues the
+/// draw. Then the audit write.
+fn route_comp(ctx: &PluginContext) -> RouteDefinition {
     let c = ctx.clone();
-    let cfg = cfg.clone();
     RouteDefinition::post_protected(
         "/api/store/order/{id}/comp",
         PERM_COMP,
         route_handler(move |req| {
             let c = c.clone();
-            let cfg = cfg.clone();
             async move {
-                let headers = match require_forwardable(&req, "finance's ledger") {
-                    Ok(headers) => headers,
-                    Err(e) => return PluginResponse::error(e.status(), e.to_string()),
-                };
                 let id = req.int_param("id")?;
                 let body: CompBody = body_or_default(&req)?;
                 let reason = match bounded(&body.reason, MAX_REASON, "reason") {
@@ -3027,23 +3189,39 @@ fn route_comp(ctx: &PluginContext, cfg: &StoreConfig) -> RouteDefinition {
                 // `store_orders_draw_matches_funding` would refuse to see
                 // pretended otherwise.
                 let has_draw = price > 0;
-                // The comp is recorded first, at its own figures: the whole price
-                // is funded and the member is charged nothing. If the draw cannot
-                // land, this is the state the worklist must be able to see.
+                // The comp is recorded at its own figures **and its draw is
+                // enqueued**, both by this one statement: the whole price is
+                // funded, the member is charged nothing, and the scholarship
+                // transfer finance will make is an outbox intent written beside
+                // the comp (see `draw_enqueue_expr`). One statement, so a comp
+                // cannot stand with its draw left owed and unbooked — and no
+                // transaction API was added to the SDK to get it.
                 let attempt_set = format!(
                     "status = '{STATUS_COMPED}', charged_cents = 0, \
                      funded_cents = o.price_cents, comp_reason = $2, comp_by = $3, \
                      comp_at = now(), completed_by = $3, completed_at = now(), {draw}",
                     draw = if has_draw {
                         format!(
-                            "draw_status = '{DRAW_ATTEMPTING}', draw_by = $3, \
-                             draw_attempted_at = now()"
+                            "draw_status = '{intent}', draw_by = $3, \
+                             draw_attempted_at = now(), draw_intent_id = {enqueue}",
+                            intent = DRAW_INTENT_ENQUEUED,
+                            enqueue = draw_enqueue_expr("$4"),
                         )
                     } else {
                         format!("draw_status = '{DRAW_NONE}'")
                     },
                 );
-                let Some(comped) = c
+                let mut comp_params = vec![
+                    SqlValue::Int(id),
+                    SqlValue::Text(reason.clone()),
+                    SqlValue::Text(caller_of(&req).unwrap_or_default()),
+                ];
+                if has_draw {
+                    comp_params.push(SqlValue::Json(
+                        draw_intent_payload(id, price, &fund_code).to_string(),
+                    ));
+                }
+                let Some(settled) = c
                     .db
                     .query_one(
                         sql_complete_order(
@@ -3055,68 +3233,16 @@ fn route_comp(ctx: &PluginContext, cfg: &StoreConfig) -> RouteDefinition {
                                 awaiting = STATUS_AWAITING_PAYMENT
                             ),
                         ),
-                        vec![
-                            SqlValue::Int(id),
-                            SqlValue::Text(reason.clone()),
-                            SqlValue::Text(caller_of(&req).unwrap_or_default()),
-                        ],
+                        comp_params,
                     )
                     .await?
                 else {
                     return PluginResponse::error(409, "this order is already completed");
                 };
-                let outcome = if has_draw {
-                    book_draw(
-                        &c,
-                        &cfg,
-                        &headers,
-                        &comped,
-                        &format!("Store order {id} comp — {reason}"),
-                        body.allow_overdraft.unwrap_or(false),
-                    )
-                    .await
+                let reported = if has_draw {
+                    DRAW_INTENT_ENQUEUED
                 } else {
-                    // Nothing to book, and nothing was called: a free item's comp
-                    // has no subsidy, so it produces no transfer.
-                    CallOutcome {
-                        ok: true,
-                        http_status: None,
-                        body: Value::Null,
-                        error: None,
-                        answer_status: 200,
-                    }
-                };
-                let reported = if has_draw { outcome_status(&outcome) } else { DRAW_NONE };
-                let draw_ref = if outcome.ok {
-                    outcome.body["transfer_group"]
-                        .as_str()
-                        .unwrap_or_default()
-                        .to_string()
-                } else {
-                    String::new()
-                };
-                let settled = if has_draw {
-                    c.db.query_one(
-                        sql_complete_order(
-                            &c,
-                            &format!(
-                                "draw_status = $2, draw_ref = $3, draw_error = $4, \
-                                 draw_booked_at = CASE WHEN $2 = '{booked}' THEN now() ELSE NULL END",
-                                booked = DRAW_BOOKED,
-                            ),
-                            &format!("o.status = '{STATUS_COMPED}'"),
-                        ),
-                        vec![
-                            SqlValue::Int(id),
-                            SqlValue::Text(reported.to_string()),
-                            SqlValue::Text(draw_ref.clone()),
-                            outcome.error.clone().map(SqlValue::Text).unwrap_or(SqlValue::Null),
-                        ],
-                    )
-                    .await?
-                    .unwrap_or(comped)
-                } else {
-                    comped
+                    DRAW_NONE
                 };
                 c.audit
                     .log(
@@ -3125,13 +3251,13 @@ fn route_comp(ctx: &PluginContext, cfg: &StoreConfig) -> RouteDefinition {
                         "store_order",
                         &id.to_string(),
                         json!({
-                            "mechanism": MECHANISM_FINANCE_TRANSFER,
+                            "mechanism": if has_draw { MECHANISM_OUTBOX_DRAW } else { "" },
                             "price_cents": price,
                             "funded_cents": settled["funded_cents"],
                             "from_fund_code": FUND_SCHOLARSHIP,
                             "to_fund_code": fund_code,
                             "draw_status": reported,
-                            "http_status": outcome.http_status,
+                            "principal": if has_draw { DRAW_PRINCIPAL } else { "" },
                             "reason": reason,
                         }),
                     )
@@ -3147,20 +3273,25 @@ fn route_comp(ctx: &PluginContext, cfg: &StoreConfig) -> RouteDefinition {
                             "funded_cents": settled["funded_cents"],
                             "fund_code": fund_code,
                             "draw_status": reported,
+                            "draw_intent_id": settled["draw_intent_id"],
                             "comp_by": settled["comp_by"],
                         }),
                     )
                     .await?;
-                if outcome.ok {
+                if has_draw {
                     c.events
                         .publish(
-                            EVENT_DRAW_BOOKED,
+                            EVENT_DRAW_ENQUEUED,
                             json!({
                                 "order_id": id,
                                 "funded_cents": settled["funded_cents"],
                                 "from_fund_code": FUND_SCHOLARSHIP,
                                 "to_fund_code": fund_code,
-                                "transfer_group": draw_ref,
+                                "principal": DRAW_PRINCIPAL,
+                                "draw_intent_id": settled["draw_intent_id"],
+                                "next": "the core's relay delivers the intent to finance as \
+                                         svc.store.draw; it settles this order's draw_status \
+                                         from the answer",
                             }),
                         )
                         .await?;
@@ -3169,21 +3300,20 @@ fn route_comp(ctx: &PluginContext, cfg: &StoreConfig) -> RouteDefinition {
                     "order": settled,
                     "draw": draw_block(&settled),
                     "finance": {
-                        "http_status": outcome.http_status,
-                        "transfer_group": draw_ref,
-                        "error": outcome.error,
-                        "note": "the draw carried your own credential; finance's gate decided, and \
-                                 this plugin holds no credential of its own",
+                        "intent_id": settled["draw_intent_id"],
+                        "principal": DRAW_PRINCIPAL,
+                        "route": format!("POST {FINANCE_TRANSFER_PATH}"),
+                        "error": Value::Null,
+                        "note": "the draw is an outbox intent written by the same statement that \
+                                 recorded the comp: the core's relay delivers it to finance as a \
+                                 declared service principal, so no caller's credential is needed \
+                                 and finance's gate re-decides finance:write",
                     },
                     "note": "a comp is an authority, not a price: the order keeps the shop's \
                              price, the member is charged nothing, and the whole price is drawn \
                              from the scholarship fund",
                 });
-                if !has_draw || outcome.ok {
-                    PluginResponse::json(200, &payload)
-                } else {
-                    PluginResponse::json(outcome.answer_status, &payload)
-                }
+                PluginResponse::json(200, &payload)
             }
         }),
     )
@@ -3200,6 +3330,11 @@ fn route_comp(ctx: &PluginContext, cfg: &StoreConfig) -> RouteDefinition {
 ///
 /// It is guarded on the order being **completed**: a draw for a sale that has not
 /// happened would move money for goods nobody has.
+///
+/// It **refuses an in-flight intent** rather than racing it: an order whose draw is
+/// already `intent_enqueued` has a durable intent the core's relay is delivering,
+/// and a second booking by hand would be a second transfer for one subsidy. The
+/// draw's fate is the intent's durable state, so the answer names it.
 ///
 /// Queries: the order, the attempt write, the outcome write. Then the audit write.
 fn route_draw(ctx: &PluginContext, cfg: &StoreConfig) -> RouteDefinition {
@@ -3246,6 +3381,24 @@ fn route_draw(ctx: &PluginContext, cfg: &StoreConfig) -> RouteDefinition {
                 let draw_status = order["draw_status"].as_str().unwrap_or_default();
                 if draw_status == DRAW_BOOKED {
                     return PluginResponse::error(409, "this order's draw is already booked");
+                }
+                // An intent is already in flight: the core's relay owns this
+                // draw now, and booking it here would be a second transfer for one
+                // subsidy. The refusal names the intent, because that is where its
+                // outcome will be written.
+                if draw_status == DRAW_INTENT_ENQUEUED {
+                    let intent = order["draw_intent_id"].as_i64().unwrap_or_default();
+                    return PluginResponse::error(
+                        409,
+                        format!(
+                            "this order's draw is already in flight as intent {intent}: it was \
+                             enqueued by the completion itself and the core's relay is \
+                             delivering it to finance as {DRAW_PRINCIPAL}. Wait for its outcome \
+                             (delivered books this order, refused or exhausted is recorded \
+                             beside it) — a second booking here would be a second transfer for \
+                             one subsidy"
+                        ),
+                    );
                 }
                 // The attempt is recorded before the call: an answer that never
                 // comes back must still be visible, because a lost answer may be a
@@ -3506,14 +3659,20 @@ async fn unsettled_sweep(c: &PluginContext, cfg: &StoreConfig) -> Result<(), Sdk
             json!({
                 "unsettled": rows.len(),
                 "total_unsettled": total,
+                "in_flight": rows
+                    .iter()
+                    .filter(|row| row["draw_status"].as_str() == Some(DRAW_INTENT_ENQUEUED))
+                    .count(),
                 "older_than_minutes": minutes,
                 "oldest_created_at": oldest,
                 "by_reason": Value::Object(by_reason),
                 "orders": rows,
-                "next": "a shopkeeper completes a paid order with POST \
-                         /api/store/order/{id}/complete; a treasurer books an unbooked draw with \
-                         POST /api/store/order/{id}/draw — the notification is not the ledger \
-                         write (plugin-to-plugin.md §3.2)",
+                "next": "a row that is 'draw_in_flight' is not a hand-job: the core's relay is \
+                         delivering its draw intent, its state is in the intent_* fields, and the \
+                         row drops out once that state is 'delivered'. A shopkeeper completes a \
+                         paid order with POST /api/store/order/{id}/complete; a treasurer books a \
+                         'draw_unbooked' row with POST /api/store/order/{id}/draw — the \
+                         notification is not the ledger write (plugin-to-plugin.md §3.2)",
             }),
         )
         .await
@@ -3609,13 +3768,23 @@ fn draw_block(order: &Value) -> Value {
         "transfer_group": order["draw_ref"],
         "error": order["draw_error"],
         "booked_at": order["draw_booked_at"],
-        "mechanism": MECHANISM_FINANCE_TRANSFER,
+        "draw_intent_id": order["draw_intent_id"],
+        "mechanism": if status == DRAW_INTENT_ENQUEUED {
+            MECHANISM_OUTBOX_DRAW
+        } else {
+            MECHANISM_FINANCE_TRANSFER
+        },
         "how": if funded <= 0 && order["charged_cents"].as_i64().unwrap_or(0) == 0 {
             "nothing is funded either way: the item's price is zero, so there is no subsidy to draw"
         } else if funded <= 0 {
             "nothing is funded: the member paid the shop's whole price"
         } else if status == DRAW_BOOKED {
             "finance wrote both legs in one statement: the sum of every fund is unchanged"
+        } else if status == DRAW_INTENT_ENQUEUED {
+            "the draw is an outbox intent the core's relay is delivering as svc.store.draw — \
+             neither booked nor unbooked: the order leaves GET /api/store/orders/unsettled once \
+             the intent's durable state is 'delivered', and the relay's notification settles \
+             this status from finance's answer"
         } else {
             "a caller holding finance:write books the draw with POST \
              /api/store/order/{id}/draw, as themselves; a machine-originated reduction has no \
@@ -3846,10 +4015,16 @@ struct CompleteBody {
 
 #[derive(Debug, Default, Deserialize)]
 struct CompBody {
+    /// A comp needs a reason and nothing else. There is deliberately **no**
+    /// `allow_overdraft` here: the draw this comp produces is delivered by the
+    /// core's relay as a machine principal, and a machine may not authorise an
+    /// overdraft (the intent says `allow_overdraft: false`). A comp the
+    /// scholarship fund cannot cover comes back `refused`, visible on the
+    /// worklist, and a treasurer who decides the overdraft is authorised books it
+    /// with POST /api/store/order/{id}/draw — as themselves, with their own
+    /// authority.
     #[serde(default)]
     reason: String,
-    #[serde(default)]
-    allow_overdraft: Option<bool>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -3866,6 +4041,16 @@ struct DrawBody {
 mod tests {
     use super::*;
     use adjutant_sdk::testing::{response_json, TestHost, TestRequest};
+
+    /// Every migration's SQL as one string — what a reader would get by reading
+    /// `migrations/*.sql`, which is what the runner applies.
+    fn schema_sql() -> String {
+        migrations::all()
+            .into_iter()
+            .map(|m| m.sql.to_string())
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
 
     // --- harness ---------------------------------------------------------
 
@@ -3974,6 +4159,7 @@ mod tests {
             "draw_by": "",
             "draw_attempted_at": Value::Null,
             "draw_booked_at": Value::Null,
+            "draw_intent_id": Value::Null,
             "created_at": "2026-09-25 12:00:00+00",
             "updated_at": "2026-09-25 12:00:00+00"
         })
@@ -4062,31 +4248,45 @@ mod tests {
             [
                 DRAW_NONE,
                 DRAW_UNBOOKED,
+                DRAW_INTENT_ENQUEUED,
                 DRAW_ATTEMPTING,
                 DRAW_BOOKED,
                 DRAW_REFUSED,
                 DRAW_FAILED
             ]
         );
+        // Every vocabulary the code holds is one the schema constrains — read
+        // from the migrations themselves, so a value added to the constant and
+        // never to a migration fails here rather than at the first write.
+        let schema = schema_sql();
         for code in [KIND_PRODUCT, KIND_RENTAL] {
-            assert!(MIGRATION_SCHEMA.contains(&format!("'{code}'")));
+            assert!(schema.contains(&format!("'{code}'")));
         }
         for tier in TIER_CODES {
-            assert!(MIGRATION_SCHEMA.contains(&format!("'{tier}'")));
+            assert!(schema.contains(&format!("'{tier}'")));
         }
         for draw in DRAW_STATUSES {
-            assert!(MIGRATION_SCHEMA.contains(&format!("'{draw}'")));
+            assert!(schema.contains(&format!("'{draw}'")), "{draw}");
         }
         // The two rules that make a comp and a payment real are constraints.
-        assert!(MIGRATION_SCHEMA.contains("store_orders_comp_is_an_authority"));
-        assert!(MIGRATION_SCHEMA.contains("store_orders_paid_is_charged"));
-        assert!(MIGRATION_SCHEMA.contains("store_orders_funding_is_the_difference"));
-        assert!(MIGRATION_SCHEMA.contains("store_orders_draw_matches_funding"));
+        assert!(schema.contains("store_orders_comp_is_an_authority"));
+        assert!(schema.contains("store_orders_paid_is_charged"));
+        assert!(schema.contains("store_orders_funding_is_the_difference"));
+        assert!(schema.contains("store_orders_draw_matches_funding"));
         // Custody is a foreign id, never a copy of equipment's facts.
-        assert!(MIGRATION_SCHEMA.contains("equipment_item_id"));
+        assert!(schema.contains("equipment_item_id"));
         assert!(
-            !MIGRATION_SCHEMA.contains("\"condition\""),
+            !schema.contains("\"condition\""),
             "the item's condition is equipment's and must not be copied here"
+        );
+        // And the draw's intent is a real column with a real index, added by a
+        // NEW migration rather than by editing the one a deployment has applied.
+        assert!(schema.contains("draw_intent_id BIGINT"));
+        assert!(schema.contains("idx_store_orders_draw_intent"));
+        assert!(
+            migrations::find(2).is_some(),
+            "the intent is version 2: an amendment to version 1 would be skipped, \
+             without its SQL being compared, on every deployed database"
         );
     }
 
@@ -4440,6 +4640,67 @@ mod tests {
         assert!(published[0].get("stripe_session_id").is_none());
     }
 
+    /// A tier-funded order completes **and** enqueues its draw in the completion's
+    /// own statement: the money the scholarship fund owes is booked by the core's
+    /// relay, not left for a treasurer who may never come.
+    #[tokio::test]
+    async fn a_paid_order_with_a_funded_tier_enqueues_its_draw_in_the_same_statement() {
+        let (host, _plugin, routes) = store_plugin(configured_host()).await;
+        host.db.push_rows(vec![order_row(
+            9,
+            STATUS_AWAITING_PAYMENT,
+            2_000,
+            1_200,
+            800,
+            DRAW_UNBOOKED,
+        )]);
+        host.http.push_json(
+            200,
+            &json!({ "payment": {
+                "payment_id": "pi_test_9",
+                "amount_cents": 1_200,
+                "session_id": "cs_test_1",
+                "member_id": "bea",
+                "ledger_status": "delegated_event"
+            }}),
+        );
+        host.http.push_json(
+            200,
+            &json!({
+                "ledger": { "status": DRAW_BOOKED },
+                "finance": { "http_status": 201, "transaction_id": 77 }
+            }),
+        );
+        let mut paid = order_row(9, STATUS_PAID, 2_000, 1_200, 800, DRAW_INTENT_ENQUEUED);
+        paid["ledger_transaction_id"] = json!(77);
+        paid["draw_intent_id"] = json!(64);
+        host.db.push_rows(vec![paid]);
+
+        let (status, body) = call(
+            &route(&routes, "POST", "/api/store/order/{id}/complete").handler,
+            bearer(TestRequest::post("/api/store/order/9/complete"))
+                .param("id", "9")
+                .identity("casey", &["storekeeper"])
+                .json(&json!({ "stripe_payment_id": 5 }))
+                .build(),
+        )
+        .await;
+        assert_eq!(status, 200, "{body}");
+        assert_eq!(body["order"]["status"], STATUS_PAID);
+        assert_eq!(body["draw"]["status"], DRAW_INTENT_ENQUEUED);
+        assert_eq!(body["draw"]["draw_intent_id"], 64);
+        // The completion and the intent are one statement: exactly one write
+        // carries both the transition and the enqueue.
+        let sql = host.db.queried_sql().join("\n");
+        assert_eq!(sql.matches("core.outbox_enqueue(").count(), 1, "{sql}");
+        assert!(sql.contains("status = 'paid'"), "{sql}");
+        assert!(sql.contains("'store-order-' || o.id || '-draw'"), "{sql}");
+        assert!(host
+            .events
+            .published_types()
+            .contains(&EVENT_DRAW_ENQUEUED.to_string()));
+    }
+
     #[tokio::test]
     async fn a_payment_that_is_not_this_orders_is_a_conflict_and_writes_nothing() {
         let (host, _plugin, routes) = store_plugin(configured_host()).await;
@@ -4476,30 +4737,17 @@ mod tests {
 
     // --- the comp and the draw -------------------------------------------
 
+    /// **A comp and its draw are one statement.** The comp records the authority
+    /// and enqueues the scholarship draw as an outbox intent in the *same*
+    /// `UPDATE` — no cross-plugin call, no credential, and no second write: the
+    /// core's relay will deliver the intent as `svc.store.draw`.
     #[tokio::test]
-    async fn a_comp_needs_a_reason_the_authority_and_books_the_draw_as_the_caller() {
+    async fn a_comp_enqueues_its_draw_in_the_same_statement() {
         let (host, _plugin, routes) = store_plugin(configured_host()).await;
         host.db.push_rows(vec![order_row(9, STATUS_OPEN, 2_000, 2_000, 0, DRAW_NONE)]);
-        host.db.push_rows(vec![order_row(9, STATUS_COMPED, 2_000, 0, 2_000, DRAW_ATTEMPTING)]);
-        host.http.push_json(
-            200,
-            &json!({ "funds": [
-                { "id": 2, "code": FUND_SCHOLARSHIP, "active": true },
-                { "id": 1, "code": FUND_GENERAL, "active": true }
-            ]}),
-        );
-        host.http.push_json(
-            201,
-            &json!({
-                "transfer_group": "9c1e2f00-0000-0000-0000-000000000001",
-                "amount_cents": 2_000,
-                "sum_cents": 0,
-                "entries": [{ "amount_cents": -2_000 }, { "amount_cents": 2_000 }]
-            }),
-        );
-        let mut booked = order_row(9, STATUS_COMPED, 2_000, 0, 2_000, DRAW_BOOKED);
-        booked["draw_ref"] = json!("9c1e2f00-0000-0000-0000-000000000001");
-        host.db.push_rows(vec![booked]);
+        let mut comped = order_row(9, STATUS_COMPED, 2_000, 0, 2_000, DRAW_INTENT_ENQUEUED);
+        comped["draw_intent_id"] = json!(41);
+        host.db.push_rows(vec![comped]);
 
         let (status, body) = call(
             &route(&routes, "POST", "/api/store/order/{id}/comp").handler,
@@ -4511,18 +4759,229 @@ mod tests {
         )
         .await;
         assert_eq!(status, 200, "{body}");
-        let urls = host.http.request_urls();
-        assert_eq!(urls.len(), 2, "the funds were resolved, then the transfer asked: {urls:?}");
-        assert!(urls[0].1.contains(FINANCE_FUNDS_PATH));
-        assert!(urls[1].1.ends_with(FINANCE_TRANSFER_PATH));
+        // Nobody was called: the draw is the core's relay's business now, so the
+        // comp needs no credential to forward and no funds read.
+        assert!(
+            host.http.request_urls().is_empty(),
+            "the draw is an intent, not a caller-forwarding call: {:?}",
+            host.http.request_urls()
+        );
+        // One write, and it is the comp: the order and the intent came from it.
+        assert_eq!(host.db.query_count(), 2, "the order read, then the one write");
+        let sql = host.db.queried_sql().join("\n");
+        assert!(sql.contains("core.outbox_enqueue("), "{sql}");
+        assert!(sql.contains("status = 'comped'"), "{sql}");
+        assert_eq!(
+            sql.matches("core.outbox_enqueue(").count(),
+            1,
+            "one statement, one intent"
+        );
         assert_eq!(body["order"]["status"], STATUS_COMPED);
         assert_eq!(body["order"]["charged_cents"], 0);
         assert_eq!(body["draw"]["funded_cents"], 2_000);
-        assert_eq!(body["draw"]["status"], DRAW_BOOKED);
-        assert_eq!(body["draw"]["from_fund_code"], FUND_SCHOLARSHIP);
+        assert_eq!(body["draw"]["status"], DRAW_INTENT_ENQUEUED);
+        assert_eq!(body["draw"]["draw_intent_id"], 41);
+        assert_eq!(body["draw"]["mechanism"], MECHANISM_OUTBOX_DRAW);
         assert!(host.events.published_types().contains(&EVENT_ORDER_COMPED.to_string()));
-        assert!(host.events.published_types().contains(&EVENT_DRAW_BOOKED.to_string()));
+        assert!(host
+            .events
+            .published_types()
+            .contains(&EVENT_DRAW_ENQUEUED.to_string()));
         assert_audited(&host, "store.order.comp");
+    }
+
+    /// **The intent is complete and deterministic.** The statement names the
+    /// principal, the method, the route and a key derived from the order's own id
+    /// (`store-order-<id>-draw`), and the payload is a bind — everything finance
+    /// needs at enqueue time, because the relay cannot read for it.
+    #[tokio::test]
+    async fn the_draw_intent_names_its_principal_its_route_and_a_deterministic_key() {
+        let (host, _plugin, routes) = store_plugin(configured_host()).await;
+        host.db.push_rows(vec![order_row(12, STATUS_OPEN, 2_000, 2_000, 0, DRAW_NONE)]);
+        let mut comped = order_row(12, STATUS_COMPED, 2_000, 0, 2_000, DRAW_INTENT_ENQUEUED);
+        comped["draw_intent_id"] = json!(7);
+        host.db.push_rows(vec![comped]);
+
+        let (status, body) = call(
+            &route(&routes, "POST", "/api/store/order/{id}/comp").handler,
+            bearer(TestRequest::post("/api/store/order/12/comp"))
+                .param("id", "12")
+                .identity("casey", &["commander"])
+                .json(&json!({ "reason": "hardship" }))
+                .build(),
+        )
+        .await;
+        assert_eq!(status, 200, "{body}");
+
+        let sql = host.db.queried_sql().join("\n");
+        assert!(sql.contains(DRAW_PRINCIPAL), "{sql}");
+        assert!(sql.contains("'POST'"), "{sql}");
+        assert!(sql.contains(FINANCE_TRANSFER_PATH), "{sql}");
+        assert!(
+            sql.contains("'store-order-' || o.id || '-draw'"),
+            "the key is deterministic per draw, so a replay returns the same intent: {sql}"
+        );
+
+        // The payload binds, and it is complete: codes (not ids), the amount, the
+        // description, the date, and no overdraft — a machine may not authorise
+        // one — with no `fiscal_year`, which is finance's to derive.
+        let payload = param_text(&host, "core.outbox_enqueue(");
+        assert!(payload.contains("from_fund_code"), "{payload}");
+        assert!(payload.contains(FUND_SCHOLARSHIP), "{payload}");
+        assert!(payload.contains("to_fund_code"), "{payload}");
+        assert!(payload.contains("amount_cents"), "{payload}");
+        assert!(payload.contains("2000"), "{payload}");
+        assert!(
+            payload.contains("Store order 12 scholarship draw"),
+            "{payload}"
+        );
+        assert!(payload.contains("occurred_on"), "{payload}");
+        assert!(payload.contains("allow_overdraft"), "{payload}");
+        assert!(!payload.contains("fiscal_year"), "{payload}");
+    }
+
+    /// **The in-flight case on the worklist.** An order whose draw is an outbox
+    /// intent is neither booked nor unbooked: it is listed explicitly, with its
+    /// `draw_intent_id` and the intent's own state, and counted apart in
+    /// `in_flight`. The statement reads that state through
+    /// `core.outbox_producer_view()` and drops the order once it is `delivered` —
+    /// the durable intent decides, not a notification.
+    #[tokio::test]
+    async fn the_worklist_lists_an_in_flight_draw_with_its_intents_own_state() {
+        let (host, _plugin, routes) = store_plugin(configured_host()).await;
+        let mut in_flight = order_row(9, STATUS_PAID, 2_000, 1_200, 800, DRAW_INTENT_ENQUEUED);
+        in_flight["draw_intent_id"] = json!(12);
+        in_flight["intent_state"] = json!("pending");
+        in_flight["intent_attempts"] = json!(0);
+        in_flight["unsettled_reason"] = json!("draw_in_flight");
+        in_flight["total_unsettled"] = json!(1);
+        host.db.push_rows(vec![in_flight]);
+
+        let (status, body) = call(
+            &route(&routes, "GET", "/api/store/orders/unsettled").handler,
+            TestRequest::get("/api/store/orders/unsettled")
+                .query_param("older_than_minutes", "0")
+                .identity("bea", &["treasurer"])
+                .build(),
+        )
+        .await;
+        assert_eq!(status, 200, "{body}");
+        assert_eq!(body["in_flight"], 1, "{body}");
+        assert_eq!(body["orders"][0]["draw_intent_id"], 12);
+        assert_eq!(body["orders"][0]["intent_state"], "pending");
+        assert_eq!(
+            body["orders"][0]["unsettled_reason"], "draw_in_flight",
+            "the in-flight case is named rather than hidden: {body}"
+        );
+        assert_eq!(body["by_reason"]["draw_in_flight"], 1);
+
+        let sql = host.db.queried_sql().join("\n");
+        assert!(
+            sql.contains("core.outbox_producer_view()"),
+            "the intent's own state is what is read: {sql}"
+        );
+        assert!(sql.contains("v.id = o.draw_intent_id"), "{sql}");
+        assert!(
+            sql.contains("draw_intent_id = o.draw_intent_id")
+                || sql.contains("LEFT JOIN core.outbox_producer_view() v ON v.id = o.draw_intent_id"),
+            "{sql}"
+        );
+        assert!(
+            sql.contains("v.state IS DISTINCT FROM 'delivered'"),
+            "the durable intent decides whether the row is listed: {sql}"
+        );
+    }
+
+    /// A replayed `core.outbox.*` outcome is a no-op, another producer's outcome
+    /// is passed over, and a non-terminal state writes nothing — then the terminal
+    /// one settles the draw to `booked` with finance's own `transfer_group`.
+    #[tokio::test]
+    async fn the_outbox_subscription_settles_the_draw_from_the_terminal_outcome() {
+        let (host, plugin, _routes) = store_plugin(configured_host()).await;
+        let subscriptions = plugin.subscriptions();
+        assert_eq!(subscriptions.len(), 1, "one subscription: core.outbox.*");
+        let handler = &subscriptions[0].handler;
+
+        let outcome = |state: &str, producer: &str, answer: Value| Event {
+            id: 0,
+            event_type: format!("core.outbox.{state}"),
+            payload: json!({
+                "intent_id": 12,
+                "producer": producer,
+                "principal": DRAW_PRINCIPAL,
+                "state": state,
+                "http_status": 201,
+                "error": Value::Null,
+                "answer": answer,
+            }),
+            source: "core".to_string(),
+            timestamp: Utc::now(),
+        };
+
+        // Not terminal: the relay is still working.
+        handler(outcome("pending", "store", Value::Null))
+            .await
+            .expect("a non-terminal outcome");
+        assert!(host.db.executed_sql().is_empty(), "nothing was written");
+
+        // Another producer's intent: not this plugin's business.
+        handler(outcome(OUTBOX_DELIVERED, "stripe", Value::Null))
+            .await
+            .expect("another producer's outcome");
+        assert!(host.db.executed_sql().is_empty(), "nothing was written");
+
+        // The terminal one: finance answered, and its `transfer_group` is the
+        // draw's reference.
+        handler(outcome(
+            OUTBOX_DELIVERED,
+            "store",
+            json!({ "transfer_group": "9c1e2f00-0000-0000-0000-000000000003" }),
+        ))
+        .await
+        .expect("the terminal outcome");
+        let sql = host.db.executed_sql().join("\n");
+        assert!(sql.contains("draw_status = $2"), "{sql}");
+        assert!(
+            sql.contains("draw_intent_id = $1") && sql.contains("draw_status = 'intent_enqueued'"),
+            "only the order that enqueued this intent can be settled by it: {sql}"
+        );
+        let params = param_text(&host, "draw_intent_id = $1");
+        assert!(params.contains("Int(12)"), "{params}");
+        assert!(params.contains("Text(\"booked\")"), "{params}");
+        assert!(
+            params.contains("9c1e2f00-0000-0000-0000-000000000003"),
+            "draw_ref is finance's own transfer_group: {params}"
+        );
+    }
+
+    /// A treasurer's hand-booking is refused while an intent is in flight — the
+    /// refusal names it — and still works for a draw no intent owns.
+    #[tokio::test]
+    async fn a_manual_draw_refuses_an_order_whose_intent_is_already_in_flight() {
+        let (host, _plugin, routes) = store_plugin(configured_host()).await;
+        let mut in_flight = order_row(9, STATUS_PAID, 2_000, 1_200, 800, DRAW_INTENT_ENQUEUED);
+        in_flight["draw_intent_id"] = json!(33);
+        host.db.push_rows(vec![in_flight]);
+
+        let (status, body) = call(
+            &route(&routes, "POST", "/api/store/order/{id}/draw").handler,
+            bearer(TestRequest::post("/api/store/order/9/draw"))
+                .param("id", "9")
+                .identity("treasurer", &["treasurer"])
+                .build(),
+        )
+        .await;
+        assert_eq!(status, 409, "{body}");
+        let error = body["error"].as_str().unwrap_or_default();
+        assert!(
+            error.contains("33"),
+            "the message names the in-flight intent: {error}"
+        );
+        assert!(
+            host.http.request_urls().is_empty(),
+            "finance was never called: the relay owns this draw"
+        );
+        assert_eq!(host.db.query_count(), 1, "the order read, and nothing written");
     }
 
     #[tokio::test]
@@ -4562,10 +5021,16 @@ mod tests {
         assert!(body["error"].as_str().unwrap_or_default().contains(FUND_SCHOLARSHIP));
     }
 
+    /// A draw finance refuses **as the caller** is recorded truthfully and stays
+    /// visible: finance's own status is passed through, not flattened, and the
+    /// order keeps the reason a reader needs. This is the path a draw takes when
+    /// no intent owns it (a reduction), which is why the refusal can happen here.
     #[tokio::test]
-    async fn a_refused_draw_leaves_the_comp_standing_and_the_money_visible() {
+    async fn a_refused_hand_booking_passes_finances_status_through_and_stays_visible() {
         let (host, _plugin, routes) = store_plugin(configured_host()).await;
-        host.db.push_rows(vec![order_row(9, STATUS_OPEN, 2_000, 2_000, 0, DRAW_NONE)]);
+        // A comp whose intent was refused: the draw is back in a treasurer's
+        // hands, and the order still stands.
+        host.db.push_rows(vec![order_row(9, STATUS_COMPED, 2_000, 0, 2_000, DRAW_REFUSED)]);
         host.db.push_rows(vec![order_row(9, STATUS_COMPED, 2_000, 0, 2_000, DRAW_ATTEMPTING)]);
         host.http.push_json(
             200,
@@ -4583,17 +5048,13 @@ mod tests {
         host.db.push_rows(vec![refused]);
 
         let (status, body) = call(
-            &route(&routes, "POST", "/api/store/order/{id}/comp").handler,
-            bearer(TestRequest::post("/api/store/order/9/comp"))
+            &route(&routes, "POST", "/api/store/order/{id}/draw").handler,
+            bearer(TestRequest::post("/api/store/order/9/draw"))
                 .param("id", "9")
-                .identity("casey", &["commander"])
-                .json(&json!({ "reason": "hardship" }))
+                .identity("treasurer", &["treasurer"])
                 .build(),
         )
         .await;
-        // Finance's own status, not a flattened 500: the caller can see it was
-        // the scholarship fund's balance that refused, and can pass
-        // allow_overdraft if that is their decision.
         assert_eq!(status, 409, "{body}");
         assert_eq!(body["order"]["status"], STATUS_COMPED);
         assert_eq!(body["draw"]["status"], DRAW_REFUSED);
@@ -4602,11 +5063,7 @@ mod tests {
                 .as_str()
                 .unwrap_or_default()
                 .contains("scholarship"),
-            "{body}"
-        );
-        assert!(
-            body["note"].as_str().unwrap_or_default().contains("authority"),
-            "the comp still stands, and the response says what it was"
+            "finance's own words, not a flattened 500: {body}"
         );
     }
 
