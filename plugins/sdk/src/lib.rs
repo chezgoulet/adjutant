@@ -529,9 +529,9 @@ impl PermissionService {
     /// ```rust,ignore
     /// let held = ctx
     ///     .permissions
-    ///     .scopes_for(req.identity.as_ref(), &["announcement:read", "announcement:manage"])
+    ///     .scopes_for(req.identity.as_ref(), &["announcements:read", "announcements:manage"])
     ///     .await?;
-    /// let reads_somewhere = held.iter().any(|p| p.permission == "announcement:read");
+    /// let reads_somewhere = held.iter().any(|p| p.permission == "announcements:read");
     /// ```
     ///
     /// **Asking cannot widen reach.** The query joins *the grants it was handed*

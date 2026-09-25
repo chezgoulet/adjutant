@@ -154,19 +154,19 @@ pub const CATEGORY_MEANINGS: [(&str, &str, &str); 3] = [
         CATEGORY_URGENT,
         "Urgent",
         "Something the troop must know now (a cancelled camp, a road closure). \
-         Publishing one needs announcement:write AND announcement:publish_urgent at the \
+         Publishing one needs announcements:write AND announcements:publish_urgent at the \
          announcement's scope.",
     ),
     (
         CATEGORY_INFORMATIONAL,
         "Informational",
-        "The ordinary notice: a schedule, a reminder, a result. Needs announcement:write.",
+        "The ordinary notice: a schedule, a reminder, a result. Needs announcements:write.",
     ),
     (
         CATEGORY_EVENT,
         "Event",
         "A notice about something on the calendar (a meeting, a service day). Needs \
-         announcement:write; related_event_id links it to the event.",
+         announcements:write; related_event_id links it to the event.",
     ),
 ];
 
@@ -192,13 +192,13 @@ pub const SCOPE_TYPES: [&str; 2] = [SCOPE_TROOP, SCOPE_LODGE];
 // --- permissions -----------------------------------------------------------
 
 /// See the announcements addressed to a scope you hold.
-pub const PERM_READ: &str = "announcement:read";
+pub const PERM_READ: &str = "announcements:read";
 /// Draft and publish an announcement at a scope you hold.
-pub const PERM_WRITE: &str = "announcement:write";
+pub const PERM_WRITE: &str = "announcements:write";
 /// Publish an *urgent* announcement — the category that interrupts.
-pub const PERM_PUBLISH_URGENT: &str = "announcement:publish_urgent";
+pub const PERM_PUBLISH_URGENT: &str = "announcements:publish_urgent";
 /// Edit, retract or delete an announcement, and read who has read it.
-pub const PERM_MANAGE: &str = "announcement:manage";
+pub const PERM_MANAGE: &str = "announcements:manage";
 
 // --- events ----------------------------------------------------------------
 
@@ -715,7 +715,7 @@ fn receipt_of(row: &Value) -> Value {
 
 /// Publishing an *urgent* announcement needs the sharper permission as well.
 ///
-/// `announcement:write` says "you may write here"; `announcement:publish_urgent`
+/// `announcements:write` says "you may write here"; `announcements:publish_urgent`
 /// says "you may interrupt". Requiring both means the emergency authority is an
 /// addition, never a substitute — and a category that can be cried wolf is
 /// worthless.

@@ -9,9 +9,9 @@
 
 use adjutant_announcements::{
     announcement_scope, normalize_category, parse_expiry, preview, AnnouncementsPlugin, CATEGORIES,
-    CATEGORY_EVENT, CATEGORY_INFORMATIONAL, CATEGORY_URGENT, DELIVERY_DEFERRED, EVENT_PUBLISHED,
-    EVENT_RECEIPT, EVENT_UNREAD, PERM_MANAGE, PERM_PUBLISH_URGENT, PERM_READ, PERM_WRITE,
-    SCOPE_LODGE, SCOPE_TROOP, STATUS_DRAFT, STATUS_PUBLISHED, STATUS_RETRACTED,
+    CATEGORY_EVENT, CATEGORY_INFORMATIONAL, CATEGORY_MEANINGS, CATEGORY_URGENT, DELIVERY_DEFERRED,
+    EVENT_PUBLISHED, EVENT_RECEIPT, EVENT_UNREAD, PERM_MANAGE, PERM_PUBLISH_URGENT, PERM_READ,
+    PERM_WRITE, SCOPE_LODGE, SCOPE_TROOP, STATUS_DRAFT, STATUS_PUBLISHED, STATUS_RETRACTED,
 };
 use adjutant_sdk::prelude::*;
 use adjutant_sdk::testing::{response_json, TestHost, TestRequest};
@@ -100,7 +100,7 @@ fn lodge_reader(lodge: &str) -> Vec<Value> {
     audience_rows(&[(PERM_READ, SCOPE_LODGE, Some(lodge))])
 }
 
-/// An overseer: `announcement:manage` from a troop-scoped grant.
+/// An overseer: `announcements:manage` from a troop-scoped grant.
 fn overseer() -> Vec<Value> {
     audience_rows(&[(PERM_MANAGE, SCOPE_TROOP, None)])
 }
@@ -190,9 +190,39 @@ async fn the_declaration_satisfies_the_load_rules() {
         .collect();
     for permission in &permissions {
         assert!(
-            permission.starts_with("announcement:"),
+            permission.starts_with("announcements:"),
             "{permission} must be namespaced by the plugin's own prefix"
         );
+    }
+
+    // `GET /api/announcements/categories` serves the category meanings to clients
+    // verbatim, so a permission name inside one is user-visible text. Every one it
+    // names must be a permission this plugin actually declares: the rename from
+    // `announcement:*` to `announcements:*` missed these strings first time round,
+    // and a client would have read a permission that does not exist.
+    for (key, _label, description) in CATEGORY_MEANINGS {
+        for token in description.split_whitespace() {
+            let token = token.trim_matches(|c: char| !c.is_alphanumeric() && c != ':' && c != '_');
+            let Some((namespace, name)) = token.split_once(':') else {
+                continue;
+            };
+            // A permission id is shaped `namespace:name`. Prose carries colons
+            // too — "the ordinary notice: a schedule" — so the shape is what
+            // separates a permission a reader might try to grant from a colon.
+            let shaped = |part: &str| {
+                !part.is_empty()
+                    && part
+                        .chars()
+                        .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_')
+            };
+            if !shaped(namespace) || !shaped(name) {
+                continue;
+            }
+            assert!(
+                permissions.iter().any(|p| p.as_str() == token),
+                "the {key} category describes {token}, which this plugin does not declare"
+            );
+        }
     }
     for expected in [PERM_READ, PERM_WRITE, PERM_PUBLISH_URGENT, PERM_MANAGE] {
         assert!(
@@ -347,7 +377,7 @@ async fn creating_without_publishing_leaves_a_draft_that_reaches_nobody() {
     let (host, _plugin, routes) = plugin().await;
     let create = route(&routes, "POST", "/api/announcements/announcement");
 
-    host.db.push_rows(vec![json!({ "n": 1 })]); // announcement:write at the troop
+    host.db.push_rows(vec![json!({ "n": 1 })]); // announcements:write at the troop
     host.db.push_rows(vec![announcement_row(
         7,
         CATEGORY_INFORMATIONAL,
@@ -398,7 +428,7 @@ async fn creating_and_sending_publishes_the_delivery_seam_once() {
 
     // A troop-wide grant covers the Lodge audience it is sending to, so the
     // authority check is the coverage rule.
-    host.db.push_rows(vec![json!({ "n": 1 })]); // announcement:write at Lodge 3
+    host.db.push_rows(vec![json!({ "n": 1 })]); // announcements:write at Lodge 3
     let mut sent = announcement_row(7, CATEGORY_EVENT, SCOPE_LODGE, Some("3"), STATUS_PUBLISHED);
     sent["related_event_id"] = json!(21);
     // The payload is built from the stored row, so the preview is the stored
@@ -467,11 +497,11 @@ async fn urgent_needs_a_second_permission_and_a_draft_does_not() {
     let (host, _plugin, routes) = plugin().await;
     let create = route(&routes, "POST", "/api/announcements/announcement");
 
-    // (a) `announcement:write` alone cannot publish an urgent announcement: the
+    // (a) `announcements:write` alone cannot publish an urgent announcement: the
     //     second `reach` finds no publish_urgent grant and refuses — after the
     //     write check and before any insert.
-    host.db.push_rows(vec![json!({ "n": 1 })]); // announcement:write
-    host.db.push_rows(vec![]); // announcement:publish_urgent — not granted
+    host.db.push_rows(vec![json!({ "n": 1 })]); // announcements:write
+    host.db.push_rows(vec![]); // announcements:publish_urgent — not granted
     let (status, body) = call(
         &create.handler,
         TestRequest::post("/api/announcements/announcement")
@@ -504,8 +534,8 @@ async fn urgent_needs_a_second_permission_and_a_draft_does_not() {
     //     says `urgent: true` — the flag a delivery plugin acts on.
     let (host, _plugin, routes) = plugin().await;
     let create = route(&routes, "POST", "/api/announcements/announcement");
-    host.db.push_rows(vec![json!({ "n": 1 })]); // announcement:write
-    host.db.push_rows(vec![json!({ "n": 1 })]); // announcement:publish_urgent
+    host.db.push_rows(vec![json!({ "n": 1 })]); // announcements:write
+    host.db.push_rows(vec![json!({ "n": 1 })]); // announcements:publish_urgent
     host.db.push_rows(vec![announcement_row(
         9,
         CATEGORY_URGENT,
@@ -533,7 +563,7 @@ async fn urgent_needs_a_second_permission_and_a_draft_does_not() {
     //     is nothing to abuse yet.
     let (host, _plugin, routes) = plugin().await;
     let create = route(&routes, "POST", "/api/announcements/announcement");
-    host.db.push_rows(vec![json!({ "n": 1 })]); // announcement:write
+    host.db.push_rows(vec![json!({ "n": 1 })]); // announcements:write
     host.db.push_rows(vec![announcement_row(
         11,
         CATEGORY_URGENT,
@@ -620,7 +650,7 @@ async fn sending_an_already_sent_announcement_is_refused_so_the_seam_fires_once(
     let (host, _plugin, routes) = plugin().await;
     let publish = route(&routes, "POST", "/api/announcements/announcement/{id}/publish");
 
-    // The draft's author may send what they wrote with `announcement:write`.
+    // The draft's author may send what they wrote with `announcements:write`.
     host.db.push_rows(vec![announcement_row(
         7,
         CATEGORY_INFORMATIONAL,
@@ -628,7 +658,7 @@ async fn sending_an_already_sent_announcement_is_refused_so_the_seam_fires_once(
         Some("3"),
         STATUS_DRAFT,
     )]);
-    host.db.push_rows(vec![json!({ "n": 1 })]); // announcement:write at Lodge 3
+    host.db.push_rows(vec![json!({ "n": 1 })]); // announcements:write at Lodge 3
     host.db.push_rows(vec![announcement_row(
         7,
         CATEGORY_INFORMATIONAL,
@@ -705,7 +735,7 @@ async fn publishing_someone_elses_draft_needs_manage_and_rechecks_the_urgent_gat
     );
     carls_draft["created_by"] = json!("carl");
     host.db.push_rows(vec![carls_draft]);
-    host.db.push_rows(vec![]); // announcement:manage at Lodge 3 — not granted
+    host.db.push_rows(vec![]); // announcements:manage at Lodge 3 — not granted
     let (status, body) = call(
         &publish.handler,
         TestRequest::post("/api/announcements/announcement/7/publish")
@@ -735,8 +765,8 @@ async fn publishing_someone_elses_draft_needs_manage_and_rechecks_the_urgent_gat
     );
     draft["created_by"] = json!("bea");
     host.db.push_rows(vec![draft]);
-    host.db.push_rows(vec![json!({ "n": 1 })]); // announcement:write
-    host.db.push_rows(vec![]); // announcement:publish_urgent — not granted
+    host.db.push_rows(vec![json!({ "n": 1 })]); // announcements:write
+    host.db.push_rows(vec![]); // announcements:publish_urgent — not granted
     let (status, body) = call(
         &publish.handler,
         TestRequest::post("/api/announcements/announcement/7/publish")
@@ -761,7 +791,7 @@ async fn a_draft_whose_expiry_has_passed_cannot_be_sent() {
     let mut draft = announcement_row(7, CATEGORY_INFORMATIONAL, SCOPE_TROOP, None, STATUS_DRAFT);
     draft["expires_at"] = json!("2020-01-01 00:00:00+00");
     host.db.push_rows(vec![draft]);
-    host.db.push_rows(vec![json!({ "n": 1 })]); // announcement:write
+    host.db.push_rows(vec![json!({ "n": 1 })]); // announcements:write
 
     let (status, body) = call(
         &publish.handler,
@@ -1119,7 +1149,7 @@ async fn the_receipt_list_names_who_read_and_is_oversight_data() {
         "/api/announcements/announcement/{id}/receipts",
     );
 
-    // A writer is not an overseer: `announcement:manage` is required.
+    // A writer is not an overseer: `announcements:manage` is required.
     host.db.push_rows(vec![announcement_row(
         7,
         CATEGORY_INFORMATIONAL,
@@ -1127,7 +1157,7 @@ async fn the_receipt_list_names_who_read_and_is_oversight_data() {
         None,
         STATUS_PUBLISHED,
     )]);
-    host.db.push_rows(vec![]); // announcement:manage — not granted
+    host.db.push_rows(vec![]); // announcements:manage — not granted
     let (status, body) = call(
         &receipts.handler,
         TestRequest::get("/api/announcements/announcement/7/receipts")
@@ -1344,7 +1374,7 @@ async fn retracting_withdraws_it_from_the_badge_but_leaves_the_record() {
         None,
         STATUS_PUBLISHED,
     )]);
-    host.db.push_rows(vec![json!({ "n": 1 })]); // announcement:manage (for an urgent one too)
+    host.db.push_rows(vec![json!({ "n": 1 })]); // announcements:manage (for an urgent one too)
     host.db.push_rows(vec![announcement_row(
         7,
         CATEGORY_URGENT,
@@ -1453,7 +1483,7 @@ async fn the_author_edits_their_own_draft_and_anybody_else_needs_manage() {
         None,
         STATUS_DRAFT,
     )]);
-    host.db.push_rows(vec![json!({ "n": 1 })]); // announcement:write
+    host.db.push_rows(vec![json!({ "n": 1 })]); // announcements:write
     host.db.push_rows(vec![announcement_row(
         7,
         CATEGORY_INFORMATIONAL,
@@ -1480,7 +1510,7 @@ async fn the_author_edits_their_own_draft_and_anybody_else_needs_manage() {
     let mut sent = announcement_row(8, CATEGORY_INFORMATIONAL, SCOPE_TROOP, None, STATUS_PUBLISHED);
     sent["created_by"] = json!("carl");
     host.db.push_rows(vec![sent]);
-    host.db.push_rows(vec![]); // announcement:manage over the troop — not granted
+    host.db.push_rows(vec![]); // announcements:manage over the troop — not granted
     let (status, body) = call(
         &edit.handler,
         TestRequest::patch("/api/announcements/announcement/8")
@@ -1513,8 +1543,8 @@ async fn editing_a_sent_announcement_into_urgent_needs_the_sharper_permission() 
         None,
         STATUS_PUBLISHED,
     )]);
-    host.db.push_rows(vec![json!({ "n": 1 })]); // announcement:manage
-    host.db.push_rows(vec![]); // announcement:publish_urgent — not granted
+    host.db.push_rows(vec![json!({ "n": 1 })]); // announcements:manage
+    host.db.push_rows(vec![]); // announcements:publish_urgent — not granted
     let (status, body) = call(
         &edit.handler,
         TestRequest::patch("/api/announcements/announcement/7")
@@ -1540,7 +1570,7 @@ async fn editing_a_sent_announcement_into_urgent_needs_the_sharper_permission() 
         None,
         STATUS_PUBLISHED,
     )]);
-    host.db.push_rows(vec![json!({ "n": 1 })]); // announcement:manage
+    host.db.push_rows(vec![json!({ "n": 1 })]); // announcements:manage
     host.db.push_rows(vec![announcement_row(
         7,
         CATEGORY_URGENT,
@@ -1603,8 +1633,8 @@ async fn moving_an_announcement_to_another_audience_needs_authority_there() {
         Some("3"),
         STATUS_DRAFT,
     )]);
-    host.db.push_rows(vec![json!({ "n": 1 })]); // announcement:write at Lodge 3
-    host.db.push_rows(vec![]); // announcement:write over the troop — not granted
+    host.db.push_rows(vec![json!({ "n": 1 })]); // announcements:write at Lodge 3
+    host.db.push_rows(vec![]); // announcements:write over the troop — not granted
     let (status, body) = call(
         &edit.handler,
         TestRequest::patch("/api/announcements/announcement/7")
