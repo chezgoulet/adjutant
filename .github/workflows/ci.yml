@@ -151,11 +151,15 @@ jobs:
           ./target/debug/adjutant validate-plugin target/debug/libadjutant_gear_locker.so
 
       - name: End-to-end harness (dev headers OFF)
-        env:
-          # Keep the harness off the live `adjutant_dev` database, like the probe
-          # ladder above; `adjutant_dev_test` is created earlier in this job.
-          ADJUTANT_DATABASE_URL: postgres://adjutant:adjutant@127.0.0.1:5432/adjutant_dev_test
         run: |
+          # Keep the harness off the live `adjutant_dev` database, like the probe ladder
+          # above; `adjutant_dev_test` is created earlier in this job. The URL is read
+          # from the job's ADJUTANT_TEST_DATABASE_URL rather than written out a second
+          # time: a duplicated credential is one more place to get it wrong, and this
+          # step's own copy once carried a redacted `***` placeholder as its password —
+          # a URL that looks perfectly valid and fails authentication, which is exactly
+          # why it went unnoticed for a day.
+          export ADJUTANT_DATABASE_URL="$ADJUTANT_TEST_DATABASE_URL"
           # The loader runs each plugin as its own restricted DB role; create the
           # roles/credentials before boot (the runtime has no CREATEROLE).
           ./target/debug/adjutant bootstrap-isolation \
@@ -169,6 +173,12 @@ jobs:
             if python3 -c "import socket,sys; socket.create_connection(('127.0.0.1',8787),1); sys.exit(0)" 2>/dev/null; then break; fi
             sleep 0.2
           done
+          # A wait loop that gives up quietly turns a dead server into a confusing
+          # network error from the harness below — a wrong database credential once
+          # surfaced as 'connection refused'. Fail here instead, beside the server's
+          # own output in this log.
+          python3 -c "import socket,sys; socket.create_connection(('127.0.0.1',8787),1); sys.exit(0)" \
+            || { echo "::error::the server never opened 127.0.0.1:8787 — see its output above"; exit 1; }
           python3 docs/e2e_m3.py
 
       # The domain lifecycle, live: six-stage missions (Art 8), motions and
@@ -178,9 +188,10 @@ jobs:
       # above is the identity proof. Both servers share the test database; the
       # first has already applied every migration by the time this one boots.
       - name: End-to-end mission + governance lifecycle (dev headers ON)
-        env:
-          ADJUTANT_DATABASE_URL: postgres://adjutant:***@127.0.0.1:5432/adjutant_dev_test
         run: |
+          # Same database as the harness above, by derivation rather than a second
+          # copy of the credential.
+          export ADJUTANT_DATABASE_URL="$ADJUTANT_TEST_DATABASE_URL"
           ADJUTANT_PLUGIN_DIR=plugins-built \
           ADJUTANT_DEV_HEADERS=true \
           ADJUTANT_ALLOW_SUPERUSER=true \
@@ -192,6 +203,12 @@ jobs:
             if python3 -c "import socket,sys; socket.create_connection(('127.0.0.1',8788),1); sys.exit(0)" 2>/dev/null; then break; fi
             sleep 0.2
           done
+          # A wait loop that gives up quietly turns a dead server into a confusing
+          # network error from the harness below — a wrong database credential once
+          # surfaced as 'connection refused'. Fail here instead, beside the server's
+          # own output in this log.
+          python3 -c "import socket,sys; socket.create_connection(('127.0.0.1',8788),1); sys.exit(0)" \
+            || { echo "::error::the server never opened 127.0.0.1:8788 — see its output above"; exit 1; }
           ADJUTANT_E2E_BASE=http://127.0.0.1:8788 python3 docs/e2e_m4.py
 
   # The declared MSRV (workspace rust-version). RUSTUP_TOOLCHAIN overrides the
