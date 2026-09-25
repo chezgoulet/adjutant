@@ -77,19 +77,25 @@ so that the v0.2.0 evidence trail keeps its existing name.
 | `membership` | §7.2 | Roster, lodges, patrols, proficiency, OSG import | M3 | **Shipped** (v0.2.0) |
 | `missions` | §7.3 | Six-stage mission lifecycle, mentor matching, Lodge Commander approval | M4 | **Shipped** (v0.2.0) |
 | `governance` | §7.4 | Motion lifecycle, voting, amendments, Accords versioning | M4 | **Shipped** (v0.2.0) |
-| `calendar` | §7.7 | Events, RSVPs, recurrence, quorum tracking | M5 | Planned |
+| `calendar` | §7.7 | Events, RSVPs, recurrence, quorum tracking | M5 | **Shipped** (v0.2.0) |
 | `mcp` | §7.10 | Permissions-aware MCP server for Hermes | M5 | **Built** (loading, tested; M5 client exit criteria pending) |
-| `finance` | §7.5 | Funds, transactions, budget vs. actuals, sliding-scale dues | M6 | Planned |
-| `equipment` | §7.6 | Inventory, checkout/checkin, maintenance | M6 | Planned |
-| `archive` | §7.8 | Congress proceedings, minutes, full-text search, timeline | M6 | Planned |
-| `conflicts` | §7.9 | Conflict-resolution pathway, stage tracking, anti-dropout | M6 | Planned |
-| `announcements` | §7.14 | Troop communication, read receipts, categories, push | M6 | Planned |
+| `finance` | §7.5 | Funds, transactions, budget vs. actuals, sliding-scale dues | M6 | **Built** (routes and permissions in `docs/api-reference.md`; stable and client coverage pending) |
+| `equipment` | §7.6 | Inventory, checkout/checkin, maintenance | M6 | **Built** (routes and permissions in `docs/api-reference.md`; stable and client coverage pending) |
+| `archive` | §7.8 | Congress proceedings, minutes, full-text search, timeline | M6 | **Built** (routes and permissions in `docs/api-reference.md`; stable and client coverage pending) |
+| `conflicts` | §7.9 | Conflict-resolution pathway, stage tracking, anti-dropout | M6 | **Built** (routes and permissions in `docs/api-reference.md`; stable and client coverage pending) |
+| `announcements` | §7.14 | Troop communication, read receipts, categories, push | M6 | **Built** (routes and permissions in `docs/api-reference.md`; delivery deferred — delivery channel is #46; client coverage pending) |
 
-> **"Shipped" vs the v1.0 gate.** `missions` and `governance` load through the
-> blessed path, are covered by tests against `adjutant_sdk::testing`, and their
-> routes and permissions are in `api-reference.md`. The §1 gate's third test
-> ("usable by a scout without SQL or curl") needs the Flutter client and the M5
-> fresh-machine harness, and is **not** met by this milestone.
+> **"Shipped" vs "Built" vs the v1.0 gate.** `auth`, `membership`, `missions`,
+> `governance` and `calendar` are **Shipped**: they load through the blessed path,
+> are covered by tests against `adjutant_sdk::testing`, and their routes and
+> permissions are in `api-reference.md`. The M6 batch — `finance`, `equipment`,
+> `archive`, `conflicts`, `announcements` — meets those same first two tests and
+> is marked **Built**. What none of them has yet is the §1 gate's third test,
+> "usable by a scout without SQL or curl", which needs the Flutter client;
+> coverage is tracked in #56. `conflicts` may never take that test in its current
+> form — a private case between two people may belong in a conversation rather
+> than a screen. The M6 batch's record is
+> `docs/milestones/M6-operational-plugins.md`.
 
 ### Tier B — per-troop integrations
 
