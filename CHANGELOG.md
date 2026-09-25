@@ -167,13 +167,33 @@ first-party plugin to pick the helpers up.
   `core.outbox_producer_view()`), and drops it once that durable state is
   `delivered` — so the worklist's honesty does not depend on a notification
   arriving. `payment.received` remains, as the fallback when no intent can be
-  composed. **What this does not close, stated rather than implied:** the
-  enqueue-time fund read is a §2(b) call carrying the caller's credential, and a
-  webhook has none, so where finance refuses that read no intent is composed and
-  the payment is recorded `unbooked` and delegated as before — that residual is
-  issue #60 (finance's write paths accept only a fund id). The plugin now
-  subscribes to `core.outbox.*` for that settlement (a notification; the intent
-  row is the durable record).
+  composed. The plugin subscribes to `core.outbox.*` for that settlement (a
+  notification; the intent row is the durable record). **Its first version left
+  the mechanism inert in production, and the two commits after it are the repair:**
+  the enqueue-time fund read is a §2(b) call carrying the caller's credential, and
+  a webhook has none, so on a real deployment finance refused that read and no
+  intent could be composed at all — see the entry below, which closes issue #60 by
+  having finance accept a fund **code**.
+
+- **finance accepts a fund *code* on its write route, which closes issue #60 and
+  makes the outbox intent real on a callerless path.** `POST
+  /api/finance/transaction` takes `fund_id` **or** `fund_code` (exactly one; both
+  is a `400`, neither is a `400`) and resolves a code inside the insert's own
+  statement — `FROM funds f` is the fund row the entry lands in — so a producer
+  that holds only the code (§3.5's reference) writes without reading finance
+  first, and finance's primary key never has to be replicated anywhere. `stripe`
+  now composes its intent payload from what it has: finance's id when its
+  enqueue-time read answered, and the fund's **code** when it did not — which is
+  every real webhook delivery, since a webhook carries no credential. The intent
+  path therefore fires in production instead of degrading to a delegation; only a
+  fund this plugin has *seen* to be missing or inactive still yields no intent,
+  and then the payment is recorded `unbooked` with the reason in the response and
+  the audit. `finance.transactions.fund_id` is still the id — resolution happens
+  before the row is written, inside the same statement. Additive: an existing
+  caller sending `fund_id` is unaffected. And the CI ladder now runs the stripe
+  plugin's DB probes (`cargo test -p adjutant-stripe --test outbox_intent --
+  --ignored`), so the money path's atomicity, idempotency and worklist claims are
+  gated by CI rather than by hand.
 
 ### Notes for plugin authors
 

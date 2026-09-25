@@ -171,11 +171,18 @@ Stated so nobody assumes otherwise:
   redelivery does not double-write, and a delivered request carries **no headers at
   all** — the identity is built from the intent row, so there is no credential to
   forward, steal or replay.
-  **What is still not built is a producer.** No plugin enqueues an intent yet, so
-  `stripe` still books through finance's idempotent `payment.received` subscriber,
-  carries a truthful `ledger_status`, and appears in `GET /api/stripe/unbooked` if no
-  ledger entry confirms it. That named gap is the next step, and it is the one that
-  makes this rail load-bearing rather than merely verified.
+  **The producer exists now** (`stripe`, 2026-09-25): a confirmed payment and its
+  ledger intent are written by **one statement** (`core.outbox_enqueue(…)` as an
+  expression in the plugin's own `INSERT`), so the fact and its booking commit
+  together or neither does, and a redelivered webhook is handed back the intent it
+  already has. Its payload is complete before the statement runs: the fund is named
+  by finance's id when a read answered and by the fund's **code** when it did not —
+  and finance's write route accepts either, resolving a code inside the statement
+  that writes the entry, which is what makes the intent real on a callerless
+  webhook. §4's earlier note that finance took only a fund id (issue #60) is
+  closed for this path. What remains open, and is a different problem: a
+  machine-originated producer can **instruct** finance but not **ask** it anything —
+  funds, balances and the ledger are reads, and a read is a caller's.
 
 ---
 

@@ -51,18 +51,19 @@
 //! Three limits of that are load-bearing, so they are stated here rather than
 //! discovered later.
 //!
-//! 1. **The payload is complete before the statement runs.** The relay cannot
-//!    read-then-write at delivery, so the fund *code* the payment names is resolved
-//!    into finance's fund *id* **at enqueue time**, over `GET /api/finance/funds`,
-//!    exactly as `POST /api/stripe/payment/{id}/book` resolves it. That read is a
-//!    §2(b) call and carries the caller's credential — which a webhook does not
-//!    have. Where the read cannot be made (there is no credential to forward, or
-//!    finance has no such fund), **no intent is composed**: the payment is still
-//!    recorded, `unbooked`, and handed to finance through `payment.received` as
-//!    before, with the reason in the response and the audit. That residual is issue
-//!    #60: finance accepts only a fund **id** on its write paths (`fund_id: i64`),
-//!    so a producer that cannot read funds cannot compose a complete payload, and
-//!    fixing it belongs to finance.
+//! 1. **The payload is complete before the statement runs, and it never needs a
+//!    read to be.** The fund is named by finance's **id** when the read above
+//!    answered (`GET /api/finance/funds`, resolving the code exactly as
+//!    `POST /api/stripe/payment/{id}/book` resolves it), and by the fund's
+//!    **code** when it did not — and that read is a §2(b) call carrying the
+//!    caller's credential, which a webhook does not have. finance accepts either
+//!    and resolves whichever it is sent *inside the statement that writes the
+//!    entry*, so **issue #60 — finance's write path taking only a fund id — is
+//!    closed for this path**: a producer with no read credential still composes a
+//!    complete instruction. Only a fund this plugin has **seen** to be missing or
+//!    inactive yields no intent: then the payment is still recorded, `unbooked`,
+//!    and handed to finance through `payment.received`, with the reason in the
+//!    response and the audit.
 //! 2. **`ledger_status` says which of those happened.** `intent_enqueued` means an
 //!    intent is enqueued and the relay will deliver it — neither booked nor
 //!    unbooked. The relay's own outcome events settle it to `booked` (finance
@@ -1335,6 +1336,22 @@ async fn read_funds(
     }
 }
 
+/// The fund an intent's payload names.
+///
+/// finance accepts either, and the two mean the same thing to it: an id is its
+/// own key, a code is the **reference** this plugin actually holds (§3.5). The id
+/// is used when the read below answered; the code is what makes a complete payload
+/// possible when it could not — the callerless webhook path, where there is no
+/// credential to read funds with (issue #60). Both are resolved by finance inside
+/// the statement that writes the entry, so neither is a guess.
+#[derive(Debug, Clone)]
+enum IntentFund {
+    /// finance's primary key, resolved at enqueue time.
+    Id(i64),
+    /// The fund's code, resolved by finance at delivery.
+    Code(String),
+}
+
 /// Why a fund code is not finance's fund id.
 enum FundResolution {
     /// finance's primary key for the fund.
@@ -1376,35 +1393,61 @@ fn resolve_fund(funds: &[Value], code: &str) -> FundResolution {
 /// finance unreachable — the caller records the payment *without* an intent and
 /// says why, rather than enqueuing a payload finance would refuse. Issue #60 is
 /// why a read is needed at all: finance's write paths accept only an id.
-async fn resolve_fund_id_for_intent(
+async fn fund_for_intent(
     c: &PluginContext,
     cfg: &StripeConfig,
     headers: &[(String, String)],
     fund_code: &str,
-) -> Result<i64, String> {
+) -> Result<(IntentFund, Option<String>), String> {
     if fund_code.trim().is_empty() {
         return Err("the payment names no fund code".to_string());
     }
     match read_funds(c, cfg, headers).await {
+        // The read answered, so this plugin KNOWS something about the fund and
+        // acts on it: a fund finance does not have, or one that is closed, is not
+        // worth an intent — a doomed instruction shows up in reconciliation as a
+        // refusal, where an `unbooked` payment with a stated reason is information.
         FundsRead::Listed { funds, .. } => match resolve_fund(&funds, fund_code) {
-            FundResolution::Id(id) => Ok(id),
+            FundResolution::Id(id) => Ok((IntentFund::Id(id), None)),
             FundResolution::Missing => Err(format!(
-                "finance has no fund with code {fund_code:?} visible to this caller, so no \
-                 complete intent payload could be composed"
+                "finance has no fund with code {fund_code:?} visible to this caller, so no intent \
+                 was enqueued: the booking would be refused at delivery"
             )),
             FundResolution::Inactive => {
                 Err(format!("finance's fund {fund_code:?} is inactive"))
             }
-            FundResolution::NoId => Err(format!(
-                "finance's fund {fund_code:?} came back without an id, so no complete intent \
-                 payload could be composed"
+            // finance answered with the fund but no usable id: the code is still
+            // the reference, and finance resolves it itself.
+            FundResolution::NoId => Ok((
+                IntentFund::Code(fund_code.to_string()),
+                Some(
+                    "finance answered with the fund but no usable id, so the payload names the \
+                     fund by its code and finance resolves it"
+                        .to_string(),
+                ),
             )),
         },
-        FundsRead::Refused { status, message } => Err(format!(
-            "finance refused the funds read (HTTP {status}): {message}; a complete intent payload \
-             needs the fund id, and the relay cannot resolve a code at delivery"
+        // Nothing could be read — no credential to forward (every real webhook),
+        // or finance was unreachable — so this plugin knows nothing against the
+        // fund and does not pretend otherwise: the payload names the fund by its
+        // **code**, which is complete, because finance resolves it inside the
+        // statement that writes the entry. This is the path that makes the intent
+        // real on a callerless webhook (issue #60).
+        FundsRead::Refused { status, message } => Ok((
+            IntentFund::Code(fund_code.to_string()),
+            Some(format!(
+                "finance refused the funds read (HTTP {status}): {message}; with nothing read and \
+                 no credential to forward there is no id to name, so the payload names the fund by \
+                 its code (issue #60) and finance resolves it where the entry is written"
+            )),
         )),
-        FundsRead::Unreachable(message) => Err(message),
+        FundsRead::Unreachable(message) => Ok((
+            IntentFund::Code(fund_code.to_string()),
+            Some(format!(
+                "{message}; the payload names the fund by its code rather than wait for an id, and \
+                 finance resolves it at delivery"
+            )),
+        )),
     }
 }
 
@@ -1417,14 +1460,16 @@ async fn resolve_fund_id_for_intent(
 ///   `donation`, `event_fee`), which is what its dues-standing view sums.
 /// * `external_ref` is Stripe's payment id, so finance's unique index makes a
 ///   second delivery a no-op instead of a second entry.
-/// * `fund_id` is the id resolved above — never a configured copy.
-fn ledger_intent_payload(fact: &PaymentFact, category: &str, fund_id: i64) -> Value {
+/// * The fund is named `fund_id` when finance's key was resolved, else
+///   `fund_code` — the reference this plugin holds. Never a configured copy of
+///   finance's key, and never a guess: finance resolves whichever is sent inside
+///   the statement that writes the entry.
+fn ledger_intent_payload(fact: &PaymentFact, category: &str, fund: &IntentFund) -> Value {
     let description = match fact.description.trim() {
         "" => format!("Stripe {} {}", fact.purpose, fact.payment_id),
         text => format!("Stripe {} {} — {text}", fact.purpose, fact.payment_id),
     };
     let mut payload = json!({
-        "fund_id": fund_id,
         "kind": "income",
         "amount_cents": fact.amount_cents,
         "category": category,
@@ -1435,6 +1480,10 @@ fn ledger_intent_payload(fact: &PaymentFact, category: &str, fund_id: i64) -> Va
         // writes the row that sets `confirmed_at` to now().
         "occurred_on": Utc::now().date_naive().to_string(),
     });
+    match fund {
+        IntentFund::Id(id) => payload["fund_id"] = json!(id),
+        IntentFund::Code(code) => payload["fund_code"] = json!(code),
+    }
     if let Some(year) = fact.dues_year {
         payload["fiscal_year"] = json!(year);
     }
@@ -2185,6 +2234,12 @@ fn route_health(cfg: &StripeConfig) -> RouteDefinition {
                             "principal": LEDGER_PRINCIPAL,
                             "target_route": format!("POST {FINANCE_TRANSACTION_PATH}"),
                             "synchronous": false,
+                            "how_the_fund_is_named": "by finance's fund id when the funds read \
+                                                      answers, else by the fund's **code** — finance \
+                                                      accepts either and resolves it inside the \
+                                                      statement that writes the entry, which is what \
+                                                      makes the intent real on a callerless webhook \
+                                                      (issue #60)",
                             "intent": "a confirmed payment and its ledger intent are written in \
                                        one statement (core.outbox_enqueue as an expression in this \
                                        plugin's own INSERT), so neither can exist without the \
@@ -2195,22 +2250,22 @@ fn route_health(cfg: &StripeConfig) -> RouteDefinition {
                                     (plugin-to-plugin.md §2(b)). The core's relay delivers the \
                                     intent as a declared service principal and records finance's \
                                     answer on the intent row",
-                            "fallback": "when the fund cannot be resolved at enqueue time (issue \
-                                         #60: finance's write paths take only a fund id, and the \
-                                         funds read needs a credential this path does not have), \
-                                         the payment is recorded with no intent and handed to \
-                                         finance through payment.received, as before — status \
-                                         'delegated_event', no answer",
+                            "fallback": "the funds read answered and said finance has no such fund (or that it is inactive), so no \
+                                         intent is enqueued: the payment is recorded, then handed \
+                                         to finance through payment.received — status \
+                                         'delegated_event', no answer. When the read could not be \
+                                         made at all, the fund is named by its **code** in the \
+                                         intent instead — finance accepts either (issue #60)",
                             "unverified": "the relay's delivery is asynchronous: 'intent_enqueued' \
                                            is neither booked nor unbooked, and GET \
                                            /api/stripe/unbooked is the worklist of everything \
                                            without a confirmed ledger entry, with each payment's \
                                            intent and its state",
-                            "blocked_on": "issue #60: finance's write routes accept only a fund \
-                                           **id**, so a producer with no read credential cannot \
-                                           compose a complete payload; accepting a fund code (or \
-                                           granting svc.stripe.ledger finance:read) is finance's \
-                                           change, not this plugin's",
+                            "blocked_on": "nothing on this path: a fund code is a complete answer. What a \
+                                           machine-originated producer still cannot do is READ \
+                                           finance (funds, balances, the ledger) — it can instruct, \
+                                           not ask, because the read is a caller's and it holds no \
+                                           credential",
                         },
                     }),
                 )
@@ -2899,16 +2954,21 @@ pub async fn handle_webhook(
     // resolves it — with the credential this request carried, which for a Stripe
     // webhook is none, and that is the limit the module docs state (issue #60).
     //
-    // What cannot be resolved yields **no intent** rather than an incomplete one:
-    // the payment is still recorded, truthfully `unbooked`, and handed to finance
-    // through `payment.received`, with the reason in the response and the audit.
-    let (intent, intent_refusal) =
-        match resolve_fund_id_for_intent(c, cfg, &forward_headers(req), &fund_code).await {
-            Ok(fund_id) => (
-                Some(ledger_intent_payload(&fact, &category, fund_id)),
+    // The payload is complete either way: the fund is named by finance's id when
+    // the read answered, and by the fund's **code** when it did not — finance
+    // resolves a code inside the statement that writes the entry, so no read at
+    // delivery is needed and none is attempted. Only a fund this plugin has
+    // *seen* to be missing or closed yields no intent at all: then the payment is
+    // still recorded, truthfully `unbooked`, and handed to finance through
+    // `payment.received`, with the reason in the response and the audit.
+    let (intent, intent_refusal, fund_note) =
+        match fund_for_intent(c, cfg, &forward_headers(req), &fund_code).await {
+            Ok((fund, note)) => (
+                Some(ledger_intent_payload(&fact, &category, &fund)),
                 None::<String>,
+                note,
             ),
-            Err(reason) => (None, Some(reason)),
+            Err(reason) => (None, Some(reason), None),
         };
 
     // One statement, two shapes: with the intent, `ledger_intent_id` is the
@@ -3102,6 +3162,7 @@ pub async fn handle_webhook(
                     // could not be completed (issue #60). The payment is recorded
                     // either way — this is the reason on the record.
                     "intent_refused": intent_refusal,
+                    "fund_note": fund_note,
                     "signature_timestamp": stamp.timestamp,
                 }),
             )
@@ -3109,7 +3170,7 @@ pub async fn handle_webhook(
     }
 
     let duplicate = !newly_recorded && already_delegated;
-    let ledger = webhook_ledger_block(&delegated, intent_refusal.as_deref());
+    let ledger = webhook_ledger_block(&delegated, intent_refusal.as_deref(), fund_note.as_deref());
     PluginResponse::json(
         200,
         &json!({
@@ -3132,7 +3193,11 @@ pub async fn handle_webhook(
 /// to tell them apart: an intent is enqueued (the relay will deliver it, and its
 /// state is readable), or no intent could be composed and the event carried the
 /// payment with the reason it was not.
-fn webhook_ledger_block(payment: &Value, intent_refusal: Option<&str>) -> Value {
+fn webhook_ledger_block(
+    payment: &Value,
+    intent_refusal: Option<&str>,
+    fund_note: Option<&str>,
+) -> Value {
     let status = payment["ledger_status"]
         .as_str()
         .unwrap_or(LEDGER_UNBOOKED);
@@ -3142,6 +3207,8 @@ fn webhook_ledger_block(payment: &Value, intent_refusal: Option<&str>) -> Value 
             "principal": LEDGER_PRINCIPAL,
             "target_route": format!("POST {FINANCE_TRANSACTION_PATH}"),
             "intent_id": payment["ledger_intent_id"],
+            // Why the payload names the fund by code, when it did.
+            "fund_note": fund_note,
             "synchronous": false,
             "status": status,
             "why": "a Stripe webhook carries no Adjutant caller, so there is no credential to \

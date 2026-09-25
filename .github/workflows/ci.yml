@@ -106,6 +106,16 @@ jobs:
       - name: test-plugin harness
         run: ADJUTANT_PLUGIN_DIR=plugins-built ./target/debug/adjutant test-plugin
 
+      # The money path's own probes: the stripe plugin's ledger booking is one
+      # statement, idempotent across a redelivery, and its worklist tells the
+      # truth about an in-flight intent. They are `#[ignore]`d (issue #25) so the
+      # bare workspace run reports them as ignored, and they need the database the
+      # ladder above has just bootstrapped — roles, the stored plugin secrets, and
+      # the plugin migrations — because they connect AS the plugin's own role:
+      # `core.outbox_enqueue` derives the producer from `session_user`.
+      - name: Stripe outbox probes (DB-backed)
+        run: cargo test -p adjutant-stripe --test outbox_intent -- --ignored --nocapture
+
       # The sandboxed path: build the WASM guest and load it through the same
       # registry/dispatch pipeline (a separate plugin dir keeps the native
       # harnesses above unaffected).

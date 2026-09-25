@@ -461,7 +461,15 @@ where
 
 #[derive(Debug, Deserialize)]
 struct TransactionBody {
-    fund_id: i64,
+    /// finance's own primary key for the fund. Optional now that `fund_code` is
+    /// accepted: a producer that holds the fund's **code** (the reference
+    /// `plugin-to-plugin.md` §3.5 asks for) can write without reading anything.
+    #[serde(default)]
+    fund_id: Option<i64>,
+    /// The fund's **code** — resolved here, where the funds table lives, inside
+    /// the same statement as the insert. Exactly one of `fund_id`/`fund_code`.
+    #[serde(default)]
+    fund_code: Option<String>,
     kind: String,
     #[serde(default)]
     amount_cents: Option<MoneySpec>,
@@ -1737,6 +1745,13 @@ fn route_list_transactions(ctx: &PluginContext) -> RouteDefinition {
 /// stored positive, `expense` negative), so a client cannot record an expense
 /// that adds money.
 ///
+/// The fund is named by `fund_id` **or** by `fund_code`, and resolved inside the
+/// insert's own statement — so a producer that holds only a fund *code* (the
+/// reference, §3.5) writes without reading finance first, and finance's primary
+/// key never has to leave its own schema except as an answer. Exactly one of the
+/// two: both together is refused, because finance would have to guess which one
+/// the caller meant.
+///
 /// Queries: one guarded `INSERT … SELECT`; when it writes nothing, one more to
 /// say *why* (unknown fund, a replayed `external_ref`, or an overdraft — see
 /// [`explain_no_entry`]); then the fund's new balance. Then the audit write.
@@ -1766,8 +1781,29 @@ fn route_record_transaction(ctx: &PluginContext) -> RouteDefinition {
                 }
                 let date = validate(occurred_on(&body.occurred_on))?;
                 let fiscal_year = validate(fiscal_year_arg(body.fiscal_year, date, &c.config))?;
+                let fund_ref = match (body.fund_id, trimmed(&body.fund_code)) {
+                    (Some(id), None) => FundRef::Id(id),
+                    (None, Some(code)) => FundRef::Code(code),
+                    (Some(_), Some(code)) => {
+                        return PluginResponse::error(
+                            400,
+                            format!(
+                                "pass either fund_id or fund_code, not both: {code:?} would be a \
+                                 second answer to the same question, and finance would have to \
+                                 choose which one you meant"
+                            ),
+                        )
+                    }
+                    (None, None) => {
+                        return PluginResponse::error(
+                            400,
+                            "the entry names no fund: pass fund_id, or the fund's code as \
+                             fund_code (either is resolved here, inside the same statement)",
+                        )
+                    }
+                };
                 let entry = LedgerEntry {
-                    fund_id: body.fund_id,
+                    fund: fund_ref,
                     amount_cents: if kind == KIND_INCOME {
                         magnitude
                     } else {
@@ -1791,7 +1827,10 @@ fn route_record_transaction(ctx: &PluginContext) -> RouteDefinition {
                 let Some(recorded) = rows.first().cloned() else {
                     return explain_no_entry(&c, &entry).await;
                 };
-                let balance = fund_balance_cents(&c, entry.fund_id).await?;
+                // The fund the entry **landed in** — the row's own id, which is
+                // what a `fund_code` entry has only after the insert resolved it.
+                let fund_id = recorded["fund_id"].as_i64().unwrap_or_default();
+                let balance = fund_balance_cents(&c, fund_id).await?;
                 c.audit
                     .log(
                         req.identity.as_ref(),
@@ -1799,7 +1838,7 @@ fn route_record_transaction(ctx: &PluginContext) -> RouteDefinition {
                         "transaction",
                         &recorded["id"].as_i64().unwrap_or_default().to_string(),
                         json!({
-                            "fund_id": entry.fund_id,
+                            "fund_id": fund_id,
                             "kind": entry.kind,
                             "amount_cents": entry.amount_cents,
                             "category": entry.category,
@@ -1815,7 +1854,7 @@ fn route_record_transaction(ctx: &PluginContext) -> RouteDefinition {
                         "finance.transaction.recorded",
                         json!({
                             "transaction_id": recorded["id"],
-                            "fund_id": entry.fund_id,
+                            "fund_id": fund_id,
                             "kind": entry.kind,
                             "amount_cents": entry.amount_cents,
                             "category": entry.category,
@@ -1828,7 +1867,7 @@ fn route_record_transaction(ctx: &PluginContext) -> RouteDefinition {
                     &format!("/api/finance/transaction/{}", recorded["id"]),
                     &json!({
                         "transaction": recorded,
-                        "fund_id": entry.fund_id,
+                        "fund_id": fund_id,
                         "balance_cents": balance,
                         "balance_display": format_cents(balance),
                         "overdrawn": balance < 0,
@@ -2884,7 +2923,7 @@ fn route_record_dues_payment(ctx: &PluginContext) -> RouteDefinition {
                 };
                 let fund_id = fund["id"].as_i64().unwrap_or_default();
                 let entry = LedgerEntry {
-                    fund_id,
+                    fund: FundRef::Id(fund_id),
                     amount_cents: amount,
                     kind: KIND_INCOME,
                     category: CATEGORY_DUES.to_string(),
@@ -3239,11 +3278,25 @@ fn sql_budget_lines_for_fund(c: &PluginContext) -> String {
 // Writing the ledger
 // ---------------------------------------------------------------------------
 
+/// How an entry names the fund it lands in.
+///
+/// **The code is the reference, the id is finance's key** (`plugin-to-plugin.md`
+/// §3.5): a producer that holds a fund *code* — the thing finance seeds and its
+/// own config names — can write an entry without reading anything first, and the
+/// code→id resolution happens here, where the funds table lives, inside the same
+/// statement as the insert. An id is still accepted, for a caller that already
+/// has one.
+#[derive(Debug, Clone)]
+enum FundRef {
+    Id(i64),
+    Code(String),
+}
+
 /// One entry the handlers write. `amount_cents` is **signed** (income positive,
 /// expense negative) and the sign is computed from the kind, never taken from a
 /// request body.
 struct LedgerEntry {
-    fund_id: i64,
+    fund: FundRef,
     amount_cents: i64,
     kind: &'static str,
     category: String,
@@ -3259,7 +3312,8 @@ struct LedgerEntry {
 /// Write one entry, guarded — **one statement**.
 ///
 /// Two guards ride along with the `INSERT … SELECT`, which is what makes them
-/// sound: the fund must exist, and the fund must not be taken negative by this
+/// sound: the fund must exist — named by id **or by code**, resolved by the same
+/// statement (`FROM funds f`) — and the fund must not be taken negative by this
 /// entry (unless `overdraft_authorized` says a person decided otherwise).
 /// `ON CONFLICT (external_ref) DO NOTHING` makes a replayed entry — the same
 /// provider payment arriving twice — a no-op rather than a second deposit; a null
@@ -3268,22 +3322,32 @@ struct LedgerEntry {
 /// An empty result is therefore one of three things, and the caller asks
 /// [`explain_no_entry`] which.
 async fn insert_entry(c: &PluginContext, entry: &LedgerEntry) -> Result<Vec<Value>, SdkError> {
+    // The fund is named by **id or code** and resolved here, in the same
+    // statement: `FROM funds f` is the fund row the entry lands in, so a caller
+    // that holds only the code needs no read of its own (`$1` an id, `$12` a
+    // code, exactly one of them non-null).
+    let (fund_id, fund_code) = match &entry.fund {
+        FundRef::Id(id) => (SqlValue::Int(*id), SqlValue::Null),
+        FundRef::Code(code) => (SqlValue::NullInt, SqlValue::Text(code.clone())),
+    };
     c.db.query(
         format!(
             "INSERT INTO {tx} AS t \
                (fund_id, amount_cents, kind, category, description, member_id, fiscal_year, \
                 occurred_on, recorded_by, overdraft_authorized, external_ref) \
-             SELECT $1, $2, $3, $4, $5, $6, $7, $8::date, $9, $10, $11 \
-             WHERE EXISTS (SELECT 1 FROM {funds} f WHERE f.id = $1) \
+             SELECT f.id, $2, $3, $4, $5, $6, $7, $8::date, $9, $10, $11 \
+               FROM {funds} f \
+             WHERE (($1::bigint IS NOT NULL AND f.id = $1) \
+                    OR ($12::text IS NOT NULL AND f.code = $12)) \
                AND ($10 OR (SELECT COALESCE(SUM(amount_cents), 0)::bigint FROM {tx} \
-                            WHERE fund_id = $1) + $2 >= 0) \
+                            WHERE fund_id = f.id) + $2 >= 0) \
              ON CONFLICT (external_ref) DO NOTHING \
              RETURNING {TRANSACTION_FIELDS}",
             tx = c.db.table("transactions"),
             funds = c.db.table("funds")
         ),
         vec![
-            SqlValue::Int(entry.fund_id),
+            fund_id,
             SqlValue::Int(entry.amount_cents),
             SqlValue::Text(entry.kind.to_string()),
             SqlValue::Text(entry.category.clone()),
@@ -3294,6 +3358,7 @@ async fn insert_entry(c: &PluginContext, entry: &LedgerEntry) -> Result<Vec<Valu
             SqlValue::Text(entry.recorded_by.clone()),
             SqlValue::Bool(entry.overdraft_authorized),
             entry.external_ref.clone().into(),
+            fund_code,
         ],
     )
     .await
@@ -3325,21 +3390,33 @@ async fn explain_no_entry(
     c: &PluginContext,
     entry: &LedgerEntry,
 ) -> Result<PluginResponse, SdkError> {
+    let (fund_id, fund_code) = match &entry.fund {
+        FundRef::Id(id) => (SqlValue::Int(*id), SqlValue::Null),
+        FundRef::Code(code) => (SqlValue::NullInt, SqlValue::Text(code.clone())),
+    };
     let fund =
         c.db.query_one(
             format!(
                 "SELECT f.id, f.code, f.name, f.active, \
                         COALESCE(SUM(t.amount_cents), 0)::bigint AS balance_cents \
                  FROM {funds} f LEFT JOIN {tx} t ON t.fund_id = f.id \
-                 WHERE f.id = $1 GROUP BY f.id",
+                 WHERE ($1::bigint IS NOT NULL AND f.id = $1) \
+                    OR ($2::text IS NOT NULL AND f.code = $2) \
+                 GROUP BY f.id",
                 funds = c.db.table("funds"),
                 tx = c.db.table("transactions")
             ),
-            vec![SqlValue::Int(entry.fund_id)],
+            vec![fund_id, fund_code],
         )
         .await?;
     let Some(fund) = fund else {
-        return PluginResponse::error(404, format!("no such fund: {}", entry.fund_id));
+        return PluginResponse::error(
+            404,
+            match &entry.fund {
+                FundRef::Id(id) => format!("no such fund: {id}"),
+                FundRef::Code(code) => format!("no such fund: code {code:?}"),
+            },
+        );
     };
     if let Some(reference) = &entry.external_ref {
         let existing =
@@ -3746,7 +3823,7 @@ async fn on_payment_received(c: &PluginContext, ev: &Event) -> Result<(), SdkErr
     let fiscal_year =
         fiscal_year_arg(payment.fiscal_year, date, &c.config).map_err(SdkError::BadRequest)?;
     let entry = LedgerEntry {
-        fund_id: fund["id"].as_i64().unwrap_or_default(),
+        fund: FundRef::Id(fund["id"].as_i64().unwrap_or_default()),
         amount_cents: payment.amount_cents,
         kind: KIND_INCOME,
         category: payment
@@ -3789,7 +3866,7 @@ async fn on_payment_received(c: &PluginContext, ev: &Event) -> Result<(), SdkErr
             &recorded["id"].as_i64().unwrap_or_default().to_string(),
             json!({
                 "payment_id": reference,
-                "fund_id": entry.fund_id,
+                "fund_id": fund["id"],
                 "fund_code": fund["code"],
                 "amount_cents": entry.amount_cents,
                 "category": entry.category,
@@ -3805,7 +3882,7 @@ async fn on_payment_received(c: &PluginContext, ev: &Event) -> Result<(), SdkErr
             json!({
                 "transaction_id": recorded["id"],
                 "payment_id": reference,
-                "fund_id": entry.fund_id,
+                "fund_id": fund["id"],
                 "amount_cents": entry.amount_cents,
                 "category": entry.category,
                 "member_id": entry.member_id,

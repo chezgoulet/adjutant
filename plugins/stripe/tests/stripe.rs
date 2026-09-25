@@ -836,6 +836,10 @@ async fn a_confirmed_payment_and_its_ledger_intent_are_one_statement() {
         other => panic!("the payload must be JSONB: {other:?}"),
     };
     assert_eq!(payload["fund_id"], 3, "resolve at enqueue time, not at delivery");
+    assert!(
+        payload["fund_code"].is_null(),
+        "the id is sent instead of the code when it is known, never both: {payload}"
+    );
     assert_eq!(payload["kind"], "income");
     assert_eq!(payload["amount_cents"], 2500, "income is a positive magnitude");
     assert_eq!(payload["category"], CATEGORY_DUES);
@@ -866,6 +870,11 @@ async fn a_confirmed_payment_and_its_ledger_intent_are_one_statement() {
         adjutant_stripe::LEDGER_PRINCIPAL
     );
     assert_eq!(body["ledger"]["synchronous"], false);
+    assert_eq!(
+        body["ledger"]["fund_note"],
+        serde_json::Value::Null,
+        "the read answered, so there is nothing to explain"
+    );
     assert_audited(&h.db, "stripe.payment.recorded");
 }
 
@@ -933,15 +942,84 @@ async fn a_redelivered_webhook_keeps_one_intent() {
 }
 
 #[tokio::test]
-async fn without_a_read_credential_the_payment_is_recorded_unbooked_and_delegated() {
+async fn when_the_funds_read_is_refused_the_payload_names_the_funds_code() {
     let h = Harness::new(config());
     let routes = h.routes().await;
     let webhook = route(&routes, "POST", "/api/stripe/webhook");
 
     h.db.push_rows(vec![serde_json::json!({ "id": 1, "redeliveries": 0 })]);
     // finance refuses the funds read, as its own gate does for a caller with no
-    // credential — which is every real webhook delivery.
+    // credential — which is every real webhook delivery. This is the case that
+    // made the intent path inert before finance accepted a fund code.
     h.http.push_json(403, &serde_json::json!({ "error": "authentication required" }));
+    let mut recorded = payment_row(LEDGER_INTENT_ENQUEUED);
+    recorded["ledger_intent_id"] = serde_json::json!(91);
+    recorded["ledger_mechanism"] = serde_json::json!(MECHANISM_OUTBOX);
+    h.db.push_rows(vec![recorded]);
+
+    let (status, body) = call(
+        &webhook.handler,
+        signed_webhook(&session_completed_payload(), WEBHOOK_SECRET, now()),
+    )
+    .await;
+    assert_eq!(status, 200, "{body}");
+
+    // The intent IS enqueued, in the same statement as the payment, and its
+    // payload is complete: the fund is named by its **code**, which finance
+    // resolves where the entry is written — no read at delivery, no read needed
+    // here.
+    let inserts: Vec<String> = h
+        .db
+        .queried_sql()
+        .into_iter()
+        .filter(|sql| sql.contains("INSERT INTO \"stripe\".\"payments\""))
+        .collect();
+    assert_eq!(inserts.len(), 1);
+    assert!(
+        inserts[0].contains("core.outbox_enqueue($15, 'POST', '/api/finance/transaction', $16::jsonb, $1)"),
+        "the intent rides the payment's own insert: {}",
+        inserts[0]
+    );
+    let params = h.db.last_query_params("core.outbox_enqueue").expect("binds");
+    let payload = match &params[15] {
+        SqlValue::Json(raw) => serde_json::from_str::<serde_json::Value>(raw).unwrap(),
+        other => panic!("the payload must be JSONB: {other:?}"),
+    };
+    assert_eq!(
+        payload["fund_code"], "general",
+        "the code is the reference this plugin holds: {payload}"
+    );
+    assert!(
+        payload["fund_id"].is_null(),
+        "no id was readable, so none is claimed: {payload}"
+    );
+    assert_eq!(payload["external_ref"], "pi_test_1");
+
+    // The response says which form the payload took, and why.
+    assert_eq!(body["ledger"]["path"], "outbox");
+    assert_eq!(body["ledger"]["intent_id"], 91);
+    assert_eq!(body["ledger"]["intent_refused"], serde_json::Value::Null);
+    let note = body["ledger"]["fund_note"].as_str().unwrap_or_default();
+    assert!(
+        note.contains("funds read (HTTP 403)") && note.contains("issue #60"),
+        "the reason is stated, and it is finance's own: {note}"
+    );
+    assert_eq!(body["payment"]["ledger_status"], LEDGER_INTENT_ENQUEUED);
+    // And the relay is the hand-off, not an event.
+    assert!(h.events.payloads("payment.received").is_empty());
+}
+
+#[tokio::test]
+async fn a_fund_finance_does_not_have_yields_no_intent_and_a_stated_reason() {
+    let h = Harness::new(config());
+    let routes = h.routes().await;
+    let webhook = route(&routes, "POST", "/api/stripe/webhook");
+
+    h.db.push_rows(vec![serde_json::json!({ "id": 1, "redeliveries": 0 })]);
+    // The read answers (a caller's credential was forwarded) and finance does not
+    // have the fund. That is a fact this plugin KNOWS, so it does not enqueue a
+    // booking it knows will be refused.
+    h.http.push_json(200, &serde_json::json!({ "funds": [] }));
     h.db.push_rows(vec![payment_row(LEDGER_UNBOOKED)]);
     h.db.push_rows(vec![payment_row(LEDGER_DELEGATED_EVENT)]);
 
@@ -952,29 +1030,22 @@ async fn without_a_read_credential_the_payment_is_recorded_unbooked_and_delegate
     .await;
     assert_eq!(status, 200, "{body}");
 
-    // No intent was composed, so none was enqueued — an incomplete payload would
-    // be refused by finance at delivery, which is worse than saying so. The
-    // payment is still recorded, truthfully `unbooked`.
     let inserts: Vec<String> = h
         .db
         .queried_sql()
         .into_iter()
         .filter(|sql| sql.contains("INSERT INTO \"stripe\".\"payments\""))
         .collect();
-    assert_eq!(inserts.len(), 1);
     assert!(
         !inserts[0].contains("core.outbox_enqueue"),
-        "no intent, so no enqueue expression: {}",
+        "no intent for a fund finance does not have: {}",
         inserts[0]
     );
-    assert!(inserts[0].contains("NULL)"), "ledger_intent_id is null: {}", inserts[0]);
     let refusal = body["ledger"]["intent_refused"].as_str().unwrap_or_default();
     assert!(
-        refusal.contains("finance refused the funds read") && refusal.contains("HTTP 403"),
-        "the reason is stated, and it is finance's own: {refusal}"
+        refusal.contains("has no fund with code") && refusal.contains("refused at delivery"),
+        "{refusal}"
     );
-
-    // The fallback carried it, exactly as before.
     assert_eq!(body["ledger"]["path"], "event");
     assert_eq!(body["payment"]["ledger_status"], LEDGER_DELEGATED_EVENT);
     assert_eq!(h.events.payloads("payment.received").len(), 1);
@@ -1987,9 +2058,23 @@ async fn health_names_the_blocker_it_cannot_fix() {
         .unwrap()
         .contains("one statement"));
     assert!(body["ledger"]["why"].as_str().unwrap().contains("no Adjutant caller"));
-    // The residual, named: finance takes only a fund id on write paths, and the
-    // callerless path holds no read credential — issue #60.
-    assert!(body["ledger"]["blocked_on"].as_str().unwrap().contains("#60"));
+    // How the fund is named, and what that closed: finance accepts a fund **id**
+    // or its **code**, so the callerless path composes a complete payload with no
+    // read at all (issue #60).
+    let naming = body["ledger"]["how_the_fund_is_named"]
+        .as_str()
+        .unwrap_or_default();
+    assert!(
+        naming.contains("code") && naming.contains("#60"),
+        "{naming}"
+    );
+    // What is left is not a blocker on this path but a limit worth stating: a
+    // machine-originated producer can instruct finance, not interrogate it.
+    let blocked = body["ledger"]["blocked_on"].as_str().unwrap_or_default();
+    assert!(
+        blocked.contains("nothing on this path") && blocked.contains("READ finance"),
+        "{blocked}"
+    );
     assert!(body["ledger"]["fallback"]
         .as_str()
         .unwrap()
