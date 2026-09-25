@@ -24,3 +24,10 @@ hex = "0.4"
 
 [dev-dependencies]
 tokio.workspace = true
+# A **dev**-dependency only: it links into the test binaries, never into the
+# cdylib, so the plugin's no-runtime-in-the-plugin rule (a plugin reaches the
+# database through `ctx.db`, never through sqlx) is untouched. The DB-backed
+# probes connect to a real PostgreSQL as this plugin's own role, because
+# `core.outbox_enqueue` derives the producer from `session_user` and the whole
+# point is to prove what the *plugin's* statement does.
+sqlx.workspace = true
