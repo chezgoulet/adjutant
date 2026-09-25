@@ -1,0 +1,34 @@
+name: adjutant_client
+description: "Adjutant — sovereignty-first administration for democratic scout troops."
+publish_to: 'none'
+
+version: 0.1.0+1
+
+environment:
+  sdk: ^3.13.4
+
+dependencies:
+  flutter:
+    sdk: flutter
+
+  cupertino_icons: ^1.0.8
+
+  # HTTP client — one implementation across android/ios/web/desktop.
+  http: ^1.2.2
+
+  # State management. Deliberately small: the client is a renderer for server
+  # state, not an application with its own domain logic.
+  provider: ^6.1.2
+
+  # Local cache for offline-first reads and the queued-write outbox. Available
+  # on every target including web.
+  shared_preferences: ^2.3.2
+
+dev_dependencies:
+  flutter_test:
+    sdk: flutter
+
+  flutter_lints: ^6.0.0
+
+flutter:
+  uses-material-design: true
