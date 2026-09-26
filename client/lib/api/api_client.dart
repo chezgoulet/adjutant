@@ -787,6 +787,64 @@ class ApiClient {
     await _send('POST', '/api/plugins/${Uri.encodeComponent(id)}/$verb');
   }
 
+  // --- backups ---------------------------------------------------------------
+
+  /// The picker's options, the schedule, and the recent runs.
+  ///
+  /// The runs include bundles the app did not produce and did not record — the
+  /// host's own timer writes into the same directory, and it is meant to keep
+  /// working when this server is down. Those come back flagged rather than
+  /// hidden, because "it exists but nobody recorded it" is worth knowing.
+  Future<Map<String, dynamic>> backups() async =>
+      _asMap(await _send('GET', '/api/backups'));
+
+  /// Set the cadence, the retention, and whether the timer runs at all.
+  ///
+  /// A null [cadenceSecs] turns scheduled backups off and is sent deliberately:
+  /// the route treats an absent key as "leave the cadence alone" and an explicit
+  /// null as "there is no schedule", and those are different intentions.
+  Future<Map<String, dynamic>> setBackupSchedule({
+    required int? cadenceSecs,
+    required int keep,
+    required bool enabled,
+  }) async =>
+      _asMap(await _send('PUT', '/api/backups/schedule', body: {
+        'cadence_secs': cadenceSecs,
+        'keep': keep,
+        'enabled': enabled,
+      }));
+
+  /// Take a backup now, whoever asked for it. The row it leaves says `manual`.
+  Future<Map<String, dynamic>> runBackupNow() async =>
+      _asMap(await _send('POST', '/api/backups/run'));
+
+  /// Fetch a bundle's bytes.
+  ///
+  /// Not routed through `_send`, because that decodes JSON and a bundle is a
+  /// `pg_dump` archive — and because it gets a much longer deadline than a JSON
+  /// call: this is the one request whose body grows with everything the troop
+  /// has ever done.
+  Future<List<int>> downloadBackup(String filename) async {
+    final uri = _uri('/api/backups/${Uri.encodeComponent(filename)}/download');
+    late http.Response response;
+    try {
+      final request = http.Request('GET', uri)..headers.addAll(_headers());
+      final streamed =
+          await _http.send(request).timeout(const Duration(minutes: 5));
+      response = await http.Response.fromStream(streamed);
+    } on SocketException catch (e) {
+      throw OfflineException(e);
+    } on TimeoutException catch (e) {
+      throw OfflineException(e);
+    } on http.ClientException catch (e) {
+      throw OfflineException(e);
+    }
+    if (response.statusCode < 200 || response.statusCode >= 300) {
+      throw ApiException(response.statusCode, _errorMessage(response));
+    }
+    return response.bodyBytes;
+  }
+
   void close() => _http.close();
 }
 

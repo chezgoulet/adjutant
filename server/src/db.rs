@@ -726,6 +726,62 @@ GRANT EXECUTE ON FUNCTION core.notify(UUID, TEXT, JSONB, TEXT) TO PUBLIC;
 REVOKE ALL ON core.notifications FROM PUBLIC;
 "
     ),
+    (11, "backups", "
+-- Backups: the cadence an admin chooses, and the runs it produced.
+--
+-- Two tables, because they answer different questions. The schedule is
+-- configuration — one row, edited in place. A run is a record: append-only, and
+-- the thing the client lists and offers for download.
+CREATE TABLE IF NOT EXISTS core.backup_schedule (
+    -- One row, and the CHECK is what makes that true rather than a convention
+    -- every reader has to assume.
+    id           BOOLEAN PRIMARY KEY DEFAULT TRUE CHECK (id),
+    -- Seconds between scheduled runs. NULL means scheduled backups are off;
+    -- the client sends a preset from a fixed list and never a free-form number,
+    -- so nobody can ask for a dump every second. The floor is enforced here too,
+    -- because the client is not the only thing that can write this row.
+    cadence_secs BIGINT CHECK (cadence_secs IS NULL OR cadence_secs >= 3600),
+    -- How many finished bundles to keep. Retention sits with the cadence
+    -- because 'how often' and 'how many' are one decision, not two.
+    keep         INTEGER NOT NULL DEFAULT 14 CHECK (keep BETWEEN 1 AND 365),
+    enabled      BOOLEAN NOT NULL DEFAULT FALSE,
+    updated_at   TIMESTAMPTZ NOT NULL DEFAULT now(),
+    updated_by   TEXT
+);
+
+CREATE TABLE IF NOT EXISTS core.backups (
+    id           BIGSERIAL PRIMARY KEY,
+    created_at   TIMESTAMPTZ NOT NULL DEFAULT now(),
+    finished_at  TIMESTAMPTZ,
+    -- Whether a person pressed the button. The audit needs that distinction and
+    -- cannot recover it from anything else.
+    trigger      TEXT NOT NULL CHECK (trigger IN ('manual', 'scheduled')),
+    requested_by TEXT,
+    status       TEXT NOT NULL DEFAULT 'running'
+                 CHECK (status IN ('running', 'done', 'failed')),
+    filename     TEXT,
+    bytes        BIGINT,
+    sha256       TEXT,
+    error        TEXT,
+    -- A finished run must carry the things that make it usable, so no row can
+    -- describe a bundle that is not there; a failed one must say why. This is
+    -- the same discipline as 'a recorded notification is never reported as
+    -- delivered' — the schema refuses the lie rather than trusting the code.
+    CONSTRAINT backup_done_is_complete CHECK (
+        status <> 'done' OR (filename IS NOT NULL AND bytes IS NOT NULL
+                             AND sha256 IS NOT NULL AND finished_at IS NOT NULL)
+    ),
+    CONSTRAINT backup_failed_says_why CHECK (status <> 'failed' OR error IS NOT NULL)
+);
+
+CREATE INDEX IF NOT EXISTS backups_recent_idx ON core.backups (created_at DESC);
+
+-- The schedule row exists from the first boot, disabled. A missing row would
+-- make 'no schedule' and 'no row' the same state in two different places.
+INSERT INTO core.backup_schedule (id, enabled) VALUES (TRUE, FALSE)
+ON CONFLICT (id) DO NOTHING;
+"
+    ),
 ];
 
 /// Bootstrap roles + permissions grants. `chief` gets everything (SPEC §9 —
@@ -742,7 +798,13 @@ ON CONFLICT (id) DO NOTHING;
 
 const SEED_PERMS: &str = "
 INSERT INTO core.permissions (id, description) VALUES
-    ('core:admin', 'Administer plugins, reload, and audit verification')
+    ('core:admin', 'Administer plugins, reload, and audit verification'),
+    -- Its own permission rather than a corner of core:admin, so a troop can give
+    -- someone the ability to protect the troop's data without also handing them
+    -- the ability to uninstall plugins. A bundle is a complete copy of everything
+    -- the troop has, so this is a grant worth being able to make and revoke on
+    -- its own.
+    ('core:backup', 'Schedule backups, run one now, and download a bundle')
 ON CONFLICT (id) DO UPDATE SET description = EXCLUDED.description;
 ";
 

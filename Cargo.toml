@@ -38,7 +38,10 @@ repository = "https://github.com/chezgoulet/adjutant"
 [workspace.dependencies]
 adjutant-sdk = { path = "plugins/sdk", version = "0.2.0" }
 axum = "0.8"
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "signal", "net"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "signal", "net", "process"] }
+# Hashing a backup bundle on disk. The audit chain hashes in SQL, so nothing
+# needed a Rust digest until the backup runner had to read a file back.
+sha2 = "0.10"
 sqlx = { version = "0.8", default-features = false, features = ["postgres", "runtime-tokio", "macros", "chrono", "uuid"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

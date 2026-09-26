@@ -117,6 +117,7 @@ fn probe_state(pool: Arc<PgPool>) -> Arc<AppState> {
         scheduler: Scheduler::new(),
         outbox_mismatches: std::sync::Mutex::new(0),
         relay: outbox::Relay::new(),
+        backups: adjutant_server::backup::Timer::new(),
         in_flight: adjutant_server::server::InFlight::new(),
         lifecycles: adjutant_server::server::LifecycleLocks::new(),
     })

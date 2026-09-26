@@ -1576,6 +1576,7 @@ mod tests {
             scheduler: Scheduler::new(),
             outbox_mismatches: Mutex::new(0),
             relay: Relay::new(),
+            backups: crate::backup::Timer::new(),
             in_flight: crate::server::InFlight::new(),
             lifecycles: crate::server::LifecycleLocks::new(),
         })

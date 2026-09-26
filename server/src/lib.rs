@@ -3,6 +3,8 @@
 
 pub mod config;
 pub mod cli;
+pub mod backup;
+pub mod backup_routes;
 pub mod db;
 pub mod events;
 pub mod host;
