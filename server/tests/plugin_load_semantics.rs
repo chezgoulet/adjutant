@@ -64,14 +64,30 @@ fn workspace_lib_dir() -> PathBuf {
 
 /// A temp plugin dir holding exactly `store` and `finance`.
 fn fixture_dir() -> PathBuf {
-    let dir = std::env::temp_dir().join(format!("adjutant-load-sem-{}", std::process::id()));
+    fixture_dir_named("")
+}
+
+/// The same fixture, under a distinct directory name.
+///
+/// A test that must corrupt a library *before anything opens it* needs its own
+/// path: the loader maps a library once per path for the life of the process, so
+/// a test reusing this fixture's directory would `dlopen` the copy already in
+/// memory and never see the corruption. (Learned the hard way — see
+/// `probe_a_failed_load_is_a_409_and_records_the_reason`.)
+fn fixture_dir_named(tag: &str) -> PathBuf {
+    let name = if tag.is_empty() {
+        format!("adjutant-load-sem-{}", std::process::id())
+    } else {
+        format!("adjutant-load-sem-{tag}-{}", std::process::id())
+    };
+    let dir = std::env::temp_dir().join(name);
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).expect("temp plugin dir");
     let src = workspace_lib_dir();
     for id in [STORE, FINANCE] {
-        let name = format!("libadjutant_{id}.so");
-        std::fs::copy(src.join(&name), dir.join(&name)).unwrap_or_else(|e| {
-            panic!("{} must exist in {} (run `cargo build --workspace`): {e}", name, src.display())
+        let lib = format!("libadjutant_{id}.so");
+        std::fs::copy(src.join(&lib), dir.join(&lib)).unwrap_or_else(|e| {
+            panic!("{} must exist in {} (run `cargo build --workspace`): {e}", lib, src.display())
         });
     }
     dir
@@ -439,5 +455,231 @@ fn fixture_libraries_follow_the_staging_convention() {
         assert!(path.exists(), "{}", path.display());
         assert_eq!(plugin_runtime::staged_plugin_id(&path), Some(id.to_string()));
     }
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+// ---------------------------------------------------------------------------
+// 3. The admin endpoints themselves — the live enable/disable path
+// ---------------------------------------------------------------------------
+//
+// Why this section exists. The registry half of this file (1 and 2) proves the
+// primitives the lifecycle is *built from*: `load_plugin`, `install`,
+// `stop_live`, `close_pool`, and the flag written by hand with SQL. It never
+// touches `enable_plugin` / `disable_plugin`, so it cannot see the
+// serialization (`LifecycleLocks`), the drain the handler reports, the
+// flag-written-last ordering on the real path, or the 409 a failed load
+// produces. Those live in the handler and were the part of requirements #1-#3
+// that no probe reached.
+//
+// These probes boot the real application — the same router, the same
+// middleware, the same handlers — on an ephemeral port and speak HTTP to it, so
+// what is asserted is what an admin would actually get.
+//
+// `finance` is the subject, not `store`. The endpoint correctly refuses to
+// enable `store` while `stripe` is not loaded (`PLUGIN_DEPENDENCIES`), and that
+// refusal has its own unit test; `finance` declares no dependencies, so it is
+// the plugin that isolates the lifecycle path from the dependency rules.
+
+/// Boot the real app and return its base URL. The returned `JoinHandle` keeps
+/// the serve task alive for the duration of the caller's scope.
+async fn spawn_app(
+    dir: &Path,
+    url: &str,
+) -> (String, Arc<adjutant_server::server::AppState>, tokio::task::JoinHandle<()>) {
+    let cfg = Config {
+        database_url: url.to_string(),
+        plugin_dir: dir.to_path_buf(),
+        bind: "127.0.0.1:0".parse().expect("bind address"),
+        allow_dev_headers: true,
+        allow_superuser: true,
+        ..Default::default()
+    };
+    let (app, state) = adjutant_server::build_app(&cfg).await.expect("the real app boots");
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("an ephemeral port");
+    let addr = listener.local_addr().expect("local address");
+    let handle = tokio::spawn(async move {
+        let _ = axum::serve(listener, app).await;
+    });
+    (format!("http://{addr}"), state, handle)
+}
+
+/// One admin request, as the chief. Returns (status, body).
+///
+/// Named `admin_req`, not `admin`: these tests hold their pool in a local called
+/// `admin`, and a same-named helper would be shadowed by it.
+async fn admin_req(base: &str, method: reqwest::Method, path: &str) -> (u16, serde_json::Value) {
+    let resp = reqwest::Client::new()
+        .request(method, format!("{base}{path}"))
+        .header("x-dev-user", "christopher")
+        .header("x-dev-role", "chief")
+        .send()
+        .await
+        .unwrap_or_else(|e| panic!("{path}: {e}"));
+    let status = resp.status().as_u16();
+    let body = resp.json().await.unwrap_or(serde_json::Value::Null);
+    (status, body)
+}
+
+/// The plain body a request gets when nothing serves the path — the answer a
+/// disabled plugin must be indistinguishable from (issue #89's parity claim).
+fn route_not_found() -> serde_json::Value {
+    serde_json::json!({ "error": "route not found" })
+}
+
+async fn flag_enabled(admin: &sqlx::PgPool, id: &str) -> bool {
+    sqlx::query_scalar::<_, bool>("SELECT enabled FROM core.plugins WHERE id = $1")
+        .bind(id)
+        .fetch_one(admin)
+        .await
+        .expect("flag read")
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "DB-gated: needs ADJUTANT_TEST_DATABASE_URL + CREATEROLE; run with `-- --ignored`"]
+async fn probe_admin_endpoints_drive_the_lifecycle() {
+    let _serial = SERIAL.lock().await;
+    let dir = fixture_dir();
+    let url = base_url();
+    let admin = provision(&dir).await;
+    set_enabled(&admin, FINANCE, true).await;
+    set_enabled(&admin, STORE, false).await;
+
+    let (base, state, _serve) = spawn_app(&dir, &url).await;
+
+    /// The permission-gated route this test uses as its routing probe.
+    const HEALTH: &str = "/api/finance/health";
+
+    // Establish the absent answer first, so the parity assertion below compares
+    // against something observed rather than something assumed.
+    let (absent_status, absent_body) =
+        admin_req(&base, reqwest::Method::GET, "/api/nothing_here/nothing").await;
+    assert_eq!(absent_status, 404, "a path nothing serves is a 404");
+    assert_eq!(absent_body, route_not_found(), "with the plain not-found body");
+
+    // The boot state, read through the registry the handlers will mutate.
+    {
+        let reg = state.registry.read().await;
+        let fin = reg.info(FINANCE).expect("finance is known");
+        assert!(fin.loaded && fin.enabled, "finance booted enabled");
+        let store = reg.info(STORE).expect("store is known");
+        assert!(!store.loaded && !store.enabled, "store booted disabled");
+        assert!(reg.record(STORE).is_some(), "and keeps a record, with a path");
+    }
+    assert!(flag_enabled(&admin, FINANCE).await);
+
+    // --- disable, through the endpoint --------------------------------------
+    let (status, body) = admin_req(&base, reqwest::Method::POST, "/api/plugins/finance/disable").await;
+    assert_eq!(status, 200, "disable must succeed: {body}");
+    assert_eq!(body["enabled"], serde_json::json!(false));
+    assert_eq!(body["loaded"], serde_json::json!(false));
+    // The drain is reported, not assumed (requirement #1). Nothing is in flight
+    // here so it completes at once; the bounded timeout has its own unit test
+    // (`server::in_flight_counts_and_drains`).
+    assert_eq!(body["drained"], serde_json::json!(true), "an idle plugin drains");
+    assert!(body["drain_ms"].is_u64(), "the wait is reported, not hidden: {body}");
+    assert!(
+        body["data"].as_str().is_some_and(|d| d.contains("preserved")),
+        "the response says what survived: {body}"
+    );
+
+    assert!(!flag_enabled(&admin, FINANCE).await, "the durable flag follows the teardown");
+
+    // Routing really stopped, and the answer is the absent one — not a special
+    // "this plugin is disabled" message. Note the enabled case below cannot be
+    // asserted as a 200: the health route is permission-gated, so a live plugin
+    // may answer 403 to a caller without `finance:read`. What the disabled
+    // state must not do is answer as though the route existed at all.
+    let (disabled_status, disabled_body) = admin_req(&base, reqwest::Method::GET, HEALTH).await;
+    assert_eq!(
+        disabled_status, 404,
+        "a disabled plugin's route does not resolve: {disabled_body}"
+    );
+    assert_eq!(
+        disabled_body, absent_body,
+        "and it answers exactly as an absent plugin does, byte for byte"
+    );
+
+    // Nothing is deleted: the schema content the plugin created survives.
+    let present: Option<String> = sqlx::query_scalar("SELECT to_regclass('finance.receipts')::text")
+        .fetch_one(admin.as_ref())
+        .await
+        .expect("regclass");
+    assert!(present.is_some(), "disable is not uninstall: the table is still there");
+
+    // --- and back on, through the endpoint ----------------------------------
+    let (status, body) = admin_req(&base, reqwest::Method::POST, "/api/plugins/finance/enable").await;
+    assert_eq!(status, 200, "enable must succeed: {body}");
+    assert_eq!(body["enabled"], serde_json::json!(true));
+    assert_eq!(body["loaded"], serde_json::json!(true), "the endpoint reports what it loaded");
+    assert!(
+        flag_enabled(&admin, FINANCE).await,
+        "the durable flag follows a successful load (requirement #3)"
+    );
+
+    let (enabled_status, enabled_body) = admin_req(&base, reqwest::Method::GET, HEALTH).await;
+    assert_ne!(
+        enabled_status, 404,
+        "the route resolves again — a 403 from the permission gate would still prove that, \
+         a 404 would not"
+    );
+    assert_ne!(
+        enabled_body,
+        route_not_found(),
+        "and it is no longer the absent-plugin answer"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Issue #89 requirement #2: one lifecycle per plugin. Two enables racing for
+/// the same plugin must not both load it.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "DB-gated: needs ADJUTANT_TEST_DATABASE_URL + CREATEROLE; run with `-- --ignored`"]
+async fn probe_enable_is_serialized() {
+    let _serial = SERIAL.lock().await;
+    let dir = fixture_dir();
+    let url = base_url();
+    let admin = provision(&dir).await;
+    set_enabled(&admin, FINANCE, true).await;
+    set_enabled(&admin, STORE, false).await;
+
+    let (base, state, _serve) = spawn_app(&dir, &url).await;
+
+    // Take it down first, so the two requests below have a real load to race
+    // for. Enabling an already-loaded plugin is idempotent by design, so
+    // racing on a live plugin would make this test vacuous.
+    let (ds, db) = admin_req(&base, reqwest::Method::POST, "/api/plugins/finance/disable").await;
+    assert_eq!(ds, 200, "the setup disable must succeed: {db}");
+
+    // --- two concurrent enables: exactly one performs the load --------------
+    let a = tokio::spawn({
+        let base = base.clone();
+        async move { admin_req(&base, reqwest::Method::POST, "/api/plugins/finance/enable").await }
+    });
+    let b = tokio::spawn({
+        let base = base.clone();
+        async move { admin_req(&base, reqwest::Method::POST, "/api/plugins/finance/enable").await }
+    });
+    let (ra, rb) = (a.await.expect("join a"), b.await.expect("join b"));
+
+    assert_eq!(ra.0, 200, "first enable: {}", ra.1);
+    assert_eq!(rb.0, 200, "second enable: {}", rb.1);
+    let already = [&ra.1, &rb.1]
+        .iter()
+        .filter(|body| body.get("note").and_then(|n| n.as_str()) == Some("already loaded"))
+        .count();
+    assert_eq!(
+        already, 1,
+        "the lifecycle lock must serialize: exactly one performs the load and the other is told \
+         it is already loaded. Two loads, or none, means the lock is not holding \
+         (got {ra:?} / {rb:?})"
+    );
+    assert!(
+        state.registry.read().await.live_ids().contains(FINANCE),
+        "and the plugin is live once the race is over"
+    );
+
     let _ = std::fs::remove_dir_all(&dir);
 }
