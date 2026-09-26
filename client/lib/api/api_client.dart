@@ -539,6 +539,150 @@ class ApiClient {
         query: query.isEmpty ? null : query));
   }
 
+  // --- equipment: the gear pool (SPEC §7.6) -------------------------------
+
+  /// The catalogue — one row per physical thing, not a quantity.
+  ///
+  /// Retired items are excluded unless `includeRetired` is asked for, and `q`
+  /// matches name or asset tag. `status`, `category` and `location` are the
+  /// server's own vocabularies; this client filters nothing by guessing them.
+  Future<List<Map<String, dynamic>>> equipmentItems({
+    String? status,
+    String? category,
+    String? location,
+    String? q,
+    bool includeRetired = false,
+    int? limit,
+  }) async {
+    final query = <String, String>{
+      'status': ?status,
+      'category': ?category,
+      'location': ?location,
+      'q': ?q,
+      if (includeRetired) 'include_retired': 'true',
+      if (limit != null) 'limit': '$limit',
+    };
+    return _asList(await _send('GET', '/api/equipment/items',
+        query: query.isEmpty ? null : query));
+  }
+
+  /// "What can I take on these dates" — the pool partitioned into `available`
+  /// and `unavailable`, each refusal with its `reasons`.
+  ///
+  /// An unavailable entry carries the item, why it was refused, and — when a
+  /// checkout blocks the window — `blocking`, naming who holds it (`held_by`)
+  /// and the promise it was given (`due_on`, `overdue`). The window is
+  /// inclusive and capped at 365 days; an omitted `from` starts today and an
+  /// omitted `to` ends `days` later (the server's own default, 7).
+  ///
+  /// The whole page is returned (`available`, `unavailable`, `out`, `counts`,
+  /// `thresholds`, `notice`) so the screen quotes the server rather than
+  /// recomputing any of it.
+  Future<Map<String, dynamic>> equipmentAvailability({
+    String? from,
+    String? to,
+    int? days,
+    String? category,
+    String? location,
+    bool includeRetired = false,
+    int? limit,
+  }) async {
+    final query = <String, String>{
+      'from': ?from,
+      'to': ?to,
+      if (days != null) 'days': '$days',
+      'category': ?category,
+      'location': ?location,
+      if (includeRetired) 'include_retired': 'true',
+      if (limit != null) 'limit': '$limit',
+    };
+    return _asMap(await _send('GET', '/api/equipment/availability',
+        query: query.isEmpty ? null : query));
+  }
+
+  /// The checkout log — who has what.
+  ///
+  /// `state` is `all` (default), `open` or `closed`; `overdue` narrows to open
+  /// checkouts past their due date by the grace period. The whole page is
+  /// returned (`checkouts`, `count`, `open`, `state`, `overdue_only`, `today`).
+  /// A caller is narrowed by the server, not here: a scout asks for their own
+  /// rows by naming themselves in `member`.
+  Future<Map<String, dynamic>> equipmentCheckouts({
+    String? state,
+    int? itemId,
+    String? member,
+    int? missionId,
+    bool overdue = false,
+    int? limit,
+  }) async {
+    final query = <String, String>{
+      'state': ?state,
+      if (itemId != null) 'item_id': '$itemId',
+      'member': ?member,
+      if (missionId != null) 'mission_id': '$missionId',
+      if (overdue) 'overdue': 'true',
+      if (limit != null) 'limit': '$limit',
+    };
+    return _asMap(await _send('GET', '/api/equipment/checkouts',
+        query: query.isEmpty ? null : query));
+  }
+
+  /// One item, its open checkout, the last 20 checkouts and the derived
+  /// `flags` (pool membership, replacement, maintenance).
+  Future<Map<String, dynamic>> equipmentItem(String id) async => _asMap(
+      await _send('GET', '/api/equipment/item/${Uri.encodeComponent(id)}'));
+
+  /// Take gear out. `equipment:checkout`.
+  ///
+  /// The holder defaults to the caller, and `condition` (the grade it leaves
+  /// in) defaults to the item's current grade. A refusal **is** the answer:
+  /// `409` when the item is retired, in maintenance, unserviceable, or already
+  /// out to somebody else, and `400` when `due_on` is in the past.
+  Future<Map<String, dynamic>> checkoutEquipmentItem(
+    String id, {
+    String? checkedOutBy,
+    String? dueOn,
+    String? purpose,
+    int? missionId,
+    String? destination,
+    String? condition,
+    String? note,
+  }) async {
+    final body = <String, Object>{
+      'checked_out_by': ?checkedOutBy,
+      'due_on': ?dueOn,
+      'purpose': ?purpose,
+      'mission_id': ?missionId,
+      'destination': ?destination,
+      'condition': ?condition,
+      if (note != null && note.trim().isNotEmpty) 'note': note.trim(),
+    };
+    return _asMap(await _send(
+        'POST', '/api/equipment/item/${Uri.encodeComponent(id)}/checkout',
+        body: body));
+  }
+
+  /// Bring gear back, closing the open checkout. `equipment:checkout`.
+  ///
+  /// `condition` is required — a checkin that does not state a grade cannot be
+  /// attributed — and `damaged` defaults server-side to "the grade got worse
+  /// than `condition_out`". `409` when there is no open checkout.
+  Future<Map<String, dynamic>> checkinEquipmentItem(
+    String id, {
+    required String condition,
+    String? note,
+    bool? damaged,
+  }) async {
+    final body = <String, Object>{
+      'condition': condition,
+      if (note != null && note.trim().isNotEmpty) 'note': note.trim(),
+      'damaged': ?damaged,
+    };
+    return _asMap(await _send(
+        'POST', '/api/equipment/item/${Uri.encodeComponent(id)}/checkin',
+        body: body));
+  }
+
   // --- governance ---------------------------------------------------------
 
   Future<List<Map<String, dynamic>>> motions() async =>
