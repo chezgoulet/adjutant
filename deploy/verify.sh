@@ -26,9 +26,17 @@ docker compose version >/dev/null 2>&1 || fail "docker compose v2 is not availab
 [ -n "${PROXY_IP:-}" ] || fail "set PROXY_IP (the proxy's static address, as in deploy/compose.proxy.yml)"
 
 # One request from a fresh container, printing just the status code.
-code() { # $1 = shell command for the probe
-  "${COMPOSE[@]}" run --rm --no-deps probe "$1" 2>/dev/null | tr -d '\r'
+code() { # $1 = shell command, $2 = probe service (probe, or probe2 for a second client)
+  "${COMPOSE[@]}" run --rm --no-deps "${2:-probe}" "$1" 2>/dev/null | tr -d '\r'
 }
+
+# The limiter's window, in seconds. Deliberately short: the readiness probe below
+# spends the *first* client's budget, and the only way the proofs can then observe
+# a 200 is if that bucket rolls over first. A 60s window would mean a 60s sleep
+# between proofs; 5s is enough to be unambiguous and keeps the whole run quick.
+WINDOW=5
+# Wait past the window so the address named (default: the first probe) starts clean.
+fresh() { sleep $((WINDOW + 1)); }
 
 echo "== check — the two compose files' adjutant service has not drifted =="
 # deploy/compose.proxy.yml duplicates the base stack on purpose (Compose
@@ -73,12 +81,23 @@ PY
 rm -f "$b" "$f"
 
 echo "== proof 1 — the proxy is the only way in =="
-published="$("${COMPOSE[@]}" port adjutant 8787 2>/dev/null || true)"
+# Read this from the *rendered* configuration, not from `docker compose port`.
+# On Compose v5.5.1 `port` prints the literal string `invalid IP:0` and exits 0
+# for a service that publishes nothing, so a `[ -z ]` test on its output fails a
+# perfectly correct stack — which is exactly what this proof did on its first
+# real run. `config` is the authoritative render, and the drift check above
+# already depends on it.
+published="$("${COMPOSE[@]}" config --format json 2>/dev/null | python3 -c '
+import json, sys
+svc = json.load(sys.stdin)["services"]["adjutant"]
+print(",".join("%s:%s" % (p.get("published", ""), p.get("target", ""))
+               for p in (svc.get("ports") or [])))
+')"
 [ -z "$published" ] || fail "adjutant publishes $published: anything on the network can skip TLS and the proxy"
 ok "no host port is published for adjutant"
 
 echo "== the stack, with the limiter observable (1 request per 60s per client) =="
-ADJUTANT_RATE_MAX=1 ADJUTANT_RATE_WINDOW=60 "${COMPOSE[@]}" up -d postgres adjutant caddy >/dev/null
+ADJUTANT_RATE_MAX=1 ADJUTANT_RATE_WINDOW=$WINDOW "${COMPOSE[@]}" up -d postgres adjutant caddy >/dev/null
 
 ready=0
 for _ in $(seq 1 60); do
@@ -92,6 +111,7 @@ if [ "$ready" != "1" ]; then
 fi
 ok "the app answers through the proxy"
 
+fresh
 echo "== proof 2 — the real client is the key, not the proxy =="
 # Client A: two requests, one container, therefore one bucket. Expect 200 then 429.
 a="$(code "curl -s -o /dev/null -w '%{http_code}\n' $THROUGH; curl -s -o /dev/null -w '%{http_code}\n' $THROUGH")"
@@ -101,10 +121,11 @@ ok "client A's own budget is one request (200 then 429)"
 # Client B: a second container, so a second address. Its first request must be 200
 # — if the app ignored the forwarded header, every request through the proxy would
 # key on the proxy's address and B would inherit A's exhausted budget.
-b="$(code "curl -s -o /dev/null -w '%{http_code}' $THROUGH")"
+b="$(code "curl -s -o /dev/null -w '%{http_code}' $THROUGH" probe2)"
 [ "$b" = "200" ] || fail "client B got $b, expected 200 — the forwarded client address is not being used, so every client behind the proxy shares one bucket"
 ok "client B has its own budget: the forwarded address is the key"
 
+fresh
 echo "== proof 3 — a forged header from an untrusted peer buys nothing =="
 # One container, two requests, a different forged header each time. The key must
 # stay the peer, so the second is refused. This is the attack the setting exists

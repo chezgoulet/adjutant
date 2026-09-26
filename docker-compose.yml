@@ -52,6 +52,15 @@ services:
       ADJUTANT_BIND: 0.0.0.0:8787
       ADJUTANT_LOG_FORMAT: json
       # Leave ADJUTANT_DEV_HEADERS unset (off). Enable only for local dev.
+      # verify.sh turns the limiter down to 1 request per 60s so its *choice of
+      # key* is observable as a 200/429 without reading a log. That only works if
+      # the value actually reaches the container, which is what these two do —
+      # without them the app keeps its own default (120 requests / 60s, see
+      # `RateConfig::default`) and a correct stack fails proof 2. Defaults are
+      # written out rather than left empty: an empty string is not a number, and
+      # the app refuses to boot on one.
+      ADJUTANT_RATE_MAX: ${ADJUTANT_RATE_MAX:-120}
+      ADJUTANT_RATE_WINDOW: ${ADJUTANT_RATE_WINDOW:-60}
     ports:
       - "8787:8787"
     restart: unless-stopped

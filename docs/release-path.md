@@ -153,15 +153,16 @@ Order within the stage is by dependency, not by size:
    and it honours `x-forwarded-for` only from a peer named in
    `ADJUTANT_TRUSTED_PROXIES` (empty by default, which ignores the header
    entirely; the M2 unconditional-trust defect is fixed and has two tests behind
-   it). **Authored, and awaiting a host:** [`deploy/`](../deploy/README.md) holds
-   the complete stack (Caddy as the default, Traefik for The House's pattern, the
-   static-address trust wiring) and `deploy/verify.sh` runs the three proofs —
-   no published port for the app, the real client as the rate-limit key, and a
-   forged `x-forwarded-for` from an untrusted peer refused. **The proof needs a
-   host with Docker**, which the authoring machine is not (no Docker, no sudo) and
-   the two that are were unreachable when this was written (SSH key refused;
-   TrueNAS API 401). Until `verify.sh` runs green and its transcript is recorded,
-   this box is not met.
+   it). **MET on 2026-09-26:** `deploy/verify.sh` runs green on a real Docker host
+   — no published port for the app, the app answering through the proxy, the real
+   client as the rate-limit key (200 then 429 for one client, 200 for a second),
+   and a forged `x-forwarded-for` from an untrusted peer refused. The transcript
+   is in `deploy/README.md` § Status. Reaching it needed five fixes there, because
+   the proofs had never been **runnable** — which is why "authored, not yet
+   proven" went unchallenged for so long. **The public TLS path is still
+   unproven:** a real name, ACME and the `:443` listener are not things
+   `verify.sh` exercises, and they take more than a placeholder domain. That
+   belongs to item 3's host decision, not to this box.
 2. **#54 — backup and restore, proven by a drill.** A backup nobody has restored
    is a hypothesis. Pairs with 3.1 as the deployment gate.
 3. **The host decision**, now against a working deployment rather than a plan —
