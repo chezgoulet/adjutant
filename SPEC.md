@@ -1189,7 +1189,9 @@ the calendar scouts actually plan their lives in.
 - [ ] MCP server plugin: tools exposed, permissions filtered, invocations logged
 - [ ] Hermes agent can connect and interact through the MCP server
 - [ ] Flutter client: login screen, mission list, membership roster, calendar, basic navigation
-- [ ] Flutter client works on Android, iOS, and Web (PWA)
+- [ ] Flutter client works on Android and Web (PWA). **iOS deferred by owner
+      decision, 2026-09-26** — no CI runner, no distribution path; revisit after
+      1.0. (This box read "Android, iOS, and Web" until that decision.)
 - [ ] Offline mode: client caches data locally, syncs when online
 - [ ] Calendar plugin: events, RSVPs, recurring events, quorum tracking
 - [ ] Basic UI/UX review — is the navigation intuitive? Are the screens useful?
@@ -1223,7 +1225,15 @@ carry the Accords — searchable history and the conflict pathway.
 
 **Exit criteria:**
 - [ ] Docker Compose deployment (one command)
-- [ ] HTTPS/TLS configuration
+- [ ] TLS terminated at a **reverse proxy**, and the proxy-fronted deployment
+      proven end to end. **The application does not terminate TLS and will not**
+      (owner decision, 2026-09-26): it is deployed alongside Caddy, nginx or
+      Traefik, and it honours `x-forwarded-for` only from a peer named in
+      `ADJUTANT_TRUSTED_PROXIES` — empty by default, which ignores the header
+      entirely. The deliverable is the deployment exercised: a real client IP
+      behind the proxy, a spoofed forwarded header refused. `docs/deployment.md`
+      §TLS already documents this shape; what is missing is the proof, not the
+      mechanism.
 - [ ] Backup and restore procedures
 - [ ] Performance testing (100+ concurrent users)
 - [ ] Security audit (OWASP Top 10, dependency scanning)
@@ -1245,10 +1255,16 @@ carry the Accords — searchable history and the conflict pathway.
 - [ ] Documentation site live
 - [ ] F-Droid listing
 - [ ] Community plugin guide published
-- [ ] 3+ troops using Adjutant in production
 - [ ] 1+ community plugin contributed by someone outside The House
 
 **Deliverable:** Adjutant v1.0. The project is real.
+
+> **Removed 2026-09-26 (owner decision): "3+ troops using Adjutant in
+> production."** Adoption is not a gate. If the 161st gets value from Adjutant,
+> or another troop does, or OSG does, that is the point — the release does not
+> wait on a headcount, and this criterion should not be added back. Everything
+> above it tests whether *we* did the work; a count of other people's choices
+> never could.
 
 ---
 
