@@ -699,19 +699,38 @@ async fn probe_scheduler_runs_records_and_stops() {
     let boom = scheduler.infos("sched_probe").into_iter().find(|s| s.name == "boom").unwrap();
     assert!(boom.last_error.is_some(), "last_error is reported");
 
-    // Stop: the run count must stop rising (allow an in-flight insert to land).
+    // Stop: the shutdown aborts the plugin's tasks, and what it *promises* is
+    // that no new run starts after the abort. It does not promise that a run
+    // already in flight when `stop()` returns fails to land its row — so
+    // comparing two totals across a settle window convicts a correct scheduler
+    // of "kept firing" for exactly that in-flight insert (issue #83). Assert the
+    // promise instead: every row recorded after the stop boundary must have
+    // *started* before it.
     scheduler.stop("sched_probe");
+    assert!(
+        scheduler.infos("sched_probe").iter().all(|s| s.next_run.is_none()),
+        "a stopped plugin's schedules report no next run"
+    );
+    // `JoinHandle::abort` cancels the task at its next await point rather than
+    // synchronously, so give the runtime a beat to drop the tasks — and any run
+    // that was mid-flight during the stop — before taking the boundary. One
+    // whole 100 ms cadence is enough that nothing already running can cross it.
     tokio::time::sleep(std::time::Duration::from_millis(250)).await;
-    let before: i64 =
-        sqlx::query_scalar("SELECT count(*) FROM core.scheduled_runs WHERE plugin_id='sched_probe'")
-            .fetch_one(admin.as_ref())
-            .await
-            .expect("count before");
+    let stopped_at = chrono::Utc::now();
+    // Watch for ~4 more cadences: a scheduler that ignored the stop would have
+    // to start a run past the boundary, and the `boom`/`tick` pair fires every
+    // 100 ms, so it cannot hide.
     tokio::time::sleep(std::time::Duration::from_millis(450)).await;
-    let after: i64 =
-        sqlx::query_scalar("SELECT count(*) FROM core.scheduled_runs WHERE plugin_id='sched_probe'")
-            .fetch_one(admin.as_ref())
-            .await
-            .expect("count after");
-    assert_eq!(before, after, "a stopped plugin's schedules must not keep firing");
+    let after_stop: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM core.scheduled_runs \
+         WHERE plugin_id='sched_probe' AND started_at > $1",
+    )
+    .bind(stopped_at)
+    .fetch_one(admin.as_ref())
+    .await
+    .expect("count runs started after stop");
+    assert_eq!(
+        after_stop, 0,
+        "a stopped plugin's schedules must not start new runs after the stop"
+    );
 }
