@@ -24,6 +24,8 @@ plugins/governance/         governance plugin (motions, votes, quorum, minutes, 
 plugins/examples/hello/     Prototype plugin proving the SDK end to end
 scripts/probes.py           Committed M1+M2 probe harness (live server)
 docs/e2e_m3.py              Committed M3 end-to-end harness (live server)
+scripts/client-live-harness.sh  Boots a server and runs the live client harness
+client/live/live_client_test.dart  The client against a real server (not mocked)
 docs/architecture.md        How the core, plugins, and sandbox fit together
 docs/api-reference.md       Core + plugin HTTP API and the SDK surface
 docs/plugin-development.md  Plugin author guide (start here to write one)
@@ -202,8 +204,8 @@ superuser container). `ADJUTANT_TEST_DATABASE_URL` must name a database ending
 in `_test`; under `--ignored` a missing or unreachable database is a hard
 failure, so CI cannot pass while the isolation proof silently does not run.
 
-Two live harnesses prove the integration claims. Both drive a real server and a
-real database, and both are committed because the earlier, uncommitted probe
+Three live harnesses prove the integration claims. Each drives a real server and
+a real database, and each is committed because the earlier, uncommitted probe
 transcripts could not be reproduced by anyone else. CI runs all of them
 (`.github/workflows/ci.yml`) on every push and pull request.
 
@@ -228,6 +230,27 @@ ADJUTANT_DATABASE_URL=postgres://adjutant@127.0.0.1:5433/adjutant_dev \
 ADJUTANT_DEV_HEADERS=false ADJUTANT_RATE_MAX=0 \
   ./target/debug/adjutant &
 python3 docs/e2e_m3.py
+```
+
+The client has a live harness of its own, and it is the reason the client's
+`flutter test` suite is not the whole v1.0 gate: those 104 tests drive a mock
+`http.Client`, so a client that has drifted from the API still passes every one
+of them. This one drives the product's `ApiClient` against a real server and
+asserts on what the server returned. It creates its own database, bootstraps the
+plugin roles into it, boots a server with the dev-header stub **off**, and fails
+loudly — never skips — if the server is not there.
+
+```bash
+# Needs `cargo build --workspace` first, plus psql, python3 and flutter on PATH.
+# Derives its database (`adjutant_client_live`) from ADJUTANT_TEST_DATABASE_URL;
+# override with ADJUTANT_CLIENT_LIVE_DATABASE_URL. Port 8790, not 8787: it boots
+# its own server rather than borrowing one, so a stale server cannot be mistaken
+# for evidence. Set ADJUTANT_CLIENT_LIVE_LOG to keep the server's log.
+scripts/client-live-harness.sh
+
+# Or against a server you booted yourself:
+cd client && ADJUTANT_LIVE_BASE=http://127.0.0.1:8790 \
+  flutter test live/live_client_test.dart
 ```
 
 ## Development milestones
