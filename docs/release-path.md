@@ -119,7 +119,17 @@ harness.
 
 ## Stage 3 — M7 production hardening (the gate on a real deployment)
 
-SPEC's eight boxes: two are met (**Docker Compose**, **CI/CD**); six are open.
+SPEC's eight boxes: one is met (**CI/CD**); the other seven are open.
+
+**Docker Compose is written but has never started** — corrected 2026-09-26. The
+roadmap counted it as met because the files exist; the first run on a real Docker
+host showed otherwise: `postgres:18-alpine` exits immediately when its volume is
+mounted at `/var/lib/postgresql/data`, because 18 moved `PGDATA` into a versioned
+subdirectory and treats the old path as an unused mount. CI never saw it, because
+the workflow's database is a GitHub Actions *service container* and not the
+compose file. Fixed in #92 (the mount is now the parent directory) and folded into
+this stage as item 9 rather than left in the "met" column, where it would have gone
+on looking finished.
 Order within the stage is by dependency, not by size:
 
 1. **#49 — the proxy-fronted deployment, proven.** *Re-scoped by owner decision:
@@ -158,6 +168,11 @@ Order within the stage is by dependency, not by size:
    `cdylib` count, the same derivation `scripts/stage-plugins.py` already uses.
    Folded in here rather than beside the probe steps because it needs a Docker
    runner, not a database.
+9. **The compose stack starts on a clean host.** Not a documentation task: the
+   first real run is what found the Postgres 18 mount fault above, and the box
+   should not be called met again on the strength of files existing. The evidence
+   is a transcript — `docker compose up -d`, the app answering through the proxy,
+   and `deploy/verify.sh`'s proofs — on a host that has never run Adjutant before.
 
 **Proves it:** M7's eight boxes checked, with the drill transcript, the proxy
 proof and the audit report committed as evidence.
