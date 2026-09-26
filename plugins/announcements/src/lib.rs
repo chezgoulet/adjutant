@@ -8,9 +8,13 @@
 //!
 //! ## Delivery is deferred, and the seam is an event
 //!
-//! No push provider is wired anywhere in Adjutant, and the core has no delivery
-//! channel (`docs/design/bg.md` §4 names this as the missing core capability).
-//! So this plugin does not pretend: it records the announcement, its category,
+//! No push provider is wired anywhere in Adjutant. The core now records
+//! per-recipient notifications with a per-user read state (#46 slice 1,
+//! `core.notifications`; design `docs/design/notifications.md`), but **this
+//! plugin is not wired to it**: an announcement is addressed to a *scope* and a
+//! notification to *one user*, so they are different objects and connecting them
+//! is a later slice. So this plugin does not pretend: it records the
+//! announcement, its category,
 //! its scope and every read receipt, publishes `announcement.published`
 //! ([`EVENT_PUBLISHED`]) with everything a sender would need, and says
 //! `"delivery": "deferred…"` in the responses it returns. A future
@@ -111,7 +115,9 @@
 //!
 //! ## What is deliberately not here
 //!
-//! * **Push/email delivery** — see above; the event is the seam.
+//! * **Push/email delivery** — see above; the event is the seam, and the
+//!   per-recipient record it would write (`core.notifications`) exists but is
+//!   not wired to this plugin.
 //! * **A roster** — "who has *not* read this" needs membership's roster, and a
 //!   plugin role cannot read another schema. The client intersects the receipt
 //!   list with the roster it already has; that is why `/receipts` returns who

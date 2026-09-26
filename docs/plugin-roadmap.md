@@ -83,7 +83,7 @@ so that the v0.2.0 evidence trail keeps its existing name.
 | `equipment` | §7.6 | Inventory, checkout/checkin, maintenance | M6 | **Built** (routes and permissions in `docs/api-reference.md`; stable and client coverage pending) |
 | `archive` | §7.8 | Congress proceedings, minutes, full-text search, timeline | M6 | **Built** (routes and permissions in `docs/api-reference.md`; stable and client coverage pending) |
 | `conflicts` | §7.9 | Conflict-resolution pathway, stage tracking, anti-dropout | M6 | **Built** (routes and permissions in `docs/api-reference.md`; stable and client coverage pending) |
-| `announcements` | §7.14 | Troop communication, read receipts, categories, push | M6 | **Built** (routes and permissions in `docs/api-reference.md`; delivery deferred — delivery channel is #46; client coverage pending) |
+| `announcements` | §7.14 | Troop communication, read receipts, categories, push | M6 | **Built** (routes and permissions in `docs/api-reference.md`; delivery deferred — the record is `core.notifications` (#46 slice 1), the plugin is not wired to it; client coverage pending) |
 
 > **"Shipped" vs "Built" vs the v1.0 gate.** `auth`, `membership`, `missions`,
 > `governance` and `calendar` are **Shipped**: they load through the blessed path,
