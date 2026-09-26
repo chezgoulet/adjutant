@@ -4,8 +4,19 @@ publish_to: 'none'
 
 version: 0.1.0+1
 
+# The exact Flutter SDK this app is built and gated with (issue #76). CI reads
+# THIS file — `flutter-version-file` in .github/workflows/ci.yml — rather than
+# following the stable channel, so a local green and the branch's gate are the
+# same toolchain. That is the same reasoning as `rust-toolchain.toml` on the Rust
+# side, and the same reason the value lives in a committed file instead of being
+# hand-copied into two CI steps that drift apart the moment one is bumped.
+#
+# It has to be an exact version. The action matches the release it installs
+# against this string literally, and its documentation marks a range
+# (`>=3.47.5 <4.0.0`) as unsupported here.
 environment:
   sdk: ^3.13.4
+  flutter: 3.47.5
 
 dependencies:
   flutter:

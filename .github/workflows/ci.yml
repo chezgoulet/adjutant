@@ -322,9 +322,14 @@ jobs:
       # Flutter, not cargo, does the asserting, so the runtime lives here. The
       # boot/teardown/readiness logic is in the script rather than inline, so the
       # same gate can be run by hand.
+      #
+      # The same pinned toolchain as the `client` job, read from the same file
+      # (issue #76): two Flutter versions in one workflow is two chances for the
+      # gates to disagree about what "green" means.
       - uses: subosito/flutter-action@v2
         with:
           channel: stable
+          flutter-version-file: client/pubspec.yaml
           cache: true
 
       - name: Flutter version
@@ -349,12 +354,17 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      # The pubspec constrains Dart to ^3.13.4 and the repo commits no Flutter
-      # version pin, so the action follows the stable channel rather than a
-      # hand-copied version that would drift the moment it is bumped.
+      # Issue #76: the toolchain is pinned, not followed. `client/pubspec.yaml`'s
+      # `environment.flutter` is the single source of truth — the same shape as
+      # `rust-toolchain.toml` on the Rust side — so a green run on a developer's
+      # machine and a green run here are the same Flutter. Following the stable
+      # channel instead meant a local 3.47.5 could pass while this gate had
+      # silently moved on for reasons nobody chose, and a red could mean the
+      # toolchain rather than the diff.
       - uses: subosito/flutter-action@v2
         with:
           channel: stable
+          flutter-version-file: client/pubspec.yaml
           cache: true
 
       # Make toolchain drift visible in the log instead of mysterious (the same
