@@ -83,9 +83,20 @@ export POSTGRES_PASSWORD="$(openssl rand -hex 24)"
 export ADJUTANT_APP_PASSWORD="$(openssl rand -hex 24)"
 
 docker compose -f deploy/compose.proxy.yml up -d --build
-# one-off, before the server will boot: create the app role and the plugin roles
-docker compose -f deploy/compose.proxy.yml run --rm adjutant \
-  bootstrap-isolation --app-role adjutant_app --app-password "$ADJUTANT_APP_PASSWORD"
+
+# One-off, before the server will boot: create the app role and the plugin roles.
+#
+# This step must NOT connect as the role it is creating. The compose file points
+# the app at `adjutant_app`, so a plain `run --rm adjutant` hands this command a
+# database URL for a role that does not exist yet; it fails with
+# `password authentication failed for user "adjutant_app"` and never creates it.
+# (Observed on a real host, 2026-09-26 — the app then crash-loops on the same
+# error, 45 restarts deep, because nothing ever created the role.) Connect as the
+# bootstrap superuser instead. `--app-role`/`--app-password` name the role to
+# create, so the connection and the role being created are separate things.
+docker compose -f deploy/compose.proxy.yml run --rm \
+  -e ADJUTANT_DATABASE_URL="postgres://adjutant:${POSTGRES_PASSWORD}@postgres:5432/adjutant" \
+  adjutant bootstrap-isolation --app-role adjutant_app --app-password "$ADJUTANT_APP_PASSWORD"
 
 ./deploy/verify.sh
 ```
@@ -96,11 +107,24 @@ that question has three answers and this directory only assumes the first.
 
 ## Status — read this before trusting it
 
-**Authored, not yet proven.** The configuration and the proofs are written and
-reviewed against the code; they have not been executed, because the machine that
-wrote them has no Docker and the two hosts that do were not reachable at the time
-(SSH key refused; TrueNAS API 401). Nothing here should be described as working
-until `verify.sh` has run green on a real host and its output is recorded.
+**The bring-up is proven; the three proofs are not.** On 2026-09-26 the stack was
+brought up on a real host by following this README, and two things came out of it.
+
+* The `bootstrap-isolation` step **as previously documented could not work**: it
+  connected as the role it was creating, so it failed and the app crash-looped on
+  the same authentication error. The command above is the corrected one, and it
+  ran clean — `core` migrated to version 10, fifteen plugin roles bootstrapped,
+  `adjutant_app` created, core schema ownership transferred — after which the app
+  booted and served (`listening 0.0.0.0:8787`, 195 routes, and `/` answering
+  `{"service":"adjutant","status":"ok"}` from inside the proxy network).
+* **`verify.sh` has not run green.** It needs a real `DOMAIN` with DNS and a
+  certificate; the host used a placeholder (`adjutant.example.invalid`), so the
+  three proofs could not be executed there. Nothing past the bring-up should be
+  described as working until `verify.sh` runs green on a host with a real name and
+  its output is recorded.
+
+Neither was a fault in the image or the server: the image built and the server has
+served correctly on this host since the one change above.
 
 When it does run, the transcript belongs in the PR and a line belongs in
 `docs/release-path.md` Stage 3.1 — which is where the deployment host gets chosen,
