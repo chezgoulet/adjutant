@@ -249,6 +249,51 @@ first-party plugin to pick the helpers up.
   at all. The plugin's SQL moves to `plugins/store/migrations/*.sql` via the SDK's
   `migrations!` macro, version 1 byte-identical to what shipped, and CI runs the
   new store DB probes beside the stripe ones.
+- **A dues waiver assesses its tier and draws the difference from `scholarship`**
+  (SPEC §7.5's funding rule — "anything free, deducted or discounted draws from the
+  Scholarship fund" — applied to the last place a price of zero survived). A
+  `finance.dues` row gains the comp's third figure: `base_cents` and
+  `assessed_cents` existed, `funded_cents` is what `scholarship` covers, and the
+  member's own share is `assessed_cents - funded_cents`. `status: "waived"` on
+  `POST /api/finance/dues/assess` no longer overrides the assessment to zero: the
+  tier is assessed honestly and the whole of it is funded, so the row — and the
+  answer, the audit entry, the `finance.dues.assessed` event and
+  `GET /api/finance/dues` — states **"waived, and here is who paid for it"** with
+  `funded_cents` and the draw's state, instead of a zero the Annual Financial
+  Report could only count. `dues_waived_is_zero` is **replaced** (migration 2,
+  never an edit to version 1, which an applied database skips without comparing
+  its SQL) by `dues_funded_valid`, `dues_funded_within_assessment` and
+  `dues_waived_is_funded`, so "waived but owing" stays unrepresentable while a
+  waiver names what was funded; every existing waiver is `assessed_cents = 0`, so
+  the swap applies cleanly and the column default satisfies all three. The **draw**
+  is a balanced transfer from `scholarship` into the configured dues fund
+  (`finance.dues_fund_code`), booked in the same call **as the caller and only the
+  caller** when they also hold `finance:write`; when they do not, the waiver is
+  neither refused nor silently unfunded — the row records the funded amount and an
+  **outstanding** draw (`unbooked`/`attempting`/`booked`/`refused`/`failed`, the
+  store's own vocabulary) for a `finance:write` holder to book later, and no
+  credential is minted. The sliding-scale self-report is machine-originated by
+  construction, so its reduction is left outstanding too (the member holds
+  `finance:self_report` and must not be given `finance:write`). `POST
+  /api/finance/transfer` gains an optional `external_ref` — the transfer's own
+  idempotency key, written on the out-leg only because the unique index is per
+  row — and the draw carries a deterministic one, `dues:{fiscal_year}:{member_id}`,
+  so a retry after a lost answer is answered with the transfer it already made
+  rather than a second pair of legs. `sql_annual_dues` gains the funded sum and the
+  unbooked-draw count, and the report's dues section states them beside the tier
+  counts (dues *collected* is unchanged: a draw is a transfer, so it does not
+  inflate it). The rows already waived at zero are **not** recomputed at startup:
+  the tier's share is Rust's, so migration 2 leaves them and a guarded, idempotent
+  `finance:manage` route — `POST /api/finance/dues/repair-waivers` — recomputes them
+  on demand from each row's own `base_cents` and `tier`, leaving a `base_cents = 0`
+  row alone. A draw that is already **booked** cannot have its funding re-derived
+  in place: the draw's key is deterministic, so a *different* amount for the same
+  member and year would be answered by the transfer route with the transfer that
+  already exists, and the row would be marked `booked` against a group whose amount
+  is the previous figure — `funded_cents` and the ledger disagreeing, silently. The
+  assess route (and the self-report, which is a re-assessment too) refuses that
+  change with a `409` naming the transfer group and the act that settles the
+  difference, and writes nothing; re-posting the same funding still passes.
 
 ### Notes for plugin authors
 
