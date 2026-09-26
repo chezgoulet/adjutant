@@ -127,6 +127,20 @@ jobs:
       - name: Store outbox probes (DB-backed)
         run: cargo test -p adjutant-store --test outbox_draw -- --ignored --nocapture
 
+      # finance's write SQL, executed: the transaction and transfer routes are
+      # driven through their **real handlers** and the rows they leave in
+      # `finance.transactions` are read back — one fund for a code and an id, two
+      # legs in one transfer_group summing to zero, and the same-fund, overdraft
+      # and unknown-reference refusals writing nothing. A gate on this plugin's
+      # handlers alone cannot see a statement PostgreSQL refuses (an
+      # alias-qualified SET target in the sibling store plugin shipped green), so
+      # this is where that class of fault is caught. Same reason as the two steps
+      # above for its position: the probes connect AS `adjutant_plugin_finance`,
+      # so they need the roles, the stored plugin secrets and the plugin
+      # migrations the live ladder above has just bootstrapped.
+      - name: Finance route SQL probes (DB-backed)
+        run: cargo test -p adjutant-finance --test route_sql -- --ignored --nocapture
+
       # The sandboxed path: build the WASM guest and load it through the same
       # registry/dispatch pipeline (a separate plugin dir keeps the native
       # harnesses above unaffected).
