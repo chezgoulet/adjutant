@@ -28,11 +28,13 @@
 -- The software invents no acknowledgment; the statement is stored on the row, so
 -- a later change of wording does not rewrite a receipt already given.
 --
--- A new migration version (2), never an edit to version 1: the runner skips a
--- version it has already applied without comparing its SQL, so amending version
--- 1 would be invisible on every deployed database while looking correct on a
--- fresh one. The statements are idempotent — `IF NOT EXISTS`, `CREATE OR
--- REPLACE FUNCTION`, `DROP TRIGGER IF EXISTS` — so re-applying them is a no-op.
+-- A new migration version (3), never an edit to an applied one: the runner skips
+-- a version it has already applied without comparing its SQL, so amending an
+-- applied version would be invisible on every deployed database while looking
+-- correct on a fresh one. Version 2 is the dues funding migration, which was
+-- merged ahead of this one, so this is 3. The statements are idempotent —
+-- `IF NOT EXISTS`, `CREATE OR REPLACE FUNCTION`, `DROP TRIGGER IF EXISTS` — so
+-- re-applying them is a no-op.
 
 -- One numbering authority for the whole troop, and one that two treasurers
 -- issuing at the same instant cannot collide over. A receipt number is unique

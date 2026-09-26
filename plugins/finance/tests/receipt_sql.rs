@@ -236,7 +236,7 @@ async fn ensure_plugin_schema(admin: &PgPool, plugin: &PgPool) {
     for expected in ["receipts_correction_same_money", "receipts_immutable"] {
         assert!(
             triggers.iter().any(|name| name == expected),
-            "finance.receipts has no {expected} trigger (found {triggers:?}) — migration 2 must be \
+            "finance.receipts has no {expected} trigger (found {triggers:?}) — migration 3 must be \
              applied, and these are the rules, not a convention"
         );
     }
