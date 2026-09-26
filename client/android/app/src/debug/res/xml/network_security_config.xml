@@ -1,0 +1,19 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  DEBUG BUILDS ONLY (this file lives under src/debug, so it is not in a release).
+
+  Android has refused cleartext HTTP by default since API 28, and that default is
+  the right one for a release: this client carries credentials, and every option
+  in docs/deployment.md § Putting it behind TLS serves https — a public name with
+  ACME, a tunnel, or a private CA on the LAN.
+
+  A developer running the app against a box on the LAN over
+  `http://192.168.x.x:8787` is the case this exists for. Android's network
+  security config cannot express an IP range, only hostnames, so this permits
+  cleartext generally rather than pretending to scope it — which is precisely why
+  it must stay confined to debug. `cleartextAllowed` in
+  lib/api/server_address.dart is the same decision, made visible to the UI.
+-->
+<network-security-config>
+    <base-config cleartextTrafficPermitted="true" />
+</network-security-config>

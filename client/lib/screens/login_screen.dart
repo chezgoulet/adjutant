@@ -2,6 +2,7 @@ import 'package:flutter/material.dart';
 import 'package:provider/provider.dart';
 
 import '../api/api_client.dart';
+import '../api/server_address.dart';
 import '../state/session.dart';
 import '../theme/app_theme.dart';
 
@@ -44,6 +45,16 @@ class _LoginScreenState extends State<LoginScreen> {
 
   Future<void> _submit() async {
     if (!(_formKey.currentState?.validate() ?? false)) return;
+
+    // Send the canonical form of what was typed, and show it back, so the field
+    // stops disagreeing with the address actually in use. A bare host becomes
+    // `https://host/`, which is also what gets saved and restored next launch.
+    final address = normaliseServerAddress(_baseUrl.text);
+    if (address == null) return;
+    if (address != _baseUrl.text) {
+      _baseUrl.text = address;
+    }
+
     setState(() {
       _busy = true;
       _error = null;
@@ -51,7 +62,7 @@ class _LoginScreenState extends State<LoginScreen> {
     final session = context.read<SessionState>();
     try {
       await session.signIn(
-        baseUrl: _baseUrl.text.trim().replaceAll(RegExp(r'/+$'), ''),
+        baseUrl: address,
         username: _username.text.trim(),
         password: _password.text,
       );
@@ -106,14 +117,17 @@ class _LoginScreenState extends State<LoginScreen> {
 
                   TextFormField(
                     controller: _baseUrl,
-                    decoration: const InputDecoration(
+                    decoration: InputDecoration(
                       labelText: 'Server',
-                      helperText: 'The address of your troop’s Adjutant server',
+                      helperText: cleartextAllowed
+                          ? 'The address of your troop’s Adjutant server'
+                          : 'The https address of your troop’s Adjutant server',
                     ),
                     keyboardType: TextInputType.url,
                     autocorrect: false,
-                    validator: (v) =>
-                        (v == null || v.trim().isEmpty) ? 'Enter the server address' : null,
+                    // The same rule the client actually applies, so the field
+                    // cannot accept an address the app will refuse to use.
+                    validator: (v) => serverAddressProblem(v ?? ''),
                   ),
                   const SizedBox(height: AppSpacing.md),
                   TextFormField(

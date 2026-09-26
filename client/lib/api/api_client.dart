@@ -44,7 +44,12 @@ class ApiClient {
       : _http = httpClient ?? http.Client();
 
   /// e.g. `https://adjutant.chezgoulet.org` — no trailing slash.
-  final String baseUrl;
+  ///
+  /// Mutable because the address belongs to the user, not the build: it is typed
+  /// on the sign-in screen and has to be restored on the next launch. Before
+  /// this was settable the field accepted an address, saved it, and every
+  /// request still went to the compiled-in default.
+  String baseUrl;
   final http.Client _http;
 
   /// Bearer token from login. Null until authenticated.
@@ -54,6 +59,11 @@ class ApiClient {
   bool get hasToken => _token != null && _token!.isNotEmpty;
 
   void setToken(String? token) => _token = token;
+
+  /// Point this client at another server. Callers pass a value that has been
+  /// through `normaliseServerAddress`, so it carries a scheme and no trailing
+  /// slash.
+  void setBaseUrl(String url) => baseUrl = url;
 
   Uri _uri(String path, [Map<String, String>? query]) =>
       Uri.parse('$baseUrl$path').replace(queryParameters: query);

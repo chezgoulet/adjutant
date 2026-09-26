@@ -150,6 +150,15 @@ reason `deploy/verify.sh` exists:
 proxy. An app reachable directly is an app reachable without TLS, whatever the
 proxy is doing — that is proof 1 in `deploy/verify.sh`.
 
+**The client has an opinion about this too.** A released build of the phone app
+reaches `https` only: Android has refused cleartext HTTP by default since API 28,
+and the app relaxes that for debug builds alone (`android/app/src/debug/…`). So a
+troop whose server is plain `http://` on the LAN has a working server and an app
+that cannot talk to it. Every option below serves https, which is why the client
+can insist on it — but if you are deploying plain HTTP on purpose, know that the
+app will refuse the address and say so on the sign-in screen rather than failing
+as an unreachable server.
+
 ### A troop with no domain name
 
 Three answers, in order of how much we support them:
