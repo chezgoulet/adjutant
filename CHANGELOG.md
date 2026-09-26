@@ -144,6 +144,25 @@ first-party plugin to pick the helpers up.
 
 ### Changed
 
+- **finance's write SQL is now executed by a gate, not only decided by a
+  mock.** `POST /api/finance/transaction` and `POST /api/finance/transfer` were
+  covered by handler tests whose host never runs a statement, so nothing in CI
+  could see a statement PostgreSQL refuses — the fault class that shipped green
+  in the sibling `store` plugin (an alias-qualified `SET` target). A new
+  `#[ignore]`d, DB-backed probe (`plugins/finance/tests/route_sql.rs`, a CI step
+  beside the stripe and store probes) drives the **real route handlers** built
+  from `FinancePlugin::routes()` against PostgreSQL as `adjutant_plugin_finance`
+  and reads the rows back: a transaction named by `fund_id` and one named by
+  `fund_code` land on the same fund row (an unknown code writes nothing and names
+  the reference), a transfer named by code on both legs writes exactly two rows
+  in one `transfer_group` summing to zero with each leg's `counterparty_fund_id`
+  naming the other fund, the same-fund and overdraft refusals write neither leg,
+  and a replayed `external_ref` leaves one row. It asserts on rows and on
+  refusals by their own reason — never on the statement's text — so the SQL may
+  change freely underneath it. `sqlx` is added to `plugins/finance` as a
+  **dev**-dependency only: it links into the test binaries, never the cdylib (a
+  plugin reaches the database through `ctx.db`).
+
 - **`adjutant-stripe` enqueues its ledger booking as an outbox intent, in the
   same statement that records a confirmed payment.** The core had the outbox, the
   relay and the declared `svc.stripe.ledger` principal, and **no producer** —
