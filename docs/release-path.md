@@ -164,7 +164,19 @@ Order within the stage is by dependency, not by size:
    `verify.sh` exercises, and they take more than a placeholder domain. That
    belongs to item 3's host decision, not to this box.
 2. **#54 — backup and restore, proven by a drill.** A backup nobody has restored
-   is a hypothesis. Pairs with 3.1 as the deployment gate.
+   is a hypothesis. **MET on 2026-09-26:** `deploy/backup.sh` and
+   `deploy/restore.sh` were written and then run end to end from a destroyed
+   volume — `pg_restore` 2s, `bootstrap-isolation` 3s, **6s wall clock** for a
+   242KB dump, after which the app answered through the proxy, 17 roles and 335
+   plugin-role grants were back, and the marker row had survived. The measurement
+   is in `docs/deployment.md` § Backup and restore, together with why the drill
+   needed a script instead of a paragraph: a `pg_dump` carries the database and
+   **not** the cluster's roles, `pg_restore` reports `errors ignored` while
+   silently dropping six `GRANT`s, and the server then crash-loops on a password
+   error whose real cause is a role that was never created. **RPO is not yet
+   automated** — the cadence is documented and nothing takes the dump on a
+   schedule; that belongs with item 3's host decision, since it is the host that
+   would own the timer.
 3. **The host decision**, now against a working deployment rather than a plan —
    and it follows 3.1, because the deployment is what tells us what the host has
    to be.
