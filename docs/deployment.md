@@ -111,7 +111,12 @@ retired plugins keep theirs, so leave reload headroom. See
 ## Putting it behind TLS
 
 Terminate TLS at a reverse proxy (Caddy, nginx, Traefik) and forward to the
-server's port. Two settings matter:
+server's port. **The application does not terminate TLS and will not** — it binds
+plain HTTP and reads exactly one header from the proxy. A working stack, its
+config for both Caddy and Traefik, and three executable proofs of the properties
+below live in [`deploy/`](../deploy/README.md).
+
+Two settings matter:
 
 - `ADJUTANT_TRUSTED_PROXIES` — comma-separated proxy IPs allowed to set
   `x-forwarded-for`. With this set, rate limiting keys on the real client;
@@ -122,6 +127,44 @@ server's port. Two settings matter:
 
 **Keep `ADJUTANT_DEV_HEADERS` off** (the default). When on, anyone who can reach
 the port can claim any role by setting `x-dev-user`/`x-dev-role`.
+
+Three things about the trust setting that are easy to get wrong, and are the
+reason `deploy/verify.sh` exists:
+
+- **It is a literal address comparison against the direct peer.** On a container
+  network the proxy's address is usually dynamic, so a hardcoded value silently
+  stops matching — and the failure is quiet: the header is ignored and every
+  client shares one bucket. Give the proxy a static address (`deploy/compose.proxy.yml`
+  pins one on a fixed subnet) and keep the two values equal.
+- **The default is empty, which ignores the header entirely.** That is the safe
+  direction: honouring `x-forwarded-for` from anyone lets any client reset its own
+  rate-limit budget by rotating one header value. The list is walked from the
+  right, skipping trusted hops, so a client-injected entry on the left is never
+  used.
+- **The address must match the bind family.** `ADJUTANT_BIND=0.0.0.0:8787` gives
+  dotted-quad peers; binding the wildcard IPv6 address can present a v4 peer as
+  `::ffff:172.x.y.z`, which never string-matches a dotted-quad entry. Fail-safe,
+  but wrong.
+
+**And the port itself:** do not publish the application's port when it is behind a
+proxy. An app reachable directly is an app reachable without TLS, whatever the
+proxy is doing — that is proof 1 in `deploy/verify.sh`.
+
+### A troop with no domain name
+
+Three answers, in order of how much we support them:
+
+1. **Own a name** (or a subdomain of one) and let the proxy obtain a certificate
+   automatically — Caddy does this with no cron job and nothing to renew by hand.
+   This is the path `deploy/Caddyfile` takes.
+2. **Use a tunnel to a hosted name** — the shape The House runs: Cloudflare Tunnel
+   terminates TLS at the edge and forwards plain HTTP to the origin. The origin
+   listener in `deploy/Caddyfile` (`:8080`, on the private network only) exists for
+   exactly this, and `ADJUTANT_TRUSTED_PROXIES` then names the tunnel container.
+3. **LAN-only with your own certificate authority.** Browsers will not trust it
+   without installing the CA on every device, which for a troop means every phone.
+   Workable, and honestly the worst of the three for a group that has to
+   self-serve.
 
 ## Upgrading
 

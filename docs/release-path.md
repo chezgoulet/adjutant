@@ -128,14 +128,20 @@ Order within the stage is by dependency, not by size:
    and it honours `x-forwarded-for` only from a peer named in
    `ADJUTANT_TRUSTED_PROXIES` (empty by default, which ignores the header
    entirely; the M2 unconditional-trust defect is fixed and has two tests behind
-   it). So the deliverable is: a committed compose example behind a real proxy,
-   the trusted-proxy value set correctly, and a live run proving **a real client
-   IP arrives behind the proxy and a spoofed forwarded header is refused** —
-   rate limiting, session cookies and absolute URLs all consistent under TLS
-   termination at the edge. Nothing in the app changes.
+   it). **Authored, and awaiting a host:** [`deploy/`](../deploy/README.md) holds
+   the complete stack (Caddy as the default, Traefik for The House's pattern, the
+   static-address trust wiring) and `deploy/verify.sh` runs the three proofs —
+   no published port for the app, the real client as the rate-limit key, and a
+   forged `x-forwarded-for` from an untrusted peer refused. **The proof needs a
+   host with Docker**, which the authoring machine is not (no Docker, no sudo) and
+   the two that are were unreachable when this was written (SSH key refused;
+   TrueNAS API 401). Until `verify.sh` runs green and its transcript is recorded,
+   this box is not met.
 2. **#54 — backup and restore, proven by a drill.** A backup nobody has restored
    is a hypothesis. Pairs with 3.1 as the deployment gate.
-3. **The host decision**, now against a working deployment rather than a plan.
+3. **The host decision**, now against a working deployment rather than a plan —
+   and it follows 3.1, because the deployment is what tells us what the host has
+   to be.
 4. **#51 — the security audit** (OWASP Top 10 + dependency scanning). The House's
    `aegis-*` audit modules are the tool; run it **after** Stage 4, so it measures
    the shape that ships.
