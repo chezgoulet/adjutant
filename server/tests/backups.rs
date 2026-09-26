@@ -13,7 +13,6 @@
 //! unreachable URL is a hard failure (issue #25).
 
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 
 use adjutant_server::config::Config;
 
