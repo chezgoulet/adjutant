@@ -12,11 +12,13 @@
 //! the shape of what they answer.
 
 use adjutant_finance::{
-    budget_variance, format_cents, ledger_verdict, parse_dollars_to_cents, parse_percent_to_bps,
-    scale_table, FinancePlugin, CATEGORY_DUES, CATEGORY_TRANSFER, DEFAULT_TIER, DIRECTIONS,
-    DIRECT_KINDS, DUES_KINDS, DUES_STATUSES, FUND_GENERAL, FUND_KINDS, MAX_SHARE_BPS,
-    MINIMUM_DUES_CENTS, STATUS_ASSESSED, STATUS_SELF_REPORTED, STATUS_WAIVED, TIER_CODES,
-    TIER_HARDSHIP, TIER_PATRON, TIER_STANDARD, TIER_SUPPORTED,
+    budget_variance, dues_draw_description, dues_draw_reference, format_cents, funded_cents_for,
+    ledger_verdict, parse_dollars_to_cents, parse_percent_to_bps, scale_table, FinancePlugin,
+    CATEGORY_DUES, CATEGORY_TRANSFER, DEFAULT_TIER, DIRECTIONS, DIRECT_KINDS, DRAW_ATTEMPTING,
+    DRAW_BOOKED, DRAW_FAILED, DRAW_NONE, DRAW_REFUSED, DRAW_STATUSES, DRAW_UNBOOKED, DUES_KINDS,
+    DUES_STATUSES, FUND_GENERAL, FUND_KINDS, FUND_SCHOLARSHIP, MAX_SHARE_BPS, MINIMUM_DUES_CENTS,
+    STATUS_ASSESSED, STATUS_SELF_REPORTED, STATUS_WAIVED, TIER_CODES, TIER_HARDSHIP, TIER_PATRON,
+    TIER_STANDARD, TIER_SUPPORTED,
 };
 use adjutant_sdk::prelude::*;
 use adjutant_sdk::testing::{response_json, TestHost, TestRequest};
@@ -82,6 +84,16 @@ fn find_statement(host: &TestHost, needle: &str) -> String {
         .into_iter()
         .find(|sql| sql.contains(needle))
         .unwrap_or_else(|| panic!("no statement contained {needle:?}"))
+}
+
+/// Every statement that wrote a **ledger row** — what a draw would write. The
+/// table is schema-qualified in the SQL (`"finance"."transactions"`), so the
+/// needle names the words rather than a made-up path.
+fn ledger_inserts(host: &TestHost) -> Vec<String> {
+    statements(host)
+        .into_iter()
+        .filter(|sql| sql.contains("INSERT INTO") && sql.contains("transactions"))
+        .collect()
 }
 
 /// The `Debug` rendering of a call's bind parameters, for asserting a value.
@@ -187,6 +199,9 @@ fn dues_row(
         "share_bps": Value::Null,
         "base_cents": base_cents,
         "assessed_cents": assessed_cents,
+        "funded_cents": 0,
+        "draw_status": DRAW_NONE,
+        "draw_ref": Value::Null,
         "self_reported": self_reported,
         "status": status,
         "note": "",
@@ -196,6 +211,57 @@ fn dues_row(
         "paid_cents": paid_cents,
         "outstanding_cents": (assessed_cents - paid_cents).max(0),
         "settled": paid_cents >= assessed_cents,
+    })
+}
+
+/// The same row with its funding line stated: what `scholarship` covers, and
+/// where the draw that carries it has got to.
+#[allow(clippy::too_many_arguments)]
+fn funded_dues_row(
+    member_id: &str,
+    tier: &str,
+    base_cents: i64,
+    assessed_cents: i64,
+    funded_cents: i64,
+    status: &str,
+    draw_status: &str,
+    draw_ref: Value,
+    paid_cents: i64,
+) -> Value {
+    let mut row = dues_row(
+        member_id,
+        tier,
+        base_cents,
+        assessed_cents,
+        status,
+        false,
+        paid_cents,
+    );
+    row["funded_cents"] = json!(funded_cents);
+    row["draw_status"] = json!(draw_status);
+    row["draw_ref"] = draw_ref;
+    row["outstanding_cents"] = json!((assessed_cents - funded_cents - paid_cents).max(0));
+    row["settled"] = json!(paid_cents >= assessed_cents - funded_cents);
+    row
+}
+
+/// One leg of a transfer, as the transfer statement returns it.
+fn transfer_leg(fund_id: i64, amount_cents: i64, group: &str, external_ref: Value) -> Value {
+    json!({
+        "id": 10 + fund_id,
+        "fund_id": fund_id,
+        "amount_cents": amount_cents,
+        "kind": "transfer",
+        "transfer_group": group,
+        "counterparty_fund_id": if amount_cents < 0 { 2 } else { 1 },
+        "category": CATEGORY_TRANSFER,
+        "description": "Dues 2026 scholarship draw — carl",
+        "fiscal_year": 2026,
+        "occurred_on": "2026-02-01",
+        "recorded_by": "treasurer",
+        "overdraft_authorized": false,
+        "external_ref": external_ref,
+        "created_at": "2026-02-01 12:00:00+00",
     })
 }
 
@@ -287,6 +353,54 @@ async fn declared_manifest_satisfies_the_load_rules() {
         "money must be integer cents"
     );
     assert!(ddl.contains("amount_cents BIGINT NOT NULL"));
+
+    // Migration 2 is a **new version**, not an edit to version 1: the core skips
+    // an applied version without comparing its SQL, so an amended version 1
+    // would be invisible on every deployed database. It adds the funding line and
+    // swaps the constraint — and the swap keeps the invariant.
+    assert_eq!(migrations.len(), 2, "the funding rule is its own version");
+    assert_eq!(migrations[1].version, 2);
+    assert_eq!(migrations[1].name, "dues_funding");
+    let swap = &migrations[1].sql;
+    for added in [
+        "ALTER TABLE dues ADD COLUMN IF NOT EXISTS funded_cents",
+        "ALTER TABLE dues ADD COLUMN IF NOT EXISTS draw_status",
+        "ALTER TABLE dues ADD COLUMN IF NOT EXISTS draw_ref",
+    ] {
+        assert!(swap.contains(added), "migration 2 is missing {added}");
+    }
+    // The three constraints the issue pins, and the drop of the one they replace.
+    // The name and the expression are checked separately because the SQL wraps
+    // the longer ones across lines.
+    for (name, expression) in [
+        ("dues_funded_valid", "CHECK (funded_cents >= 0)"),
+        ("dues_funded_within_assessment", "CHECK (funded_cents <= assessed_cents)"),
+        (
+            "dues_waived_is_funded",
+            "CHECK (status <> 'waived' OR funded_cents = assessed_cents)",
+        ),
+    ] {
+        assert!(swap.contains(name), "migration 2 is missing {name}");
+        assert!(
+            swap.contains(expression),
+            "migration 2 is missing {name}'s expression {expression}"
+        );
+    }
+    assert!(swap.contains("ALTER TABLE dues DROP CONSTRAINT IF EXISTS dues_waived_is_zero"));
+    assert!(
+        !swap.contains("dues_waived_is_zero CHECK"),
+        "the old rule is replaced, never re-added"
+    );
+    // Every existing waiver is `assessed_cents = 0` (which is what the old
+    // constraint enforced), so the column default satisfies all three and the
+    // swap applies cleanly. Nothing recomputes a past row in SQL: the tier scale
+    // is Rust's.
+    assert!(swap.contains("DEFAULT 0"));
+    assert!(
+        !swap.contains("UPDATE dues SET assessed_cents"),
+        "SQL must not guess a tier's share: the repair is a Rust route"
+    );
+    assert!(!swap.contains("NUMERIC") && !swap.contains("DECIMAL"));
 
     let mut seen: Vec<(String, String)> = Vec::new();
     for r in &routes {
@@ -1815,7 +1929,7 @@ fn an_unconfigured_scale_is_zero_and_says_so() {
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
-async fn assessing_dues_applies_the_scale_and_a_waiver_is_always_zero() {
+async fn assessing_dues_applies_the_scale_and_a_waiver_is_funded_not_zero() {
     let (host, _plugin, routes) = plugin().await;
     let assess = route(&routes, "POST", "/api/finance/dues/assess");
 
@@ -1846,6 +1960,11 @@ async fn assessing_dues_applies_the_scale_and_a_waiver_is_always_zero() {
     assert_eq!(status, 200, "{body}");
     assert_eq!(body["assessed_display"], json!("$600.00"));
     assert_eq!(body["dues"]["assessed_cents"], json!(60_000));
+    // The standard tier is the whole membership cost: nothing to fund, so no
+    // draw and no permission query at all.
+    assert_eq!(body["funded_cents"], json!(0));
+    assert_eq!(body["draw_status"], json!(DRAW_NONE));
+    assert_eq!(host.db.query_count(), 1, "nothing to fund: one query");
     // The whole scale travels with the assessment, so a client can show the
     // alternatives a scout might choose.
     assert_eq!(body["scale"].as_array().unwrap().len(), 4);
@@ -1862,15 +1981,20 @@ async fn assessing_dues_applies_the_scale_and_a_waiver_is_always_zero() {
     host.events.assert_published("finance.dues.assessed");
     assert_audited(&host, "dues.assess");
 
-    // A waiver assesses nothing, whatever tier is named — and the database
-    // insists on the same rule.
-    host.db.push_rows(vec![dues_row(
+    // A waiver assesses the tier it was measured at — and funds the whole of it
+    // from `scholarship`. This treasurer does **not** hold `finance:write` (the
+    // permission query answers no), so the draw is outstanding rather than
+    // booked: the waiver is neither refused nor silently unfunded.
+    host.db.push_rows(vec![]); // has_in_scope("finance:write", troop): no
+    host.db.push_rows(vec![funded_dues_row(
         "carl",
         TIER_STANDARD,
         60_000,
-        0,
+        60_000,
+        60_000,
         STATUS_WAIVED,
-        false,
+        DRAW_UNBOOKED,
+        Value::Null,
         0,
     )]);
     let (status, body) = call(
@@ -1887,14 +2011,30 @@ async fn assessing_dues_applies_the_scale_and_a_waiver_is_always_zero() {
     )
     .await;
     assert_eq!(status, 200, "{body}");
-    assert_eq!(body["assessed_display"], json!("$0.00"));
+    assert_eq!(body["assessed_display"], json!("$600.00"));
+    assert_eq!(body["assessed_cents"], json!(60_000));
+    assert_eq!(body["funded_cents"], json!(60_000));
+    assert_eq!(body["funded_display"], json!("$600.00"));
+    assert_eq!(body["draw_status"], json!(DRAW_UNBOOKED));
+    assert_eq!(body["draw_reference"], json!("dues:2026:carl"));
+    assert_eq!(body["member_share_cents"], json!(0));
     let params = params_of(&host, "INSERT INTO");
     assert!(
-        params.iter().any(|p| p.contains("Int(0)")),
-        "a waiver assesses nothing: {params:?}"
+        params.iter().any(|p| p.contains("Int(60000)")),
+        "a waiver assesses its tier, not zero: {params:?}"
+    );
+    assert!(
+        params.iter().any(|p| p.contains("\"unbooked\"")),
+        "and records that the draw is outstanding: {params:?}"
+    );
+    let sql = find_statement(&host, "INSERT INTO");
+    assert!(
+        sql.contains("funded_cents, draw_status, draw_ref"),
+        "the row carries the funding line: {sql}"
     );
 
-    // The hardship tier is $0 with no waiver needed at all.
+    // The hardship tier is $0 with no waiver needed at all — and that is a
+    // legitimate zero: there is no assessment for the fund to cover.
     host.db.push_rows(vec![dues_row(
         "dana",
         TIER_HARDSHIP,
@@ -1918,7 +2058,589 @@ async fn assessing_dues_applies_the_scale_and_a_waiver_is_always_zero() {
     .await;
     assert_eq!(status, 200, "{body}");
     assert_eq!(body["assessed_display"], json!("$0.00"));
+    assert_eq!(body["funded_cents"], json!(0));
+    assert_eq!(body["draw_status"], json!(DRAW_NONE));
     assert_eq!(MINIMUM_DUES_CENTS, 0, "the mandatory minimum is $0");
+}
+
+/// **The funding probe.** A waiver whose caller holds `finance:write` books its
+/// draw in the same flow, **as the caller**: one balanced transfer from
+/// `scholarship` into the configured dues fund, carrying the draw's deterministic
+/// reference, and the row records the group it landed under.
+#[tokio::test]
+async fn a_waiver_that_the_caller_can_book_draws_it_from_scholarship() {
+    let (host, _plugin, routes) = plugin().await;
+    let assess = route(&routes, "POST", "/api/finance/dues/assess");
+
+    // 1. the permission check: this caller holds `finance:write`.
+    host.db.push_rows(vec![json!({ "n": 1 })]);
+    // 2. the upsert, opening the draw as `attempting`.
+    host.db.push_rows(vec![funded_dues_row(
+        "carl",
+        TIER_STANDARD,
+        60_000,
+        60_000,
+        60_000,
+        STATUS_WAIVED,
+        DRAW_ATTEMPTING,
+        Value::Null,
+        0,
+    )]);
+    // 3. the transfer's two legs, under one group.
+    let group = "4f2a8c1e-0000-4000-8000-00000000d001";
+    host.db.push_rows(vec![
+        transfer_leg(1, -60_000, group, json!("dues:2026:carl")),
+        transfer_leg(2, 60_000, group, Value::Null),
+    ]);
+    // 4. the two funds' balances, for the transfer's answer.
+    host.db.push_rows(vec![
+        json!({ "id": 1, "code": FUND_SCHOLARSHIP, "name": "Scholarship Fund", "active": true, "balance_cents": 240_000 }),
+        json!({ "id": 2, "code": FUND_GENERAL, "name": "General Fund", "active": true, "balance_cents": 60_000 }),
+    ]);
+    // 5. the second half of the booking: the row, now `booked`.
+    host.db.push_rows(vec![funded_dues_row(
+        "carl",
+        TIER_STANDARD,
+        60_000,
+        60_000,
+        60_000,
+        STATUS_WAIVED,
+        DRAW_BOOKED,
+        json!(group),
+        0,
+    )]);
+
+    let (status, body) = call(
+        &assess.handler,
+        TestRequest::post("/api/finance/dues/assess")
+            .identity("treasurer", &["chief"])
+            .json(&json!({
+                "member_id": "carl",
+                "tier": TIER_STANDARD,
+                "status": STATUS_WAIVED,
+                "fiscal_year": 2026,
+            }))
+            .build(),
+    )
+    .await;
+
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body["funded_cents"], json!(60_000));
+    assert_eq!(body["draw_status"], json!(DRAW_BOOKED));
+    assert_eq!(body["draw_ref"], json!(group));
+    assert_eq!(body["draw_fund_code"], json!(FUND_GENERAL));
+
+    // The transfer was called with the draw's own shape: from `scholarship` into
+    // the configured dues fund, the funded amount, and the deterministic key.
+    let transfers = ledger_inserts(&host);
+    assert_eq!(transfers.len(), 1, "one transfer statement: {transfers:?}");
+    let transfer = &transfers[0];
+    assert!(transfer.contains("'transfer'"), "{transfer}");
+    assert!(
+        transfer.contains("CASE WHEN v.amount_cents < 0 THEN $12::text ELSE NULL END"),
+        "the draw's reference is bound as a parameter, written on the out-leg only: {transfer}"
+    );
+    let transfer_params = params_of(&host, "NOT EXISTS");
+    let rendered = format!("{transfer_params:?}");
+    assert!(
+        rendered.contains("dues:2026:carl"),
+        "the draw carries its deterministic reference: {rendered}"
+    );
+    assert!(
+        rendered.contains("IntArray([-60000, 60000])"),
+        "the balanced legs, and the funded amount: {rendered}"
+    );
+    assert!(
+        rendered.contains("scholarship") && rendered.contains("general"),
+        "from `scholarship` into the configured dues fund: {rendered}"
+    );
+    assert!(
+        rendered.contains("Int(2026)"),
+        "the draw belongs to the year: {rendered}"
+    );
+
+    // And the row was told the truth afterwards — `attempting` first, then the
+    // group finance answered with.
+    let update = host
+        .db
+        .queried_sql()
+        .into_iter()
+        .find(|sql| sql.contains("SET draw_status"))
+        .expect("the booking's second half");
+    assert!(update.contains("draw_ref = $4::text::uuid"), "{update}");
+    assert_audited(&host, "dues.assess");
+    host.events.assert_published("finance.dues.assessed");
+}
+
+/// **The referee probe.** A waiver the caller cannot book (no `finance:write`) is
+/// left **outstanding** with its amount visible — the worklist a treasurer closes
+/// with `POST /api/finance/transfer`. Nothing is refused and nothing is silently
+/// unfunded, and no credential is minted to book it.
+#[tokio::test]
+async fn a_waiver_the_caller_cannot_book_is_left_outstanding() {
+    let (host, _plugin, routes) = plugin().await;
+    let assess = route(&routes, "POST", "/api/finance/dues/assess");
+
+    host.db.push_rows(vec![]); // no `finance:write`
+    host.db.push_rows(vec![funded_dues_row(
+        "carl",
+        TIER_STANDARD,
+        60_000,
+        60_000,
+        60_000,
+        STATUS_WAIVED,
+        DRAW_UNBOOKED,
+        Value::Null,
+        0,
+    )]);
+
+    let (status, body) = call(
+        &assess.handler,
+        TestRequest::post("/api/finance/dues/assess")
+            .identity("dues_clerk", &["chief"])
+            .json(&json!({
+                "member_id": "carl",
+                "tier": TIER_STANDARD,
+                "status": STATUS_WAIVED,
+                "fiscal_year": 2026,
+            }))
+            .build(),
+    )
+    .await;
+
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body["funded_cents"], json!(60_000));
+    assert_eq!(body["draw_status"], json!(DRAW_UNBOOKED));
+    assert_eq!(body["draw_ref"], Value::Null);
+    // No transfer ran, so no ledger statement did: the money has not moved.
+    assert!(
+        ledger_inserts(&host).is_empty(),
+        "a caller without `finance:write` books nothing: {:?}",
+        statements(&host)
+    );
+    assert_eq!(
+        host.db.query_count(),
+        2,
+        "the permission query and the upsert, and no booking"
+    );
+}
+
+/// **The zero probe.** A waiver of a zero assessment funds nothing, and that is
+/// representable: no transaction is booked (a zero amount is unrepresentable in
+/// the ledger anyway) and the row says so.
+#[tokio::test]
+async fn a_waiver_of_a_zero_assessment_funds_nothing_and_says_so() {
+    let (host, _plugin, routes) = plugin().await;
+    let assess = route(&routes, "POST", "/api/finance/dues/assess");
+
+    host.db.push_rows(vec![dues_row(
+        "carl",
+        TIER_HARDSHIP,
+        60_000,
+        0,
+        STATUS_WAIVED,
+        false,
+        0,
+    )]);
+
+    let (status, body) = call(
+        &assess.handler,
+        TestRequest::post("/api/finance/dues/assess")
+            .identity("treasurer", &["chief"])
+            .json(&json!({
+                "member_id": "carl",
+                "tier": TIER_HARDSHIP,
+                "status": STATUS_WAIVED,
+                "fiscal_year": 2026,
+            }))
+            .build(),
+    )
+    .await;
+
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body["assessed_cents"], json!(0));
+    assert_eq!(body["funded_cents"], json!(0));
+    assert_eq!(body["draw_status"], json!(DRAW_NONE));
+    // No permission query is spent learning a permission that cannot matter.
+    assert_eq!(host.db.query_count(), 1, "nothing to fund: one query");
+    assert!(ledger_inserts(&host).is_empty(), "a zero subsidy books no transaction");
+}
+
+/// **The edge case.** If the configured dues fund *is* `scholarship`, the draw
+/// has the same fund on both sides and finance's own transfer route refuses it —
+/// correctly: the subsidy is already inside the fund that would fund it. Nothing
+/// is booked and the waiver still stands.
+#[tokio::test]
+async fn a_dues_fund_that_is_scholarship_refuses_the_draw_and_the_waiver_stands() {
+    let (host, _plugin, routes) =
+        plugin_with_config(json!({ "membership_cost_cents": 60_000, "dues_fund_code": FUND_SCHOLARSHIP }))
+            .await;
+    let assess = route(&routes, "POST", "/api/finance/dues/assess");
+
+    host.db.push_rows(vec![json!({ "n": 1 })]); // holds `finance:write`
+    host.db.push_rows(vec![funded_dues_row(
+        "carl",
+        TIER_STANDARD,
+        60_000,
+        60_000,
+        60_000,
+        STATUS_WAIVED,
+        DRAW_ATTEMPTING,
+        Value::Null,
+        0,
+    )]);
+    // The transfer route refuses the same fund on both legs *before* its
+    // statement runs, so no legs are queued at all.
+    host.db.push_rows(vec![funded_dues_row(
+        "carl",
+        TIER_STANDARD,
+        60_000,
+        60_000,
+        60_000,
+        STATUS_WAIVED,
+        DRAW_REFUSED,
+        Value::Null,
+        0,
+    )]);
+
+    let (status, body) = call(
+        &assess.handler,
+        TestRequest::post("/api/finance/dues/assess")
+            .identity("treasurer", &["chief"])
+            .json(&json!({
+                "member_id": "carl",
+                "tier": TIER_STANDARD,
+                "status": STATUS_WAIVED,
+                "fiscal_year": 2026,
+            }))
+            .build(),
+    )
+    .await;
+
+    assert_eq!(status, 200, "the waiver stands: {body}");
+    assert_eq!(body["assessed_cents"], json!(60_000));
+    assert_eq!(body["funded_cents"], json!(60_000));
+    assert_eq!(body["draw_status"], json!(DRAW_REFUSED));
+    assert!(
+        body["draw_note"]
+            .as_str()
+            .is_some_and(|note| note.contains("two different funds")),
+        "finance's own words are carried back: {body}"
+    );
+    assert!(ledger_inserts(&host).is_empty(), "nothing was booked");
+}
+
+/// **The lost-answer probe.** A transfer retried with the same `external_ref`
+/// writes **no** second pair of legs: the reference the first attempt wrote
+/// answers for it, and the answer is the transfer that already exists. This is
+/// what makes a re-attempted draw safe.
+#[tokio::test]
+async fn a_transfer_retried_with_the_same_external_ref_writes_nothing_twice() {
+    let (host, _plugin, routes) = plugin().await;
+    let transfer = route(&routes, "POST", "/api/finance/transfer");
+
+    // The statement's guard wrote nothing: the reference is already in the
+    // ledger (which is what `$12`'s NOT EXISTS tests).
+    host.db.push_rows(vec![]);
+    host.db.push_rows(vec![json!({
+        "transfer_group": "4f2a8c1e-0000-4000-8000-00000000d001",
+        "entries": 2,
+        "group_sum_cents": 0,
+        "in_legs": 1,
+    })]);
+
+    let (status, body) = call(
+        &transfer.handler,
+        TestRequest::post("/api/finance/transfer")
+            .identity("treasurer", &["chief"])
+            .json(&json!({
+                "from_fund_code": FUND_SCHOLARSHIP,
+                "to_fund_code": FUND_GENERAL,
+                "amount_cents": 60_000,
+                "fiscal_year": 2026,
+                "external_ref": "dues:2026:carl",
+            }))
+            .build(),
+    )
+    .await;
+
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body["duplicate"], json!(true));
+    assert_eq!(body["transfer_group"], json!("4f2a8c1e-0000-4000-8000-00000000d001"));
+    assert_eq!(body["entries"], json!(2));
+    assert_eq!(body["group_sum_cents"], json!(0));
+
+    // The retry's own statement carried the guard, and the lookup is what
+    // answered — a second group was never generated.
+    let sql = find_statement(&host, "external_ref");
+    assert!(sql.contains("NOT EXISTS"), "the guard is in the statement: {sql}");
+    let lookup = host
+        .db
+        .queried_sql()
+        .into_iter()
+        .find(|sql| sql.contains("WHERE t.external_ref = $1"))
+        .expect("the duplicate lookup");
+    assert!(lookup.contains("group_sum_cents"), "{lookup}");
+    assert_eq!(
+        ledger_inserts(&host).len(),
+        1,
+        "the retry ran the transfer statement once — and it wrote no rows, which is \
+         why the lookup answered: {:?}",
+        statements(&host)
+    );
+}
+
+/// **The repair probe.** The guarded, idempotent repair recomputes the historic
+/// rows that were waived at zero from their own `base_cents` and `tier`, leaves a
+/// `base_cents = 0` row alone, and does nothing at all the second time.
+#[tokio::test]
+async fn the_repair_recomputes_the_waived_at_zero_rows_and_is_idempotent() {
+    let (host, _plugin, routes) = plugin().await;
+    let repair = route(&routes, "POST", "/api/finance/dues/repair-waivers");
+
+    // The worklist: one repairable row, and one whose tier assesses nothing (so
+    // there is nothing for the fund to cover). A row with no membership cost is
+    // not here at all — the worklist's own `base_cents > 0` never selects it.
+    host.db.push_rows(vec![
+        json!({ "id": 7, "member_id": "carl", "fiscal_year": 2025, "base_cents": 60_000, "tier": TIER_STANDARD }),
+        json!({ "id": 8, "member_id": "dana", "fiscal_year": 2025, "base_cents": 60_000, "tier": TIER_HARDSHIP }),
+    ]);
+    // The first row's guarded rewrite, which returns it with its new figures.
+    host.db.push_rows(vec![funded_dues_row(
+        "carl",
+        TIER_STANDARD,
+        60_000,
+        60_000,
+        60_000,
+        STATUS_WAIVED,
+        DRAW_UNBOOKED,
+        Value::Null,
+        0,
+    )]);
+
+    let (status, body) = call(
+        &repair.handler,
+        TestRequest::post("/api/finance/dues/repair-waivers")
+            .identity("treasurer", &["chief"])
+            .json(&json!({ "fiscal_year": 2025 }))
+            .build(),
+    )
+    .await;
+
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body["candidates"], json!(2));
+    assert_eq!(body["repaired"], json!(1));
+    assert_eq!(
+        body["nothing_to_fund"],
+        json!(1),
+        "the row whose tier assesses nothing had nothing to fund and was left alone"
+    );
+    // The worklist itself never selects a row with no membership cost to fund:
+    // there is nothing it could compute.
+    let worklist = host
+        .db
+        .queried_sql()
+        .into_iter()
+        .find(|sql| sql.contains("base_cents > 0"))
+        .expect("the repair's worklist");
+    assert!(worklist.contains("assessed_cents = 0"), "{worklist}");
+    assert!(worklist.contains("base_cents > 0"), "{worklist}");
+    assert_eq!(body["rows"][0]["funded_cents"], json!(60_000));
+    assert_eq!(body["rows"][0]["dues"]["draw_status"], json!(DRAW_UNBOOKED));
+
+    // The repair's own statement: guarded, so it can only ever write once, and
+    // it names the tier's share as the assessment *and* the funding.
+    let update = host
+        .db
+        .queried_sql()
+        .into_iter()
+        .find(|sql| sql.contains("SET assessed_cents"))
+        .expect("the repair's rewrite");
+    assert!(update.contains("AND d.assessed_cents = 0"), "{update}");
+    assert!(update.contains("AND d.base_cents > 0"), "{update}");
+    let params = params_of(&host, "SET assessed_cents");
+    assert!(
+        params.iter().filter(|p| p.contains("Int(60000)")).count() >= 1,
+        "{params:?}"
+    );
+    assert_audited(&host, "dues.repair_waivers");
+
+    // Idempotent: nothing matches the worklist the second time.
+    host.db.push_rows(vec![]);
+    let (status, body) = call(
+        &repair.handler,
+        TestRequest::post("/api/finance/dues/repair-waivers")
+            .identity("treasurer", &["chief"])
+            .json(&json!({ "fiscal_year": 2025 }))
+            .build(),
+    )
+    .await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body["candidates"], json!(0));
+    assert_eq!(body["repaired"], json!(0));
+
+    // A dry run reports and writes nothing.
+    host.db.push_rows(vec![json!({
+        "id": 9, "member_id": "erin", "fiscal_year": 2024, "base_cents": 60_000, "tier": TIER_SUPPORTED
+    })]);
+    let (status, body) = call(
+        &repair.handler,
+        TestRequest::post("/api/finance/dues/repair-waivers")
+            .identity("treasurer", &["chief"])
+            .json(&json!({ "fiscal_year": 2024, "dry_run": true }))
+            .build(),
+    )
+    .await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body["rows"][0]["applied"], json!(false));
+    assert_eq!(
+        body["rows"][0]["assessed_cents"],
+        json!(30_000),
+        "a supported waiver funds the tier's share"
+    );
+}
+
+/// The self-report's reduction is a scholarship draw too, and it is left
+/// **outstanding**: the member holds `finance:self_report` and must not be given
+/// `finance:write`, so no credential is minted to book it — a `finance:write`
+/// holder closes it with `POST /api/finance/transfer`.
+#[tokio::test]
+async fn a_self_report_records_its_reduction_as_an_outstanding_draw() {
+    let (host, _plugin, routes) = plugin().await;
+    let report = route(&routes, "POST", "/api/finance/dues/self-report");
+
+    // The existing assessment whose base the self-report reuses.
+    host.db.push_rows(vec![dues_row(
+        "bea",
+        TIER_STANDARD,
+        60_000,
+        60_000,
+        STATUS_ASSESSED,
+        false,
+        0,
+    )]);
+    host.db.push_rows(vec![dues_row(
+        "bea",
+        TIER_SUPPORTED,
+        60_000,
+        30_000,
+        STATUS_SELF_REPORTED,
+        true,
+        0,
+    )]);
+    host.db.push_rows(vec![dues_row(
+        "bea",
+        TIER_SUPPORTED,
+        60_000,
+        30_000,
+        STATUS_SELF_REPORTED,
+        true,
+        0,
+    )]);
+
+    let (status, body) = call(
+        &report.handler,
+        TestRequest::post("/api/finance/dues/self-report")
+            .identity("bea", &["scout"])
+            .json(&json!({ "tier": TIER_SUPPORTED, "fiscal_year": 2026 }))
+            .build(),
+    )
+    .await;
+
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body["assessed_cents"], json!(30_000));
+    assert_eq!(
+        body["funded_cents"],
+        json!(30_000),
+        "supported funds half the membership cost"
+    );
+    assert_eq!(body["draw_status"], json!(DRAW_UNBOOKED));
+    assert_eq!(body["draw_reference"], json!("dues:2026:bea"));
+    assert!(
+        ledger_inserts(&host).is_empty(),
+        "the machine-originated draw is named, never booked: {:?}",
+        statements(&host)
+    );
+
+    // Hardship funds nothing — a legitimate zero, not a failure to collect.
+    host.db.push_rows(vec![dues_row(
+        "carl",
+        TIER_HARDSHIP,
+        60_000,
+        0,
+        STATUS_SELF_REPORTED,
+        true,
+        0,
+    )]);
+    host.db.push_rows(vec![dues_row(
+        "carl",
+        TIER_HARDSHIP,
+        60_000,
+        0,
+        STATUS_SELF_REPORTED,
+        true,
+        0,
+    )]);
+    host.db.push_rows(vec![dues_row(
+        "carl",
+        TIER_HARDSHIP,
+        60_000,
+        0,
+        STATUS_SELF_REPORTED,
+        true,
+        0,
+    )]);
+    let (status, body) = call(
+        &report.handler,
+        TestRequest::post("/api/finance/dues/self-report")
+            .identity("carl", &["scout"])
+            .json(&json!({ "tier": TIER_HARDSHIP, "fiscal_year": 2026 }))
+            .build(),
+    )
+    .await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body["funded_cents"], json!(0));
+    assert_eq!(body["draw_status"], json!(DRAW_NONE));
+}
+
+/// The arithmetic of the funding rule, pure and stated: a waiver funds the whole
+/// assessment; a discount funds what the tier does not assess, never more than
+/// what is owed; a patron (above the base cost) funds nothing.
+#[test]
+fn the_funding_rule_funds_a_waiver_and_caps_a_discount_at_the_assessment() {
+    // A waiver: the member's own share is zero, so the whole assessment is funded.
+    assert_eq!(funded_cents_for(STATUS_WAIVED, 60_000, 60_000), 60_000);
+    assert_eq!(funded_cents_for(STATUS_WAIVED, 0, 0), 0);
+    // A discount equal to what is owed (supported is half the base cost).
+    assert_eq!(funded_cents_for(STATUS_SELF_REPORTED, 60_000, 30_000), 30_000);
+    // The standard tier is the whole cost: nothing is discounted.
+    assert_eq!(funded_cents_for(STATUS_ASSESSED, 60_000, 60_000), 0);
+    // A patron assesses above the base cost: a subsidy cannot be negative.
+    assert_eq!(funded_cents_for(STATUS_ASSESSED, 60_000, 120_000), 0);
+    // Hardship assesses nothing, so there is no assessment to cover and the
+    // legitimate answer is nothing — not the whole membership cost.
+    assert_eq!(funded_cents_for(STATUS_SELF_REPORTED, 60_000, 0), 0);
+    assert_eq!(funded_cents_for(STATUS_WAIVED, 60_000, 0), 0);
+    // A nonsense base cannot produce a nonsense subsidy.
+    assert_eq!(funded_cents_for(STATUS_SELF_REPORTED, -5, 0), 0);
+    assert!(funded_cents_for(STATUS_SELF_REPORTED, i64::MAX, 1) <= 1);
+}
+
+/// One draw, one key: the reference is deterministic per member and year, so a
+/// retry after a lost answer is recognisable as the same money move.
+#[test]
+fn the_draws_reference_is_deterministic_and_reads_as_the_store_writes_it() {
+    assert_eq!(dues_draw_reference(2026, "carl"), "dues:2026:carl");
+    assert_eq!(dues_draw_reference(2026, "carl"), dues_draw_reference(2026, "carl"));
+    assert_ne!(dues_draw_reference(2026, "carl"), dues_draw_reference(2025, "carl"));
+    assert_ne!(dues_draw_reference(2026, "carl"), dues_draw_reference(2026, "dana"));
+    assert_eq!(
+        dues_draw_description(2026, "carl"),
+        "Dues 2026 scholarship draw — carl"
+    );
+    assert!(DRAW_STATUSES.contains(&DRAW_BOOKED));
+    assert!(DRAW_STATUSES.contains(&DRAW_ATTEMPTING));
+    assert!(DRAW_STATUSES.contains(&DRAW_FAILED));
 }
 
 #[tokio::test]
@@ -2105,13 +2827,17 @@ async fn the_dues_list_totals_what_the_ledger_shows() {
             60_000,
         ),
         dues_row("carl", TIER_HARDSHIP, 60_000, 0, STATUS_WAIVED, false, 0),
-        dues_row(
+        // A supported self-report: the discount is funded from `scholarship`, and
+        // the draw has not been booked yet.
+        funded_dues_row(
             "dana",
             TIER_SUPPORTED,
             60_000,
             30_000,
+            30_000,
             STATUS_SELF_REPORTED,
-            true,
+            DRAW_UNBOOKED,
+            Value::Null,
             10_000,
         ),
     ]);
@@ -2131,10 +2857,19 @@ async fn the_dues_list_totals_what_the_ledger_shows() {
     assert_eq!(body["totals"]["assessed_cents"], json!(90_000));
     assert_eq!(body["totals"]["assessed_display"], json!("$900.00"));
     assert_eq!(body["totals"]["collected_cents"], json!(70_000));
-    assert_eq!(body["totals"]["outstanding_cents"], json!(20_000));
+    assert_eq!(body["totals"]["outstanding_cents"], json!(0));
     assert_eq!(body["totals"]["at_no_cost"], json!(1));
     assert_eq!(body["totals"]["waived"], json!(1));
-    assert_eq!(body["totals"]["settled"], json!(2));
+    // What the year was funded: the figure a treasurer now reads instead of
+    // `at_no_cost`, and the outstanding draws behind it.
+    assert_eq!(body["totals"]["funded_cents"], json!(30_000));
+    assert_eq!(body["totals"]["funded_display"], json!("$300.00"));
+    assert_eq!(body["totals"]["draws_unbooked"], json!(1));
+    assert_eq!(
+        body["totals"]["settled"],
+        json!(3),
+        "a funded member owes nothing: the member's share is assessed less funded"
+    );
     assert_eq!(body["honor_system"], json!(true));
 
     // Grouped by tier, in the scale's own order, with unknown tiers absent.
@@ -2511,8 +3246,8 @@ async fn the_annual_report_states_the_year_and_the_money_moving_through_it() {
     host.db
         .push_rows(vec![budget_row(1, 1, "income", "", 100_000, 85_000, false)]);
     host.db.push_rows(vec![
-        json!({ "tier": TIER_STANDARD, "members": 2, "assessed_cents": 120_000, "at_no_cost": 0, "self_reported": 2, "waived": 0 }),
-        json!({ "tier": TIER_HARDSHIP, "members": 1, "assessed_cents": 0, "at_no_cost": 1, "self_reported": 1, "waived": 0 }),
+        json!({ "tier": TIER_STANDARD, "members": 2, "assessed_cents": 120_000, "funded_cents": 60_000, "unbooked_draws": 1, "at_no_cost": 0, "self_reported": 2, "waived": 1 }),
+        json!({ "tier": TIER_HARDSHIP, "members": 1, "assessed_cents": 0, "funded_cents": 0, "unbooked_draws": 0, "at_no_cost": 1, "self_reported": 1, "waived": 0 }),
     ]);
     host.db
         .push_rows(vec![json!({ "collected_cents": 85_000 })]);
@@ -2582,11 +3317,25 @@ async fn the_annual_report_states_the_year_and_the_money_moving_through_it() {
     );
     assert_eq!(body["dues"]["assessed_cents"], json!(120_000));
     assert_eq!(body["dues"]["collected_cents"], json!(85_000));
-    assert_eq!(body["dues"]["outstanding_cents"], json!(35_000));
+    // What the troop spent on access: the figure the report could not state
+    // before, and the reason `at_no_cost` is no longer the interesting count.
+    assert_eq!(body["dues"]["funded_cents"], json!(60_000));
+    assert_eq!(body["dues"]["funded_display"], json!("$600.00"));
+    assert_eq!(body["dues"]["unbooked_draws"], json!(1));
+    // The member's own share is assessed less funded, so an over-collected year
+    // reports nothing outstanding rather than a negative debt.
+    assert_eq!(body["dues"]["outstanding_cents"], json!(0));
     assert_eq!(body["dues"]["members_assessed"], json!(3));
     assert_eq!(body["dues"]["at_no_cost"], json!(1));
     assert_eq!(body["dues"]["honor_system"], json!(true));
     assert_eq!(body["dues"]["by_tier"].as_array().unwrap().len(), 2);
+    // And a draw is a transfer, so it does not inflate what the ledger collected.
+    assert!(
+        body["dues"]["funding"]
+            .as_str()
+            .is_some_and(|note| note.contains("scholarship")),
+        "the report states the rule it is applying: {body}"
+    );
 
     // The report carries the ledger's own verdict: it is the document handed to
     // an outside body.

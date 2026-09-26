@@ -215,11 +215,91 @@ pub const DEFAULT_TIER: &str = TIER_STANDARD;
 pub const STATUS_ASSESSED: &str = "assessed";
 /// The scout reported the tier themselves (the honor system working).
 pub const STATUS_SELF_REPORTED: &str = "self_reported";
-/// Dues waived — always with an assessment of zero.
+/// Dues waived — the whole assessment is funded from `scholarship`, so the
+/// member's own share (`assessed_cents - funded_cents`) is zero.
 pub const STATUS_WAIVED: &str = "waived";
 
 /// The statuses the API and the database both accept.
 pub const DUES_STATUSES: [&str; 3] = [STATUS_ASSESSED, STATUS_SELF_REPORTED, STATUS_WAIVED];
+
+/// Nothing to fund: the assessment is zero, or the tier funds nothing.
+pub const DRAW_NONE: &str = "none";
+/// Funded, and no `finance:write` holder has booked the draw yet.
+pub const DRAW_UNBOOKED: &str = "unbooked";
+/// A `finance:write` caller is booking it now.
+pub const DRAW_ATTEMPTING: &str = "attempting";
+/// The transfer landed; `draw_ref` carries its group.
+pub const DRAW_BOOKED: &str = "booked";
+/// Finance's own transfer route refused it (the configured dues fund IS
+/// `scholarship`): nothing was booked, and the waiver still stands.
+pub const DRAW_REFUSED: &str = "refused";
+/// The transfer call errored: nothing was booked.
+pub const DRAW_FAILED: &str = "failed";
+
+/// The draw states, in the order they are reached — the same vocabulary the
+/// store uses for its own scholarship draw (`plugins/store/src/lib.rs`), because
+/// a draw is a draw whatever funded it.
+pub const DRAW_STATUSES: [&str; 6] = [
+    DRAW_NONE,
+    DRAW_UNBOOKED,
+    DRAW_ATTEMPTING,
+    DRAW_BOOKED,
+    DRAW_REFUSED,
+    DRAW_FAILED,
+];
+
+/// The draw states that mean "funded, and the money has not moved yet" — what
+/// the outstanding-draw worklist and the Annual Financial Report count.
+pub const DRAW_UNSETTLED: [&str; 3] = [DRAW_UNBOOKED, DRAW_ATTEMPTING, DRAW_FAILED];
+
+/// The description a booked dues draw carries into the ledger.
+pub fn dues_draw_description(fiscal_year: i32, member_id: &str) -> String {
+    format!("Dues {fiscal_year} scholarship draw — {member_id}")
+}
+
+/// The draw's **deterministic** idempotency key: one waiver, one transfer,
+/// however many times the answer is lost. `finance.transactions.external_ref`
+/// has a unique index, so a retry carrying the same reference writes nothing new
+/// — the shape the store uses for its own draw reference.
+pub fn dues_draw_reference(fiscal_year: i32, member_id: &str) -> String {
+    format!("dues:{fiscal_year}:{member_id}")
+}
+
+/// What `scholarship` funds of one assessment, in cents.
+///
+/// A **waiver** funds the whole assessment (`funded_cents = assessed_cents`), so
+/// the member's own share is zero. Anything else funds the **discount** — the
+/// part of the membership cost the tier does not assess (`base_cents -
+/// assessed_cents`) — clamped at zero, because a patron assesses *above* the base
+/// cost and a subsidy cannot be negative.
+///
+/// It is also clamped **at the assessment**, because `funded_cents` is what
+/// `scholarship` covers *of what is owed*: the database's
+/// `dues_funded_within_assessment` refuses a subsidy larger than the assessment,
+/// and a `$0` tier (hardship) is a legitimate zero — there is no assessment for
+/// the fund to cover, so it funds nothing (the note's own outcome for hardship).
+/// The clamp is why a self-reported `supported` tier funds half the membership
+/// cost (its whole assessment) while a self-reported hardship funds nothing.
+pub fn funded_cents_for(status: &str, base_cents: i64, assessed_cents: i64) -> i64 {
+    let assessed = assessed_cents.max(0);
+    if status == STATUS_WAIVED {
+        return assessed;
+    }
+    base_cents
+        .max(0)
+        .saturating_sub(assessed)
+        .clamp(0, assessed)
+}
+
+/// The draw state an assessment earns before anyone tries to book it: `none`
+/// when there is nothing to fund, `unbooked` when there is.
+pub fn unbooked_draw_state(funded_cents: i64) -> &'static str {
+    if funded_cents > 0 {
+        DRAW_UNBOOKED
+    } else {
+        DRAW_NONE
+    }
+}
 
 /// A member's assessment row in `finance.dues`.
 pub const DUES_KIND_MEMBER: &str = "member";
@@ -520,6 +600,15 @@ struct TransferBody {
     fiscal_year: Option<i32>,
     #[serde(default)]
     allow_overdraft: Option<bool>,
+    /// An idempotency key for the **transfer as a whole** — a value the caller
+    /// chooses that identifies this money move rather than the two rows it
+    /// writes. `finance.transactions.external_ref` has a unique index, so a
+    /// retry carrying the same reference is answered with the transfer it
+    /// already made instead of a second pair of legs. The dues draw gives it a
+    /// deterministic value ([`dues_draw_reference`]) for exactly that reason: a
+    /// lost answer must not become a doubled subsidy.
+    #[serde(default)]
+    external_ref: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -858,7 +947,8 @@ const BUDGET_FIELDS: &str = r#"
 /// A dues row as the API states it, for `RETURNING` (alias `d`).
 const DUES_FIELDS: &str = r#"
     d.id, d.fiscal_year, d.dues_kind, d.member_id, d.lodge_id, d.tier, d.share_bps,
-    d.base_cents, d.assessed_cents, d.self_reported, d.status, d.note, d.recorded_by,
+    d.base_cents, d.assessed_cents, d.funded_cents, d.draw_status,
+    d.draw_ref::text AS draw_ref, d.self_reported, d.status, d.note, d.recorded_by,
     d.assessed_at::text AS assessed_at, d.updated_at::text AS updated_at
 "#;
 
@@ -867,13 +957,19 @@ const DUES_FIELDS: &str = r#"
 /// member and year, never stored: a payment recorded by any route (the dues
 /// route, the ledger route, a `payment.received` event) moves them, and a refund
 /// moves them back.
+///
+/// `funded_cents` and the draw's state come off the row itself, because they are
+/// the assessment's own figures: what `scholarship` covers, and whether the
+/// balanced transfer that funds it has been booked yet.
 const DUES_STANDING_FIELDS: &str = r#"
     d.id, d.fiscal_year, d.dues_kind, d.member_id, d.lodge_id, d.tier, d.share_bps,
-    d.base_cents, d.assessed_cents, d.self_reported, d.status, d.note, d.recorded_by,
+    d.base_cents, d.assessed_cents, d.funded_cents, d.draw_status,
+    d.draw_ref::text AS draw_ref, d.self_reported, d.status, d.note, d.recorded_by,
     d.assessed_at::text AS assessed_at, d.updated_at::text AS updated_at,
     COALESCE(p.paid_cents, 0)::bigint AS paid_cents,
-    GREATEST(d.assessed_cents - COALESCE(p.paid_cents, 0), 0)::bigint AS outstanding_cents,
-    (COALESCE(p.paid_cents, 0) >= d.assessed_cents) AS settled
+    GREATEST(d.assessed_cents - d.funded_cents - COALESCE(p.paid_cents, 0), 0)::bigint
+        AS outstanding_cents,
+    (COALESCE(p.paid_cents, 0) >= d.assessed_cents - d.funded_cents) AS settled
 "#;
 
 /// A transfer's two legs, grouped, with their sum — the integrity check reads
@@ -1017,17 +1113,29 @@ fn sql_annual_funds(c: &PluginContext) -> String {
 }
 
 /// The year's dues by tier: how many scouts chose each tier, what it assessed,
-/// and how many paid nothing at all. A tier nobody chose is simply absent.
+/// **what `scholarship` funded**, and how many paid nothing at all. A tier nobody
+/// chose is simply absent.
+///
+/// `funded_cents` is the figure the report was missing: the sum of what the troop
+/// spent on access. `unbooked_draws` counts the funded rows whose balanced
+/// transfer has not been booked yet — money that is owed to the dues fund and has
+/// not moved, which is exactly what a treasurer needs to see rather than a zero.
 fn sql_annual_dues(c: &PluginContext) -> String {
     format!(
         "SELECT tier, COUNT(*)::bigint AS members, \
                 COALESCE(SUM(assessed_cents), 0)::bigint AS assessed_cents, \
+                COALESCE(SUM(funded_cents), 0)::bigint AS funded_cents, \
+                COUNT(*) FILTER (WHERE draw_status IN ('{unbooked}', '{attempting}', \
+                                                       '{failed}'))::bigint AS unbooked_draws, \
                 COUNT(*) FILTER (WHERE assessed_cents = 0)::bigint AS at_no_cost, \
                 COUNT(*) FILTER (WHERE self_reported)::bigint AS self_reported, \
                 COUNT(*) FILTER (WHERE status = '{STATUS_WAIVED}')::bigint AS waived \
          FROM {dues} WHERE dues_kind = '{DUES_KIND_MEMBER}' AND fiscal_year = $1 \
          GROUP BY tier ORDER BY tier",
-        dues = c.db.table("dues")
+        dues = c.db.table("dues"),
+        unbooked = DRAW_UNBOOKED,
+        attempting = DRAW_ATTEMPTING,
+        failed = DRAW_FAILED,
     )
 }
 
@@ -1074,7 +1182,8 @@ impl Default for FinancePlugin {
 /// Vocabulary that reaches an arithmetic result is a constraint, not a
 /// convention: `kind` decides a sign, `direction` decides how a variance reads,
 /// the subject rule decides whose payments a dues row counts, and
-/// `dues_waived_is_zero` makes "waived but owing" unrepresentable.
+/// `dues_waived_is_funded` makes "waived but owing" unrepresentable while a
+/// waiver names what was funded (migration 2, [`DUES_FUNDING_MIGRATION`]).
 const MIGRATION_SCHEMA: &str = r#"
 CREATE TABLE IF NOT EXISTS funds (
     id BIGSERIAL PRIMARY KEY,
@@ -1183,6 +1292,18 @@ INSERT INTO funds (code, name, kind, purpose, restricted, created_by) VALUES
 ON CONFLICT (code) DO NOTHING;
 "#;
 
+/// Migration 2's SQL, embedded at compile time from
+/// `migrations/002_dues_funding.sql`.
+///
+/// It is a **new version**, never an edit to version 1: the core records applied
+/// versions per schema and skips one it has already run without comparing its SQL
+/// (`server/src/db.rs`, `server/src/plugin_runtime.rs`), so an amended version 1
+/// would be invisible on every deployed database. It adds `funded_cents`, the
+/// draw-state column and `draw_ref`, and replaces `dues_waived_is_zero` with the
+/// three constraints that keep "waived but owing" unrepresentable while a waiver
+/// names what was funded.
+const DUES_FUNDING_MIGRATION: &str = include_str!("../migrations/002_dues_funding.sql");
+
 #[async_trait]
 impl AdjutantPlugin for FinancePlugin {
     fn id(&self) -> &str {
@@ -1229,7 +1350,10 @@ impl AdjutantPlugin for FinancePlugin {
     }
 
     fn migrations(&self) -> Vec<Migration> {
-        vec![Migration::new(1, "finance_schema", MIGRATION_SCHEMA)]
+        vec![
+            Migration::new(1, "finance_schema", MIGRATION_SCHEMA),
+            Migration::new(2, "dues_funding", DUES_FUNDING_MIGRATION),
+        ]
     }
 
     fn routes(&self) -> Vec<RouteDefinition> {
@@ -1282,6 +1406,7 @@ fn finance_routes(ctx: &PluginContext) -> Vec<RouteDefinition> {
         route_set_budget(ctx),
         route_sliding_scale(ctx),
         route_assess_dues(ctx),
+        route_repair_waived_dues(ctx),
         route_set_lodge_dues(ctx),
         route_get_lodge_dues(ctx),
         route_list_dues(ctx),
@@ -1608,10 +1733,17 @@ const LEDGER_FILTER: &str = r#"
 /// `$1`/`$2` are the origin reference (an id, or a code — exactly one non-null),
 /// `$3`/`$4` the destination's, `$5` the two signed amounts `[-a, +a]` (computed
 /// in Rust, where `-a` and `+a` are the same validated number), `$6`…`$10` the
-/// shared fields, `$11` the overdraft flag. `gen_random_uuid()` gives both legs
-/// one group; the guard requires both references to resolve *and* the two funds
-/// to differ *and* the out-leg not to overdraw, and because it sits on the single
-/// `SELECT` both rows pass it or neither is written.
+/// shared fields, `$11` the overdraft flag, `$12` the transfer's own idempotency
+/// key (nullable — a caller that gives none always writes). `gen_random_uuid()`
+/// gives both legs one group; the guard requires both references to resolve *and*
+/// the two funds to differ *and* the out-leg not to overdraw, and because it sits
+/// on the single `SELECT` both rows pass it or neither is written.
+///
+/// `$12` is written on the **out-leg only**, because
+/// `idx_transactions_external_ref` is unique and one transfer is one money move,
+/// not two: a retry carrying the same key writes **no rows at all** (the
+/// `NOT EXISTS` guard), and [`explain_no_transfer`] answers it with the transfer
+/// it already made. Writing it on both legs would collide with itself.
 const TRANSFER_SQL: &str = r#"
 WITH ref AS (
   SELECT
@@ -1624,10 +1756,11 @@ WITH ref AS (
 ), g AS (SELECT gen_random_uuid() AS id)
 INSERT INTO {tx} AS t
   (fund_id, amount_cents, kind, transfer_group, counterparty_fund_id, category, description,
-   fiscal_year, occurred_on, recorded_by, overdraft_authorized)
+   fiscal_year, occurred_on, recorded_by, overdraft_authorized, external_ref)
 SELECT v.fund_id, v.amount_cents, 'transfer', g.id,
        CASE WHEN v.amount_cents < 0 THEN r.to_id ELSE r.from_id END,
-       $6, $7, $8, $9::date, $10, $11
+       $6, $7, $8, $9::date, $10, $11,
+       CASE WHEN v.amount_cents < 0 THEN $12::text ELSE NULL END
 FROM ref r
 CROSS JOIN g
 CROSS JOIN LATERAL unnest($5::bigint[], ARRAY[r.from_id, r.to_id]::bigint[])
@@ -1635,10 +1768,13 @@ CROSS JOIN LATERAL unnest($5::bigint[], ARRAY[r.from_id, r.to_id]::bigint[])
 WHERE r.from_id IS NOT NULL
   AND r.to_id IS NOT NULL
   AND r.from_id <> r.to_id
+  AND ($12::text IS NULL
+       OR NOT EXISTS (SELECT 1 FROM {tx} x WHERE x.external_ref = $12::text))
   AND ($11 OR (SELECT COALESCE(SUM(amount_cents), 0) FROM {tx} WHERE fund_id = r.from_id) + $5[1] >= 0)
 RETURNING t.id, t.fund_id, t.amount_cents, t.kind, t.transfer_group::text AS transfer_group,
           t.counterparty_fund_id, t.category, t.description, t.fiscal_year,
-          t.occurred_on::text AS occurred_on, t.recorded_by, t.created_at::text AS created_at
+          t.occurred_on::text AS occurred_on, t.recorded_by, t.external_ref,
+          t.created_at::text AS created_at
 "#;
 
 /// `GET /api/finance/transactions` — the ledger, filtered and paged.
@@ -2011,6 +2147,7 @@ fn route_transfer(ctx: &PluginContext) -> RouteDefinition {
                 let legs = vec![-magnitude, magnitude];
                 let category = CATEGORY_TRANSFER.to_string();
                 let description = trimmed(&body.description).unwrap_or_default();
+                let external_ref = trimmed(&body.external_ref);
                 let recorder = caller_of(&req).unwrap_or_default();
                 let (from_id_bind, from_code_bind) = from_ref.bind();
                 let (to_id_bind, to_code_bind) = to_ref.bind();
@@ -2035,10 +2172,35 @@ fn route_transfer(ctx: &PluginContext) -> RouteDefinition {
                             SqlValue::Text(date.to_string()),
                             SqlValue::Text(recorder.clone()),
                             SqlValue::Bool(overdraft),
+                            external_ref.clone().into(),
                         ],
                     )
                     .await?;
                 if rows.len() != 2 {
+                    // A reference the ledger already holds is not a refusal, it is
+                    // the **same transfer**: the caller retried a money move whose
+                    // answer it lost. Answer with the transfer that already exists
+                    // rather than a second pair of legs — which is why the draw
+                    // carries a deterministic reference.
+                    if let Some(reference) = &external_ref {
+                        if let Some(existing) = existing_transfer(&c, reference).await? {
+                            return PluginResponse::json(
+                                200,
+                                &json!({
+                                    "duplicate": true,
+                                    "transfer_group": existing["transfer_group"],
+                                    "entries": existing["entries"],
+                                    "group_sum_cents": existing["group_sum_cents"],
+                                    "amount_cents": magnitude,
+                                    "external_ref": reference,
+                                    "note": format!(
+                                        "external_ref {reference:?} already holds this transfer — \
+                                         nothing was written a second time"
+                                    ),
+                                }),
+                            );
+                        }
+                    }
                     return explain_no_transfer(&c, &from_ref, &to_ref, magnitude, overdraft).await;
                 }
                 // The ids the statement resolved, read from its own rows: the out
@@ -2333,10 +2495,23 @@ fn route_sliding_scale(ctx: &PluginContext) -> RouteDefinition {
 ///
 /// This is the treasurer's route: the tier here is the one the troop records for
 /// a scout who has not self-reported (or the one a scout asks for in person). A
-/// waiver is expressed as `status: "waived"` and always assesses zero, which the
-/// database also insists on.
+/// waiver is `status: "waived"`, and it is **not** a price of zero: the tier's
+/// assessment is written honestly and the whole of it is funded from
+/// `scholarship`, so the row says both what the member was measured at and who
+/// paid for it. The member's own share is `assessed_cents - funded_cents`, which
+/// is zero for a waiver and can never go negative.
 ///
-/// One query (the upsert), then the audit write.
+/// The draw is booked **in this same flow when the caller also holds
+/// `finance:write`**, as the caller: the transfer is called with their own
+/// request, their identity and nothing added. When they do not hold it, the
+/// waiver is neither refused nor silently unfunded — the row records the funded
+/// amount and an **outstanding** draw, and a `finance:write` holder books it
+/// later with `POST /api/finance/transfer`. No credential is minted or
+/// substituted for either case.
+///
+/// Queries: the permission check when there is something to fund, the upsert,
+/// then — when the caller can book — the transfer's own statements and the
+/// second half of the booking.
 fn route_assess_dues(ctx: &PluginContext) -> RouteDefinition {
     let c = ctx.clone();
     RouteDefinition::post_protected(
@@ -2362,22 +2537,36 @@ fn route_assess_dues(ctx: &PluginContext) -> RouteDefinition {
                 if base_cents < 0 {
                     return PluginResponse::error(400, "base_cents must not be negative");
                 }
-                let Some(scale_amount) = tier_assessment(base_cents, &tier) else {
+                let Some(assessed_cents) = tier_assessment(base_cents, &tier) else {
                     return Err(SdkError::Internal(format!(
                         "tier {tier:?} validated but carries no share"
                     )));
-                };
-                // A waiver assesses nothing, whoever asked for it.
-                let assessed_cents = if status == STATUS_WAIVED {
-                    0
-                } else {
-                    scale_amount
                 };
                 let fiscal_year = validate(fiscal_year_arg(
                     body.fiscal_year,
                     Utc::now().date_naive(),
                     &c.config,
                 ))?;
+                // The tier's assessment is written whatever the status says: a
+                // waiver funds all of it, anything else funds the discount the
+                // tier gives (and never more than what is owed).
+                let funded_cents = funded_cents_for(&status, base_cents, assessed_cents);
+                let draw_reference = dues_draw_reference(fiscal_year, member);
+                let dues_fund = configured_dues_fund(&c.config);
+                // `finance:manage_dues` waives; `finance:write` books the ledger
+                // write. They are separate permissions and not the same caller by
+                // default, so the draw is booked only when this caller holds both.
+                let can_book = funded_cents > 0
+                    && c.permissions
+                        .has_in_scope(req.identity.as_ref(), "finance:write", &Scope::troop())
+                        .await;
+                let opening_state = if funded_cents <= 0 {
+                    DRAW_NONE
+                } else if can_book {
+                    DRAW_ATTEMPTING
+                } else {
+                    DRAW_UNBOOKED
+                };
                 let assessment = Assessment {
                     fiscal_year,
                     dues_kind: DUES_KIND_MEMBER,
@@ -2387,15 +2576,48 @@ fn route_assess_dues(ctx: &PluginContext) -> RouteDefinition {
                     share_bps: None,
                     base_cents,
                     assessed_cents,
+                    funded_cents,
+                    draw_status: opening_state.to_string(),
+                    draw_ref: None,
                     self_reported: false,
                     status: status.clone(),
                     note: trimmed(&body.note).unwrap_or_default(),
                     recorded_by: caller_of(&req).unwrap_or_default(),
                 };
-                let row = upsert_dues(&c, &assessment).await?;
-                let Some(dues) = row else {
+                let Some(mut dues) = upsert_dues(&c, &assessment).await? else {
                     return Err(SdkError::Internal("the dues upsert returned no row".into()));
                 };
+                // The draw, booked as this caller when they hold `finance:write`.
+                let mut draw_note: Option<String> = None;
+                if can_book {
+                    let (state, reference, note) = match book_dues_draw(
+                        &c,
+                        &req,
+                        member,
+                        fiscal_year,
+                        funded_cents,
+                        &dues_fund,
+                        &draw_reference,
+                    )
+                    .await?
+                    {
+                        DrawOutcome::Booked(group) => (DRAW_BOOKED, Some(group), None),
+                        DrawOutcome::Refused(message) => (DRAW_REFUSED, None, Some(message)),
+                        DrawOutcome::Failed(message) => (DRAW_FAILED, None, Some(message)),
+                    };
+                    draw_note = note;
+                    if let Some(updated) =
+                        set_dues_draw_state(&c, fiscal_year, member, state, reference.as_deref())
+                            .await?
+                    {
+                        dues = updated;
+                    }
+                }
+                let draw_status = dues["draw_status"]
+                    .as_str()
+                    .unwrap_or(opening_state)
+                    .to_string();
+                let draw_ref = dues["draw_ref"].as_str().map(str::to_string);
                 c.audit
                     .log(
                         req.identity.as_ref(),
@@ -2409,6 +2631,11 @@ fn route_assess_dues(ctx: &PluginContext) -> RouteDefinition {
                             "status": status,
                             "base_cents": base_cents,
                             "assessed_cents": assessed_cents,
+                            "funded_cents": funded_cents,
+                            "draw_status": draw_status,
+                            "draw_ref": draw_ref,
+                            "draw_reference": draw_reference,
+                            "draw_note": draw_note,
                         }),
                     )
                     .await?;
@@ -2421,6 +2648,10 @@ fn route_assess_dues(ctx: &PluginContext) -> RouteDefinition {
                             "tier": tier,
                             "status": status,
                             "assessed_cents": assessed_cents,
+                            "funded_cents": funded_cents,
+                            "draw_status": draw_status,
+                            "draw_ref": draw_ref,
+                            "draw_fund_code": dues_fund,
                             "self_reported": false,
                             "assessed_by": assessment.recorded_by,
                         }),
@@ -2430,7 +2661,16 @@ fn route_assess_dues(ctx: &PluginContext) -> RouteDefinition {
                     200,
                     &json!({
                         "dues": dues,
+                        "assessed_cents": assessed_cents,
                         "assessed_display": format_cents(assessed_cents),
+                        "funded_cents": funded_cents,
+                        "funded_display": format_cents(funded_cents),
+                        "draw_status": draw_status,
+                        "draw_ref": draw_ref,
+                        "draw_reference": draw_reference,
+                        "draw_fund_code": dues_fund,
+                        "draw_note": draw_note,
+                        "member_share_cents": (assessed_cents - funded_cents).max(0),
                         "scale": scale_table(base_cents),
                         "next": "the scout may change their own tier at \
                                  POST /api/finance/dues/self-report",
@@ -2513,6 +2753,12 @@ fn route_set_lodge_dues(ctx: &PluginContext) -> RouteDefinition {
                     share_bps: Some(share_bps),
                     base_cents,
                     assessed_cents,
+                    // A Lodge's levy is the Lodge's own fraction of the membership
+                    // cost, not a member's access: nothing funds it, so there is
+                    // no draw to book.
+                    funded_cents: 0,
+                    draw_status: DRAW_NONE.to_string(),
+                    draw_ref: None,
                     self_reported: false,
                     status: STATUS_ASSESSED.to_string(),
                     note: trimmed(&body.note).unwrap_or_default(),
@@ -2887,6 +3133,15 @@ fn route_self_report(ctx: &PluginContext) -> RouteDefinition {
                         "tier {tier:?} validated but carries no share"
                     )));
                 };
+                // A self-report lowers what the member pays, and the reduction is
+                // a scholarship draw like any other — but this caller holds
+                // `finance:self_report` and must **not** be given `finance:write`
+                // (the sliding scale would become a spending authority). So the
+                // draw is recorded as outstanding with its amount visible and a
+                // `finance:write` holder books it later: the machine-originated
+                // case is named, not solved by minting a credential.
+                let funded_cents = funded_cents_for(STATUS_SELF_REPORTED, base_cents, assessed_cents);
+                let draw_status = unbooked_draw_state(funded_cents);
                 let assessment = Assessment {
                     fiscal_year,
                     dues_kind: DUES_KIND_MEMBER,
@@ -2900,6 +3155,9 @@ fn route_self_report(ctx: &PluginContext) -> RouteDefinition {
                     share_bps: None,
                     base_cents,
                     assessed_cents,
+                    funded_cents,
+                    draw_status: draw_status.to_string(),
+                    draw_ref: None,
                     self_reported: true,
                     status: STATUS_SELF_REPORTED.to_string(),
                     note: trimmed(&body.note).unwrap_or_default(),
@@ -2933,6 +3191,8 @@ fn route_self_report(ctx: &PluginContext) -> RouteDefinition {
                             "tier": tier,
                             "base_cents": base_cents,
                             "assessed_cents": assessed_cents,
+                            "funded_cents": funded_cents,
+                            "draw_status": draw_status,
                             "reported_by": caller,
                             "on_behalf": subject != caller,
                         }),
@@ -2946,6 +3206,8 @@ fn route_self_report(ctx: &PluginContext) -> RouteDefinition {
                             "fiscal_year": fiscal_year,
                             "tier": tier,
                             "assessed_cents": assessed_cents,
+                            "funded_cents": funded_cents,
+                            "draw_status": draw_status,
                             "reported_by": caller,
                         }),
                     )
@@ -2955,10 +3217,188 @@ fn route_self_report(ctx: &PluginContext) -> RouteDefinition {
                     &json!({
                         "dues": dues,
                         "standing": standing,
+                        "assessed_cents": assessed_cents,
                         "assessed_display": format_cents(assessed_cents),
+                        "funded_cents": funded_cents,
+                        "funded_display": format_cents(funded_cents),
+                        "draw_status": draw_status,
+                        "draw_reference": dues_draw_reference(fiscal_year, &subject),
                         "honor_system": true,
                         "note": "Self-reported: no income verification is asked for or \
-                                 recorded. Hardship assesses $0.",
+                                 recorded. Hardship assesses $0. A reduction is funded from \
+                                 scholarship by a finance:write holder (POST \
+                                 /api/finance/transfer) — this route never books it.",
+                    }),
+                )
+            }
+        }),
+    )
+}
+
+/// The body of the waiver repair — both fields optional, so a bare `POST` (no
+/// body at all) means "every year, really do it".
+#[derive(Debug, Deserialize)]
+struct WaiverRepairBody {
+    /// Repair one year; absent repairs every year that has a candidate.
+    #[serde(default)]
+    fiscal_year: Option<i32>,
+    /// Report what would change, and change nothing.
+    #[serde(default)]
+    dry_run: Option<bool>,
+}
+
+/// `POST /api/finance/dues/repair-waivers` — recompute the rows already waived at
+/// zero, **on demand and only on demand**.
+///
+/// Migration 2 leaves a deployed database's historic waivers at
+/// `assessed_cents = 0`: the tier's share is a Rust computation
+/// ([`tier_assessment`]) and SQL must not guess it. This route is the repair that
+/// note §4.3 asks for, and it is deliberately manual — recomputing a row changes
+/// what a *past* year's Annual Financial Report says, and that is the owner's
+/// call, not a startup step's. Nothing runs this automatically.
+///
+/// It touches only `status = 'waived' AND assessed_cents = 0` rows and computes
+/// each one's assessment from **its own** `base_cents` and `tier`. A row whose
+/// `base_cents` is 0 had no membership cost to fund and is left alone; so is a
+/// row whose tier assesses nothing. The repair is **idempotent** by construction:
+/// once a row's assessment is non-zero it no longer matches the worklist, and the
+/// `UPDATE` re-states the same guard, so a concurrent or repeated call writes at
+/// most once. The recomputed row's draw is left **outstanding** (`unbooked`): this
+/// route repairs figures, it does not move money.
+///
+/// Queries: the worklist, then one guarded `UPDATE … RETURNING` per repaired row
+/// (skipped entirely for a dry run).
+fn route_repair_waived_dues(ctx: &PluginContext) -> RouteDefinition {
+    let c = ctx.clone();
+    RouteDefinition::post_protected(
+        "/api/finance/dues/repair-waivers",
+        "finance:manage",
+        route_handler(move |req| {
+            let c = c.clone();
+            async move {
+                let body: WaiverRepairBody = if req.body.is_empty() {
+                    WaiverRepairBody {
+                        fiscal_year: None,
+                        dry_run: None,
+                    }
+                } else {
+                    req.json()?
+                };
+                let dry_run = body.dry_run.unwrap_or(false);
+                let candidates =
+                    c.db.query(
+                        format!(
+                            "SELECT id, member_id, fiscal_year, base_cents, tier FROM {dues} \
+                             WHERE status = '{STATUS_WAIVED}' AND dues_kind = '{DUES_KIND_MEMBER}' \
+                               AND assessed_cents = 0 AND base_cents > 0 \
+                               AND ($1::bigint IS NULL OR fiscal_year = $1) \
+                             ORDER BY fiscal_year, member_id LIMIT $2",
+                            dues = c.db.table("dues")
+                        ),
+                        vec![
+                            body.fiscal_year
+                                .map(|year| SqlValue::Int(i64::from(year)))
+                                .unwrap_or(SqlValue::NullInt),
+                            SqlValue::Int(MAX_DUES_ROWS),
+                        ],
+                    )
+                    .await?;
+                let mut repaired: Vec<Value> = Vec::new();
+                let mut nothing_to_fund = 0i64;
+                let mut unrepairable = 0i64;
+                for row in &candidates {
+                    let Some(id) = row["id"].as_i64() else {
+                        continue;
+                    };
+                    let member = row["member_id"].as_str().unwrap_or_default().to_string();
+                    let fiscal_year = row["fiscal_year"].as_i64().unwrap_or_default() as i32;
+                    let base_cents = row["base_cents"].as_i64().unwrap_or(0);
+                    let tier = row["tier"].as_str().unwrap_or_default().to_string();
+                    let assessed = match tier_assessment(base_cents, &tier) {
+                        Some(cents) if cents > 0 => cents,
+                        // A tier that assesses nothing (hardship by its own base,
+                        // or a base of 0) has nothing to fund.
+                        _ => {
+                            nothing_to_fund += 1;
+                            continue;
+                        }
+                    };
+                    if dry_run {
+                        repaired.push(json!({
+                            "id": id,
+                            "member_id": member,
+                            "fiscal_year": fiscal_year,
+                            "tier": tier,
+                            "base_cents": base_cents,
+                            "assessed_cents": assessed,
+                            "funded_cents": assessed,
+                            "applied": false,
+                        }));
+                        continue;
+                    }
+                    let updated = c
+                        .db
+                        .query_one(
+                            format!(
+                                "UPDATE {dues} AS d SET assessed_cents = $2, funded_cents = $2, \
+                                   draw_status = $3, updated_at = now() \
+                                 WHERE d.id = $1 AND d.status = '{STATUS_WAIVED}' \
+                                   AND d.assessed_cents = 0 AND d.base_cents > 0 \
+                                 RETURNING {DUES_FIELDS}",
+                                dues = c.db.table("dues")
+                            ),
+                            vec![
+                                SqlValue::Int(id),
+                                SqlValue::Int(assessed),
+                                SqlValue::Text(DRAW_UNBOOKED.to_string()),
+                            ],
+                        )
+                        .await?;
+                    match updated {
+                        Some(dues) => repaired.push(json!({
+                            "dues": dues,
+                            "assessed_cents": assessed,
+                            "funded_cents": assessed,
+                            "applied": true,
+                        })),
+                        // The guard did not match: another caller repaired it, or
+                        // its base moved under us. Nothing to write, nothing lost.
+                        None => unrepairable += 1,
+                    }
+                }
+                c.audit
+                    .log(
+                        req.identity.as_ref(),
+                        "dues.repair_waivers",
+                        "dues",
+                        &body
+                            .fiscal_year
+                            .map(|year| year.to_string())
+                            .unwrap_or_else(|| "all".to_string()),
+                        json!({
+                            "fiscal_year": body.fiscal_year,
+                            "dry_run": dry_run,
+                            "repaired": repaired.len(),
+                            "nothing_to_fund": nothing_to_fund,
+                            "unrepairable": unrepairable,
+                        }),
+                    )
+                    .await?;
+                PluginResponse::json(
+                    200,
+                    &json!({
+                        "dry_run": dry_run,
+                        "fiscal_year": body.fiscal_year,
+                        "candidates": candidates.len(),
+                        "repaired": repaired.len(),
+                        "nothing_to_fund": nothing_to_fund,
+                        "unrepairable": unrepairable,
+                        "rows": repaired,
+                        "note": "Recomputes only rows that are 'waived' with an assessment of \
+                                 zero, from each row's own base_cents and tier. A repair of a \
+                                 past year changes what that year's report says, so it is \
+                                 manual and idempotent, never a startup step. The draw is left \
+                                 unbooked for a finance:write holder to book.",
                     }),
                 )
             }
@@ -3202,6 +3642,14 @@ fn route_annual_report(ctx: &PluginContext) -> RouteDefinition {
                     .iter()
                     .map(|tier| tier["assessed_cents"].as_i64().unwrap_or(0))
                     .sum();
+                let funded_total: i64 = dues_by_tier
+                    .iter()
+                    .map(|tier| tier["funded_cents"].as_i64().unwrap_or(0))
+                    .sum();
+                let unbooked_draws: i64 = dues_by_tier
+                    .iter()
+                    .map(|tier| tier["unbooked_draws"].as_i64().unwrap_or(0))
+                    .sum();
                 let collected_cents = collected["collected_cents"].as_i64().unwrap_or(0);
                 c.audit
                     .log(
@@ -3244,9 +3692,12 @@ fn route_annual_report(ctx: &PluginContext) -> RouteDefinition {
                             "fiscal_year": fiscal_year,
                             "assessed_cents": assessed_total,
                             "assessed_display": format_cents(assessed_total),
+                            "funded_cents": funded_total,
+                            "funded_display": format_cents(funded_total),
+                            "unbooked_draws": unbooked_draws,
                             "collected_cents": collected_cents,
                             "collected_display": format_cents(collected_cents),
-                            "outstanding_cents": (assessed_total - collected_cents).max(0),
+                            "outstanding_cents": (assessed_total - funded_total - collected_cents).max(0),
                             "members_assessed": dues_by_tier
                                 .iter()
                                 .map(|tier| tier["members"].as_i64().unwrap_or(0))
@@ -3257,6 +3708,10 @@ fn route_annual_report(ctx: &PluginContext) -> RouteDefinition {
                                 .sum::<i64>(),
                             "by_tier": dues_by_tier,
                             "honor_system": true,
+                            "funding": "Anything free, deducted or discounted draws from the \
+                                        scholarship fund: funded_cents is what the troop spent \
+                                        on access, and a draw is a transfer, so it does not \
+                                        appear in collected_cents.",
                         },
                         "integrity": verdict,
                         "ledger": {
@@ -3673,6 +4128,136 @@ async fn explain_no_transfer(
 // Dues rows
 // ---------------------------------------------------------------------------
 
+/// The transfer a reference already made, read back as its own two legs.
+///
+/// This is what a retried draw is answered with: an `external_ref` that is
+/// already in the ledger names a money move that has happened, so the retry must
+/// not write a second pair of legs. One query.
+async fn existing_transfer(c: &PluginContext, reference: &str) -> Result<Option<Value>, SdkError> {
+    c.db.query_one(
+        format!(
+            "SELECT t.transfer_group::text AS transfer_group, \
+                    (SELECT COUNT(*)::bigint FROM {tx} g \
+                      WHERE g.transfer_group = t.transfer_group) AS entries, \
+                    (SELECT COALESCE(SUM(g.amount_cents), 0)::bigint FROM {tx} g \
+                      WHERE g.transfer_group = t.transfer_group) AS group_sum_cents, \
+                    (SELECT COUNT(*)::bigint FROM {tx} g2 \
+                      WHERE g2.transfer_group = t.transfer_group AND g2.fund_id = t.fund_id \
+                        AND g2.amount_cents > 0) AS in_legs \
+             FROM {tx} t WHERE t.external_ref = $1",
+            tx = c.db.table("transactions")
+        ),
+        vec![SqlValue::Text(reference.to_string())],
+    )
+    .await
+}
+
+/// Record a draw's state on its own dues row — the second half of a booking —
+/// and hand the row back as the API states it.
+///
+/// It is deliberately a separate statement from the transfer: money that moved
+/// and a row that does not know it is exactly the state `attempting` names, and
+/// the row can be told the truth afterwards (or by the next caller, whose retry
+/// is idempotent through the draw's deterministic reference). One query.
+async fn set_dues_draw_state(
+    c: &PluginContext,
+    fiscal_year: i32,
+    member_id: &str,
+    draw_status: &str,
+    draw_ref: Option<&str>,
+) -> Result<Option<Value>, SdkError> {
+    c.db.query_one(
+        format!(
+            "UPDATE {dues} AS d SET draw_status = $3, draw_ref = $4::text::uuid, \
+               updated_at = now() \
+             WHERE d.dues_kind = '{DUES_KIND_MEMBER}' AND d.member_id = $1 \
+               AND d.fiscal_year = $2 \
+             RETURNING {DUES_FIELDS}",
+            dues = c.db.table("dues")
+        ),
+        vec![
+            SqlValue::Text(member_id.to_string()),
+            SqlValue::Int(i64::from(fiscal_year)),
+            SqlValue::Text(draw_status.to_string()),
+            draw_ref
+                .map(|r| SqlValue::Text(r.to_string()))
+                .unwrap_or(SqlValue::Null),
+        ],
+    )
+    .await
+}
+
+/// What booking a dues draw came to.
+enum DrawOutcome {
+    /// The transfer landed; the group it landed under.
+    Booked(String),
+    /// Finance's own transfer route refused it (a 4xx): nothing was booked.
+    Refused(String),
+    /// The call errored: nothing was booked, and nothing is claimed to be.
+    Failed(String),
+}
+
+/// Book one draw: a **balanced transfer from `scholarship`** into the fund the
+/// dues would have landed in, through finance's own transfer route.
+///
+/// The route is called **as the caller**: the request is the caller's own, with
+/// their identity and nothing added, so the ledger write is authorised by
+/// `finance:write` — the caller's, not a credential this plugin minted. That is
+/// the discipline `plugin-to-plugin.md` §3.1 states, and the reason a caller who
+/// does not hold `finance:write` records an outstanding draw instead of a booked
+/// one.
+///
+/// The draw carries its deterministic reference ([`dues_draw_reference`]), so if
+/// the answer to this call is lost and the caller retries, the retry is answered
+/// with the transfer that already exists rather than a second pair of legs.
+async fn book_dues_draw(
+    c: &PluginContext,
+    req: &PluginRequest,
+    member_id: &str,
+    fiscal_year: i32,
+    amount_cents: i64,
+    dues_fund: &str,
+    reference: &str,
+) -> Result<DrawOutcome, SdkError> {
+    let mut draw = req.clone();
+    draw.method = "POST".to_string();
+    draw.path = "/api/finance/transfer".to_string();
+    draw.params = Default::default();
+    draw.query = Vec::new();
+    draw.headers = Default::default();
+    draw.body = serde_json::to_vec(&json!({
+        "from_fund_code": FUND_SCHOLARSHIP,
+        "to_fund_code": dues_fund,
+        "amount_cents": amount_cents,
+        "description": dues_draw_description(fiscal_year, member_id),
+        "fiscal_year": fiscal_year,
+        "external_ref": reference,
+    }))
+    .map_err(|e| SdkError::Internal(format!("the draw body would not serialize: {e}")))?;
+    let transfer = route_transfer(c);
+    match (transfer.handler)(draw).await {
+        Ok(response) => {
+            let body: Value = serde_json::from_slice(&response.body).unwrap_or(Value::Null);
+            if response.status < 300 {
+                Ok(DrawOutcome::Booked(
+                    body["transfer_group"]
+                        .as_str()
+                        .unwrap_or_default()
+                        .to_string(),
+                ))
+            } else {
+                Ok(DrawOutcome::Refused(
+                    body["error"]
+                        .as_str()
+                        .map(str::to_string)
+                        .unwrap_or_else(|| format!("the transfer was refused ({})", response.status)),
+                ))
+            }
+        }
+        Err(e) => Ok(DrawOutcome::Failed(e.to_string())),
+    }
+}
+
 /// One assessment being written. `share_bps` is set for a Lodge's levy and empty
 /// for a member's; the database's `dues_subject_present` and
 /// `dues_share_for_lodges` keep the two shapes apart.
@@ -3685,6 +4270,13 @@ struct Assessment {
     share_bps: Option<i64>,
     base_cents: i64,
     assessed_cents: i64,
+    /// What `scholarship` covers of this assessment — the figure the Annual
+    /// Financial Report needs to say what the troop spent on access.
+    funded_cents: i64,
+    /// The draw's state, in [`DRAW_STATUSES`]' vocabulary.
+    draw_status: String,
+    /// The transfer group the draw landed under, once it has one.
+    draw_ref: Option<String>,
     self_reported: bool,
     status: String,
     note: String,
@@ -3696,6 +4288,13 @@ struct Assessment {
 /// One row per (year, kind, member, lodge): posting again revises, which is what
 /// makes "the treasurer opens it, the scout revises their own tier" a single
 /// record rather than a history of drafts.
+///
+/// The funding figures come from the assessment itself, with one exception the
+/// `DO UPDATE` states: a draw that is already **booked** stays booked while the
+/// status and the funded amount are unchanged. A re-assessment that recomputes
+/// the same funding has not moved money, and the row must not forget that it did
+/// — the draw's deterministic reference makes a re-booking a no-op, but a row
+/// that lost its `booked` state would claim a subsidy twice.
 async fn upsert_dues(
     c: &PluginContext,
     assessment: &Assessment,
@@ -3704,12 +4303,23 @@ async fn upsert_dues(
         format!(
             "INSERT INTO {dues} AS d \
                (fiscal_year, dues_kind, member_id, lodge_id, tier, share_bps, base_cents, \
-                assessed_cents, self_reported, status, note, recorded_by) \
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12) \
+                assessed_cents, funded_cents, draw_status, draw_ref, self_reported, status, \
+                note, recorded_by) \
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11::text::uuid, $12, $13, \
+                $14, $15) \
              ON CONFLICT (fiscal_year, dues_kind, member_id, lodge_id) DO UPDATE \
                SET tier = EXCLUDED.tier, share_bps = EXCLUDED.share_bps, \
                    base_cents = EXCLUDED.base_cents, \
                    assessed_cents = EXCLUDED.assessed_cents, \
+                   funded_cents = EXCLUDED.funded_cents, \
+                   draw_status = CASE WHEN d.status = EXCLUDED.status \
+                                       AND d.funded_cents = EXCLUDED.funded_cents \
+                                       AND d.draw_status = '{DRAW_BOOKED}' \
+                                      THEN d.draw_status ELSE EXCLUDED.draw_status END, \
+                   draw_ref = CASE WHEN d.status = EXCLUDED.status \
+                                    AND d.funded_cents = EXCLUDED.funded_cents \
+                                    AND d.draw_status = '{DRAW_BOOKED}' \
+                                   THEN d.draw_ref ELSE EXCLUDED.draw_ref END, \
                    self_reported = EXCLUDED.self_reported, status = EXCLUDED.status, \
                    note = EXCLUDED.note, recorded_by = EXCLUDED.recorded_by, \
                    updated_at = now() \
@@ -3728,6 +4338,13 @@ async fn upsert_dues(
                 .unwrap_or(SqlValue::NullInt),
             SqlValue::Int(assessment.base_cents),
             SqlValue::Int(assessment.assessed_cents),
+            SqlValue::Int(assessment.funded_cents),
+            SqlValue::Text(assessment.draw_status.clone()),
+            assessment
+                .draw_ref
+                .clone()
+                .map(SqlValue::Text)
+                .unwrap_or(SqlValue::Null),
             SqlValue::Bool(assessment.self_reported),
             SqlValue::Text(assessment.status.clone()),
             SqlValue::Text(assessment.note.clone()),
@@ -3749,12 +4366,15 @@ fn dues_totals(rows: &[Value]) -> Value {
         rows.iter().filter(|row| predicate(row)).count() as i64
     };
     let assessed = sum("assessed_cents");
+    let funded = sum("funded_cents");
     let collected = sum("paid_cents");
     let outstanding = sum("outstanding_cents");
     json!({
         "members": rows.len(),
         "assessed_cents": assessed,
         "assessed_display": format_cents(assessed),
+        "funded_cents": funded,
+        "funded_display": format_cents(funded),
         "collected_cents": collected,
         "collected_display": format_cents(collected),
         "outstanding_cents": outstanding,
@@ -3762,6 +4382,9 @@ fn dues_totals(rows: &[Value]) -> Value {
         "at_no_cost": count(|row| row["assessed_cents"].as_i64().unwrap_or(0) == 0),
         "self_reported": count(|row| row["self_reported"].as_bool().unwrap_or(false)),
         "waived": count(|row| row["status"].as_str() == Some(STATUS_WAIVED)),
+        "draws_unbooked": count(|row| {
+            DRAW_UNSETTLED.contains(&row["draw_status"].as_str().unwrap_or_default())
+        }),
         "settled": count(|row| row["settled"].as_bool().unwrap_or(false)),
         "honor_system": true,
     })
@@ -3791,6 +4414,7 @@ fn dues_by_tier(rows: &[Value]) -> Vec<Value> {
                 "share_bps": tier.bps,
                 "members": members.len(),
                 "assessed_cents": sum("assessed_cents"),
+                "funded_cents": sum("funded_cents"),
                 "collected_cents": sum("paid_cents"),
                 "outstanding_cents": sum("outstanding_cents"),
                 "at_no_cost": members
@@ -3800,6 +4424,12 @@ fn dues_by_tier(rows: &[Value]) -> Vec<Value> {
                 "self_reported": members
                     .iter()
                     .filter(|row| row["self_reported"].as_bool().unwrap_or(false))
+                    .count(),
+                "draws_unbooked": members
+                    .iter()
+                    .filter(|row| {
+                        DRAW_UNSETTLED.contains(&row["draw_status"].as_str().unwrap_or_default())
+                    })
                     .count(),
             }))
         })
