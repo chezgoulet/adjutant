@@ -1140,21 +1140,6 @@ async fn disable_plugin(
     if let Some(resp) = state.require_admin(req.headers()).await {
         return resp;
     }
-    // With the dev-header stub off, the identity providers ARE the only way to
-    // authenticate. Removing the last one makes every authenticated route —
-    // including the admin route that would undo this — unreachable until the
-    // process restarts. Refuse, and say how to proceed. (`auth` is also in
-    // `REQUIRED_PLUGINS`; this catches a third-party provider.)
-    if !state.config.allow_dev_headers && state.identity.is_sole_enabled_provider(&name) {
-        return (
-            StatusCode::CONFLICT,
-            Json(json!({
-                "error": "refusing to remove the only identity provider while dev headers are off",
-                "hint": "register/enable another identity provider, or set ADJUTANT_DEV_HEADERS=true for a dev instance",
-            })),
-        )
-            .into_response();
-    }
     let identity = state.resolve_identity(req.headers()).await;
 
     // One lifecycle per plugin: a disable cannot race an enable's load.
@@ -1172,6 +1157,21 @@ async fn disable_plugin(
             audit_refusal(&state, identity.as_ref(), "plugin.disable.refused", &name, &reason).await;
             return refusal(&name, &reason);
         }
+    }
+
+    // The declarative minimum is checked first (above), so `auth` is always
+    // refused for the permanent reason — it is required — rather than for the
+    // situational one. This guard catches what the set cannot: a *third-party*
+    // plugin that happens to be the last enabled identity provider. With the
+    // dev-header stub off the providers ARE the only way to authenticate, so
+    // removing the last one makes every authenticated route — including the
+    // admin route that would undo this — unreachable until a process restart.
+    if !state.config.allow_dev_headers && state.identity.is_sole_enabled_provider(&name) {
+        let reason =
+            "refusing to remove the only identity provider while dev headers are off;              register/enable another identity provider, or set ADJUTANT_DEV_HEADERS=true              for a dev instance"
+                .to_string();
+        audit_refusal(&state, identity.as_ref(), "plugin.disable.refused", &name, &reason).await;
+        return refusal(&name, &reason);
     }
 
     // Audit, then apply (see `audit_state_change`).

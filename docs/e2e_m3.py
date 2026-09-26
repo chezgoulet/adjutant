@@ -372,20 +372,33 @@ probe_raw("38 audit captured admin actions", audit_rows)
 
 # ------------------------------------------------- 8. plugin lifecycle (M3)
 # Exit criterion: "both plugins load, enable, disable, and uninstall through
-# the core". Auth cannot be disable-probed here: with the dev-header stub off,
-# the auth plugin IS the only way to authenticate, so disabling it locks the
-# operator out of the admin routes until a process restart. README documents
-# that hazard; membership proves the lifecycle without the lockout.
-probe("39 disable membership", "POST", "/api/plugins/membership/disable",
+# the core".
+#
+# Neither `auth` nor `membership` can be disabled any more (issue #89). `auth`
+# because with the dev-header stub off it IS the only way to authenticate, so
+# disabling it locks the operator out of the admin routes until a process
+# restart (README documents that hazard); `membership` because every grant
+# addresses a member the roster names, so a troop whose roster plugin is off
+# cannot name anyone to grant anything to. The core refuses both — by name, with
+# its reason, and audited — and `hello` carries the lifecycle proof instead.
+probe("39a auth cannot be disabled", "POST", "/api/plugins/auth/disable",
+      token=chief_token, expect_status=409, expect_in="cannot be disabled")
+probe("39b membership cannot be disabled", "POST", "/api/plugins/membership/disable",
+      token=chief_token, expect_status=409, expect_in="cannot be disabled")
+probe("39 disable hello", "POST", "/api/plugins/hello/disable",
       token=chief_token, expect_status=200, expect_in='"enabled":false')
-probe("40 disabled plugin route 404", "GET", "/api/membership/members",
-      token=chief_token, expect_status=404, expect_in="plugin membership is disabled")
-probe("41 auth still answers while membership is down", "GET", "/api/auth/me",
+# A disabled plugin is not loaded, so its route answers exactly as it does when
+# the library is absent from disk: a plain 404 with the same body (probes.py
+# compares the two bodies byte-for-byte; this asserts the message the E2E
+# harness can see).
+probe("40 disabled plugin route 404", "GET", "/api/hello",
+      token=chief_token, expect_status=404, expect_in="route not found")
+probe("41 auth still answers while hello is down", "GET", "/api/auth/me",
       token=chief_token, expect_status=200, expect_in='"roles":["chief"]')
-probe("42 enable membership", "POST", "/api/plugins/membership/enable",
+probe("42 enable hello", "POST", "/api/plugins/hello/enable",
       token=chief_token, expect_status=200, expect_in='"enabled":true')
-probe("43 route back after enable", "GET", "/api/membership/members",
-      token=chief_token, expect_status=200, expect_in="Tiguidou")
+probe("43 route back after enable", "GET", "/api/hello",
+      token=chief_token, expect_status=200, expect_in="Hello, Adjutant!")
 probe("44 uninstall membership", "DELETE", "/api/plugins/membership",
       token=chief_token, expect_status=200, expect_in='"uninstalled":true')
 probe("45 uninstalled route 404", "GET", "/api/membership/members",
