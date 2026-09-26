@@ -89,7 +89,7 @@ changed, it is a mechanical follow-up across the records, not a decision.
 | `finance` | §7.5 | Funds, transactions, budget vs. actuals, sliding-scale dues | M6 | **Built** (routes and permissions in `docs/api-reference.md`; a member's own dues — assessment, self-report, pay — are in the client, the treasurer's ledger and budgets are not) |
 | `equipment` | §7.6 | Inventory, checkout/checkin, maintenance | M6 | **Built** (routes and permissions in `docs/api-reference.md`; the pool, the item record, checkout and checkin are in the client) |
 | `archive` | §7.8 | Congress proceedings, minutes, full-text search, timeline | M6 | **Built** (routes and permissions in `docs/api-reference.md`; no client surface) |
-| `conflicts` | §7.9 | Conflict-resolution pathway, stage tracking, anti-dropout | M6 | **Built** (routes and permissions in `docs/api-reference.md`; no client surface — see below) |
+| `conflicts` | §7.9 | Conflict-resolution pathway, stage tracking, anti-dropout | M6 | **Built** (routes and permissions in `docs/api-reference.md`; party-facing client surface — the case list and the stage timeline — decided 2026-09-26, release-path Stage 2.3) |
 | `announcements` | §7.14 | Troop communication, read receipts, categories, push | M6 | **Built** (routes and permissions in `docs/api-reference.md`; the inbox, unread badge and mark-read are in the client; delivery deferred — the record is `core.notifications` (#46 slice 1) and the plugin is not wired to it) |
 
 > **"Shipped" vs "Built" vs the v1.0 gate.** `auth`, `membership`, `missions`,
@@ -132,8 +132,8 @@ recorded in this document saying it is deferred and why.
 
 | Integration | SPEC | Notes |
 |---|---|---|
-| Meshcore (LoRa) | §7.11 | Field comms; hardware-dependent; **undecided** — in M6 or post-1.0 is a Coyote Company timeline question (§6.2) |
-| ATAK | §7.12 | Situational awareness; hardware-dependent; **undecided**, same question |
+| Meshcore (LoRa) | §7.11 | Field comms; hardware-dependent. **Deferred to post-1.0 — dated decision, 2026-09-26** (§6.2) |
+| ATAK | §7.12 | Situational awareness; hardware-dependent. **Deferred to post-1.0 — dated decision, 2026-09-26** (§6.2) |
 | Stripe | §7.13 | Payments; only for troops that take money online. **In use** — the store's checkout and the dues payment both go through it, and its ledger booking is an outbox intent |
 | Store | §7.16 | The troop's shop — catalogue, sliding scale, rentals, comp sales; needs `stripe`. **Built and client-covered**: the catalogue (after #79), orders, the scholarship draw and the admin screens are in |
 | Community suites | §7.15 | Google, Apple, Microsoft, Nextcloud, Proton — explicitly optional per troop; **not started**, and each needs its own dated decision or a shipped integration before 1.0 |
@@ -219,19 +219,45 @@ built on top of it, because both plugins are full of scope decisions:
 
 ---
 
-## 6. Open decisions this document does not settle
+## 6. Decisions taken (2026-09-26)
 
-Listed so they are visible rather than decided by accident:
+This section used to list what the document did not settle. Those questions were
+put to the owner on **2026-09-26** and answered; the answers are recorded here so
+the reasoning survives the commits that implement them.
 
-1. **Announcements: plugin or client feature?** It is in Tier A as a plugin
-   because push notifications need a server-side owner. If the client owns them
-   instead, it should leave the inventory deliberately.
-2. **Tier B sizing.** Meshcore and ATAK are hardware integrations with real
-   field use in Operation Slipperyskin. Whether they are M6 or post-1.0 is a
-   decision about the Coyote Company's timeline, not about the software.
-3. **What "3+ troops" means for the M8 gate** — three troops we know, or three
-   independent operators? The current wording is ambiguous and should be
-   tightened before it is measured.
+1. **Announcements: plugin or client, and which channel? — the plugin owns
+   delivery, and delivery is not one channel.** The vocabulary is the notification
+   record's existing `delivery_channel`: in-app, **email**, **ntfy**, and
+   FCM/APNs only if a platform ever forces it. Email and ntfy first. ntfy is the
+   self-hosted push service — the House already runs one, so no vendor enters the
+   stack, and it is the UnifiedPush path a GrapheneOS user expects, which is what
+   makes "native app notifications" and "no Google" stop being opposites. The
+   plugin stays in Tier A; the channel model is the `core.notifications` row, not
+   a new table.
+2. **Tier B sizing — Meshcore and ATAK are both post-1.0, each with a dated
+   decision** (see the Tier B table above and
+   [`release-path.md`](release-path.md) Stage 5). Hardware integration is not what
+   makes 1.0 real, and neither is refused — they are sequenced.
+3. **What "3+ troops" meant — nothing: the criterion is removed.** SPEC §15's M8
+   list no longer counts adopters (see its note). Adoption is an outcome we hope
+   for, not a gate we hold ourselves behind.
+4. **Conflicts in the client — build the party-facing surface.** The roadmap's
+   earlier argument (a private case belongs in a conversation, not a screen) is
+   overruled by the owner: *a pathway nobody can see is a pathway nobody uses*.
+   The case list and the stage timeline are Stage 2 work; the stage machinery is
+   already built and probed.
+5. **iOS — deferred entirely** (no runner, no distribution path) and revisitable
+   after 1.0. SPEC §15's M5 box now reads Android + Web.
+6. **TLS — the application terminates nothing.** It is deployed alongside Caddy,
+   nginx or Traefik; the M7 box is the proven proxy-fronted deployment, not a
+   certificate inside the binary.
+7. **The deployment host stays undecided** until the proxy-fronted deployment is
+   finished and exercised, then it is chosen against something real.
+
+**One action the owner owes, and nothing is blocked behind anything else:** the
+crates.io token. Both crate names are free today, and reserving them at the
+current `0.2.x` — with the API promise starting at 1.0 — is a five-minute errand
+that unblocks SPEC M3's publication box and M8's.
 
 ---
 
