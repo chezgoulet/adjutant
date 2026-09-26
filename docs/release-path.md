@@ -85,9 +85,24 @@ Two items, because they protect everything after them and both are one sitting:
    the application. The host is chosen **after** 3.1, deliberately: the owner's
    decision is to pick a host against a finished, exercised deployment rather
    than an aspiration.
+7. **Choose the plugin set — and make the choice real (#89, #90).** Owner
+   requirement, 2026-09-26. Two halves that ship together, because either alone
+   is a lie: (a) **`enabled` must decide what is loaded, not just what answers**
+   — today a disabled plugin is still `dlopen`ed, migrated, granted permissions
+   and holding a database pool, with only `resolve()` returning
+   `RouteLookup::Disabled` (#89); and (b) **a first-run flow that lets the
+   operator choose the plugin set from the start** (#90), with the same choice
+   available from the CLI so an unattended install never needs a browser. A
+   plugin that was never enabled has no schema — the truest form of "content not
+   loaded at all" — so the first enable is a migrating operation, and that is the
+   acceptance the core half has to meet. This sits in Stage 1 rather than with
+   the other core work because the day-one release is judged by a leader's first
+   ten minutes, and a deployment that starts by asking what the troop needs is a
+   different product from one that starts with fourteen plugins switched on.
 
-**Proves it:** the seven boxes checked in a new `M5` record, each with its run id,
-and the client harness green on `testing`.
+**Proves it:** the seven M5 boxes checked in a new `M5` record, each with its run
+id; the plugin set chosen on a fresh deployment and honoured by what the server
+loads (#89/#90); and the client harness green on `testing`.
 
 ---
 
