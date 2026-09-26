@@ -2,6 +2,7 @@ import 'package:flutter/material.dart';
 
 import '../theme/app_theme.dart';
 import 'dues_screen.dart';
+import 'governance_screen.dart';
 import 'plugins_screen.dart';
 import 'store_admin_screen.dart';
 
@@ -33,6 +34,18 @@ class SettingsScreen extends StatelessWidget {
         ),
         const Divider(height: 1),
         _SectionHeader('The House'),
+        ListTile(
+          leading: const Icon(Icons.gavel_outlined),
+          title: const Text('Governance'),
+          subtitle: const Text(
+            'The troop\'s motions, where each one stands, and your vote',
+          ),
+          trailing: const Icon(Icons.chevron_right),
+          onTap: () => Navigator.of(context).push(
+            MaterialPageRoute<void>(builder: (_) => const GovernanceScreen()),
+          ),
+        ),
+        const Divider(height: 1),
         ListTile(
           leading: const Icon(Icons.storefront_outlined),
           title: const Text('The shop'),

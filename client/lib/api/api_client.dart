@@ -685,11 +685,72 @@ class ApiClient {
 
   // --- governance ---------------------------------------------------------
 
-  Future<List<Map<String, dynamic>>> motions() async =>
-      _asList(await _send('GET', '/api/governance/motions'));
+  /// The motion list — what the troop has been asked to decide, and where each
+  /// one stands.
+  ///
+  /// `GET /api/governance/motions`, `governance:read`. Each row carries the
+  /// recorded tally (`votes_yes`, `votes_no`, `votes_abstain`) alongside its
+  /// `stage` and `result`, so the list shows both state and numbers without
+  /// asking for every motion again. The filters are the server's own
+  /// vocabulary (`body`, `stage`, `result`, `category`); this client passes
+  /// them through and never guesses a stage name.
+  Future<List<Map<String, dynamic>>> motions({
+    int? meeting,
+    String? body,
+    String? stage,
+    String? result,
+    String? category,
+    int? limit,
+  }) async {
+    final query = <String, String>{
+      if (meeting != null) 'meeting': '$meeting',
+      'body': ?body,
+      'stage': ?stage,
+      'result': ?result,
+      'category': ?category,
+      if (limit != null) 'limit': '$limit',
+    };
+    return _asList(await _send('GET', '/api/governance/motions',
+        query: query.isEmpty ? null : query));
+  }
 
+  /// One motion: the record, its votes, its amendments, the tally a close would
+  /// produce right now, and the live quorum when it belongs to a meeting.
+  ///
+  /// The whole page is returned (`motion`, `votes`, `amendments`, `tally`,
+  /// `quorum`) because every figure here is the server's own arithmetic — the
+  /// client counts nothing. The caller's own vote is one row of `votes`, told
+  /// from the rest by its `voter`.
   Future<Map<String, dynamic>> motion(String id) async =>
-      _asMap(await _send('GET', '/api/governance/motion/$id'));
+      _asMap(await _send(
+          'GET', '/api/governance/motion/${Uri.encodeComponent(id)}'));
+
+  /// Record the caller's own vote on a motion. `governance:vote`.
+  ///
+  /// The documented body is `{choice: yes|no|abstain, method?}` — `method` is
+  /// one of `voice`, `show_of_hands`, `ballot`, `roll_call` and defaults
+  /// server-side to `voice`.
+  ///
+  /// **One vote per member.** There is no route that changes a recorded vote:
+  /// a second vote is a `409` ("you have already voted on this motion"), and
+  /// the refusal is the answer — shown as it stands, never as a broken screen.
+  /// A caller not recorded present at the meeting the motion belongs to is a
+  /// `403`; a motion past its voteable stages is a `409` naming the stage.
+  Future<Map<String, dynamic>> castVote(
+    String motionId, {
+    required String choice,
+    String? method,
+    String? note,
+  }) async {
+    final body = <String, Object>{
+      'choice': choice,
+      'method': ?method,
+      if (note != null && note.trim().isNotEmpty) 'note': note.trim(),
+    };
+    return _asMap(await _send(
+        'POST', '/api/governance/motion/${Uri.encodeComponent(motionId)}/vote',
+        body: body));
+  }
 
   // --- core: plugins (admin) ----------------------------------------------
 
