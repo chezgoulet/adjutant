@@ -1,4 +1,5 @@
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 import 'package:provider/provider.dart';
 
 import '../api/api_client.dart';
@@ -14,6 +15,12 @@ import '../widgets/common.dart';
 ///    (`assessed_cents`, `paid_cents`, `outstanding_cents`, `settled`). This
 ///    screen renders those figures; it never adds money up, because a second
 ///    implementation of that is a second answer.
+///  * **What is covered** is the row's own `funded_cents` — what the Scholarship
+///    fund pays of the assessment. A waiver is not a price of zero: the
+///    assessment stands and all of it is funded, so the member's own share is
+///    zero and the screen says **covered**. A self-reported reduction funds the
+///    discount. The draw that moves the money (`draw_status`, `draw_ref`) is the
+///    troop's business, not the scout's, and never appears here.
 ///  * **What tier I am on** is mine to say. The sliding scale is honor-system
 ///    (Accords): nobody verifies income, `hardship` assesses $0 so cost never
 ///    decides who belongs, and a self-report never sets the base cost it is a
@@ -265,7 +272,23 @@ class _DuesScreenState extends State<DuesScreen> {
     final assessed = int.tryParse(field(dues, ['assessed_cents']));
     final paid = int.tryParse(field(dues, ['paid_cents']));
     final outstanding = int.tryParse(field(dues, ['outstanding_cents']));
+    // What scholarship covers of the assessment. A waiver funds the whole of it,
+    // so the member's own share is zero; a self-reported reduction funds the
+    // discount. The figure is the server's, taken off the row.
+    final funded = int.tryParse(field(dues, ['funded_cents']));
+    final covered = (funded ?? 0) > 0;
+    final outstandingCents = outstanding ?? 0;
     final settled = dues['settled'] == true;
+    // What a covered member reads. The draw that funds it — its state, its
+    // reference, the fund it draws on — is the troop's business and is not shown
+    // here: a scout's screen says their dues are covered, not who booked what.
+    final coverageNote = !covered
+        ? ''
+        : outstandingCents <= 0
+            ? 'Covered — your dues for this year are paid for you. Nothing is '
+                'owed.'
+            : 'Covered — the covered part of your dues is paid for you. What '
+                'remains is what you owe above.';
 
     return RefreshIndicator(
       onRefresh: _load,
@@ -305,24 +328,33 @@ class _DuesScreenState extends State<DuesScreen> {
           else
             AppCard(
               child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
                 children: [
+                  Text('My dues', style: AppText.titleLarge),
+                  const SizedBox(height: AppSpacing.sm),
+                  // The headline is the one figure a scout came for: what is
+                  // still owed, as the ledger derived it. Everything below it
+                  // explains how the server got there.
+                  _OwedHeadline(cents: outstanding),
+                  const Divider(height: AppSpacing.lg),
                   _MoneyRow(
                     label: 'Assessed',
                     cents: assessed,
                     emphasis: scheme.onSurface,
                   ),
-                  const Divider(height: AppSpacing.lg),
+                  if (covered) ...[
+                    const SizedBox(height: AppSpacing.sm),
+                    _MoneyRow(
+                      label: 'Covered',
+                      cents: funded,
+                      emphasis: AppColors.success,
+                    ),
+                  ],
+                  const SizedBox(height: AppSpacing.sm),
                   _MoneyRow(
                     label: 'Paid',
                     cents: paid,
                     emphasis: AppColors.success,
-                  ),
-                  const Divider(height: AppSpacing.lg),
-                  _MoneyRow(
-                    label: 'Outstanding',
-                    cents: outstanding,
-                    emphasis:
-                        (outstanding ?? 0) > 0 ? AppColors.warning : AppColors.success,
                   ),
                   const SizedBox(height: AppSpacing.sm),
                   Row(
@@ -343,6 +375,13 @@ class _DuesScreenState extends State<DuesScreen> {
                       ),
                     ],
                   ),
+                  if (coverageNote.isNotEmpty) ...[
+                    const SizedBox(height: AppSpacing.sm),
+                    Text(
+                      coverageNote,
+                      style: AppText.bodySmall.copyWith(color: scheme.outline),
+                    ),
+                  ],
                 ],
               ),
             ),
@@ -351,7 +390,12 @@ class _DuesScreenState extends State<DuesScreen> {
           const SizedBox(height: AppSpacing.md),
           _paymentsCard(),
           const SizedBox(height: AppSpacing.md),
-          const DuesPaymentSection(),
+          DuesPaymentSection(
+            member: _member,
+            duesYear: _fiscalYear,
+            outstandingCents: outstandingCents,
+            onRefresh: () => _load(silent: true),
+          ),
           const SizedBox(height: AppSpacing.md),
           Text(
             _scaleError != null
@@ -487,7 +531,12 @@ class _DuesScreenState extends State<DuesScreen> {
   static String _statusLabel(String status) => switch (status) {
         'self_reported' => 'Self-reported',
         'assessed' => 'Assessed',
-        'waived' => 'Waived',
+        // A waiver is not a price of zero: the assessment stands and the whole of
+        // it is *funded*, so the member's own share is zero. The scout reads that
+        // their dues are **covered** — the draw that funds it, and the fund it
+        // draws on, are the troop's business, not the scout's, and do not appear
+        // here.
+        'waived' => 'Covered',
         _ => status,
       };
 
@@ -529,36 +578,321 @@ class _MoneyRow extends StatelessWidget {
   }
 }
 
-/// The place a payment affordance goes.
+/// The one figure a scout opens this screen for: what is still owed, taken
+/// straight from the standing the ledger derived (`outstanding_cents`) and never
+/// re-added here. Zero reads green; anything left reads as the warning it is.
+class _OwedHeadline extends StatelessWidget {
+  const _OwedHeadline({required this.cents});
+
+  final int? cents;
+
+  @override
+  Widget build(BuildContext context) {
+    final owed = cents ?? 0;
+    return Row(
+      crossAxisAlignment: CrossAxisAlignment.end,
+      children: [
+        Expanded(child: Text('You owe', style: AppText.bodyLarge)),
+        Text(
+          formatCents(cents),
+          style: AppText.displayMedium.copyWith(
+            color: owed > 0 ? AppColors.warning : AppColors.success,
+          ),
+        ),
+      ],
+    );
+  }
+}
+
+/// Paying dues — a member may pay their own dues from here.
 ///
-/// Paying is deliberately not built here: it belongs to the payments plugin
-/// (Stripe, SPEC §7.13), which books an income entry and lets the ledger move
-/// the standing this screen already renders. Rather than a button that does
-/// nothing — or one that pretends to — this section states where it will live,
-/// so the affordance drops in here and nothing above it has to move.
-class DuesPaymentSection extends StatelessWidget {
-  const DuesPaymentSection({super.key});
+/// `POST /api/stripe/checkout` (`stripe:checkout`, any scope) opens a Stripe
+/// Checkout session for what is owed: `{purpose: "dues", amount_cents, dues_year,
+/// member_id}`, the member naming only themselves. Opening it charges nothing —
+/// Stripe confirms the payment, the webhook books the income in finance under
+/// category `dues` against that member, and only then does the standing move. So
+/// the session is opened, its URL is shown to be copied (this build adds no
+/// browser dependency, and invents none), and the payment's landing is read back
+/// rather than assumed.
+///
+/// Two rules the money holds this screen to:
+///  * **Pay is offered only when something is owed.** Stripe cannot take zero
+///    and the server refuses a non-positive amount, so a covered or settled
+///    member sees why there is nothing to pay rather than a button that cannot
+///    work.
+///  * **A `503` is stated as itself**: the troop's Stripe is unconfigured, and
+///    the screen says so rather than showing a broken button.
+///
+/// The treasurer's own route (`POST /api/finance/dues/payment`, `finance:write`)
+/// is a *different* act with a different authority and is not this screen's: a
+/// member pays through Stripe, and the ledger entry follows from the payment.
+class DuesPaymentSection extends StatefulWidget {
+  const DuesPaymentSection({
+    super.key,
+    required this.member,
+    required this.duesYear,
+    required this.outstandingCents,
+    required this.onRefresh,
+  });
+
+  /// The caller's own roster id — the only member this screen may pay for.
+  final String member;
+
+  /// The fiscal year the standing is for; omitted from the request when unknown,
+  /// so the server's own default applies.
+  final int? duesYear;
+
+  /// What the standing says is still owed, as `outstanding_cents`.
+  final int outstandingCents;
+
+  /// Re-read the standing — the ledger, not this screen, decides what is owed.
+  final VoidCallback onRefresh;
+
+  @override
+  State<DuesPaymentSection> createState() => _DuesPaymentSectionState();
+}
+
+class _DuesPaymentSectionState extends State<DuesPaymentSection> {
+  String _checkoutUrl = '';
+  List<Map<String, dynamic>> _sessions = const [];
+  bool _busy = false;
+  String? _error;
+  int? _errorStatus;
+
+  @override
+  void initState() {
+    super.initState();
+    _loadSessions();
+  }
+
+  Future<void> _loadSessions() async {
+    final session = context.read<SessionState>();
+    try {
+      final sessions = await session.api.duesSessions(memberId: widget.member);
+      if (!mounted) return;
+      setState(() => _sessions = sessions);
+    } on ApiException {
+      // The payment status is a courtesy; a refusal here must not take the pay
+      // affordance down with it — what is owed is the more important fact.
+    } on Object {
+      // Offline, most likely. Same reasoning.
+    }
+  }
+
+  Future<void> _pay() async {
+    if (widget.outstandingCents <= 0) return;
+    setState(() {
+      _busy = true;
+      _error = null;
+      _errorStatus = null;
+    });
+    try {
+      final response = await context.read<SessionState>().api.payDues(
+            amountCents: widget.outstandingCents,
+            duesYear: widget.duesYear,
+            memberId: widget.member,
+          );
+      if (!mounted) return;
+      final url = field(response, ['checkout_url']);
+      setState(() => _checkoutUrl = url);
+      if (url.isEmpty) {
+        _say('The server opened a session but returned no link to it.', bad: true);
+      }
+      // The payment has not landed until it lands: re-read the sessions and the
+      // standing rather than claiming a state the ledger has not reached.
+      await _loadSessions();
+      widget.onRefresh();
+    } on ApiException catch (e) {
+      if (!mounted) return;
+      setState(() {
+        _error = e.message;
+        _errorStatus = e.statusCode;
+      });
+      _say(e.message, bad: true);
+    } on Object catch (e) {
+      if (!mounted) return;
+      _say('Cannot reach the server — no session was opened.', bad: true);
+      debugPrint('dues checkout failed: $e');
+    } finally {
+      if (mounted) setState(() => _busy = false);
+    }
+  }
+
+  void _say(String message, {bool bad = false}) {
+    final scheme = Theme.of(context).colorScheme;
+    ScaffoldMessenger.of(context).showSnackBar(
+      SnackBar(
+        content: Text(message),
+        backgroundColor: bad ? scheme.errorContainer : null,
+      ),
+    );
+  }
+
+  Future<void> _copy(String value) async {
+    await Clipboard.setData(ClipboardData(text: value));
+    if (!mounted) return;
+    _say('Copied.');
+  }
 
   @override
   Widget build(BuildContext context) {
     final scheme = Theme.of(context).colorScheme;
+    final owed = widget.outstandingCents;
+    final unconfigured = _errorStatus == 503;
+
     return AppCard(
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.start,
         children: [
-          Text('Paying', style: AppText.titleLarge),
+          Text('Paying dues', style: AppText.titleLarge),
           const SizedBox(height: AppSpacing.sm),
-          Text(
-            'Not available yet. Paying dues from the app lands with the payments '
-            'plugin; until it does, a treasurer records the payment and your '
-            'standing above updates from the ledger. No card details are asked '
-            'for here, because nothing here can take them.',
-            style: AppText.bodyMedium.copyWith(color: scheme.outline),
-          ),
+          if (owed <= 0)
+            Text(
+              'There is nothing left to pay, so this screen offers no payment — '
+              'a Checkout session charges, and Stripe cannot take zero. The '
+              'standing above is the ledger\'s own answer.',
+              style: AppText.bodyMedium.copyWith(color: scheme.outline),
+            )
+          else ...[
+            Text(
+              'Open a Stripe Checkout session for ${formatCents(owed)} — what you '
+              'owe, and nothing more. The session charges nothing by itself: once '
+              'Stripe confirms your payment, finance books it against your name '
+              'and the figure above moves. This build shows the link to open '
+              'rather than launching a browser for you.',
+              style: AppText.bodyMedium,
+            ),
+            const SizedBox(height: AppSpacing.md),
+            if (_busy)
+              const SizedBox(
+                width: 24,
+                height: 24,
+                child: CircularProgressIndicator(strokeWidth: 2),
+              )
+            else
+              FilledButton.icon(
+                onPressed: _pay,
+                icon: const Icon(Icons.credit_card_outlined, size: 20),
+                label: Text('Pay ${formatCents(owed)} with Stripe'),
+              ),
+            if (unconfigured) ...[
+              const SizedBox(height: AppSpacing.sm),
+              Text(
+                'This troop\'s Stripe is not configured, so no payment can be '
+                'taken from the app yet. The server said: $_error',
+                style: AppText.bodySmall.copyWith(color: scheme.error),
+              ),
+            ] else if (_error != null) ...[
+              const SizedBox(height: AppSpacing.sm),
+              Text(
+                'The server refused the session: $_error',
+                style: AppText.bodySmall.copyWith(color: scheme.error),
+              ),
+            ],
+          ],
+          if (_checkoutUrl.isNotEmpty) ...[
+            const SizedBox(height: AppSpacing.md),
+            _checkoutUrlCard(scheme),
+          ],
+          if (_sessions.isNotEmpty) ...[
+            const SizedBox(height: AppSpacing.md),
+            _sessionsCard(scheme),
+          ],
         ],
       ),
     );
   }
+
+  Widget _checkoutUrlCard(ColorScheme scheme) {
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        Row(
+          children: [
+            const Icon(Icons.open_in_new, size: 20),
+            const SizedBox(width: AppSpacing.sm),
+            Expanded(child: Text('Checkout session', style: AppText.titleMedium)),
+          ],
+        ),
+        const SizedBox(height: AppSpacing.sm),
+        SelectableText(_checkoutUrl, style: AppText.bodySmall),
+        const SizedBox(height: AppSpacing.sm),
+        Row(
+          children: [
+            TextButton.icon(
+              onPressed: () => _copy(_checkoutUrl),
+              icon: const Icon(Icons.copy, size: 18),
+              label: const Text('Copy the link'),
+            ),
+          ],
+        ),
+        Text(
+          'This build does not launch a browser for you, so the link is shown '
+          'and copyable rather than dressed up as a button that cannot open it.',
+          style: AppText.bodySmall.copyWith(color: scheme.outline),
+        ),
+      ],
+    );
+  }
+
+  Widget _sessionsCard(ColorScheme scheme) {
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        Text('Your payment sessions', style: AppText.titleMedium),
+        const SizedBox(height: AppSpacing.sm),
+        for (final s in _sessions)
+          Padding(
+            padding: const EdgeInsets.only(bottom: AppSpacing.sm),
+            child: Row(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Expanded(
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      Text(
+                        _sessionStatusLabel(field(s, ['status'])),
+                        style: AppText.bodyMedium,
+                      ),
+                      const SizedBox(height: 2),
+                      Text(
+                        formatDate(field(s, ['created_at']), withTime: true),
+                        style: AppText.bodySmall.copyWith(color: scheme.outline),
+                      ),
+                    ],
+                  ),
+                ),
+                const SizedBox(width: AppSpacing.sm),
+                Text(
+                  formatCents(int.tryParse(field(s, ['amount_cents']))),
+                  style: AppText.titleMedium,
+                ),
+              ],
+            ),
+          ),
+        Row(
+          children: [
+            TextButton.icon(
+              onPressed: _loadSessions,
+              icon: const Icon(Icons.refresh, size: 18),
+              label: const Text('Check again'),
+            ),
+          ],
+        ),
+      ],
+    );
+  }
+
+  /// The session's state, in a member's words: has the payment landed or not.
+  static String _sessionStatusLabel(String status) => switch (status) {
+        'pending' => 'Opening…',
+        'created' => 'Awaiting payment',
+        'completed' => 'Stripe confirmed the payment',
+        'expired' => 'Expired — not paid',
+        'failed' => 'Failed — not paid',
+        _ => status,
+      };
 }
 
 /// The tier chooser — the scale, as the server states it.
