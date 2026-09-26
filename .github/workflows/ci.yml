@@ -85,9 +85,11 @@ jobs:
       # the same failure: a mismatched client refuses with "server version
       # mismatch", which reads as a broken feature rather than a missing tool.
       #
-      # The host-side `deploy/backup.sh` never has this problem because it dumps
-      # from *inside* the postgres container and so always uses the server's own
-      # client. The in-app runner cannot: it brings its own.
+      # The deployment never has to think about this: the image carries exactly
+      # one client version, so there is nothing to choose between.
+      # `deploy/backup.sh` sidesteps it a different way — it dumps from *inside*
+      # the postgres container and so always uses the server's own client. The
+      # in-app runner brings its own, which is the whole difference.
       - name: PostgreSQL client 18 (for the backup probes)
         run: |
           sudo install -d /usr/share/postgresql-common/pgdg
@@ -98,12 +100,27 @@ jobs:
             | sudo tee /etc/apt/sources.list.d/pgdg.list
           sudo apt-get update -qq
           sudo apt-get install -y -qq postgresql-client-18
-          pg_dump --version
+          echo "wrapper:  $(pg_dump --version)"
+          echo "real 18:  $(/usr/lib/postgresql/18/bin/pg_dump --version)"
+          # `pg_dump` on Debian and Ubuntu is postgresql-common's **wrapper**, not
+          # the binary, and on this runner it kept selecting client 16 even after
+          # 18 was installed:
+          #
+          #     Setting up postgresql-client-18 (18.6-1.pgdg24.04+2) ...
+          #     pg_dump (PostgreSQL) 16.15
+          #     pg_dump: error: aborting because of server version mismatch
+          #
+          # The wrapper's own selection rules (PGCLUSTER, `--cluster`, a newest-
+          # installed fallback) are not worth reverse-engineering for a test job,
+          # so this does not try to steer it: it puts the real binary's directory
+          # first on PATH for the steps below, which bypasses the wrapper.
+          echo "/usr/lib/postgresql/18/bin" >> "$GITHUB_PATH"
 
       - name: DB-backed host tests + pool lifecycle + plugin load semantics + backups
-        run: >-
-          cargo test -p adjutant-server --test host_db --test pool_lifecycle
-          --test plugin_load_semantics --test backups -- --ignored --nocapture
+        run: |
+          pg_dump --version
+          cargo test -p adjutant-server --test host_db --test pool_lifecycle \
+            --test plugin_load_semantics --test backups -- --ignored --nocapture
 
       # The notification record (#46, slice 1): a scheduled run records one
       # through `core.notify` (as a plugin role, its source derived from
