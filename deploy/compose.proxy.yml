@@ -33,7 +33,13 @@ services:
     restart: unless-stopped
 
   adjutant:
-    build: .
+    # The context is the repository root, `..`, not `.`: Compose resolves relative
+    # paths against the *compose file's* directory, so `build: .` in this file
+    # would look for `deploy/Dockerfile` and fail with "failed to read dockerfile"
+    # — which is exactly what the first real run did.
+    build:
+      context: ..
+      dockerfile: Dockerfile
     depends_on:
       postgres:
         condition: service_healthy
