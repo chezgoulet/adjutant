@@ -127,18 +127,6 @@ jobs:
       - name: Store outbox probes (DB-backed)
         run: cargo test -p adjutant-store --test outbox_draw -- --ignored --nocapture
 
-      # The rail's second producer, gated the same way and at the same point: the
-      # store plugin's scholarship draw is enqueued by the same statement that
-      # completes (or comps) an order, so a revocation leaves the order
-      # untransitioned, a replay is one intent, and the worklist tells the truth
-      # about an in-flight draw. Same prerequisite as the stripe step — the ladder
-      # above has just bootstrapped the roles, the stored plugin secrets and the
-      # plugin migrations (including `store` migration 2) — because these connect
-      # AS the plugin's own role: `core.outbox_enqueue` derives the producer from
-      # `session_user`.
-      - name: Store outbox probes (DB-backed)
-        run: cargo test -p adjutant-store --test outbox_draw -- --ignored --nocapture
-
       # The sandboxed path: build the WASM guest and load it through the same
       # registry/dispatch pipeline (a separate plugin dir keeps the native
       # harnesses above unaffected).
