@@ -7,11 +7,22 @@ while the workspace had twelve, so the route ladder — the only gate that catch
 data-layer fault at request time — never probed calendar, mcp or the whole M6
 batch. Two routes answered `500` on `testing` and CI stayed green. Issue #55.
 
-The fix is to stop keeping the list. A plugin library is exactly a workspace crate
-that produces a `cdylib`, which `cargo metadata` knows and nobody has to remember:
+The fix is to stop keeping the list. A plugin library is exactly a **publishable**
+workspace crate that produces a `cdylib`, which `cargo metadata` knows and nobody
+has to remember:
 
     python3 scripts/stage-plugins.py            # target/debug  -> plugins-built/
     python3 scripts/stage-plugins.py --profile release
+
+"Publishable" is load-bearing, and it was learned the hard way. The rule used to
+read "has no hand-written list", which is not the same as "what is a plugin": the
+`broken-init-fixture` crate (`server/tests/plugin_load_semantics.rs`'s failed-load
+fixture) is a workspace crate that builds a `cdylib` and is *not* a plugin, so it
+was staged, discovered, and loaded — and the harness died on
+`plugin broken_init init failed: internal error: fixture: init fails on purpose`.
+A crate that exists to fail must not be something the loader is handed. `publish =
+false` is the manifests' own way of saying "not part of the product", and every
+real plugin is publishable, so the rule reads it rather than a name list.
 
 Prints what it staged and fails loudly if a crate built a `cdylib` that is not on
 disk, because a missing library is the failure this script exists to prevent.
@@ -31,10 +42,14 @@ OUT = REPO / "plugins-built"
 
 
 def cdylib_crates() -> list[tuple[str, str]]:
-    """`(package name, lib target name)` for every workspace crate that builds a cdylib.
+    """`(package name, lib target name)` for every plugin crate that builds a cdylib.
 
-    The SDK is not a plugin (it exports no plugin symbols) and is an `rlib`, so it
-    is excluded by the same rule rather than by being named.
+    Three exclusions, each by a rule rather than by a name:
+
+    * the SDK is an `rlib` and exports no plugin symbols;
+    * a crate with `publish = false` is a test fixture, not part of the product.
+      `broken-init-fixture` builds a cdylib and must never be handed to the loader
+      — see the module docstring for what happened when it was.
     """
     raw = subprocess.run(
         ["cargo", "metadata", "--no-deps", "--format-version", "1"],
@@ -47,6 +62,9 @@ def cdylib_crates() -> list[tuple[str, str]]:
 
     found: list[tuple[str, str]] = []
     for package in meta["packages"]:
+        # `publish = false` arrives as an empty list; `None` means publishable.
+        if package.get("publish") == []:
+            continue
         for target in package.get("targets", []):
             kinds = target.get("crate_types") or []
             if "cdylib" in kinds:
