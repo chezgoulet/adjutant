@@ -24,7 +24,13 @@ services:
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD}
       POSTGRES_DB: adjutant
     volumes:
-      - pgdata:/var/lib/postgresql/data
+      # Postgres 18 moved PGDATA into a versioned subdirectory of
+      # /var/lib/postgresql, and the image refuses to start if the volume is
+      # mounted at the old .../data path: it reports an "unused mount/volume" and
+      # exits. Mount the parent and let the image manage its own layout.
+      # (Found by running the stack — see the 2026-09-26 finding in
+      # docs/release-path.md Stage 3.)
+      - pgdata:/var/lib/postgresql
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U adjutant"]
       interval: 5s
