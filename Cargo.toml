@@ -19,6 +19,10 @@ members = [
     "plugins/stripe",
     "plugins/store",
     "plugins/examples/hello",
+    # A test fixture, not a plugin: it must never appear in `libadjutant_*.so`,
+    # which is why its package name does not begin with `adjutant-`. The probe in
+    # `server/tests/plugin_load_semantics.rs` stages it under a staged name.
+    "plugins/examples/broken-init",
     "server",
 ]
 

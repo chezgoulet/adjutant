@@ -37,6 +37,12 @@ use adjutant_server::{cli, db, host, schema};
 const STORE: &str = "store";
 const FINANCE: &str = "finance";
 
+/// The fixture whose `init` always fails: `plugins/examples/broken-init`, built
+/// by `cargo build --workspace` as `libbroken_init_fixture.so`. It is staged under
+/// an `adjutant_`-style name so `bootstrap-isolation` gives it a role and a
+/// `core.plugins` row, which is what the enable endpoint looks up.
+const BROKEN_INIT: &str = "broken_init";
+
 /// Serializes the probes: they share the test database and both drop and
 /// re-create `store`/`finance`, so they must not interleave.
 static SERIAL: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
@@ -62,6 +68,24 @@ fn workspace_lib_dir() -> PathBuf {
         .to_path_buf()
 }
 
+/// Stage one more workspace library into a fixture directory.
+///
+/// [`fixture_dir_named`] stages `store` and `finance` and nothing else; a probe
+/// that needs a third library says so here rather than every fixture carrying it.
+/// `crate_lib` is the library's own file stem and `plugin_id` the id it declares —
+/// they differ for the failure fixture, whose package name is deliberately not
+/// `adjutant-` so the Dockerfile's `libadjutant_*.so` glob never ships it.
+fn stage_library(dir: &Path, crate_lib: &str, plugin_id: &str) {
+    let src = workspace_lib_dir().join(format!("lib{crate_lib}.so"));
+    let dst = dir.join(format!("libadjutant_{plugin_id}.so"));
+    std::fs::copy(&src, &dst).unwrap_or_else(|e| {
+        panic!(
+            "{} must exist (run `cargo build --workspace`): {e}",
+            src.display()
+        )
+    });
+}
+
 /// A temp plugin dir holding exactly `store` and `finance`.
 fn fixture_dir() -> PathBuf {
     fixture_dir_named("")
@@ -69,11 +93,12 @@ fn fixture_dir() -> PathBuf {
 
 /// The same fixture, under a distinct directory name.
 ///
-/// A test that must corrupt a library *before anything opens it* needs its own
-/// path: the loader maps a library once per path for the life of the process, so
-/// a test reusing this fixture's directory would `dlopen` the copy already in
-/// memory and never see the corruption. (Learned the hard way — see
-/// `probe_a_failed_load_is_a_409_and_records_the_reason`.)
+/// A probe that must stage something the other probes must not see needs its own
+/// path — and anything about *loading* needs a path nothing has opened yet: the
+/// loader maps a library once per path for the life of the process, so a probe
+/// reusing this directory would get back the copy already in memory. The failure
+/// fixture the 409 probe stages is exactly that case, which is why it is named
+/// separately rather than sharing the common directory.
 fn fixture_dir_named(tag: &str) -> PathBuf {
     let name = if tag.is_empty() {
         format!("adjutant-load-sem-{}", std::process::id())
@@ -679,6 +704,94 @@ async fn probe_enable_is_serialized() {
     assert!(
         state.registry.read().await.live_ids().contains(FINANCE),
         "and the plugin is live once the race is over"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Issue #89 requirement #3, the branch that was never covered: **a load that
+/// fails**. The refusal is a 409 carrying the reason, the reason is recorded on
+/// the record as `last_error` where the admin surface shows it, and the durable
+/// flag is never written.
+///
+/// The failure is produced by a fixture whose `init` returns an error
+/// (`plugins/examples/broken-init`) rather than by damaging a library, and that
+/// choice is the whole design of this probe. Every cruder way to fail a load
+/// takes the test process with it — and all three were tried before this one
+/// existed:
+///
+/// * corrupting a library the process has already opened is **invisible**;
+///   `dlopen` dedupes by path and a retired library stays mapped, so the enable
+///   answers `200 {"loaded":true}` and the probe proves nothing;
+/// * truncating it into a non-ELF is **SIGBUS**, reading past the mapped end;
+/// * loading a valid library under a different name is **SIGSEGV** in symbol
+///   resolution, two copies of one object in one process.
+///
+/// And because `load_opened` runs `init` *before* migrations, permissions and
+/// routes, the failure lands on the ordinary path rather than on a version gate.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "DB-gated: needs ADJUTANT_TEST_DATABASE_URL + CREATEROLE; run with `-- --ignored`"]
+async fn probe_a_failed_init_is_a_409_and_records_the_reason() {
+    let _serial = SERIAL.lock().await;
+    // Its own directory, and the fixture staged *before* provisioning:
+    // `bootstrap-isolation` is what gives a library on disk its role and its
+    // `core.plugins` row, and the enable endpoint looks that row up.
+    let dir = fixture_dir_named("failinit");
+    stage_library(&dir, "broken_init_fixture", BROKEN_INIT);
+    let url = base_url();
+    let admin = provision(&dir).await;
+    set_enabled(&admin, FINANCE, true).await;
+    set_enabled(&admin, STORE, false).await;
+    set_enabled(&admin, BROKEN_INIT, false).await;
+
+    let (base, state, _serve) = spawn_app(&dir, &url).await;
+
+    // The boot did not open it. That is the #89 semantics doing their job — a
+    // disabled plugin is skipped before its library is dlopened — and it is also
+    // what makes this a probe of the *enable* path: if boot had loaded it, the
+    // server would not have come up at all.
+    {
+        let reg = state.registry.read().await;
+        let info = reg.info(BROKEN_INIT).expect("the fixture is known");
+        assert!(!info.loaded && !info.enabled, "known, not loaded");
+        assert!(reg.record(BROKEN_INIT).is_some(), "and it has a record to enable");
+    }
+
+    let (status, body) =
+        admin_req(&base, reqwest::Method::POST, "/api/plugins/broken_init/enable").await;
+
+    // 409, not 500: "this plugin cannot be loaded" is a state of the world the
+    // admin can act on, not a fault in the server.
+    assert_eq!(status, 409, "a failed load is a conflict: {body}");
+    let reason = body["error"].as_str().unwrap_or_default();
+    assert!(
+        reason.contains("init failed"),
+        "the reason says which step failed: {reason}"
+    );
+    assert!(
+        reason.contains("init fails on purpose"),
+        "and carries the plugin's own words, not a generic message: {reason}"
+    );
+    assert!(
+        reason.contains(BROKEN_INIT),
+        "and names the plugin: {reason}"
+    );
+
+    let reg = state.registry.read().await;
+    let info = reg.info(BROKEN_INIT).expect("still known after a failed enable");
+    assert!(!info.loaded, "a failed enable leaves it disabled");
+    assert!(!info.enabled);
+    assert!(
+        info.last_error
+            .as_deref()
+            .is_some_and(|e| e.contains("init fails on purpose")),
+        "and records why, where the admin surface shows it (requirement #3): {info:?}"
+    );
+    drop(reg);
+
+    assert!(
+        !flag_enabled(&admin, BROKEN_INIT).await,
+        "the durable flag was never written, so a restart still has it disabled"
     );
 
     let _ = std::fs::remove_dir_all(&dir);
