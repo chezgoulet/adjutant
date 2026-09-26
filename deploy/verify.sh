@@ -22,8 +22,113 @@ fail() { echo "FAIL: $*" >&2; exit 1; }
 ok()   { echo "  ok — $*"; }
 
 command -v docker >/dev/null 2>&1 || fail "docker is not installed; this proof needs a host with Docker and Compose v2"
+
+# --- the proxy's address, derived rather than declared ------------------------
+#
+# It has to come from the same variable the subnet does. When the subnet was
+# hard-coded and the address was independent, a second stack could end up with an
+# address outside its own network — and worse, `ADJUTANT_TRUSTED_PROXIES` is a
+# literal comparison, so the failure mode is a proxy that is no longer recognised
+# and a rate limiter that silently keys everyone to one bucket.
+#
+# PROXY_IP may still be set for compatibility, and if it is it has to agree. A
+# stale value is more dangerous than none, because it looks like configuration.
+PREFIX="${ADJUTANT_EDGE_PREFIX:-172.31.7}"
+DERIVED_PROXY_IP="${PREFIX}.2"
+if [ -n "${PROXY_IP:-}" ] && [ "$PROXY_IP" != "$DERIVED_PROXY_IP" ]; then
+  fail "PROXY_IP=$PROXY_IP disagrees with ADJUTANT_EDGE_PREFIX=$PREFIX, which puts the proxy at $DERIVED_PROXY_IP. Set one, not both."
+fi
+PROXY_IP="$DERIVED_PROXY_IP"
+export PROXY_IP
+
+# This stack's compose project name, so the precondition checks can tell our own
+# containers and networks from a foreign stack's. Dummy secrets because
+# `compose config` will not render without the required variables, and this only
+# reads the name.
+PROJECT="$(POSTGRES_PASSWORD=x ADJUTANT_APP_PASSWORD=x DOMAIN=x ACME_EMAIL=x \
+  docker compose -f "$HERE/compose.proxy.yml" config --format json 2>/dev/null | python3 -c '
+import json, sys
+try:
+    print(json.load(sys.stdin).get("name", ""))
+except Exception:
+    print("")
+')"
+[ -n "$PROJECT" ] || fail "cannot determine this stack compose project name; is compose.proxy.yml readable?"
+
+echo "== precondition — the edge subnet is free =="
+# Docker refuses a second network on an overlapping pool, and its error —
+# "Pool overlaps with other one on this address space" — names neither the subnet
+# nor the network already holding it. That is the least legible failure in this
+# directory, so ask first and say which.
+EDGE_SUBNET="${PREFIX}.0/24"
+collision="$(docker network ls --format '{{.Name}}' | python3 -c '
+import ipaddress, subprocess, sys
+want = ipaddress.ip_network(sys.argv[1])
+mine = sys.argv[2]
+hits = []
+for name in sys.stdin.read().split():
+    info = subprocess.run(
+        ["docker", "network", "inspect", name, "--format",
+         "{{index .Labels \"com.docker.compose.project\"}}|{{range .IPAM.Config}}{{.Subnet}} {{end}}"],
+        capture_output=True, text=True).stdout.strip()
+    project, _, subnets = info.partition("|")
+    # This stack own network is meant to be on this subnet — it is the one about
+    # to be reused. Excluding it is not a convenience: without the exclusion the
+    # check fails on a correct stack. (The first attempt excluded on
+    # `com.docker.compose.project.working_dir`, which networks do not carry at
+    # all, so it silently never matched. `project` is the label they do have.)
+    if project == mine:
+        continue
+    for s in subnets.split():
+        try:
+            if ipaddress.ip_network(s).overlaps(want):
+                hits.append(name + " (" + s + ")")
+        except ValueError:
+            pass
+print(", ".join(hits))
+' "$EDGE_SUBNET" "$PROJECT")"
+if [ -n "$collision" ]; then
+  fail "the edge subnet $EDGE_SUBNET overlaps a network that already exists: $collision
+       Two Adjutant stacks on one host need different subnets. Set
+       ADJUTANT_EDGE_PREFIX to a different third octet (for example 172.31.8) and
+       bring this stack up again."
+fi
+ok "no existing network overlaps $EDGE_SUBNET"
+
+echo "== precondition — the edge ports are free =="
+# Distinct subnets are not enough for a second stack: two of them cannot both
+# publish 80 and 443, and the daemon's complaint about that arrives *after* the
+# networks, volumes and database have been created. Ask first, and name what is
+# holding the port.
+#
+# This stack's OWN proxy is excluded, and that exclusion is the whole point: the
+# first version of this check counted it, which made `verify.sh` fail on the very
+# deployment it exists to prove. A precondition that cannot pass on a correct
+# stack is worse than no precondition.
+busy="$(docker ps --format '{{.Names}}\t{{.Label "com.docker.compose.project"}}\t{{.Ports}}' | python3 -c '
+import sys
+mine = sys.argv[1]
+hits = []
+for line in sys.stdin:
+    parts = line.rstrip("\n").split("\t")
+    if len(parts) != 3:
+        continue
+    name, project, ports = parts
+    if project == mine:
+        continue          # ours, and it is supposed to be holding them
+    for port in ("80", "443"):
+        if ("0.0.0.0:" + port + "->") in ports or ("[::]:" + port + "->") in ports:
+            hits.append(name + " holds " + port)
+            break
+print("; ".join(hits))
+' "$PROJECT")"
+if [ -n "$busy" ]; then
+  fail "port 80 or 443 is already published: $busy
+       A second Adjutant stack on this host needs different published ports, or
+       it is not a second stack — one stack serves a name on 80 and 443."
+fi
+ok "nothing outside this stack is publishing 80 or 443"
 docker compose version >/dev/null 2>&1 || fail "docker compose v2 is not available"
-[ -n "${PROXY_IP:-}" ] || fail "set PROXY_IP (the proxy's static address, as in deploy/compose.proxy.yml)"
 
 # One request from a fresh container, printing just the status code.
 code() { # $1 = shell command, $2 = probe service (probe, or probe2 for a second client)

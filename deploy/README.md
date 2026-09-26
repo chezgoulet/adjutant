@@ -78,9 +78,12 @@ rather than global.
 ```bash
 export DOMAIN=adjutant.example.org      # the certificate is for this name
 export ACME_EMAIL=you@example.org
-export PROXY_IP=172.31.7.2              # must match compose.proxy.yml's network
 export POSTGRES_PASSWORD="$(openssl rand -hex 24)"
 export ADJUTANT_APP_PASSWORD="$(openssl rand -hex 24)"
+# The edge network's third octet (default 172.31.7). The subnet, the proxy's
+# static address and the value the app trusts are all derived from it, so this is
+# the one thing a second stack on the same host changes.
+export ADJUTANT_EDGE_PREFIX=172.31.7
 
 docker compose -f deploy/compose.proxy.yml up -d --build
 

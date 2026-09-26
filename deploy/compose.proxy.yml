@@ -55,7 +55,7 @@ services:
       # against the direct peer: get this wrong and every client behind the proxy
       # shares one rate-limit bucket (fail-safe, but wrong). Keep it equal to the
       # `ipv4_address` below and to `PROXY_IP`.
-      ADJUTANT_TRUSTED_PROXIES: ${PROXY_IP:?set PROXY_IP to the proxy's static address}
+      ADJUTANT_TRUSTED_PROXIES: ${ADJUTANT_EDGE_PREFIX:-172.31.7}.2
       # The client's origin, if the app is served from a different name than the
       # API. Same-origin only when unset.
       ADJUTANT_CORS: ${ADJUTANT_CORS:-}
@@ -92,7 +92,7 @@ services:
     networks:
       edge:
         # Static, because ADJUTANT_TRUSTED_PROXIES above must match it exactly.
-        ipv4_address: ${PROXY_IP:?set PROXY_IP to the proxy's static address}
+        ipv4_address: ${ADJUTANT_EDGE_PREFIX:-172.31.7}.2
     restart: unless-stopped
 
   # A throwaway curl on the `edge` network, so `verify.sh` can originate requests
@@ -104,13 +104,17 @@ services:
   # addresses" is false. Docker returns a freed address to the next container, so
   # four successive `run`s of one service all came up as 172.31.7.4, and proof 2
   # could not tell two clients apart. `verify.sh` now names which probe it wants.
+  # The addresses are derived from ADJUTANT_EDGE_PREFIX, and so is the subnet they
+  # live in — one knob, because a subnet and an address that disagree is exactly
+  # the failure this file is trying to avoid. A second stack on the same host sets
+  # only that: `ADJUTANT_EDGE_PREFIX=172.31.8`.
   probe:
     image: curlimages/curl:8.22.0
     profiles: ["probe"]
     entrypoint: ["sh", "-c"]
     networks:
       edge:
-        ipv4_address: 172.31.7.4
+        ipv4_address: ${ADJUTANT_EDGE_PREFIX:-172.31.7}.4
     restart: "no"
 
   # The second client. Same image, different pinned address — this is what makes
@@ -121,7 +125,7 @@ services:
     entrypoint: ["sh", "-c"]
     networks:
       edge:
-        ipv4_address: 172.31.7.5
+        ipv4_address: ${ADJUTANT_EDGE_PREFIX:-172.31.7}.5
     restart: "no"
 
 volumes:
@@ -133,8 +137,18 @@ networks:
   # The app and its database, invisible to the host.
   internal:
     internal: true
-  # What the proxy is on. A fixed subnet so the static address is meaningful.
+  # What the proxy is on. A fixed subnet so the static address is meaningful —
+  # and it is derived from ADJUTANT_EDGE_PREFIX along with every address that has
+  # to sit inside it.
+  #
+  # This used to be hard-coded to 172.31.7.0/24, which made one Adjutant stack per
+  # host a real constraint: Docker refuses a second network on an overlapping
+  # pool, so a second copy of this deployment — or a leftover network from a
+  # failed attempt under a different project name — blocked every later `up` with
+  # "Pool overlaps with other one on this address space", an error that names
+  # none of this. `verify.sh` now checks for that collision first and says which
+  # network is in the way.
   edge:
     ipam:
       config:
-        - subnet: 172.31.7.0/24
+        - subnet: ${ADJUTANT_EDGE_PREFIX:-172.31.7}.0/24
