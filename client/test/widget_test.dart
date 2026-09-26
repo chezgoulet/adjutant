@@ -684,6 +684,63 @@ void main() {
       expect(body, {'tier': 'supported'});
     });
 
+    test('paying opens a Stripe session for what is owed, as the member', () async {
+      String? path;
+      Map<String, dynamic>? body;
+      final client = ApiClient(
+        baseUrl: 'http://example.test',
+        httpClient: MockClient((request) async {
+          path = request.url.path;
+          body = jsonDecode(request.body) as Map<String, dynamic>;
+          return http.Response(
+            '{"checkout_url":"https://checkout.stripe.test/cs_1",'
+            '"session":{"id":7},"checkout":{"amount_cents":10000}}',
+            201,
+          );
+        }),
+      );
+
+      final response = await client.payDues(
+        amountCents: 10000,
+        duesYear: 2026,
+        memberId: 'u1',
+      );
+
+      expect(path, '/api/stripe/checkout');
+      // The member names only themselves; finance:write is never touched — dues
+      // move by stripe's payment being booked, not by this call.
+      expect(body, {
+        'purpose': 'dues',
+        'amount_cents': 10000,
+        'dues_year': 2026,
+        'member_id': 'u1',
+      });
+      expect(response['checkout_url'], 'https://checkout.stripe.test/cs_1');
+    });
+
+    test('the payment sessions are read narrowed to the caller', () async {
+      String? url;
+      final client = ApiClient(
+        baseUrl: 'http://example.test',
+        httpClient: MockClient((request) async {
+          url = request.url.toString();
+          return http.Response(
+            '{"sessions":[{"id":7,"status":"completed","amount_cents":10000}],'
+            '"count":1,"narrowed_to_caller":true}',
+            200,
+          );
+        }),
+      );
+
+      final sessions = await client.duesSessions(memberId: 'u1');
+
+      expect(
+        url,
+        'http://example.test/api/stripe/sessions?purpose=dues&member_id=u1',
+      );
+      expect(sessions.single['status'], 'completed');
+    });
+
     test('the scale is read whole, with the amounts the server assessed', () async {
       final client = ApiClient(
         baseUrl: 'http://example.test',
@@ -1095,7 +1152,12 @@ void main() {
       await pump(tester, client);
 
       expect(find.text('Dues 2026'), findsOneWidget);
+      // The headline is what is still owed, and the rows that explain it.
+      expect(find.text('You owe'), findsOneWidget);
       expect(find.text('Assessed'), findsOneWidget);
+      expect(find.text('Paid'), findsOneWidget);
+      // Nothing is funded, so no "Covered" row is invented.
+      expect(find.text('Covered'), findsNothing);
       expect(find.text(r'$150.00'), findsWidgets);
       // The paid total and the payment that made it are the same figure, by
       // construction: a balance is derived from the ledger, never stored twice.
@@ -1115,34 +1177,234 @@ void main() {
       expect(find.text('Dues 2026 — u1'), findsOneWidget);
     });
 
-    testWidgets('paying is stated, not faked', (tester) async {
+    testWidgets('a waived, funded year reads as covered — not as a price of zero',
+        (tester) async {
+      // What the server actually returns after a waiver: the assessment stands
+      // (it is the tier's), the whole of it is funded, and `outstanding_cents`
+      // and `settled` are derived from that and the ledger. The scout must read
+      // "covered", never a bare "Waived" that hides who paid — and never the
+      // draw's mechanics, which are the troop's business.
+      Map<String, dynamic> waived() => {
+            'member_id': 'u1',
+            'fiscal_year': 2026,
+            'dues': {
+              'id': 12,
+              'fiscal_year': 2026,
+              'dues_kind': 'member',
+              'member_id': 'u1',
+              'lodge_id': '3',
+              'tier': 'supported',
+              'share_bps': 5000,
+              'base_cents': 15000,
+              'assessed_cents': 7500,
+              'funded_cents': 7500,
+              'draw_status': 'unbooked',
+              'draw_ref': null,
+              'self_reported': false,
+              'status': 'waived',
+              'note': '',
+              'paid_cents': 0,
+              'outstanding_cents': 0,
+              'settled': true,
+            },
+            'payments': <Map<String, dynamic>>[],
+            'honor_system': true,
+            'next': 'no assessment to change',
+          };
+
       final client = ApiClient(
         baseUrl: 'http://example.test',
         httpClient: MockClient((request) async {
           if (request.url.path == '/api/finance/sliding-scale') {
             return jsonResponse(scale());
           }
+          return jsonResponse(waived());
+        }),
+      );
+      await pump(tester, client);
+
+      // The badge and the money row both read "Covered"; "Waived" is gone.
+      expect(find.text('Covered'), findsWidgets);
+      expect(find.text('Waived'), findsNothing);
+      // Nothing is owed, and the scout is told so, in words. The two zeroes are
+      // the "you owe" headline and the paid row.
+      expect(find.text('You owe'), findsOneWidget);
+      expect(find.text(r'$0.00'), findsNWidgets(2));
+      expect(find.textContaining('Nothing is owed'), findsOneWidget);
+      expect(find.text('Settled — nothing outstanding for the year'), findsOneWidget);
+      // What the troop's books say about the subsidy never reaches this screen.
+      expect(find.textContaining('scholarship'), findsNothing);
+      expect(find.textContaining('unbooked'), findsNothing);
+      expect(find.textContaining('draw'), findsNothing);
+      // And a covered member is not offered a payment: Stripe cannot take zero.
+      await tester.scrollUntilVisible(
+        find.text('Paying dues'),
+        300,
+        scrollable: find.byType(Scrollable).first,
+      );
+      expect(find.textContaining('nothing left to pay'), findsOneWidget);
+      expect(find.textContaining('with Stripe'), findsNothing);
+    });
+
+    testWidgets('a partly-covered year states the covered part and what is left',
+        (tester) async {
+      // A self-reported reduction funds the discount, not the whole assessment:
+      // funded $75 of a $75 assessment, nothing paid yet — so the scout owes the
+      // assessment and is told which part is covered.
+      Map<String, dynamic> partly() => {
+            'member_id': 'u1',
+            'fiscal_year': 2026,
+            'dues': {
+              'id': 13,
+              'fiscal_year': 2026,
+              'dues_kind': 'member',
+              'member_id': 'u1',
+              'lodge_id': '3',
+              'tier': 'supported',
+              'share_bps': 5000,
+              'base_cents': 15000,
+              'assessed_cents': 7500,
+              'funded_cents': 7500,
+              'draw_status': 'unbooked',
+              'draw_ref': null,
+              'self_reported': true,
+              'status': 'self_reported',
+              'note': '',
+              'paid_cents': 0,
+              'outstanding_cents': 7500,
+              'settled': false,
+            },
+            'payments': <Map<String, dynamic>>[],
+            'honor_system': true,
+            'next': 'self-report a different tier',
+          };
+
+      final client = ApiClient(
+        baseUrl: 'http://example.test',
+        httpClient: MockClient((request) async {
+          if (request.url.path == '/api/finance/sliding-scale') {
+            return jsonResponse(scale());
+          }
+          return jsonResponse(partly());
+        }),
+      );
+      await pump(tester, client);
+
+      expect(find.text('You owe'), findsOneWidget);
+      expect(find.text(r'$75.00'), findsWidgets);
+      expect(find.text('Covered'), findsWidgets);
+      expect(find.textContaining('the covered part of your dues is paid for you'),
+          findsOneWidget);
+      expect(find.textContaining('Not settled'), findsOneWidget);
+      expect(find.text('Waived'), findsNothing);
+    });
+
+    testWidgets('a member pays what they owe through a Stripe session', (tester) async {
+      final calls = <String>[];
+      Map<String, dynamic>? checkoutBody;
+      final client = ApiClient(
+        baseUrl: 'http://example.test',
+        httpClient: MockClient((request) async {
+          calls.add('${request.method} ${request.url.path}');
+          if (request.url.path == '/api/finance/sliding-scale') {
+            return jsonResponse(scale());
+          }
+          if (request.url.path == '/api/stripe/checkout') {
+            checkoutBody = jsonDecode(request.body) as Map<String, dynamic>;
+            return jsonResponse({
+              'checkout_url': 'https://checkout.stripe.test/cs_test_123',
+              'session': {'id': 7, 'status': 'created'},
+              'checkout': {'provider': 'stripe', 'mode': 'payment', 'amount_cents': 10000},
+              'ledger': {'category': 'dues', 'not_yet': 'nothing is booked yet'},
+            }, 201);
+          }
+          if (request.url.path == '/api/stripe/sessions') {
+            return jsonResponse({
+              'sessions': [
+                {
+                  'id': 7,
+                  'status': 'created',
+                  'amount_cents': 10000,
+                  'created_at': '2026-09-26T10:00:00Z',
+                }
+              ],
+              'count': 1,
+              'narrowed_to_caller': true,
+            });
+          }
           return jsonResponse(standing());
         }),
       );
       await pump(tester, client);
 
-      // The one button on the screen is the tier chooser — nothing here offers
-      // to take money.
-      expect(find.widgetWithText(FilledButton, 'Change my tier'), findsOneWidget);
-      expect(find.text('Pay dues'), findsNothing);
-      expect(find.text('Pay now'), findsNothing);
-
-      // The placeholder says where payment will live and why it is not here. It
-      // is below the fold, so the page is scrolled to it.
       await tester.scrollUntilVisible(
-        find.text('Paying'),
+        find.text('Paying dues'),
         300,
         scrollable: find.byType(Scrollable).first,
       );
-      expect(find.text('Paying'), findsOneWidget);
-      expect(find.textContaining('Not available yet'), findsOneWidget);
-      expect(find.textContaining('card details are asked for'), findsOneWidget);
+      // The button offers exactly what is owed — the assessment less what is paid.
+      expect(
+        find.widgetWithText(FilledButton, r'Pay $100.00 with Stripe'),
+        findsOneWidget,
+      );
+
+      await tester.tap(find.text(r'Pay $100.00 with Stripe'));
+      await tester.pumpAndSettle();
+
+      // The session is opened for what is owed, by the member for themselves —
+      // no member but the caller, and nothing charged by opening it.
+      expect(calls, contains('POST /api/stripe/checkout'));
+      expect(checkoutBody, {
+        'purpose': 'dues',
+        'amount_cents': 10000,
+        'dues_year': 2026,
+        'member_id': 'u1',
+      });
+      // The link is shown to be copied, exactly as the store screen shows one —
+      // this client launches no browser.
+      expect(find.text('Checkout session'), findsOneWidget);
+      expect(find.text('https://checkout.stripe.test/cs_test_123'), findsOneWidget);
+      expect(find.text('Copy the link'), findsOneWidget);
+      // The payment's own state is read back, not assumed: the standing was
+      // re-read and the session says where it is.
+      expect(calls, contains('GET /api/finance/dues/member/u1'));
+      expect(find.text('Awaiting payment'), findsOneWidget);
+    });
+
+    testWidgets('an unconfigured Stripe is said as itself, not a broken button',
+        (tester) async {
+      final client = ApiClient(
+        baseUrl: 'http://example.test',
+        httpClient: MockClient((request) async {
+          if (request.url.path == '/api/finance/sliding-scale') {
+            return jsonResponse(scale());
+          }
+          if (request.url.path == '/api/stripe/checkout') {
+            return http.Response(
+              '{"error":"no Stripe secret_key is configured for this plugin"}',
+              503,
+              headers: {'content-type': 'application/json; charset=utf-8'},
+            );
+          }
+          return jsonResponse(standing());
+        }),
+      );
+      await pump(tester, client);
+
+      await tester.scrollUntilVisible(
+        find.text('Paying dues'),
+        300,
+        scrollable: find.byType(Scrollable).first,
+      );
+      await tester.tap(find.text(r'Pay $100.00 with Stripe'));
+      await tester.pumpAndSettle();
+
+      // The 503 is stated as an unconfigured troop, in the server's words. The
+      // server's message appears both inline and in the snackbar.
+      expect(find.textContaining('Stripe is not configured'), findsOneWidget);
+      expect(find.textContaining('no Stripe secret_key is configured'), findsWidgets);
+      // No checkout link is invented when no session was opened.
+      expect(find.text('Checkout session'), findsNothing);
     });
 
     testWidgets('reporting a tier posts the tier alone, and the scale is the source',
@@ -1189,6 +1451,10 @@ void main() {
 
       expect(calls, contains('POST /api/finance/dues/self-report'));
       expect(reportBody, {'tier': 'supported'});
+      // The contract is own-record-only: no `member_id` is sent, so the subject
+      // is the caller and nothing else (naming another member needs
+      // finance:manage_dues, which a scout does not hold).
+      expect(reportBody!.containsKey('member_id'), isFalse);
       // The server's answer is what the screen reports back.
       expect(find.textContaining('assessed \$75.00'), findsOneWidget);
       expect(find.text('Supported — self-reported'), findsOneWidget);

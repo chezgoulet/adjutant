@@ -291,6 +291,54 @@ class ApiClient {
         await _send('POST', '/api/finance/dues/self-report', body: body));
   }
 
+  /// Open a Stripe Checkout session to pay this member's dues.
+  ///
+  /// `stripe:checkout` at any scope. The member names only themselves —
+  /// `member_id` is their own roster id, and naming somebody else needs
+  /// `stripe:manage` at troop scope, which the server, not this client, decides.
+  /// Opening the session charges nothing: Stripe must confirm the payment, the
+  /// webhook books the income in finance under category `dues` and this member,
+  /// and only then does the standing move. The answer carries `checkout_url`
+  /// (and `session`, `checkout`, `ledger`); it is a `503` when the troop has no
+  /// Stripe key configured, and a `400` refusing a zero amount — which is why the
+  /// caller offers this only when something is owed.
+  Future<Map<String, dynamic>> payDues({
+    required int amountCents,
+    int? duesYear,
+    required String memberId,
+  }) async {
+    final body = <String, Object>{
+      'purpose': 'dues',
+      'amount_cents': amountCents,
+      'dues_year': ?duesYear,
+      'member_id': memberId,
+    };
+    return _asMap(await _send('POST', '/api/stripe/checkout', body: body));
+  }
+
+  /// The caller's own Checkout sessions, dues ones for one member.
+  ///
+  /// `stripe:read` at any scope; a caller without `stripe:read_all` is narrowed
+  /// by the server to the sessions they opened or that name them, so a scout
+  /// sees their own and not the troop's. Read after a payment to show whether it
+  /// landed — a `completed` session means Stripe confirmed it and the ledger
+  /// entry follows.
+  Future<List<Map<String, dynamic>>> duesSessions({String? memberId}) async {
+    final query = <String, String>{
+      'purpose': 'dues',
+      if (memberId != null && memberId.trim().isNotEmpty)
+        'member_id': memberId.trim(),
+    };
+    final data = await _send('GET', '/api/stripe/sessions', query: query);
+    if (data is Map && data['sessions'] is List) {
+      return (data['sessions'] as List)
+          .whereType<Map>()
+          .map((e) => Map<String, dynamic>.from(e))
+          .toList();
+    }
+    return _asList(data);
+  }
+
   // --- store: the shop (SPEC §7.16) ---------------------------------------
 
   /// The catalogue, with each item's whole sliding scale.
