@@ -148,7 +148,7 @@ async fn provision(dir: &Path) -> Arc<sqlx::PgPool> {
             .await
             .expect("forget the fixture's migrations");
     }
-    cli::bootstrap_isolation(&cfg, false, None, None)
+    cli::bootstrap_isolation(&cfg, false, None, None, None)
         .await
         .expect("bootstrap-isolation (needs CREATEROLE)");
     admin

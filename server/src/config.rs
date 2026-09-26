@@ -142,10 +142,14 @@ USAGE:
     adjutant validate-plugin <so>  statically validate a compiled plugin (no DB)
     adjutant test-plugin [OPTIONS] boot against a pristine test DB and probe
                                    every plugin route with mock permissions
-    adjutant bootstrap-isolation [--rotate] [OPTIONS]
+    adjutant bootstrap-isolation [--rotate] [--enable <ids>] [OPTIONS]
                                    create/refresh per-plugin DB roles, schema
                                    ownership, grants and stored credentials
                                    (run once by the operator, against an admin URL)
+                                   --enable names which plugins this deployment
+                                   runs, comma or space separated; every other
+                                   plugin on disk is disabled. Omit it and the
+                                   existing flags are left alone.
     adjutant --help                print this help
 
 SERVE OPTIONS:
