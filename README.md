@@ -28,6 +28,7 @@ docs/architecture.md        How the core, plugins, and sandbox fit together
 docs/api-reference.md       Core + plugin HTTP API and the SDK surface
 docs/plugin-development.md  Plugin author guide (start here to write one)
 docs/plugin-roadmap.md      Plugin inventory, sequencing, and the v1.0 gate
+docs/release-path.md        Ordered work from testing to v1.0 (stages, lanes, decisions)
 docs/design/                Designs awaiting or carrying a decision (isolation, scopes)
 docs/sdk-compatibility.md   SDK version + compatibility policy
 docs/deployment.md          Deployment, upgrades, backup/restore
@@ -231,10 +232,16 @@ python3 docs/e2e_m3.py
 
 ## Development milestones
 
-Tracked in [`SPEC.md` §15](SPEC.md); evidence per milestone in `docs/milestones/`.
-Milestones 1–3 are complete (prototype validation, core server, SDK v0.1 + auth
-and membership plugins) — see `docs/milestones/M3-sdk-and-plugins.md` for the
-audit pass that corrected this repo's earlier evidence claims.
+Tracked in [`SPEC.md` §15](SPEC.md); evidence per milestone in `docs/milestones/`,
+and the order of the work remaining in
+[`docs/release-path.md`](docs/release-path.md).
+
+Milestones **1–4 are complete**, including the inserted core/SDK stabilization
+gate the roadmap calls M3-S — see `docs/milestones/M3-sdk-and-plugins.md` for the
+audit pass that corrected this repo's earlier evidence claims. **M6 is built**
+(its five plugins load, are tested and are probed) with two boxes open by
+decision: SDK v0.3, and announcements' delivery. **M5** is partially met and
+**M7/M8** are open; both are ordered in the release path.
 
 ## Git flow
 

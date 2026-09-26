@@ -1,7 +1,9 @@
 # Releasing & publishing
 
 How to cut an Adjutant release and publish the crates. See
-[`sdk-compatibility.md`](sdk-compatibility.md) for what a version promises.
+[`sdk-compatibility.md`](sdk-compatibility.md) for what a version promises, and
+[`release-path.md`](release-path.md) for what has to be true before the next tag —
+in particular the interim `v0.3.0` recommendation and the v1.0 gate.
 
 ## What a release contains
 

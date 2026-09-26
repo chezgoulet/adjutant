@@ -6,6 +6,19 @@ searchable history, and the conflict pathway the Accords define. It is also the
 milestone where the plugin API stops being a promise and becomes eleven plugins
 built against it.
 
+**Status (2026-09-26, `testing` at `150d024`):** five of the seven exit boxes are
+met, one is partial and one is not delivered — **SDK v0.3** (not) and
+**announcements' delivery** (partial, deferred by decision, #46). The eleven
+plugins exist, load, and are probed. The figures in the table below are that
+day's run and are left as recorded; for scale today, **fourteen** libraries are
+staged (thirteen plugins plus `hello`), the route ladder reports **145/145** and
+the workspace suite **564 passed / 0 failed**. The milestone's *client* intent is
+now largely in the app — dues, equipment, announcements and governance all have
+surfaces — but none of it has §1's third test yet, because no client path is
+exercised against a live server in CI. See
+[`../plugin-roadmap.md`](../plugin-roadmap.md) §3 and
+[`../release-path.md`](../release-path.md) Stage 1.
+
 ## Goal
 
 > Build the operational plugins that scouts use daily, and the two that carry the
