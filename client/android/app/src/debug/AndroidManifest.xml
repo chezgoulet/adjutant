@@ -4,4 +4,12 @@
          to allow setting breakpoints, to provide hot reload, etc.
     -->
     <uses-permission android:name="android.permission.INTERNET"/>
+
+    <!-- Debug builds may talk to a plain-http box on the LAN; release builds
+         keep the platform default and refuse cleartext. See
+         res/xml/network_security_config.xml next to this file, and
+         `cleartextAllowed` in lib/api/server_address.dart — the same decision,
+         stated once for the UI and once for the OS.
+    -->
+    <application android:networkSecurityConfig="@xml/network_security_config" />
 </manifest>

@@ -30,9 +30,16 @@ class SessionState extends ChangeNotifier {
   static const _tokenKey = 'adjutant.token';
   static const _baseUrlKey = 'adjutant.baseUrl';
 
-  /// Where the server lives. Overridden at runtime on the login screen so a
-  /// self-hosting troop can point the app at their own box without a rebuild.
-  static const defaultBaseUrl = 'http://localhost:8080';
+  /// The address the app holds before the user has supplied one.
+  ///
+  /// A debug build gets a developer's own machine, which is genuinely useful for
+  /// `flutter run`. A release build gets **nothing**, because there is no honest
+  /// default: `localhost` on a phone is the phone, so a pre-filled value is
+  /// always wrong — and, worse, plausible, which is how a user ends up debugging
+  /// a network they were never talking to. The field starts empty instead, and
+  /// the validator says why it is required.
+  static final String defaultBaseUrl =
+      kDebugMode ? 'http://localhost:8080' : '';
 
   final ApiClient api;
 
@@ -54,9 +61,13 @@ class SessionState extends ChangeNotifier {
     final prefs = await SharedPreferences.getInstance();
     final savedBase = prefs.getString(_baseUrlKey);
     if (savedBase != null && savedBase.isNotEmpty) {
-      api.setToken(null);
-      // Replace the client base URL by rebuilding the token holder; the client
-      // is cheap and stateless apart from the token.
+      // Apply the address the user signed in with, before anything below asks
+      // the server for anything. This is the whole point of having saved it:
+      // without it the app relaunched onto the built-in default, asked *that*
+      // address for the session, failed, and showed the cached user as
+      // "offline" — so every launch after the first was broken, and nothing in
+      // the UI said why.
+      api.setBaseUrl(savedBase);
     }
     final token = prefs.getString(_tokenKey);
     if (token != null && token.isNotEmpty) {
@@ -99,6 +110,12 @@ class SessionState extends ChangeNotifier {
     required String password,
   }) async {
     api.setToken(null);
+    // Point the client at the address the user typed *before* logging in.
+    // Saving it was never enough on its own: `api` kept the built-in default, so
+    // the sign-in request itself went to the default and the Server field had no
+    // effect whatsoever — it accepted anything and the app talked to
+    // `localhost` regardless.
+    api.setBaseUrl(baseUrl);
     final prefs = await SharedPreferences.getInstance();
     await prefs.setString(_baseUrlKey, baseUrl);
     final token = await api.login(username: username, password: password);
