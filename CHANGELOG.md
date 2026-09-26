@@ -142,6 +142,48 @@ first-party plugin to pick the helpers up.
   and no rank in the software: commander-and-above is a `core.role_permissions`
   row the troop writes.
 
+- **`adjutant-finance` issues receipts for the money the troop receives** (SPEC
+  §7.5, issue #59): a donation, a dues payment, a purchase, a fee — any income
+  entry the ledger holds. **The receipt is issued from the ledger record, never
+  from the payment provider**: finance owns the money, so finance owns the
+  receipt, `finance.receipts.transaction_id` is `NOT NULL` with a foreign key,
+  and a receipt for money that was never recorded is unrepresentable rather than
+  merely discouraged. **A receipt is a record**, so migration 2 installs the
+  rules as database rules and not conventions: a trigger refuses every `UPDATE`
+  and every `DELETE` (as `archive.records` and `conflicts.stage_log` do), a
+  correction is a **new** receipt carrying `supersedes_id` — both rows remain, and
+  `superseded_by` is derived, because the superseded row cannot be updated to name
+  its own successor — a unique index makes a second correction of the same
+  receipt unrepresentable, and a trigger refuses a correction pointed at another
+  entry's receipt. Numbers come from one sequence (`R-<year>-<nnnnnn>`) drawn
+  inside the issuing statement, so two treasurers issuing at the same instant
+  cannot collide. **Addressed to the giver:** a member by their roster identity,
+  anyone else — a parent, a business — by the name as they gave it, snapshotted
+  on the receipt. There is deliberately **no donor table**: a second receipt for
+  the same person is issued from the money, not from a profile. **The wording
+  claims nothing about tax** unless the troop has declared a status of its own
+  (`receipt_tax_statement`, empty by default): the software invents no
+  acknowledgment, because a receipt claiming a deduction the troop cannot
+  substantiate is a liability for the troop, and the statement is snapshotted on
+  the row so a later change of wording cannot rewrite a receipt already given.
+  `POST /api/finance/receipt` issues, `POST
+  /api/finance/receipt/{id}/supersede` corrects, `GET /api/finance/receipts` and
+  `GET /api/finance/receipt/{id}` read — **a giver sees their own receipts and no
+  one else's** (an ownership check with `finance:read`, not a grant), the
+  treasurer sees every one (`finance:read_all`) — and the Annual Financial Report
+  totals them, counting only receipts nothing supersedes so a correction never
+  doubles a donation. Publishes `finance.receipt.issued` and
+  `finance.receipt.superseded`. **The scholarship draw is not a receipt, and
+  that is deliberate**: a waiver, comp or reduction draws on the Scholarship fund
+  (#58) and the member sees that their cost is *covered*, not that they are being
+  helped — the draw stays internal, in the ledger and the report. The new
+  `#[ignore]`d DB-backed probe (`plugins/finance/tests/receipt_sql.rs`, a CI step
+  beside the other DB probes) drives the real handlers against PostgreSQL and
+  proves what a mock cannot: the trigger refuses `UPDATE` and `DELETE` for the
+  plugin's own role *and* for the operator, a correction supersedes and both
+  receipts remain, and a receipt for an entry that does not exist is refused by
+  the database.
+
 ### Changed
 
 - **finance's write SQL is now executed by a gate, not only decided by a

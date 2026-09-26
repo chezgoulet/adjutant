@@ -2516,6 +2516,10 @@ async fn the_annual_report_states_the_year_and_the_money_moving_through_it() {
     ]);
     host.db
         .push_rows(vec![json!({ "collected_cents": 85_000 })]);
+    // 5. the year's receipts — only the ones nothing supersedes are summed.
+    host.db.push_rows(vec![json!({
+        "issued": 2, "live": 1, "total_cents": 2_500, "corrections": 1
+    })]);
     host.db.push_rows(vec![
         json!({ "ledger_total_cents": 80_000, "entries": 4, "unpaired_transfers": 0 }),
     ]);
@@ -2588,6 +2592,20 @@ async fn the_annual_report_states_the_year_and_the_money_moving_through_it() {
     assert_eq!(body["dues"]["honor_system"], json!(true));
     assert_eq!(body["dues"]["by_tier"].as_array().unwrap().len(), 2);
 
+    // The year's receipts: every one issued in the year, and the money only the
+    // ones nothing supersedes stand for — a correction restates, it never adds.
+    assert_eq!(body["receipts"]["fiscal_year"], json!(2026));
+    assert_eq!(body["receipts"]["issued"], json!(2));
+    assert_eq!(body["receipts"]["live"], json!(1));
+    assert_eq!(body["receipts"]["corrections"], json!(1));
+    assert_eq!(body["receipts"]["total_cents"], json!(2_500));
+    assert_eq!(body["receipts"]["total_display"], json!("$25.00"));
+    assert_eq!(
+        body["receipts"]["tax_statement_declared"],
+        json!(false),
+        "the troop declared no status, so no receipt claims one"
+    );
+
     // The report carries the ledger's own verdict: it is the document handed to
     // an outside body.
     assert_eq!(body["integrity"]["balanced"], json!(true));
@@ -2595,7 +2613,7 @@ async fn the_annual_report_states_the_year_and_the_money_moving_through_it() {
     assert_eq!(body["integrity"]["transfer_groups"], json!(1));
     assert_eq!(body["ledger"]["entries"], json!(4));
 
-    assert_eq!(host.db.query_count(), 7);
+    assert_eq!(host.db.query_count(), 8);
     assert_audited(&host, "report.annual");
 
     // A nonsense year is the caller's mistake.
