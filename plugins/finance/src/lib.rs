@@ -493,8 +493,21 @@ struct TransactionBody {
 
 #[derive(Debug, Deserialize)]
 struct TransferBody {
-    from_fund_id: i64,
-    to_fund_id: i64,
+    /// The origin fund by finance's own primary key. Optional now that
+    /// `from_fund_code` is accepted — exactly one of the two per leg.
+    #[serde(default)]
+    from_fund_id: Option<i64>,
+    /// The origin fund by **code**, resolved inside the transfer's own
+    /// statement. Exactly one of `from_fund_id`/`from_fund_code`.
+    #[serde(default)]
+    from_fund_code: Option<String>,
+    /// The destination fund by id. Exactly one of `to_fund_id`/`to_fund_code`.
+    #[serde(default)]
+    to_fund_id: Option<i64>,
+    /// The destination fund by **code**. Exactly one of
+    /// `to_fund_id`/`to_fund_code`.
+    #[serde(default)]
+    to_fund_code: Option<String>,
     #[serde(default)]
     amount_cents: Option<MoneySpec>,
     #[serde(default)]
@@ -1586,22 +1599,43 @@ const LEDGER_FILTER: &str = r#"
 /// The transfer statement: **one** `INSERT … SELECT`, so the two legs are all or
 /// nothing.
 ///
-/// `$1` is the two fund ids `[from, to]`, `$2` their signed amounts `[-a, +a]`,
-/// `$3` their counterparties `[to, from]` — all `bigint[]`, computed in Rust
-/// where `-a` and `+a` are the same validated number. `$4`…`$9` are the shared
-/// fields. `gen_random_uuid()` gives both legs one group; the guard requires both
-/// funds to exist *and* the out-leg not to overdraw, and because it sits on the
-/// single `SELECT` both rows pass it or neither is written.
+/// Each leg is named by an **id or a code** — exactly one of the two — and both
+/// are resolved here, inside this statement, where the funds table lives (`ref`).
+/// That is what makes a transfer possible for a producer that holds only a fund
+/// **code** (the reference `plugin-to-plugin.md` §3.5 asks for) without a read of
+/// its own; an id is still accepted for a caller that already has one.
+///
+/// `$1`/`$2` are the origin reference (an id, or a code — exactly one non-null),
+/// `$3`/`$4` the destination's, `$5` the two signed amounts `[-a, +a]` (computed
+/// in Rust, where `-a` and `+a` are the same validated number), `$6`…`$10` the
+/// shared fields, `$11` the overdraft flag. `gen_random_uuid()` gives both legs
+/// one group; the guard requires both references to resolve *and* the two funds
+/// to differ *and* the out-leg not to overdraw, and because it sits on the single
+/// `SELECT` both rows pass it or neither is written.
 const TRANSFER_SQL: &str = r#"
-WITH g AS (SELECT gen_random_uuid() AS id)
+WITH ref AS (
+  SELECT
+    (SELECT f.id FROM {funds} f
+      WHERE ($1::bigint IS NOT NULL AND f.id = $1)
+         OR ($2::text IS NOT NULL AND f.code = $2)) AS from_id,
+    (SELECT f.id FROM {funds} f
+      WHERE ($3::bigint IS NOT NULL AND f.id = $3)
+         OR ($4::text IS NOT NULL AND f.code = $4)) AS to_id
+), g AS (SELECT gen_random_uuid() AS id)
 INSERT INTO {tx} AS t
   (fund_id, amount_cents, kind, transfer_group, counterparty_fund_id, category, description,
    fiscal_year, occurred_on, recorded_by, overdraft_authorized)
-SELECT v.fund_id, v.amount_cents, 'transfer', g.id, v.counterparty_fund_id, $4, $5, $6, $7::date, $8, $9
-FROM unnest($1::bigint[], $2::bigint[], $3::bigint[])
-       AS v(fund_id, amount_cents, counterparty_fund_id), g
-WHERE (SELECT COUNT(*) FROM {funds} f WHERE f.id = ANY($1)) = 2
-  AND ($9 OR (SELECT COALESCE(SUM(amount_cents), 0) FROM {tx} WHERE fund_id = $1[1]) + $2[1] >= 0)
+SELECT v.fund_id, v.amount_cents, 'transfer', g.id,
+       CASE WHEN v.amount_cents < 0 THEN r.to_id ELSE r.from_id END,
+       $6, $7, $8, $9::date, $10, $11
+FROM ref r
+CROSS JOIN g
+CROSS JOIN LATERAL unnest($5::bigint[], ARRAY[r.from_id, r.to_id]::bigint[])
+       AS v(amount_cents, fund_id)
+WHERE r.from_id IS NOT NULL
+  AND r.to_id IS NOT NULL
+  AND r.from_id <> r.to_id
+  AND ($11 OR (SELECT COALESCE(SUM(amount_cents), 0) FROM {tx} WHERE fund_id = r.from_id) + $5[1] >= 0)
 RETURNING t.id, t.fund_id, t.amount_cents, t.kind, t.transfer_group::text AS transfer_group,
           t.counterparty_fund_id, t.category, t.description, t.fiscal_year,
           t.occurred_on::text AS occurred_on, t.recorded_by, t.created_at::text AS created_at
@@ -1910,7 +1944,61 @@ fn route_transfer(ctx: &PluginContext) -> RouteDefinition {
                          one way, and the destination names the direction",
                     );
                 }
-                if body.from_fund_id == body.to_fund_id {
+                let from_ref = match (body.from_fund_id, trimmed(&body.from_fund_code)) {
+                    (Some(id), None) => FundRef::Id(id),
+                    (None, Some(code)) => FundRef::Code(code),
+                    (Some(_), Some(code)) => {
+                        return PluginResponse::error(
+                            400,
+                            format!(
+                                "pass either from_fund_id or from_fund_code, not both: {code:?} \
+                                 would be a second answer to the same question, and finance would \
+                                 have to choose which one you meant"
+                            ),
+                        )
+                    }
+                    (None, None) => {
+                        return PluginResponse::error(
+                            400,
+                            "the transfer names no origin fund: pass from_fund_id, or the fund's \
+                             code as from_fund_code (either is resolved here, inside the same \
+                             statement)",
+                        )
+                    }
+                };
+                let to_ref = match (body.to_fund_id, trimmed(&body.to_fund_code)) {
+                    (Some(id), None) => FundRef::Id(id),
+                    (None, Some(code)) => FundRef::Code(code),
+                    (Some(_), Some(code)) => {
+                        return PluginResponse::error(
+                            400,
+                            format!(
+                                "pass either to_fund_id or to_fund_code, not both: {code:?} would \
+                                 be a second answer to the same question, and finance would have \
+                                 to choose which one you meant"
+                            ),
+                        )
+                    }
+                    (None, None) => {
+                        return PluginResponse::error(
+                            400,
+                            "the transfer names no destination fund: pass to_fund_id, or the \
+                             fund's code as to_fund_code (either is resolved here, inside the \
+                             same statement)",
+                        )
+                    }
+                };
+                // Two references that are *the same kind* can be compared here, and
+                // refusing them before the statement keeps the existing 400. Two of
+                // different kinds (an id and a code) can only be compared once the
+                // code is resolved, which the statement's own guard does — and
+                // `explain_no_transfer` says so in the same words.
+                let same_reference = match (&from_ref, &to_ref) {
+                    (FundRef::Id(from), FundRef::Id(to)) => from == to,
+                    (FundRef::Code(from), FundRef::Code(to)) => from == to,
+                    _ => false,
+                };
+                if same_reference {
                     return PluginResponse::error(
                         400,
                         "a transfer needs two different funds (use a transaction to correct a \
@@ -1920,12 +2008,12 @@ fn route_transfer(ctx: &PluginContext) -> RouteDefinition {
                 let date = validate(occurred_on(&body.occurred_on))?;
                 let fiscal_year = validate(fiscal_year_arg(body.fiscal_year, date, &c.config))?;
                 let overdraft = body.allow_overdraft.unwrap_or(false);
-                let funds = vec![body.from_fund_id, body.to_fund_id];
                 let legs = vec![-magnitude, magnitude];
-                let counterparties = vec![body.to_fund_id, body.from_fund_id];
                 let category = CATEGORY_TRANSFER.to_string();
                 let description = trimmed(&body.description).unwrap_or_default();
                 let recorder = caller_of(&req).unwrap_or_default();
+                let (from_id_bind, from_code_bind) = from_ref.bind();
+                let (to_id_bind, to_code_bind) = to_ref.bind();
 
                 let rows =
                     c.db.query(
@@ -1936,9 +2024,11 @@ fn route_transfer(ctx: &PluginContext) -> RouteDefinition {
                             .replace("{tx}", &c.db.table("transactions"))
                             .replace("{funds}", &c.db.table("funds")),
                         vec![
-                            SqlValue::IntArray(funds.clone()),
+                            from_id_bind,
+                            from_code_bind,
+                            to_id_bind,
+                            to_code_bind,
                             SqlValue::IntArray(legs),
-                            SqlValue::IntArray(counterparties),
                             SqlValue::Text(category.clone()),
                             SqlValue::Text(description.clone()),
                             SqlValue::Int(i64::from(fiscal_year)),
@@ -1949,8 +2039,23 @@ fn route_transfer(ctx: &PluginContext) -> RouteDefinition {
                     )
                     .await?;
                 if rows.len() != 2 {
-                    return explain_no_transfer(&c, &funds, magnitude, overdraft).await;
+                    return explain_no_transfer(&c, &from_ref, &to_ref, magnitude, overdraft).await;
                 }
+                // The ids the statement resolved, read from its own rows: the out
+                // leg is the negative one, so this is where a code-named fund's id
+                // comes from without a second statement.
+                let leg_fund = |sign_positive: bool| {
+                    rows.iter()
+                        .find(|row| {
+                            row["amount_cents"].as_i64().unwrap_or(0).is_positive()
+                                == sign_positive
+                        })
+                        .and_then(|row| row["fund_id"].as_i64())
+                        .unwrap_or_default()
+                };
+                let from_fund_id = leg_fund(false);
+                let to_fund_id = leg_fund(true);
+                let funds = vec![from_fund_id, to_fund_id];
                 // Defence in depth: the statement's two legs are `-a` and `+a`,
                 // and this says so out loud rather than trusting that.
                 let legs_sum: i64 = rows
@@ -1979,8 +2084,8 @@ fn route_transfer(ctx: &PluginContext) -> RouteDefinition {
                         "transfer",
                         &group,
                         json!({
-                            "from_fund_id": body.from_fund_id,
-                            "to_fund_id": body.to_fund_id,
+                            "from_fund_id": from_fund_id,
+                            "to_fund_id": to_fund_id,
                             "amount_cents": magnitude,
                             "fiscal_year": fiscal_year,
                             "occurred_on": date.to_string(),
@@ -1994,8 +2099,8 @@ fn route_transfer(ctx: &PluginContext) -> RouteDefinition {
                         "finance.transfer.recorded",
                         json!({
                             "transfer_group": rows[0]["transfer_group"],
-                            "from_fund_id": body.from_fund_id,
-                            "to_fund_id": body.to_fund_id,
+                            "from_fund_id": from_fund_id,
+                            "to_fund_id": to_fund_id,
                             "amount_cents": magnitude,
                             "entries": rows.len(),
                             "sum_cents": legs_sum,
@@ -3292,6 +3397,26 @@ enum FundRef {
     Code(String),
 }
 
+impl FundRef {
+    /// The pair every statement binds for one leg: `$n` an id (or NULL) and
+    /// `$n+1` a code (or NULL), which is how a reference is resolved *inside* the
+    /// statement that needs the fund's id.
+    fn bind(&self) -> (SqlValue, SqlValue) {
+        match self {
+            FundRef::Id(id) => (SqlValue::Int(*id), SqlValue::Null),
+            FundRef::Code(code) => (SqlValue::NullInt, SqlValue::Text(code.clone())),
+        }
+    }
+
+    /// The reference as a reader of an error message should see it.
+    fn describe(&self) -> String {
+        match self {
+            FundRef::Id(id) => format!("id {id}"),
+            FundRef::Code(code) => format!("code {code:?}"),
+        }
+    }
+}
+
 /// One entry the handlers write. `amount_cents` is **signed** (income positive,
 /// expense negative) and the sign is computed from the kind, never taken from a
 /// request body.
@@ -3460,47 +3585,76 @@ async fn explain_no_entry(
 
 /// The transfer statement returned fewer than two rows. Say why.
 ///
-/// One query for both funds' balances.
+/// Three cases, in the order the statement could have refused them: a reference
+/// that resolves to no fund (both funds of a transfer must exist), two references
+/// that resolve to *the same* fund (a transfer to itself is not a transfer), and
+/// an out-leg that would take its fund negative. The references are resolved by
+/// this query too — by id **or by code** — so a code-named leg is explained in
+/// the same words an id-named one is.
+///
+/// One query.
 async fn explain_no_transfer(
     c: &PluginContext,
-    funds: &[i64],
+    from_ref: &FundRef,
+    to_ref: &FundRef,
     amount_cents: i64,
     overdraft: bool,
 ) -> Result<PluginResponse, SdkError> {
-    let Some(from_id) = funds.first().copied() else {
-        return Err(SdkError::Internal(
-            "a transfer was attempted with no funds".into(),
-        ));
-    };
+    let (from_id_bind, from_code_bind) = from_ref.bind();
+    let (to_id_bind, to_code_bind) = to_ref.bind();
     let rows =
         c.db.query(
-            sql_fund_balances(c),
-            vec![SqlValue::IntArray(funds.to_vec())],
+            format!(
+                "SELECT f.id, f.code, f.name, f.active, \
+                        COALESCE(SUM(t.amount_cents), 0)::bigint AS balance_cents \
+                 FROM {funds} f LEFT JOIN {tx} t ON t.fund_id = f.id \
+                 WHERE (($1::bigint IS NOT NULL AND f.id = $1) \
+                        OR ($2::text IS NOT NULL AND f.code = $2)) \
+                    OR (($3::bigint IS NOT NULL AND f.id = $3) \
+                        OR ($4::text IS NOT NULL AND f.code = $4)) \
+                 GROUP BY f.id",
+                funds = c.db.table("funds"),
+                tx = c.db.table("transactions")
+            ),
+            vec![from_id_bind, from_code_bind, to_id_bind, to_code_bind],
         )
         .await?;
-    if rows.len() < funds.len() {
-        let found: Vec<i64> = rows.iter().filter_map(|row| row["id"].as_i64()).collect();
-        let missing: Vec<i64> = funds
-            .iter()
-            .copied()
-            .filter(|id| !found.contains(id))
-            .collect();
+    // Which of the resolved rows is which leg. A reference is matched by what it
+    // named: an id by id, a code by code.
+    let matches = |row: &Value, reference: &FundRef| match reference {
+        FundRef::Id(id) => row["id"].as_i64() == Some(*id),
+        FundRef::Code(code) => row["code"].as_str() == Some(code.as_str()),
+    };
+    let from = rows.iter().find(|row| matches(row, from_ref));
+    let to = rows.iter().find(|row| matches(row, to_ref));
+    if from.is_none() || to.is_none() {
+        let missing = if from.is_none() {
+            from_ref.describe()
+        } else {
+            to_ref.describe()
+        };
         return PluginResponse::error(
             404,
             format!(
-                "no such fund(s): {missing:?} — both funds of a transfer must exist, and \
-                 neither leg is written when one does not"
+                "no such fund: {missing} — both funds of a transfer must exist, and neither leg \
+                 is written when one does not"
             ),
         );
     }
-    let from = rows.iter().find(|row| row["id"].as_i64() == Some(from_id));
-    let balance = from
-        .and_then(|row| row["balance_cents"].as_i64())
-        .unwrap_or(0);
-    let code = from
-        .and_then(|row| row["code"].as_str())
-        .unwrap_or("?")
-        .to_string();
+    let (Some(from), Some(to)) = (from, to) else {
+        return Err(SdkError::Internal(
+            "a transfer was explained with no funds".into(),
+        ));
+    };
+    if from["id"].as_i64() == to["id"].as_i64() {
+        return PluginResponse::error(
+            409,
+            "a transfer needs two different funds (use a transaction to correct a fund's own \
+             entry): the two references resolve to the same fund, and neither leg is written",
+        );
+    }
+    let balance = from["balance_cents"].as_i64().unwrap_or(0);
+    let code = from["code"].as_str().unwrap_or("?").to_string();
     PluginResponse::error(
         409,
         format!(

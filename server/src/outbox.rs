@@ -166,14 +166,24 @@ pub struct ServicePrincipalDecl {
 /// distinct identity with its own grant, so revoking one does not disturb
 /// another, and an operator's revocation is never re-granted (see
 /// [`seed_service_principals`]).
-pub const SERVICE_PRINCIPALS: &[ServicePrincipalDecl] = &[ServicePrincipalDecl {
-    principal: "svc.stripe.ledger",
-    producer: "stripe",
-    display_name: "Service principal — Stripe ledger booking",
-    description: "Books one confirmed Stripe payment into finance's ledger via \
-                  POST /api/finance/transaction. Declared for the stripe plugin only.",
-    grants: &["finance:write"],
-}];
+pub const SERVICE_PRINCIPALS: &[ServicePrincipalDecl] = &[
+    ServicePrincipalDecl {
+        principal: "svc.stripe.ledger",
+        producer: "stripe",
+        display_name: "Service principal — Stripe ledger booking",
+        description: "Books one confirmed Stripe payment into finance's ledger via \
+                      POST /api/finance/transaction. Declared for the stripe plugin only.",
+        grants: &["finance:write"],
+    },
+    ServicePrincipalDecl {
+        principal: "svc.store.draw",
+        producer: "store",
+        display_name: "Service principal - Store scholarship draw",
+        description: "Books one store order's scholarship draw into finance's ledger via \
+                      POST /api/finance/transfer. Declared for the store plugin only.",
+        grants: &["finance:write"],
+    },
+];
 
 /// The declaration for `principal` if (and only if) `producer` owns it.
 ///
@@ -2368,25 +2378,74 @@ mod tests {
     // Pure boundaries
     // =======================================================================
 
-    /// The declaration is scoped to **exactly one producer**, which is what makes
-    /// "a plugin cannot widen its own machine authority" true in the core's
-    /// mirror of the SQL check.
+    /// **The declaration set, stated rather than incidental.** One entry per
+    /// machine-originated operation that has no caller, each scoped to exactly one
+    /// producer — which is what makes "a plugin cannot widen its own machine
+    /// authority" true in the core's mirror of the SQL check.
+    #[test]
+    fn the_declared_principals_are_the_ones_the_core_ships() {
+        let declared: Vec<(&str, &str)> = SERVICE_PRINCIPALS
+            .iter()
+            .map(|d| (d.principal, d.producer))
+            .collect();
+        assert_eq!(
+            declared,
+            vec![
+                ("svc.stripe.ledger", "stripe"),
+                ("svc.store.draw", "store"),
+            ],
+            "a new machine-originated operation is a new entry here, and only here"
+        );
+        for decl in SERVICE_PRINCIPALS {
+            assert!(
+                !decl.display_name.is_empty() && !decl.description.is_empty(),
+                "{} is declared without a name or a description an operator can read",
+                decl.principal
+            );
+            assert!(
+                !decl.grants.iter().any(|p| p.contains("admin")),
+                "a service principal never holds an admin permission: {:?}",
+                decl.grants
+            );
+            assert!(
+                !decl.grants.is_empty(),
+                "{} holds no grant, so every delivery as it would be refused",
+                decl.principal
+            );
+        }
+    }
+
+    /// The scope is the *pair*: a principal is deliverable by one producer, and a
+    /// producer may own any number of principals — but never somebody else's.
     #[test]
     fn a_principal_is_declared_for_exactly_one_producer() {
         let decl = declared_for("stripe", "svc.stripe.ledger").expect("stripe owns it");
         assert_eq!(decl.principal, "svc.stripe.ledger");
         assert_eq!(decl.producer, "stripe");
-        assert!(
-            !decl.grants.iter().any(|p| p.contains("admin")),
-            "a service principal never holds an admin permission: {:?}",
-            decl.grants
-        );
         assert_eq!(decl.grants, &["finance:write"], "and its grant is narrow");
         assert!(
             declared_for("store", "svc.stripe.ledger").is_none(),
             "another producer may not deliver as it"
         );
         assert!(declared_for("stripe", "svc.nobody").is_none());
+
+        // The store's draw is the second producer on the same rail, with the one
+        // grant finance's transfer route gates on.
+        let draw = declared_for("store", "svc.store.draw").expect("store owns it");
+        assert_eq!(
+            draw.display_name,
+            "Service principal - Store scholarship draw"
+        );
+        assert!(
+            draw.description.contains("POST /api/finance/transfer"),
+            "the description names the one route it may call: {}",
+            draw.description
+        );
+        assert_eq!(draw.grants, &["finance:write"], "and nothing else");
+        assert!(
+            declared_for("stripe", "svc.store.draw").is_none(),
+            "the rail is scoped by producer, not by convention"
+        );
     }
 
     /// The delivered identity is namespaced and carries the principal's own

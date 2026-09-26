@@ -184,6 +184,23 @@ Stated so nobody assumes otherwise:
   machine-originated producer can **instruct** finance but not **ask** it anything —
   funds, balances and the ledger are reads, and a read is a caller's.
 
+- **The rail is infrastructure, and `store` is its second producer** (`store`,
+  2026-09-25). Completing or comping an order with a scholarship draw owing writes
+  the order's transition **and** `core.outbox_enqueue(…)` in one statement, so a
+  callerless draw — a sliding-scale reduction, or a comp a shopkeeper exercises —
+  cannot be left owed and unbooked, which is the exact gap §3.2 was written for.
+  Its principal `svc.store.draw` (grant `finance:write`, declared for the `store`
+  producer alone) delivers `POST /api/finance/transfer`, and the payload names both
+  funds by **code**, which finance resolves inside its own transfer statement — so
+  this producer writes without reading anything, and a machine still cannot read.
+  Two producers now share the mechanism with **no new machinery between them**: the
+  compiled declared-principal registry, the draining relay,
+  `core.outbox_producer_view()` and the terminal-outcome notification are the same
+  for `stripe` and for `store`. That is what makes it a rail rather than a one-off —
+  a third producer declares a principal, a route and a key, and writes one
+  statement. A machine principal may still not authorise an overdraft, and this
+  producer's intents say `allow_overdraft: false`.
+
 ---
 
 ## 5. Why this is written before the plugins it constrains

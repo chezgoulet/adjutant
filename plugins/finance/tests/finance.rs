@@ -1228,41 +1228,49 @@ async fn a_transfer_writes_both_legs_in_one_statement() {
 
     // Both legs, one statement, one group — that is what makes it atomic.
     assert_eq!(host.db.query_count(), 2, "the transfer, then the balances");
-    let sql = find_statement(&host, "unnest($1::bigint[]");
+    let sql = find_statement(&host, "CROSS JOIN LATERAL unnest");
     assert_eq!(
         host.db
             .queried_sql()
             .iter()
-            .filter(|s| s.contains("unnest($1::bigint[]"))
+            .filter(|s| s.contains("CROSS JOIN LATERAL unnest"))
             .count(),
         1,
         "a transfer is ONE statement, never two writes"
     );
     assert!(sql.contains("gen_random_uuid()"), "{sql}");
+    // Both references are resolved **inside** the statement (`WITH ref AS …`), so
+    // an id is never required from the caller and the ids that land in
+    // `transactions.fund_id` are the statement's own.
+    assert!(sql.contains("WITH ref AS ("), "{sql}");
     assert!(
-        sql.contains("(SELECT COUNT(*) FROM") && sql.contains("= 2"),
-        "both funds must exist or neither leg is written: {sql}"
+        sql.contains("f.code = $3") || sql.contains("f.code = $4"),
+        "a reference by code is resolved against the funds table in this statement: {sql}"
     );
     assert!(
-        sql.contains("$1[1]"),
-        "the out-leg's fund is the guarded one: {sql}"
+        sql.contains("r.from_id IS NOT NULL") && sql.contains("r.to_id IS NOT NULL"),
+        "both references must resolve or neither leg is written: {sql}"
+    );
+    assert!(
+        sql.contains("r.from_id <> r.to_id"),
+        "a transfer between one fund and itself is refused by the statement: {sql}"
+    );
+    assert!(
+        sql.contains("$5[1]"),
+        "the out-leg's amount is the guarded one: {sql}"
     );
     // The legs are the same validated number, signed once in Rust.
-    let params = params_of(&host, "unnest($1::bigint[]");
+    let params = params_of(&host, "CROSS JOIN LATERAL unnest");
     assert!(
         params
             .iter()
             .any(|p| p.contains("IntArray([-10000, 10000])")),
         "the legs are -a and +a: {params:?}"
     );
-    assert!(
-        params.iter().any(|p| p.contains("IntArray([1, 2])")),
-        "{params:?}"
-    );
-    assert!(
-        params.iter().any(|p| p.contains("IntArray([2, 1])")),
-        "each leg names the other fund: {params:?}"
-    );
+    // Each reference is an id **or** a code: one non-null per leg.
+    assert!(params.iter().any(|p| p.contains("Int(1)")), "{params:?}");
+    assert!(params.iter().any(|p| p.contains("Int(2)")), "{params:?}");
+    assert!(params.iter().any(|p| p.contains("Null")), "{params:?}");
     host.events.assert_published("finance.transfer.recorded");
     assert_audited(&host, "transaction.transfer");
 }
@@ -1353,6 +1361,220 @@ async fn a_transfer_needs_two_funds_and_a_positive_amount() {
         assert_eq!(status, 400, "{bad} gave {response}");
     }
     assert_eq!(host.db.query_count(), 0);
+}
+
+// ---------------------------------------------------------------------------
+// Transfers named by code: the resolution happens inside the statement
+// ---------------------------------------------------------------------------
+
+/// A caller that holds only the funds' **codes** (the reference
+/// `plugin-to-plugin.md` §3.5 asks for) writes a transfer without reading
+/// finance first: both legs are resolved by the statement's own `WITH ref`, and
+/// the ids that land in `transactions.fund_id` are the ones it resolved.
+#[tokio::test]
+async fn a_code_named_transfer_resolves_both_legs_inside_the_statement() {
+    let (host, _plugin, routes) = plugin().await;
+    let transfer = route(&routes, "POST", "/api/finance/transfer");
+
+    // 1. the one statement that writes both legs (it returns two rows, with the
+    //    ids the resolution produced: scholarship is fund 2, general is fund 1).
+    // 2. the two funds' balances.
+    host.db.push_rows(vec![
+        json!({
+            "id": 7, "fund_id": 2, "amount_cents": -8_000, "kind": "transfer",
+            "transfer_group": "4f2a8c1e-0000-4000-8000-000000000002",
+            "counterparty_fund_id": 1, "category": CATEGORY_TRANSFER, "description": "",
+            "member_id": "", "fiscal_year": 2026, "occurred_on": "2026-03-01",
+            "recorded_by": "", "overdraft_authorized": false,
+            "external_ref": Value::Null, "created_at": "2026-03-01 12:00:00+00",
+        }),
+        json!({
+            "id": 8, "fund_id": 1, "amount_cents": 8_000, "kind": "transfer",
+            "transfer_group": "4f2a8c1e-0000-4000-8000-000000000002",
+            "counterparty_fund_id": 2, "category": CATEGORY_TRANSFER, "description": "",
+            "member_id": "", "fiscal_year": 2026, "occurred_on": "2026-03-01",
+            "recorded_by": "", "overdraft_authorized": false,
+            "external_ref": Value::Null, "created_at": "2026-03-01 12:00:00+00",
+        }),
+    ]);
+    host.db.push_rows(vec![
+        json!({ "id": 2, "code": "scholarship", "name": "Scholarship Fund", "active": true, "balance_cents": 20_000 }),
+        json!({ "id": 1, "code": FUND_GENERAL, "name": "General Fund", "active": true, "balance_cents": 5_000 }),
+    ]);
+
+    let (status, body) = call(
+        &transfer.handler,
+        TestRequest::post("/api/finance/transfer")
+            .identity("treasurer", &["chief"])
+            .json(&json!({
+                "from_fund_code": "scholarship",
+                "to_fund_code": FUND_GENERAL,
+                "amount_cents": 8_000,
+                "description": "Store order 12 scholarship draw",
+                "fiscal_year": 2026,
+            }))
+            .build(),
+    )
+    .await;
+
+    assert_eq!(status, 201, "{body}");
+    assert_eq!(body["sum_cents"], json!(0));
+    let funds: Vec<i64> = body["entries"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|e| e["fund_id"].as_i64().unwrap())
+        .collect();
+    assert_eq!(
+        funds,
+        vec![2, 1],
+        "the ids are the ones the statement resolved, not the ones nobody sent: {body}"
+    );
+    // One statement, and it carried the codes rather than ids.
+    assert_eq!(host.db.query_count(), 2, "the transfer, then the balances");
+    let sql = find_statement(&host, "CROSS JOIN LATERAL unnest");
+    assert!(sql.contains("$2::text") && sql.contains("$4::text"), "{sql}");
+    let params = params_of(&host, "CROSS JOIN LATERAL unnest");
+    assert!(
+        params.iter().any(|p| p == "Text(\"scholarship\")"),
+        "the origin is named by code: {params:?}"
+    );
+    assert!(
+        params.iter().any(|p| *p == format!("Text({FUND_GENERAL:?})")),
+        "{params:?}"
+    );
+    assert!(
+        params.iter().filter(|p| p == &"NullInt").count() == 2,
+        "and no id was sent for either leg: {params:?}"
+    );
+    assert_audited(&host, "transaction.transfer");
+}
+
+/// Two codes that name **one** fund are the same refusal as two equal ids: a
+/// transfer to itself is not a transfer. It is caught before the statement, so
+/// nothing is read and nothing is written.
+#[tokio::test]
+async fn a_transfer_naming_one_fund_by_code_twice_is_refused() {
+    let (host, _plugin, routes) = plugin().await;
+    let transfer = route(&routes, "POST", "/api/finance/transfer");
+
+    let (status, body) = call(
+        &transfer.handler,
+        TestRequest::post("/api/finance/transfer")
+            .identity("treasurer", &["chief"])
+            .json(&json!({
+                "from_fund_code": "scholarship",
+                "to_fund_code": "scholarship",
+                "amount_cents": 100,
+            }))
+            .build(),
+    )
+    .await;
+    assert_eq!(status, 400, "{body}");
+    assert!(
+        body["error"].as_str().unwrap().contains("two different funds"),
+        "{body}"
+    );
+    assert_eq!(host.db.query_count(), 0, "nothing was read");
+}
+
+/// A code-named transfer that would overdraw is refused by the **same guard**,
+/// and explained in the same words: the resolution did not change which fund is
+/// the guarded one.
+#[tokio::test]
+async fn a_code_named_transfer_that_would_overdraw_is_refused_with_the_balance() {
+    let (host, _plugin, routes) = plugin().await;
+    let transfer = route(&routes, "POST", "/api/finance/transfer");
+
+    host.db.push_rows(vec![]); // the guarded statement wrote nothing
+    host.db.push_rows(vec![
+        json!({ "id": 2, "code": "scholarship", "name": "Scholarship Fund", "active": true, "balance_cents": 5_000 }),
+        json!({ "id": 1, "code": FUND_GENERAL, "name": "General Fund", "active": true, "balance_cents": 0 }),
+    ]);
+
+    let (status, body) = call(
+        &transfer.handler,
+        TestRequest::post("/api/finance/transfer")
+            .identity("treasurer", &["chief"])
+            .json(&json!({
+                "from_fund_code": "scholarship",
+                "to_fund_code": FUND_GENERAL,
+                "amount_cents": 90_000,
+                "fiscal_year": 2026,
+            }))
+            .build(),
+    )
+    .await;
+    assert_eq!(status, 409, "{body}");
+    let error = body["error"].as_str().unwrap();
+    assert!(error.contains("$50.00"), "{error}");
+    assert!(
+        error.contains("-85000") || error.contains("-$850.00"),
+        "{error}"
+    );
+    assert!(
+        !host.db.executed_sql().iter().any(|s| s.contains("INSERT")),
+        "no leg was written"
+    );
+    host.events.assert_none();
+}
+
+/// A code finance does not have is a `404` naming the reference — and neither leg
+/// is written, exactly as for an unknown id.
+#[tokio::test]
+async fn a_transfer_to_an_unknown_code_is_refused_whole() {
+    let (host, _plugin, routes) = plugin().await;
+    let transfer = route(&routes, "POST", "/api/finance/transfer");
+
+    host.db.push_rows(vec![]); // the statement wrote nothing
+    host.db.push_rows(vec![json!({
+        "id": 2, "code": "scholarship", "name": "Scholarship Fund", "active": true, "balance_cents": 5_000
+    })]);
+
+    let (status, body) = call(
+        &transfer.handler,
+        TestRequest::post("/api/finance/transfer")
+            .identity("treasurer", &["chief"])
+            .json(&json!({
+                "from_fund_code": "scholarship",
+                "to_fund_code": "no-such-fund",
+                "amount_cents": 100,
+                "fiscal_year": 2026,
+            }))
+            .build(),
+    )
+    .await;
+    assert_eq!(status, 404, "{body}");
+    assert!(
+        body["error"].as_str().unwrap().contains("no-such-fund"),
+        "the code is named back: {body}"
+    );
+}
+
+/// Exactly one reference per leg. Both together, or neither, is a `400` in the
+/// same vocabulary `POST /api/finance/transaction` uses for the same question.
+#[tokio::test]
+async fn a_transfer_needs_exactly_one_reference_per_leg() {
+    let (host, _plugin, routes) = plugin().await;
+    let transfer = route(&routes, "POST", "/api/finance/transfer");
+
+    for bad in [
+        json!({ "from_fund_id": 1, "from_fund_code": FUND_GENERAL, "to_fund_id": 2, "amount_cents": 100 }),
+        json!({ "from_fund_id": 1, "to_fund_id": 2, "to_fund_code": "scholarship", "amount_cents": 100 }),
+        json!({ "to_fund_id": 2, "amount_cents": 100 }),
+        json!({ "from_fund_id": 1, "amount_cents": 100 }),
+    ] {
+        let (status, response) = call(
+            &transfer.handler,
+            TestRequest::post("/api/finance/transfer")
+                .identity("treasurer", &["chief"])
+                .json(&bad)
+                .build(),
+        )
+        .await;
+        assert_eq!(status, 400, "{bad} gave {response}");
+    }
+    assert_eq!(host.db.query_count(), 0, "nothing was read");
 }
 
 // ---------------------------------------------------------------------------
