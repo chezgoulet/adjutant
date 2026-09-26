@@ -288,7 +288,18 @@ def batch_lifecycle():
     # Disable must stop the event handlers too, not just the routes.
     bound = plugins_json().get("bound_subscriptions", [])
     check(b, "L1b disable aborts subscriptions", "hello" not in bound, f"bound={bound}")
-    probe(b, "L2 disabled route 404", "GET", "/api/hello", status=404, contains="plugin hello is disabled")
+    # Issue #89: a disabled plugin is not loaded, so its route answers EXACTLY as
+    # it does when the library is absent from disk — a plain, identical 404 —
+    # rather than through a special "disabled" message.
+    probe(b, "L2 disabled route 404", "GET", "/api/hello", status=404, contains="route not found")
+    _, disabled_body, _ = http("GET", "/api/hello")
+    _, absent_body, _ = http("GET", "/api/absent_plugin/absent_route")
+    check(b, "L2b disabled answers exactly like an absent plugin", disabled_body == absent_body,
+          f"disabled={disabled_body!r} absent={absent_body!r}")
+    # ...and disabling deletes nothing: the schema content it never created is
+    # its own; the content it DID create stays exactly where it was.
+    probe_sql(b, "L2c disabled plugin keeps its schema content",
+              "SELECT to_regclass('hello.greetings') IS NOT NULL", "t")
     probe(b, "L3 core routes unaffected", "GET", "/", status=200, contains='"ok"')
     probe_sql(b, "L4 db enabled=false", "SELECT enabled FROM core.plugins WHERE id='hello'", "f")
     probe(b, "L5 enable", "POST", "/api/plugins/hello/enable", status=200, contains='"enabled":true', headers=CHIEF)

@@ -79,10 +79,10 @@ jobs:
       # These are #[ignore]d so a bare `cargo test` reports them as ignored, not
       # passed (issue #25). Here the database exists, so run them explicitly and
       # fail the job if it is unavailable. `pool_lifecycle` is the #30 leak probe.
-      - name: DB-backed host tests + pool lifecycle
+      - name: DB-backed host tests + pool lifecycle + plugin load semantics
         run: >-
           cargo test -p adjutant-server --test host_db --test pool_lifecycle
-          -- --ignored --nocapture
+          --test plugin_load_semantics -- --ignored --nocapture
 
       # The notification record (#46, slice 1): a scheduled run records one
       # through `core.notify` (as a plugin role, its source derived from

@@ -33,7 +33,9 @@ use crate::db;
 use crate::events::EventBus;
 use crate::middleware::{request_log, RateLimiter};
 use crate::permissions::{authorize, extract_identity};
-use crate::plugin_runtime::{load_all, PluginRegistry, RouteLookup};
+use crate::plugin_runtime::{
+    close_pool, load_all, load_plugin, LoadEnv, PluginRegistry, PluginSlot, RouteLookup,
+};
 
 /// Shared app state. The registry lives behind a lock: admin lifecycle ops
 /// (enable/disable/uninstall/reload) mutate it while requests dispatch through
@@ -65,6 +67,190 @@ pub struct AppState {
     /// The outbox relay: one drain loop per process, held here (like
     /// `scheduler`) so `shutdown()` can stop it.
     pub relay: Arc<crate::outbox::Relay>,
+    /// In-flight request counts per plugin, so `disable` can stop routing and
+    /// let the requests already inside a plugin finish before its pool closes
+    /// (issue #89 requirement #1: quiesce, then close).
+    pub in_flight: Arc<InFlight>,
+    /// One lifecycle lock per plugin id: enable/disable/re-enable of the same
+    /// plugin are serialized, so two admins (or a double-click) cannot run two
+    /// loads or two migration passes against one schema (requirement #2).
+    pub lifecycles: LifecycleLocks,
+}
+
+/// Per-plugin in-flight request counts.
+///
+/// A request *enters* while the registry read lock is held (so the counter can
+/// never miss a dispatch that a concurrent `disable` would otherwise race), and
+/// leaves when its handler returns — via [`InFlightGuard`], which decrements on
+/// drop, including on a panic or an early return.
+#[derive(Default)]
+pub struct InFlight {
+    counts: Mutex<HashMap<String, usize>>,
+}
+
+impl InFlight {
+    pub fn new() -> Arc<Self> {
+        Arc::new(Self::default())
+    }
+
+    /// Count one request against `plugin` until the returned guard drops.
+    pub fn enter(self: &Arc<Self>, plugin: &str) -> InFlightGuard {
+        *self
+            .counts
+            .lock()
+            .expect("in-flight map poisoned")
+            .entry(plugin.to_string())
+            .or_insert(0) += 1;
+        InFlightGuard { inner: self.clone(), plugin: plugin.to_string() }
+    }
+
+    pub fn count(&self, plugin: &str) -> usize {
+        self.counts
+            .lock()
+            .expect("in-flight map poisoned")
+            .get(plugin)
+            .copied()
+            .unwrap_or(0)
+    }
+
+    /// Wait (polling, bounded) until no request is inside `plugin`. Returns how
+    /// long the wait took when it drained, `None` if `timeout` expired first.
+    ///
+    /// Polling rather than a notification is deliberate: the counter is touched
+    /// on every dispatch, and a 10 ms poll costs nothing next to the pool close
+    /// that follows it. The bound is what keeps a hung handler from holding the
+    /// admin's request open forever — the caller decides what to do when it
+    /// expires (the server keeps the pool open until the request really ends;
+    /// see `disable_plugin`).
+    pub async fn wait_idle(&self, plugin: &str, timeout: std::time::Duration) -> Option<std::time::Duration> {
+        let start = std::time::Instant::now();
+        loop {
+            if self.count(plugin) == 0 {
+                return Some(start.elapsed());
+            }
+            if start.elapsed() >= timeout {
+                return None;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    }
+}
+
+/// Decrements its plugin's in-flight count when the request ends. Held from the
+/// moment the registry resolves a route to the moment the handler returns.
+pub struct InFlightGuard {
+    inner: Arc<InFlight>,
+    plugin: String,
+}
+
+impl Drop for InFlightGuard {
+    fn drop(&mut self) {
+        let mut counts = self.inner.counts.lock().expect("in-flight map poisoned");
+        if let Some(n) = counts.get_mut(&self.plugin) {
+            *n = n.saturating_sub(1);
+            if *n == 0 {
+                counts.remove(&self.plugin);
+            }
+        }
+    }
+}
+
+/// One mutex per plugin id, created on demand. The guard from
+/// [`LifecycleLocks::get`] is held across an entire enable/disable, including
+/// the load and its migrations — that is the serialization the requirement asks
+/// for. Lock order is always **lifecycle → registry**; nothing takes a registry
+/// lock and then a lifecycle lock.
+#[derive(Default)]
+pub struct LifecycleLocks {
+    locks: Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
+}
+
+impl LifecycleLocks {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// The lock for `id`, creating it on first use. Callers await
+    /// `lock_owned().await` and hold the guard for the whole transition.
+    pub fn get(&self, id: &str) -> Arc<tokio::sync::Mutex<()>> {
+        self.locks
+            .lock()
+            .expect("lifecycle map poisoned")
+            .entry(id.to_string())
+            .or_default()
+            .clone()
+    }
+}
+
+/// Plugins an admin **cannot disable**, with the reason the refusal carries
+/// (issue #89 requirement #6).
+///
+/// A declarative list, not an `if id == "auth"`: adding a plugin to the minimum
+/// is a one-line change here, and the refusal message is the entry's reason —
+/// so the operator is told *why*, never just "refused".
+///
+/// `auth` is certain: with the dev-header stub off, disabling it makes every
+/// authenticated route (including the admin route that would undo the change)
+/// unreachable until a restart. `membership` is the roster every grant
+/// addresses — a troop whose roster plugin is off cannot name a member to grant
+/// anything to. `membership`'s membership in this set is the owner's judgement
+/// call, flagged for review in the PR.
+pub const REQUIRED_PLUGINS: &[(&str, &str)] = &[
+    (
+        "auth",
+        "authentication: disabling it locks every admin out of the server until a restart",
+    ),
+    (
+        "membership",
+        "the roster: every grant addresses a member it names",
+    ),
+];
+
+/// Declared plugin dependencies: `(dependent, dependency)`. Disabling a
+/// dependency while an enabled plugin depends on it is **refused** with the
+/// names (issue #89 requirement #7); enabling the dependent while its
+/// dependency is not loaded is refused too, so a plugin can never be left
+/// configured to call nothing. Declarative, like [`REQUIRED_PLUGINS`].
+pub const PLUGIN_DEPENDENCIES: &[(&str, &str)] = &[("store", "stripe")];
+
+/// Why `name` may not be disabled, when it may not be. Returns the reason.
+fn disable_refusal(name: &str, registry: &PluginRegistry) -> Option<String> {
+    if let Some((_, why)) = REQUIRED_PLUGINS.iter().find(|(id, _)| *id == name) {
+        return Some(format!("{name} is required and cannot be disabled: {why}"));
+    }
+    // A loaded dependent means disabling this plugin would leave it calling
+    // nothing. Refuse explicitly rather than cascade silently.
+    let dependents: Vec<&str> = PLUGIN_DEPENDENCIES
+        .iter()
+        .filter(|(_, dep)| *dep == name)
+        .map(|(dependent, _)| *dependent)
+        .filter(|dependent| registry.info(dependent).is_some_and(|i| i.loaded))
+        .collect();
+    if !dependents.is_empty() {
+        return Some(format!(
+            "{name} is required by {}: disable {} first",
+            dependents.join(", "),
+            dependents.join(", ")
+        ));
+    }
+    None
+}
+
+/// Why `name` may not be enabled, when it may not be. Returns the reason.
+fn enable_refusal(name: &str, registry: &PluginRegistry) -> Option<String> {
+    let missing: Vec<&str> = PLUGIN_DEPENDENCIES
+        .iter()
+        .filter(|(dependent, _)| *dependent == name)
+        .map(|(_, dependency)| *dependency)
+        .filter(|dependency| !registry.info(dependency).is_some_and(|i| i.loaded))
+        .collect();
+    if !missing.is_empty() {
+        return Some(format!(
+            "{name} needs {}: enable it first",
+            missing.join(", ")
+        ));
+    }
+    None
 }
 
 impl AppState {
@@ -105,7 +291,10 @@ impl AppState {
         let mut reg = self.registry.write().await;
         // Destructure the guard so the two vecs borrow independently.
         let PluginRegistry { plugins, retired } = &mut *reg;
-        for lp in plugins.iter_mut().chain(retired.iter_mut()) {
+        // A disabled plugin has no instance to shut down: it was already dropped
+        // when it was disabled (issue #89). Retired generations keep theirs, so
+        // their documented `shutdown()` hook still runs.
+        for lp in plugins.iter_mut().filter_map(crate::plugin_runtime::PluginSlot::live_mut).chain(retired.iter_mut()) {
             if let Err(e) = lp.plugin.shutdown().await {
                 tracing::warn!(plugin = %lp.info.id, error = %e, "plugin shutdown failed");
             }
@@ -182,22 +371,30 @@ pub async fn build_app(cfg: &Config) -> Result<(Router, Arc<AppState>), BuildErr
     .map_err(BuildError::Plugin)?;
 
     // Bind event subscriptions before any traffic flows — but only for plugins
-    // that are actually enabled. A plugin disabled in core.plugins is loaded with
-    // enabled=false; binding its subscriptions anyway made "disabled" mean
-    // "routes off, event handlers still running".
-    for lp in &registry.plugins {
-        if !lp.enabled {
-            tracing::info!(plugin = lp.plugin.id(), "disabled at boot; not binding subscriptions");
+    // that are actually **loaded**. A disabled plugin is not in the live set at
+    // all now (issue #89), so this is no longer a flag check that could drift: a
+    // `Known` slot simply has no plugin to ask for subscriptions or schedules.
+    for slot in &registry.plugins {
+        let Some(lp) = slot.live() else {
+            tracing::info!(
+                plugin = %slot.info().id,
+                "disabled at boot; not loaded, so no subscriptions and no schedules"
+            );
             continue;
-        }
+        };
         for sub in lp.plugin.subscriptions() {
             bus.subscribe(lp.plugin.id(), sub);
         }
-        // Same discipline as subscriptions: only enabled plugins get their
+        // Same discipline as subscriptions: only loaded plugins get their
         // schedules started, and they are aborted on disable/uninstall/reload.
         scheduler.start(lp.plugin.id(), lp.plugin.schedules(), pool.clone());
     }
-    let route_count: usize = registry.plugins.iter().map(|p| p.routes.len()).sum();
+    let route_count: usize = registry
+        .plugins
+        .iter()
+        .filter_map(|s| s.live())
+        .map(|p| p.routes.len())
+        .sum();
 
     // Bootstrap role grants: plugins registered their permissions during load;
     // now grant them. SPEC §9 — Chief holds full troop authority, so `chief`
@@ -244,6 +441,8 @@ pub async fn build_app(cfg: &Config) -> Result<(Router, Arc<AppState>), BuildErr
         scheduler,
         outbox_mismatches: Mutex::new(0),
         relay: relay.clone(),
+        in_flight: InFlight::new(),
+        lifecycles: LifecycleLocks::new(),
     });
 
     // The core's own subscription to the relay's terminal-outcome events, bound
@@ -420,6 +619,11 @@ async fn dynamic_dispatch(State(state): State<Arc<AppState>>, req: Request) -> R
 
     // Resolve under the read lock, clone what we need, release BEFORE awaiting
     // the handler (a slow plugin must not block reload/uninstall writers).
+    //
+    // The in-flight count is taken under the SAME read lock that resolved the
+    // route: that is what makes a concurrent disable unable to miss a request —
+    // either it took the write lock first (this request then finds no route and
+    // 404s), or the count is already incremented and the drain will see it.
     let lookup = {
         let reg = state.registry.read().await;
         match reg.find(&method, &path) {
@@ -429,16 +633,19 @@ async fn dynamic_dispatch(State(state): State<Arc<AppState>>, req: Request) -> R
                 handler,
                 plugin_id,
                 params,
-            } => Ok((plugin_id, required_permission, required_scope, handler, params)),
-            RouteLookup::Disabled { plugin_id } => Err((
-                StatusCode::NOT_FOUND,
-                format!("plugin {plugin_id} is disabled"),
+            } => Ok((
+                plugin_id.clone(),
+                required_permission,
+                required_scope,
+                handler,
+                params,
+                state.in_flight.enter(&plugin_id),
             )),
             RouteLookup::NotFound => Err((StatusCode::NOT_FOUND, "route not found".to_string())),
         }
     };
 
-    let (plugin_id, required, required_scope, handler, params) = match lookup {
+    let (plugin_id, required, required_scope, handler, params, _in_flight) = match lookup {
         Ok(x) => x,
         Err((status, msg)) => {
             return error_response(status, msg);
@@ -724,9 +931,52 @@ async fn audit_verify(State(state): State<Arc<AppState>>, req: Request) -> Respo
 }
 
 // ---------------------------------------------------------------------------
-// Admin lifecycle (all require core:admin; every action is audit-logged)
+// Admin lifecycle (all require core:admin; every action — and every refusal —
+// is audit-logged, and each plugin's transitions are serialized)
 // ---------------------------------------------------------------------------
 
+/// Bound on the in-flight drain a `disable` performs before closing the pool
+/// (issue #89 requirement #1). Five seconds is longer than any handler this core
+/// ships, and the timeout is not a failure: the pool stays open until the last
+/// request really ends, so a request can never meet a closed pool.
+const DRAIN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Audit a **refusal** (issue #89 requirement #8). Best effort by design: the
+/// refusal stands even when its audit row cannot be written, because refusing is
+/// the safe direction — the write failure is logged loudly either way.
+async fn audit_refusal(
+    state: &AppState,
+    identity: Option<&Identity>,
+    action: &str,
+    name: &str,
+    reason: &str,
+) {
+    if let Err(e) = state
+        .audit
+        .log(identity, action, "plugin", name, json!({ "refused": reason }))
+        .await
+    {
+        tracing::error!(action, plugin = name, error = %e, "refusal audit write failed");
+    }
+}
+
+/// A refusal an admin can act on: 409 with the reason, never a bare "refused".
+fn refusal(name: &str, reason: &str) -> Response {
+    (
+        StatusCode::CONFLICT,
+        Json(json!({ "error": reason, "plugin": name })),
+    )
+        .into_response()
+}
+
+/// Enable = **load** (issue #89). `dlopen` + `init` + migrate + register
+/// permissions + routes — the same body boot uses — and only once that has
+/// succeeded is the `core.plugins.enabled` flag written.
+///
+/// Serialized per plugin by `AppState::lifecycles`, so a double-click cannot run
+/// two migrations against one schema. On a load failure the plugin stays
+/// disabled, the reason is recorded on its record (visible in
+/// `GET /api/plugins`) and the attempt is audited.
 async fn enable_plugin(
     State(state): State<Arc<AppState>>,
     Path(name): Path<String>,
@@ -737,64 +987,151 @@ async fn enable_plugin(
     }
     let identity = state.resolve_identity(req.headers()).await;
 
-    // Validate before any side effect: the plugin must be loaded.
-    if !state.registry.read().await.contains(&name) {
-        return error_response(StatusCode::NOT_FOUND, "plugin not loaded");
+    // One lifecycle per plugin: held for the whole load, migrations included.
+    let lock = state.lifecycles.get(&name);
+    let _guard = lock.lock().await;
+
+    // Validate before any side effect.
+    {
+        let reg = state.registry.read().await;
+        let Some(info) = reg.info(&name) else {
+            return error_response(StatusCode::NOT_FOUND, "unknown plugin");
+        };
+        if info.loaded {
+            // Already loaded and serving: enabling is idempotent, and a second
+            // load would run a second migration pass for no reason.
+            return Json(json!({
+                "plugin": name, "enabled": true, "loaded": true,
+                "note": "already loaded",
+            }))
+            .into_response();
+        }
+        if let Some(reason) = enable_refusal(&name, &reg) {
+            drop(reg);
+            audit_refusal(&state, identity.as_ref(), "plugin.enable.refused", &name, &reason).await;
+            return refusal(&name, &reason);
+        }
     }
 
-    // Audit, then apply — a state change is never applied unless its audit row
-    // was written. Everything below this point mutates state.
+    // Where the library is. A record always carries the path it was discovered
+    // at; if the file has gone, the enable cannot be honoured — refuse with the
+    // reason rather than loading something else.
+    let path = match state.registry.read().await.record(&name) {
+        Some(record) => record.path.clone(),
+        None => return error_response(StatusCode::NOT_FOUND, "unknown plugin"),
+    };
+    if !path.exists() {
+        let reason = format!("{name} cannot be enabled: its library {} is missing", path.display());
+        audit_refusal(&state, identity.as_ref(), "plugin.enable.refused", &name, &reason).await;
+        return refusal(&name, &reason);
+    }
+
+    // Audit, then apply. The load below is the state change this row precedes;
+    // as with a reload, a failed load leaves an audited attempt whose effect did
+    // not land (see `audit_state_change`).
     if let Some(resp) = audit_state_change(
         &state.audit,
         identity.as_ref(),
         "plugin.enable",
         "plugin",
         &name,
-        json!({}),
+        json!({ "library": path.display().to_string() }),
     )
     .await
     {
         return resp;
     }
 
-    {
-        let mut reg = state.registry.write().await;
-        if !reg.set_enabled(&name, true) {
-            // Raced with an uninstall between validation and apply. The audit row
-            // above is the accepted residual: an attempt is recorded.
-            return error_response(StatusCode::NOT_FOUND, "plugin not loaded");
+    // Load first, flag after (requirement #3). The collision check is seeded
+    // from the routes already being served, so an enable can never shadow one.
+    let env = LoadEnv {
+        database_url: &state.config.database_url,
+        pool: state.pool.clone(),
+        event_tx: state.bus.sender(),
+        config: serde_json::Value::Object(Default::default()),
+        identity: state.identity.clone(),
+        http: state.http.clone(),
+    };
+    let mut seen_routes = state.registry.read().await.live_route_keys();
+    let loaded = match load_plugin(&path, &env, &mut seen_routes).await {
+        Ok(l) => l,
+        Err(e) => {
+            let reason = format!("{name} stays disabled: {e}");
+            tracing::error!(plugin = %name, error = %e, "enable failed; plugin stays disabled");
+            // The reason lands on the record, where the admin surface shows it.
+            state.registry.write().await.record_error(&name, &reason);
+            audit_refusal(&state, identity.as_ref(), "plugin.enable.refused", &name, &reason).await;
+            return error_response(StatusCode::CONFLICT, reason);
         }
+    };
+    if loaded.info.id != name {
+        // The file declares another id: installing it would create a plugin the
+        // admin did not ask for. Refuse; the record is untouched.
+        let reason = format!(
+            "{name} cannot be enabled: {} declares plugin id {}",
+            path.display(),
+            loaded.info.id
+        );
+        tracing::error!(plugin = %name, declared = %loaded.info.id, "enable refused: id mismatch");
+        state.registry.write().await.record_error(&name, &reason);
+        audit_refusal(&state, identity.as_ref(), "plugin.enable.refused", &name, &reason).await;
+        return refusal(&name, &reason);
     }
+
+    // Apply: the slot moves from Known to Live. Nothing else can make it live.
+    state.registry.write().await.install(loaded);
     state.identity.set_enabled(&name, true);
     {
+        // Re-bind subscriptions (only if none are bound, so a repeated enable
+        // cannot double-subscribe) and restart schedules (idempotent).
         let reg = state.registry.read().await;
-        if let Some(lp) = reg.plugins.iter().find(|p| p.info.id == name) {
-            // Re-bind subscriptions that disable aborted (only if none are bound,
-            // so a repeated enable cannot double-subscribe).
+        let live = reg
+            .plugins
+            .iter()
+            .filter_map(PluginSlot::live)
+            .find(|p| p.info.id == name);
+        if let Some(lp) = live {
             if !state.bus.subscriber_ids().iter().any(|id| id == &name) {
                 for sub in lp.plugin.subscriptions() {
                     state.bus.subscribe(&name, sub);
                 }
             }
-            // Restart schedules (idempotent: `start` aborts any existing tasks).
             let schedules = lp.plugin.schedules();
             if !schedules.is_empty() {
                 state.scheduler.start(&name, schedules, state.pool.clone());
             }
         }
     }
-    let dbres = sqlx::query(
-        "UPDATE core.plugins SET enabled = true, updated_at = now() WHERE id = $1",
-    )
-    .bind(&name)
-    .execute(state.pool.as_ref())
-    .await;
-    if let Err(e) = dbres {
+
+    if let Err(e) = sqlx::query("UPDATE core.plugins SET enabled = true, updated_at = now() WHERE id = $1")
+        .bind(&name)
+        .execute(state.pool.as_ref())
+        .await
+    {
+        // The flag is the durable truth (a restart reads it). If it cannot be
+        // written, undo the load so no state contradicts the database.
+        tracing::error!(plugin = %name, error = %e, "enable flag write failed; reverting the load");
+        let parts = { state.registry.write().await.stop_live(&name) };
+        if let Some(p) = parts {
+            close_pool(&p);
+        }
+        state.bus.clear_plugin(&name).await;
+        state.identity.set_enabled(&name, false);
+        state.scheduler.stop(&name);
         return internal_error("plugin lifecycle", &e);
     }
-    Json(json!({ "plugin": name, "enabled": true })).into_response()
+    tracing::info!(plugin = %name, "plugin enabled (loaded)");
+    Json(json!({ "plugin": name, "enabled": true, "loaded": true })).into_response()
 }
 
+/// Disable = **tear down** (issue #89). Routing stops first, the requests
+/// already inside the plugin finish (bounded, and the wait is reported), and
+/// only then does the pool close. Nothing is deleted: schema, rows and grants
+/// survive any number of enable/disable cycles (disable is not uninstall).
+///
+/// The `enabled` flag is written **before** the teardown: there is no fallible
+/// step after it, so a crash mid-transition leaves the database saying
+/// "disabled" — which is what a restart would load — and never the reverse.
 async fn disable_plugin(
     State(state): State<Arc<AppState>>,
     Path(name): Path<String>,
@@ -803,24 +1140,38 @@ async fn disable_plugin(
     if let Some(resp) = state.require_admin(req.headers()).await {
         return resp;
     }
-    // With the dev-header stub off, the identity providers ARE the only way to
-    // authenticate. Removing the last one makes every authenticated route —
-    // including the admin route that would undo this — unreachable until the
-    // process restarts. Refuse, and say how to proceed.
-    if !state.config.allow_dev_headers && state.identity.is_sole_enabled_provider(&name) {
-        return (
-            StatusCode::CONFLICT,
-            Json(json!({
-                "error": "refusing to remove the only identity provider while dev headers are off",
-                "hint": "register/enable another identity provider, or set ADJUTANT_DEV_HEADERS=true for a dev instance",
-            })),
-        )
-            .into_response();
-    }
     let identity = state.resolve_identity(req.headers()).await;
-    // Validate before any side effect: the plugin must be loaded.
-    if !state.registry.read().await.contains(&name) {
-        return error_response(StatusCode::NOT_FOUND, "plugin not loaded");
+
+    // One lifecycle per plugin: a disable cannot race an enable's load.
+    let lock = state.lifecycles.get(&name);
+    let _guard = lock.lock().await;
+
+    // Validate before any side effect.
+    {
+        let reg = state.registry.read().await;
+        if !reg.contains(&name) {
+            return error_response(StatusCode::NOT_FOUND, "unknown plugin");
+        }
+        if let Some(reason) = disable_refusal(&name, &reg) {
+            drop(reg);
+            audit_refusal(&state, identity.as_ref(), "plugin.disable.refused", &name, &reason).await;
+            return refusal(&name, &reason);
+        }
+    }
+
+    // The declarative minimum is checked first (above), so `auth` is always
+    // refused for the permanent reason — it is required — rather than for the
+    // situational one. This guard catches what the set cannot: a *third-party*
+    // plugin that happens to be the last enabled identity provider. With the
+    // dev-header stub off the providers ARE the only way to authenticate, so
+    // removing the last one makes every authenticated route — including the
+    // admin route that would undo this — unreachable until a process restart.
+    if !state.config.allow_dev_headers && state.identity.is_sole_enabled_provider(&name) {
+        let reason =
+            "refusing to remove the only identity provider while dev headers are off;              register/enable another identity provider, or set ADJUTANT_DEV_HEADERS=true              for a dev instance"
+                .to_string();
+        audit_refusal(&state, identity.as_ref(), "plugin.disable.refused", &name, &reason).await;
+        return refusal(&name, &reason);
     }
 
     // Audit, then apply (see `audit_state_change`).
@@ -837,27 +1188,56 @@ async fn disable_plugin(
         return resp;
     }
 
+    // Flag first: past this point the teardown cannot fail.
+    if let Err(e) = sqlx::query("UPDATE core.plugins SET enabled = false, updated_at = now() WHERE id = $1")
+        .bind(&name)
+        .execute(state.pool.as_ref())
+        .await
     {
-        let mut reg = state.registry.write().await;
-        if !reg.set_enabled(&name, false) {
-            return error_response(StatusCode::NOT_FOUND, "plugin not loaded");
-        }
+        return internal_error("plugin lifecycle", &e);
     }
+
+    // 1. Stop routing: the slot becomes a record, so no new request can reach a
+    //    handler. The parts we take are still alive for the requests inside.
+    let parts = { state.registry.write().await.stop_live(&name) };
     state.identity.set_enabled(&name, false);
-    // Stop the plugin's event handlers too: routes 404-ing while its handlers keep
+    // Stop its event handlers too: routes 404-ing while its handlers keep
     // appending audit rows and writing to its schema is not "disabled".
     state.bus.clear_plugin(&name).await;
     state.scheduler.stop(&name);
-    let dbres = sqlx::query(
-        "UPDATE core.plugins SET enabled = false, updated_at = now() WHERE id = $1",
-    )
-    .bind(&name)
-    .execute(state.pool.as_ref())
-    .await;
-    if let Err(e) = dbres {
-        return internal_error("plugin lifecycle", &e);
+
+    // 2. Quiesce: let the requests already inside finish, bounded.
+    let mut drained = true;
+    let mut wait_ms = 0u128;
+    if let Some(parts) = parts {
+        match state.in_flight.wait_idle(&name, DRAIN_TIMEOUT).await {
+            Some(wait) => wait_ms = wait.as_millis(),
+            None => {
+                drained = false;
+                tracing::warn!(
+                    plugin = %name,
+                    timeout_ms = DRAIN_TIMEOUT.as_millis(),
+                    "in-flight drain timed out; the pool stays open until the last request ends"
+                );
+            }
+        }
+        // 3. Close the pool. `PgPool::close()` waits for checked-out connections
+        //    to be returned, so the choice on timeout is safe rather than
+        //    lossy: a request that outlasted the bounded drain still finishes
+        //    against a live pool, and the pool closes when it ends. Nothing is
+        //    ever closed under a request.
+        close_pool(&parts);
     }
-    Json(json!({ "plugin": name, "enabled": false })).into_response()
+    tracing::info!(plugin = %name, drained, wait_ms, "plugin disabled (torn down, nothing deleted)");
+    Json(json!({
+        "plugin": name,
+        "enabled": false,
+        "loaded": false,
+        "drained": drained,
+        "drain_ms": wait_ms,
+        "data": "preserved (schema, rows and grants survive)",
+    }))
+    .into_response()
 }
 
 /// Uninstall: routes stop resolving immediately, the library is retired (kept
@@ -967,12 +1347,17 @@ async fn reload_plugins(State(state): State<Arc<AppState>>, req: Request) -> Res
             );
         }
     };
-    let route_count: usize = fresh.plugins.iter().map(|p| p.routes.len()).sum();
-    let ids: Vec<String> = fresh.plugins.iter().map(|p| p.info.id.clone()).collect();
+    let route_count: usize = fresh
+        .plugins
+        .iter()
+        .filter_map(PluginSlot::live)
+        .map(|p| p.routes.len())
+        .sum();
+    let ids: Vec<String> = fresh.plugins.iter().map(|p| p.info().id.clone()).collect();
     let versions: HashMap<String, String> = fresh
         .plugins
         .iter()
-        .map(|p| (p.info.id.clone(), p.info.version.clone()))
+        .map(|p| (p.info().id.clone(), p.info().version.clone()))
         .collect();
 
     // `load_all` ran each plugin's `init`, which re-declares its scope edges;
@@ -1022,19 +1407,20 @@ async fn reload_plugins(State(state): State<Arc<AppState>>, req: Request) -> Res
     {
         let reg = state.registry.read().await;
         let live: std::collections::HashSet<String> =
-            reg.plugins.iter().map(|p| p.info.id.clone()).collect();
+            reg.plugins.iter().map(|p| p.info().id.clone()).collect();
         state.identity.retain(&live);
     }
     clear_plugin_subscriptions(&state.bus).await;
     {
         let reg = state.registry.read().await;
-        for lp in &reg.plugins {
+        // Only **loaded** plugins get subscriptions and schedules: a disabled
+        // plugin is a record with nothing to bind (issue #89). This is what the
+        // old `enabled` flag check was approximating.
+        for lp in reg.plugins.iter().filter_map(PluginSlot::live) {
             for sub in lp.plugin.subscriptions() {
                 state.bus.subscribe(lp.plugin.id(), sub);
             }
-            if lp.enabled {
-                state.scheduler.start(lp.plugin.id(), lp.plugin.schedules(), state.pool.clone());
-            }
+            state.scheduler.start(lp.plugin.id(), lp.plugin.schedules(), state.pool.clone());
         }
     }
 
@@ -1049,7 +1435,11 @@ async fn reload_plugins(State(state): State<Arc<AppState>>, req: Request) -> Res
 
 #[cfg(test)]
 mod tests {
-    use super::{audit_state_change, decode_path, enable_plugin, superuser_refusal, AppState};
+    use super::{
+        audit_state_change, decode_path, disable_refusal, enable_plugin, enable_refusal,
+        superuser_refusal, AppState, InFlight, LifecycleLocks, PLUGIN_DEPENDENCIES,
+        REQUIRED_PLUGINS,
+    };
     use adjutant_sdk::{
         async_trait, AdjutantPlugin, AuditService, EventSubscription, HostDb, Identity, Migration,
         Permission, PermissionService, PluginContext, RouteDefinition, SdkError, SqlValue,
@@ -1062,7 +1452,7 @@ mod tests {
     use crate::config::Config;
     use crate::events::EventBus;
     use crate::identity::IdentityHub;
-    use crate::plugin_runtime::{LoadedPlugin, PluginInfo, PluginRegistry};
+    use crate::plugin_runtime::{LoadedPlugin, PluginInfo, PluginRegistry, PluginSlot};
 
     #[test]
     fn superuser_boot_is_refused_unless_explicitly_allowed() {
@@ -1151,25 +1541,48 @@ mod tests {
         }
     }
 
-    fn loaded_hello(enabled: bool) -> LoadedPlugin {
-        LoadedPlugin {
-            plugin: Box::new(TinyPlugin),
-            library: None,
-            pool: None,
-            routes: Vec::new(),
-            enabled,
-            info: PluginInfo {
-                id: "hello".into(),
-                name: "Hello".into(),
-                version: "0.0.1".into(),
-                enabled,
-                routes: 0,
-                kind: "native".into(),
-                isolated: true,
-                permissions: Vec::new(),
-                schedules: Vec::new(),
-                route_list: Vec::new(),
-            },
+    /// A path that exists, so the enable handler gets past its "library is
+    /// present?" validation and reaches the audit step this test is about.
+    fn existing_path() -> std::path::PathBuf {
+        std::env::current_exe().unwrap_or_else(|_| std::path::PathBuf::from("/bin/sh"))
+    }
+
+    /// A slot fixture for the lifecycle tests: `loaded = false` yields the
+    /// disabled *record*; `true` yields the loaded half.
+    fn loaded_hello(loaded: bool) -> PluginSlot {
+        slot("hello", loaded)
+    }
+
+    /// A registry slot with an arbitrary id, for the refusal rules.
+    fn slot(id: &str, loaded: bool) -> PluginSlot {
+        let info = PluginInfo {
+            id: id.into(),
+            name: id.into(),
+            version: "0.0.1".into(),
+            enabled: loaded,
+            routes: 0,
+            kind: "native".into(),
+            isolated: true,
+            loaded,
+            last_error: None,
+            permissions: Vec::new(),
+            schedules: Vec::new(),
+            route_list: Vec::new(),
+        };
+        if loaded {
+            PluginSlot::Live(LoadedPlugin {
+                plugin: Box::new(TinyPlugin),
+                library: None,
+                pool: None,
+                routes: Vec::new(),
+                path: std::path::PathBuf::new(),
+                info,
+            })
+        } else {
+            PluginSlot::Known(crate::plugin_runtime::PluginRecord::from_info(
+                info,
+                existing_path(),
+            ))
         }
     }
 
@@ -1202,6 +1615,8 @@ mod tests {
             scheduler: crate::scheduler::Scheduler::new(),
             outbox_mismatches: Mutex::new(0),
             relay: crate::outbox::Relay::new(),
+            in_flight: InFlight::new(),
+            lifecycles: LifecycleLocks::new(),
         })
     }
 
@@ -1254,18 +1669,103 @@ mod tests {
         );
 
         let reg = state.registry.read().await;
-        let plugin = reg
-            .plugins
-            .iter()
-            .find(|p| p.info.id == "hello")
-            .expect("fixture plugin");
-        assert!(!plugin.enabled, "the registry flag must not be flipped on audit failure");
-        assert!(!plugin.info.enabled);
+        let info = reg.info("hello").expect("fixture plugin");
+        assert!(!info.enabled, "the flag must not be flipped on audit failure");
+        assert!(!info.loaded, "nothing may be loaded on audit failure");
         drop(reg);
         assert!(
             !state.bus.subscriber_ids().iter().any(|id| id == "hello"),
             "no subscription may be bound on audit failure"
         );
+    }
+
+    /// Issue #89 requirement #1: the drain a `disable` performs is observable
+    /// and bounded. The guard decrements on drop, so a handler that panics or
+    /// returns early cannot leave a plugin looking busy forever.
+    #[tokio::test]
+    async fn in_flight_counts_and_drains() {
+        let flights = InFlight::new();
+        let a = flights.enter("store");
+        let b = flights.enter("store");
+        assert_eq!(flights.count("store"), 2);
+        assert!(
+            flights
+                .wait_idle("store", std::time::Duration::from_millis(50))
+                .await
+                .is_none(),
+            "a busy plugin reports the bounded drain as timed out"
+        );
+        drop(a);
+        assert_eq!(flights.count("store"), 1);
+        drop(b);
+        assert!(
+            flights
+                .wait_idle("store", std::time::Duration::from_millis(50))
+                .await
+                .is_some(),
+            "an idle plugin drains immediately"
+        );
+        assert_eq!(flights.count("store"), 0);
+        // Another plugin's requests are not this plugin's business.
+        let _other = flights.enter("hello");
+        assert!(
+            flights
+                .wait_idle("store", std::time::Duration::from_millis(50))
+                .await
+                .is_some()
+        );
+    }
+
+    /// Issue #89 requirement #6: the non-disableable minimum is a *declarative*
+    /// set and the refusal carries its reason, so an operator is told why.
+    #[test]
+    fn the_required_plugins_refuse_with_their_reason() {
+        let reg = PluginRegistry::new(vec![slot("auth", true), slot("membership", true)]);
+        for (id, why) in REQUIRED_PLUGINS {
+            let reason = disable_refusal(id, &reg)
+                .unwrap_or_else(|| panic!("{id} must not be disableable"));
+            assert!(reason.contains(why), "the reason is carried: {reason}");
+            assert!(reason.contains("required"), "and says it is required: {reason}");
+        }
+        // A plugin outside the set is not refused.
+        assert!(disable_refusal("hello", &reg).is_none());
+        // The set is the one the PR names; adding a plugin is a one-line change.
+        assert!(REQUIRED_PLUGINS.iter().any(|(id, _)| *id == "auth"));
+        assert!(REQUIRED_PLUGINS.iter().any(|(id, _)| *id == "membership"));
+    }
+
+    /// Issue #89 requirement #7: `store` needs `stripe`. Disabling a dependency
+    /// an enabled plugin needs is refused by name, and enabling the dependent
+    /// while its dependency is not loaded is refused too — never a silent
+    /// dependent calling nothing.
+    #[test]
+    fn dependencies_are_refused_in_both_directions() {
+        assert!(PLUGIN_DEPENDENCIES.contains(&("store", "stripe")));
+
+        // stripe disabled while store is loaded: refuse, naming store.
+        let reg = PluginRegistry::new(vec![slot("store", true), slot("stripe", false)]);
+        let reason = disable_refusal("stripe", &reg).expect("stripe is needed by store");
+        assert!(reason.contains("store"), "names the dependent: {reason}");
+        println!("[dependencies] disable refusal: {reason}");
+
+        // stripe disabled and store disabled: nothing needs it, so it is allowed.
+        let reg = PluginRegistry::new(vec![slot("store", false), slot("stripe", false)]);
+        assert!(disable_refusal("stripe", &reg).is_none());
+
+        // store enabled while stripe is not loaded: refuse, naming stripe.
+        let reg = PluginRegistry::new(vec![slot("store", false), slot("stripe", false)]);
+        let reason = enable_refusal("store", &reg).expect("store needs stripe");
+        assert!(reason.contains("stripe"), "names the dependency: {reason}");
+        println!("[dependencies] enable refusal: {reason}");
+
+        // stripe loaded: store may be enabled.
+        let reg = PluginRegistry::new(vec![slot("store", false), slot("stripe", true)]);
+        assert!(enable_refusal("store", &reg).is_none());
+
+        // A plugin with no dependencies is unaffected either way.
+        let reg = PluginRegistry::new(vec![slot("hello", true)]);
+        assert!(disable_refusal("hello", &reg).is_none());
+        assert!(enable_refusal("hello", &reg).is_none());
     }
 }
 
