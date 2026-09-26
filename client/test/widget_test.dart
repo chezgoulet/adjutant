@@ -6,6 +6,7 @@ import 'package:adjutant_client/screens/announcements_screen.dart';
 import 'package:adjutant_client/screens/dues_screen.dart';
 import 'package:adjutant_client/screens/equipment_item_screen.dart';
 import 'package:adjutant_client/screens/equipment_screen.dart';
+import 'package:adjutant_client/screens/governance_screen.dart';
 import 'package:adjutant_client/screens/home_shell.dart';
 import 'package:adjutant_client/screens/plugins_screen.dart';
 import 'package:adjutant_client/screens/store_admin_screen.dart';
@@ -205,6 +206,85 @@ Map<String, dynamic> orderLineFixture({int quantity = 1, int listPrice = 2500}) 
       'unit_price_cents': listPrice ~/ 2,
       'quantity': quantity,
       'line_total_cents': (listPrice ~/ 2) * quantity,
+    };
+
+// ---------------------------------------------------------------------------
+// Governance's fixtures (SPEC §7.4)
+// ---------------------------------------------------------------------------
+
+/// One motion, in the shape `GET /api/governance/motions` returns it: the row
+/// with its stage, its result and the recorded tally already on it.
+Map<String, dynamic> motionFixture({
+  int id = 7,
+  int? meetingId = 3,
+  String title = 'Adopt the 2027 dues schedule',
+  String text = 'That the 2027 dues schedule be adopted as circulated.',
+  String body = 'congress',
+  String category = 'dues',
+  String stage = 'voting',
+  String result = '',
+  String threshold = 'two_thirds',
+  int yes = 3,
+  int no = 1,
+  int abstain = 1,
+}) =>
+    {
+      'id': id,
+      'meeting_id': meetingId,
+      'title': title,
+      'text': text,
+      'body': body,
+      'category': category,
+      'stage': stage,
+      'result': result,
+      'threshold': threshold,
+      'amends_accords': false,
+      'proposed_by': 'u2',
+      'seconded_by': 'u3',
+      'votes_yes': yes,
+      'votes_no': no,
+      'votes_abstain': abstain,
+      'decided_at': result.isEmpty ? null : '2026-09-26T19:00:00Z',
+      'implemented_at': null,
+      'created_at': '2026-09-20T09:00:00Z',
+    };
+
+/// One motion's whole page, as `GET /api/governance/motion/{id}` returns it:
+/// the record, its votes, its amendments, the tally a close would produce now,
+/// and the live quorum when it belongs to a meeting.
+Map<String, dynamic> motionDetailFixture({
+  int id = 7,
+  String stage = 'voting',
+  String result = '',
+  String threshold = 'two_thirds',
+  int yes = 3,
+  int no = 1,
+  int abstain = 1,
+  bool wouldPass = true,
+  List<Map<String, dynamic>>? votes,
+  Map<String, dynamic>? quorum,
+}) =>
+    {
+      'motion': motionFixture(
+        id: id,
+        stage: stage,
+        result: result,
+        threshold: threshold,
+        yes: yes,
+        no: no,
+        abstain: abstain,
+      ),
+      'votes': votes ?? <Map<String, dynamic>>[],
+      'amendments': <Map<String, dynamic>>[],
+      'tally': {
+        'yes': yes,
+        'no': no,
+        'abstain': abstain,
+        'cast': yes + no,
+        'would_pass': wouldPass,
+        'threshold': threshold,
+      },
+      'quorum': quorum,
     };
 
 /// The tests that earn their place: the pure logic the UI depends on, and the
@@ -3042,6 +3122,434 @@ void main() {
 
       expect(calls, contains('POST /api/equipment/item/1/checkin'));
       expect(body?['condition'], 'fair');
+    });
+  });
+
+  // -------------------------------------------------------------------------
+  // Governance (SPEC §7.4, Accords Art 5/9/12/17)
+  // -------------------------------------------------------------------------
+
+  group('Governance API', () {
+    test('the motion list sends only the filters it was given', () async {
+      final calls = <Uri>[];
+      final client = ApiClient(
+        baseUrl: 'http://example.test',
+        httpClient: MockClient((request) async {
+          calls.add(request.url);
+          return jsonResponse({'motions': <Map<String, dynamic>>[]});
+        }),
+      );
+
+      await client.motions();
+      expect(calls.single.path, '/api/governance/motions');
+      expect(calls.single.query, isEmpty);
+
+      await client.motions(stage: 'voting', limit: 10);
+      expect(calls.last.queryParameters, {'stage': 'voting', 'limit': '10'});
+    });
+
+    test('one motion is read by id, and the whole page comes back', () async {
+      final calls = <Uri>[];
+      final client = ApiClient(
+        baseUrl: 'http://example.test',
+        httpClient: MockClient((request) async {
+          calls.add(request.url);
+          return jsonResponse(motionDetailFixture(
+              quorum: {
+                'meeting_id': 3,
+                'required': 6,
+                'present': 5,
+                'met': false,
+              },
+            ));
+        }),
+      );
+
+      final page = await client.motion('7');
+      expect(calls.single.path, '/api/governance/motion/7');
+      expect((page['motion'] as Map)['id'], 7);
+      expect((page['tally'] as Map)['yes'], 3);
+      expect(page['votes'], isA<List>());
+      expect(page['quorum'], isA<Map>());
+    });
+
+    test('a vote posts the documented body — choice, method, note — and no more',
+        () async {
+      Map<String, dynamic>? body;
+      final client = ApiClient(
+        baseUrl: 'http://example.test',
+        httpClient: MockClient((request) async {
+          expect(request.method, 'POST');
+          expect(request.url.path, '/api/governance/motion/7/vote');
+          body = jsonDecode(request.body) as Map<String, dynamic>;
+          return jsonResponse({
+            'vote_id': 9,
+            'motion_id': 7,
+            'choice': 'no',
+            'method': 'ballot',
+          }, 201);
+        }),
+      );
+
+      final answer = await client.castVote('7',
+          choice: 'no', method: 'ballot', note: '  reading the ledger  ');
+      // The documented body names the choice and the method, and a blank note
+      // is left out rather than sent empty.
+      expect(body, {'choice': 'no', 'method': 'ballot', 'note': 'reading the ledger'});
+      expect(answer['choice'], 'no');
+
+      await client.castVote('7', choice: 'yes');
+      expect(body, {'choice': 'yes'});
+    });
+  });
+
+  group('GovernanceScreen', () {
+    setUp(() => SharedPreferences.setMockInitialValues({}));
+
+    Future<void> pump(WidgetTester tester, ApiClient client) async {
+      tester.view.physicalSize = const Size(1000, 2400);
+      tester.view.devicePixelRatio = 1.0;
+      addTearDown(tester.view.reset);
+      await tester.pumpWidget(
+        ChangeNotifierProvider<SessionState>(
+          create: (_) => SessionState(client: client)
+            ..user = {'id': 'u1', 'username': 'scout', 'roles': ['scout']},
+          child: MaterialApp(
+            theme: AppTheme.light(),
+            home: const GovernanceScreen(),
+          ),
+        ),
+      );
+      await tester.pumpAndSettle();
+    }
+
+    testWidgets('lists each motion with its stage, its result and its tally',
+        (tester) async {
+      final client = ApiClient(
+        baseUrl: 'http://example.test',
+        httpClient: MockClient((request) async {
+          if (request.url.path == '/api/governance/motions') {
+            return jsonResponse({
+              'motions': [
+                motionFixture(
+                  id: 7,
+                  title: 'Adopt the 2027 dues schedule',
+                  stage: 'voting',
+                  yes: 3,
+                  no: 1,
+                  abstain: 1,
+                ),
+                motionFixture(
+                  id: 6,
+                  title: 'Add a fourth lodge',
+                  stage: 'decided',
+                  result: 'failed',
+                  yes: 1,
+                  no: 4,
+                ),
+              ],
+            });
+          }
+          return http.Response('[]', 200);
+        }),
+      );
+
+      await pump(tester, client);
+
+      expect(find.text('Adopt the 2027 dues schedule'), findsOneWidget);
+      // The stage is a word, not a colour — and the list carries the tally, so
+      // a scout sees where a motion stands without opening it.
+      expect(find.widgetWithText(StatusBadge, 'Voting'), findsOneWidget);
+      expect(find.text('Yes 3 · No 1 · Abstain 1'), findsOneWidget);
+
+      expect(find.text('Add a fourth lodge'), findsOneWidget);
+      expect(find.widgetWithText(StatusBadge, 'Decided'), findsOneWidget);
+      // A decided motion states its outcome, in the server's own word.
+      expect(find.widgetWithText(StatusBadge, 'Failed'), findsOneWidget);
+      expect(find.text('Yes 1 · No 4 · Abstain 1'), findsOneWidget);
+    });
+
+    testWidgets('a refusal reads as the permission it needs, not an empty list',
+        (tester) async {
+      final client = ApiClient(
+        baseUrl: 'http://example.test',
+        httpClient: MockClient((request) async => jsonResponse(
+            {'error': 'missing permission governance:read'}, 403)),
+      );
+
+      await pump(tester, client);
+
+      expect(find.text('The motions are not yours to read'), findsOneWidget);
+      expect(find.textContaining('governance:read'), findsWidgets);
+      expect(find.textContaining('missing permission governance:read'),
+          findsOneWidget);
+    });
+  });
+
+  group('MotionDetailScreen', () {
+    setUp(() => SharedPreferences.setMockInitialValues({}));
+
+    Future<void> pump(WidgetTester tester, ApiClient client) async {
+      tester.view.physicalSize = const Size(1000, 2600);
+      tester.view.devicePixelRatio = 1.0;
+      addTearDown(tester.view.reset);
+      await tester.pumpWidget(
+        ChangeNotifierProvider<SessionState>(
+          create: (_) => SessionState(client: client)
+            ..user = {'id': 'u1', 'username': 'scout', 'roles': ['scout']},
+          child: MaterialApp(
+            theme: AppTheme.light(),
+            home: const MotionDetailScreen(id: '7'),
+          ),
+        ),
+      );
+      await tester.pumpAndSettle();
+    }
+
+    testWidgets('shows the tally, the quorum, and the caller\'s own vote',
+        (tester) async {
+      final client = ApiClient(
+        baseUrl: 'http://example.test',
+        httpClient: MockClient((request) async => jsonResponse(
+              motionDetailFixture(
+                quorum: {
+                  'meeting_id': 3,
+                  'required': 6,
+                  'present': 5,
+                  'met': false,
+                },
+                votes: [
+                  {
+                    'id': 1,
+                    'motion_id': 7,
+                    'voter': 'u2',
+                    'choice': 'no',
+                    'method': 'voice',
+                    'recorded_at': '2026-09-26T18:00:00Z',
+                    'note': '',
+                  },
+                  {
+                    'id': 2,
+                    'motion_id': 7,
+                    'voter': 'u1',
+                    'choice': 'yes',
+                    'method': 'ballot',
+                    'recorded_at': '2026-09-26T18:05:00Z',
+                    'note': 'the treasurer\'s numbers convinced me',
+                  },
+                ],
+              ),
+            )),
+      );
+
+      await pump(tester, client);
+
+      // Every figure on this screen is the server's own tally.
+      expect(find.text('YES'), findsOneWidget);
+      expect(find.text('NO'), findsOneWidget);
+      expect(find.text('ABSTAIN'), findsOneWidget);
+      expect(find.text('CAST'), findsOneWidget);
+      expect(find.text('3'), findsOneWidget);
+      expect(find.text('4'), findsOneWidget);
+      expect(
+        find.text('This would carry now, on the two thirds.'),
+        findsOneWidget,
+      );
+      // Quorum is stated as the numbers, and what they are short by.
+      expect(find.text('5 present of 6 required — short by 1.'), findsOneWidget);
+      expect(find.widgetWithText(StatusBadge, 'Not met'), findsOneWidget);
+      // The caller's own vote, told from the troop's by its voter.
+      expect(find.text('You voted Yes (Ballot).'), findsOneWidget);
+      expect(find.textContaining('the treasurer\'s numbers convinced me'),
+          findsOneWidget);
+    });
+
+    testWidgets('casting a vote posts the documented body, and the screen '
+        'reflects the server\'s answer', (tester) async {
+      final calls = <String>[];
+      Map<String, dynamic>? body;
+      var voted = false;
+      final client = ApiClient(
+        baseUrl: 'http://example.test',
+        httpClient: MockClient((request) async {
+          final path = request.url.path;
+          calls.add('${request.method} $path');
+          if (path == '/api/governance/motion/7/vote') {
+            body = jsonDecode(request.body) as Map<String, dynamic>;
+            voted = true;
+            return jsonResponse({
+              'vote_id': 9,
+              'motion_id': 7,
+              'choice': 'no',
+              'method': 'voice',
+            }, 201);
+          }
+          if (path == '/api/governance/motion/7') {
+            return jsonResponse(motionDetailFixture(
+              // After the vote the server's own page carries it — the screen
+              // reads that, rather than editing its own tally.
+              votes: voted
+                  ? [
+                      {
+                        'id': 9,
+                        'motion_id': 7,
+                        'voter': 'u1',
+                        'choice': 'no',
+                        'method': 'voice',
+                        'recorded_at': '2026-09-26T18:10:00Z',
+                        'note': '',
+                      },
+                    ]
+                  : <Map<String, dynamic>>[],
+            ));
+          }
+          return http.Response('[]', 200);
+        }),
+      );
+
+      await pump(tester, client);
+
+      expect(find.text('You have not voted on this motion.'), findsOneWidget);
+
+      await tester.tap(find.text('Cast vote'));
+      await tester.pumpAndSettle();
+
+      // The choice comes from the route's three, by name.
+      await tester.tap(find.text('No'));
+      await tester.pumpAndSettle();
+      await tester.tap(find.widgetWithText(FilledButton, 'Cast my vote'));
+      await tester.pumpAndSettle();
+
+      expect(calls, contains('POST /api/governance/motion/7/vote'));
+      expect(body?['choice'], 'no');
+      expect(body?['method'], 'voice');
+      // The screen now shows the vote the server recorded.
+      expect(find.text('You voted No (Voice).'), findsOneWidget);
+      expect(find.text('Your vote was recorded'), findsOneWidget);
+    });
+
+    testWidgets('a refused vote is the server\'s words, and leaves the state '
+        'unchanged', (tester) async {
+      final calls = <String>[];
+      final client = ApiClient(
+        baseUrl: 'http://example.test',
+        httpClient: MockClient((request) async {
+          final path = request.url.path;
+          calls.add('${request.method} $path');
+          if (path == '/api/governance/motion/7/vote') {
+            return jsonResponse(
+                {'error': 'you have already voted on this motion'}, 409);
+          }
+          if (path == '/api/governance/motion/7') {
+            return jsonResponse(motionDetailFixture());
+          }
+          return http.Response('[]', 200);
+        }),
+      );
+
+      await pump(tester, client);
+
+      await tester.tap(find.text('Cast vote'));
+      await tester.pumpAndSettle();
+      await tester.tap(find.widgetWithText(FilledButton, 'Cast my vote'));
+      await tester.pumpAndSettle();
+
+      // The 409 is the answer: the server's message is kept, not replaced.
+      expect(find.text('The server refused'), findsOneWidget);
+      expect(find.textContaining('already voted on this motion'), findsOneWidget);
+      // The sheet stays open so the scout can see why, and nothing was
+      // re-read or re-counted: the record is unchanged.
+      expect(find.text('Cast my vote'), findsOneWidget);
+      expect(find.text('You have not voted on this motion.'), findsOneWidget);
+      expect(calls.where((c) => c == 'GET /api/governance/motion/7').length, 1);
+    });
+
+    testWidgets('a motion past its voteable stages offers no vote to cast',
+        (tester) async {
+      final client = ApiClient(
+        baseUrl: 'http://example.test',
+        httpClient: MockClient((request) async => jsonResponse(
+              motionDetailFixture(
+                stage: 'decided',
+                result: 'passed',
+                votes: [
+                  {
+                    'id': 1,
+                    'motion_id': 7,
+                    'voter': 'u1',
+                    'choice': 'yes',
+                    'method': 'show_of_hands',
+                    'recorded_at': '2026-09-26T18:00:00Z',
+                    'note': '',
+                  },
+                ],
+              ),
+            )),
+      );
+
+      await pump(tester, client);
+
+      expect(find.widgetWithText(StatusBadge, 'Passed'), findsOneWidget);
+      expect(find.text('You voted Yes (Show of hands).'), findsOneWidget);
+      expect(find.text('Cast vote'), findsNothing);
+    });
+  });
+
+  group('Settings → Governance', () {
+    setUp(() => SharedPreferences.setMockInitialValues({}));
+
+    testWidgets('a scout reaches the motions without curl, and the bar keeps '
+        'its eight destinations', (tester) async {
+      tester.view.physicalSize = const Size(1170, 2532);
+      tester.view.devicePixelRatio = 3.0;
+      addTearDown(tester.view.reset);
+
+      final client = ApiClient(
+        baseUrl: 'http://example.test',
+        httpClient: MockClient((request) async {
+          final path = request.url.path;
+          if (path == '/api/announcements/unread') {
+            return jsonResponse({
+              'member_id': 'u1',
+              'unread': 0,
+              'has_urgent': false,
+              'addressed': {'troop': true, 'lodges': <String>[]},
+            });
+          }
+          if (path == '/api/governance/motions') {
+            return jsonResponse({
+              'motions': [
+                motionFixture(id: 7, title: 'Adopt the 2027 dues schedule'),
+              ],
+            });
+          }
+          return http.Response('[]', 200);
+        }),
+      );
+
+      await tester.pumpWidget(
+        ChangeNotifierProvider<SessionState>(
+          create: (_) => SessionState(client: client)
+            ..user = {'id': 'u1', 'username': 'scout', 'roles': ['scout']},
+          child: const MaterialApp(home: HomeShell()),
+        ),
+      );
+      await tester.pumpAndSettle();
+
+      // Governance is not a ninth destination: the bottom bar is already eight
+      // entries wide, and a ninth would push each below the 48dp outdoor touch
+      // floor (390dp / 9 < 48). It is reached from Settings, the way Dues is.
+      expect(tester.widgetList(find.byType(NavigationDestination)).length, 8);
+
+      await tester.tap(find.text('Settings'));
+      await tester.pumpAndSettle();
+
+      expect(find.text('Governance'), findsOneWidget);
+      await tester.tap(find.text('Governance'));
+      await tester.pumpAndSettle();
+
+      expect(find.text('Adopt the 2027 dues schedule'), findsOneWidget);
+      expect(find.widgetWithText(StatusBadge, 'Voting'), findsOneWidget);
     });
   });
 }
