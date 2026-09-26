@@ -61,9 +61,19 @@ services:
       # the app refuses to boot on one.
       ADJUTANT_RATE_MAX: ${ADJUTANT_RATE_MAX:-120}
       ADJUTANT_RATE_WINDOW: ${ADJUTANT_RATE_WINDOW:-60}
+      # Where the in-app backup button writes. A volume rather than the
+      # container's filesystem: a bundle inside a container is lost the next
+      # time the container is replaced, which is precisely when someone wants
+      # it. `docs/backup-and-restore` is the host-side producer, if any.
+      ADJUTANT_BACKUP_DIR: /app/backups
     ports:
       - "8787:8787"
+    # The bundles survive the container. Named rather than a bind mount so the
+    # host path is Docker's business.
+    volumes:
+      - backups:/app/backups
     restart: unless-stopped
 
 volumes:
   pgdata:
+  backups:

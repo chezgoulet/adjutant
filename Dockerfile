@@ -17,13 +17,29 @@ RUN rustup target add wasm32-wasip1 \
 
 # --- runtime ----------------------------------------------------------------
 FROM debian:bookworm-slim AS runtime
+# `pg_dump` for the in-app backup button, from PGDG rather than bookworm's own
+# repo. That is not a preference: bookworm ships postgresql-client 15, the deploy
+# stack runs postgres:18, and `pg_dump` refuses to dump a *newer* server. A
+# mismatched client fails with "server version mismatch", which at the admin's end
+# would look like the button doing nothing at all — the least diagnosable shape a
+# failure can take. Match the client to the server, and if the deployment's
+# Postgres ever moves, this line moves with it.
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends ca-certificates \
+    && apt-get install -y --no-install-recommends ca-certificates curl gnupg \
+    && install -d /usr/share/postgresql-common/pgdg \
+    && curl -fsSL https://www.postgresql.org/media/keys/ACCC4CF8.asc \
+         -o /usr/share/postgresql-common/pgdg/apt.postgresql.org.asc \
+    && echo "deb [signed-by=/usr/share/postgresql-common/pgdg/apt.postgresql.org.asc] \
+https://apt.postgresql.org/pub/repos/apt bookworm-pgdg main" \
+         > /etc/apt/sources.list.d/pgdg.list \
+    && apt-get update \
+    && apt-get install -y --no-install-recommends postgresql-client-18 \
+    && apt-get purge -y --auto-remove curl gnupg \
     && rm -rf /var/lib/apt/lists/*
 WORKDIR /app
 
 COPY --from=builder /src/target/release/adjutant /usr/local/bin/adjutant
-RUN mkdir -p /app/plugins
+RUN mkdir -p /app/plugins /app/backups
 
 # Every plugin library the workspace built, by the same rule
 # `scripts/stage-plugins.py` uses: a plugin is a workspace crate that produces a
@@ -43,6 +59,7 @@ COPY --from=builder /src/wasm/target/wasm32-wasip1/release/adjutant_hello_wasm.w
 # Dev identity headers stay OFF unless explicitly opted in (SPEC §7.1).
 ENV ADJUTANT_PLUGIN_DIR=/app/plugins \
     ADJUTANT_BIND=0.0.0.0:8787 \
+    ADJUTANT_BACKUP_DIR=/app/backups \
     ADJUTANT_LOG_FORMAT=json
 EXPOSE 8787
 

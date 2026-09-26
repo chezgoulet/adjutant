@@ -35,6 +35,12 @@ dependencies:
   # on every target including web.
   shared_preferences: ^2.3.2
 
+  # Backups: write a bundle to a real file and hand it to the platform's share
+  # sheet. Without these the download could only land in app-private storage,
+  # where the admin has no way to reach it — a download in name only.
+  path_provider: ^2.1.0
+  share_plus: ^10.0.0
+
 dev_dependencies:
   flutter_test:
     sdk: flutter

@@ -67,6 +67,11 @@ pub struct AppState {
     /// The outbox relay: one drain loop per process, held here (like
     /// `scheduler`) so `shutdown()` can stop it.
     pub relay: Arc<crate::outbox::Relay>,
+    /// The backup timer: one loop per process, in the same shape as the
+    /// relay above. It reads the schedule every minute and takes a run when
+    /// one is due; `shutdown` aborts it, so a stop does not leave a
+    /// `pg_dump` writing into a directory nobody is watching.
+    pub backups: Arc<crate::backup::Timer>,
     /// In-flight request counts per plugin, so `disable` can stop routing and
     /// let the requests already inside a plugin finish before its pool closes
     /// (issue #89 requirement #1: quiesce, then close).
@@ -288,6 +293,7 @@ impl AppState {
         // The outbox relay is a core task, like the scheduler's: stop it before
         // the plugins it delivers to are torn down.
         self.relay.stop();
+        self.backups.stop();
         let mut reg = self.registry.write().await;
         // Destructure the guard so the two vecs borrow independently.
         let PluginRegistry { plugins, retired } = &mut *reg;
@@ -305,8 +311,31 @@ impl AppState {
     /// Admin gate: `core:admin` permission. Returns a ready 401/403 response
     /// when the caller isn't allowed, `None` when allowed.
     pub(crate) async fn require_admin(&self, headers: &axum::http::HeaderMap) -> Option<Response> {
+        self.require_permission(headers, "core:admin").await
+    }
+
+    /// The same gate for a named permission.
+    ///
+    /// Backups ask for `core:backup` rather than borrowing the admin gate: a
+    /// bundle is a complete copy of the troop's data, which is a grant a troop
+    /// should be able to make — and revoke — on its own without also handing over
+    /// plugin installation. Asking by name keeps the two separable; reusing
+    /// `require_admin` would have quietly made this route admin-only and read as
+    /// if it were not.
+    pub(crate) async fn require_permission(
+        &self,
+        headers: &axum::http::HeaderMap,
+        permission: &str,
+    ) -> Option<Response> {
         let identity = self.resolve_identity(headers).await;
-        match authorize(identity.as_ref(), &self.permissions, "core:admin", Some(&adjutant_sdk::Scope::troop())).await {
+        match authorize(
+            identity.as_ref(),
+            &self.permissions,
+            permission,
+            Some(&adjutant_sdk::Scope::troop()),
+        )
+        .await
+        {
             Ok(()) => None,
             Err(status) => {
                 let msg = if status == 401 {
@@ -427,6 +456,7 @@ pub async fn build_app(cfg: &Config) -> Result<(Router, Arc<AppState>), BuildErr
         .map_err(BuildError::Db)?;
 
     let relay = crate::outbox::Relay::new();
+    let backups = crate::backup::Timer::new();
 
     let state = Arc::new(AppState {
         pool: pool.clone(),
@@ -441,6 +471,7 @@ pub async fn build_app(cfg: &Config) -> Result<(Router, Arc<AppState>), BuildErr
         scheduler,
         outbox_mismatches: Mutex::new(0),
         relay: relay.clone(),
+        backups: backups.clone(),
         in_flight: InFlight::new(),
         lifecycles: LifecycleLocks::new(),
     });
@@ -453,6 +484,7 @@ pub async fn build_app(cfg: &Config) -> Result<(Router, Arc<AppState>), BuildErr
         .bus
         .subscribe(crate::outbox::SUBSCRIBER_OWNER, crate::outbox::outcome_subscription());
     relay.start(&state);
+    backups.start(&state);
 
     let cors = cfg.cors_origins.first().map(|_| {
         let layer = CorsLayer::new();
@@ -480,6 +512,22 @@ pub async fn build_app(cfg: &Config) -> Result<(Router, Arc<AppState>), BuildErr
         .route("/api/plugins/reload", post(reload_plugins))
         .route("/api/events/recent", get(recent_events))
         .route("/api/audit/verify", get(audit_verify))
+        // Backups: the picker's options and recent runs, the schedule, the
+        // manual run, and the bundle itself. All four ask for `core:backup`,
+        // which is its own grant rather than a corner of `core:admin`.
+        .route("/api/backups", get(crate::backup_routes::list))
+        .route(
+            "/api/backups/schedule",
+            axum::routing::put(crate::backup_routes::set_schedule),
+        )
+        .route(
+            "/api/backups/run",
+            axum::routing::post(crate::backup_routes::run_now),
+        )
+        .route(
+            "/api/backups/{filename}/download",
+            get(crate::backup_routes::download),
+        )
         // The outbox operator surface: the queue and its states, reconciliation
         // (the control of last resort), and the hand that re-arms an intent.
         .route("/api/outbox/intents", get(crate::outbox::list_intents))
@@ -1615,6 +1663,7 @@ mod tests {
             scheduler: crate::scheduler::Scheduler::new(),
             outbox_mismatches: Mutex::new(0),
             relay: crate::outbox::Relay::new(),
+            backups: crate::backup::Timer::new(),
             in_flight: InFlight::new(),
             lifecycles: LifecycleLocks::new(),
         })
