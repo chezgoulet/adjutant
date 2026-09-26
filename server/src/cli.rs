@@ -447,6 +447,32 @@ pub async fn bootstrap_isolation(
             ));
         }
 
+        // The same two rules the API already enforces — and the wizard drives that
+        // API, so a CLI that could reach a state the wizard refuses would make the
+        // two paths disagree. That equivalence is #90's acceptance criterion, and
+        // this is where it would have broken: the first version of this flag wrote
+        // every row unconditionally and could disable `auth`.
+        //
+        // 1. A required plugin cannot be left off.
+        if let Some((id, why)) = crate::server::REQUIRED_PLUGINS
+            .iter()
+            .find(|(id, _)| !chosen.iter().any(|c| c == id))
+        {
+            return Err(format!("{id} is required and cannot be turned off: {why}"));
+        }
+
+        // 2. A dependent cannot be on without its dependency, or it is left
+        //    configured to call something that is not loaded.
+        for (dependent, dependency) in crate::server::PLUGIN_DEPENDENCIES {
+            if chosen.iter().any(|c| c == dependent)
+                && !chosen.iter().any(|c| c == dependency)
+            {
+                return Err(format!(
+                    "{dependent} needs {dependency}, which is not in the set"
+                ));
+            }
+        }
+
         // One statement, both directions: the chosen set is enabled and everything
         // else discovered is disabled, so the result does not depend on what the
         // flags happened to be, and an interrupted run cannot leave half the
