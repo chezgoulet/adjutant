@@ -600,6 +600,132 @@ $fn$;
 GRANT EXECUTE ON FUNCTION core.outbox_producer_view() TO PUBLIC;
 "
     ),
+    (
+        10,
+        "notifications",
+        "-- Why this is a new version and not more DDL in 1: an applied version is
+-- skipped by number and its SQL is never re-run or compared, so anything added
+-- to an earlier version would exist on a fresh database and be absent on every
+-- deployed one. Numbered 10 because 1-9 are already applied in the field; the
+-- next core migration takes 11. Design: docs/design/notifications.md.
+--
+-- The recorded in-app notification (#46, slice 1): a machine-recorded fact
+-- addressed to ONE user, plus a per-user read state. It is the record the
+-- owner called 'not a fallback' — the board in the app. Web Push, device push
+-- and email are later transports behind this same row; none of them is built.
+
+CREATE TABLE IF NOT EXISTS core.notifications (
+    id               BIGSERIAL PRIMARY KEY,
+    -- The recipient is a user, not a scope: a notification is addressed to a
+    -- person. ON DELETE CASCADE because the row is about them, like a session.
+    recipient        UUID NOT NULL REFERENCES core.users(id) ON DELETE CASCADE,
+    -- Which plugin (or 'core') recorded it. Also the namespace of message_code.
+    source           TEXT NOT NULL,
+    -- A stable identifier, NEVER display text (docs/design/localization.md §4):
+    -- the client renders (code, params, locale) from its own catalogue.
+    message_code     TEXT NOT NULL,
+    -- Data only — ISO-8601 dates, ids, counts. Never a sentence.
+    message_params   JSONB NOT NULL DEFAULT '{}'::jsonb,
+    -- The recipient's language AT CREATION (a snapshot), BCP-47. 'und' is the
+    -- honest value when the producer does not know the recipient's language.
+    locale           TEXT NOT NULL,
+    -- Delivery is policy, not a caller's choice: this is the transport the row
+    -- is recorded for, picked by the core (notifications::DELIVERY_CHANNELS).
+    delivery_channel TEXT NOT NULL DEFAULT 'in_app',
+    -- The DELIVERY fact, kept separate from read_at below. 'recorded' means
+    -- exactly that: nothing was sent. Slice 1 only ever writes this value.
+    delivery_state   TEXT NOT NULL DEFAULT 'recorded',
+    -- The evidence of a delivery. NULL while nothing has been delivered.
+    delivered_at     TIMESTAMPTZ,
+    -- The READ fact: a fact about the person, not about a transport. Marking a
+    -- notification read writes this and touches delivery_state not at all.
+    read_at          TIMESTAMPTZ,
+    created_at       TIMESTAMPTZ NOT NULL DEFAULT now(),
+    CONSTRAINT notifications_source_present CHECK (btrim(source) <> ''),
+    CONSTRAINT notifications_code_is_a_code CHECK (message_code ~ '^[a-z][a-z0-9_.]*$'),
+    CONSTRAINT notifications_locale_is_a_tag CHECK (locale ~ '^[A-Za-z]{2,8}(-[A-Za-z0-9]{1,8})*$'),
+    -- A row may not claim a channel the core has no transport for, or it would
+    -- record a delivery promise no code can keep. Widening this list (with
+    -- DELIVERY_CHANNELS) is what adding email/push *is*.
+    CONSTRAINT notifications_channel_known CHECK (delivery_channel IN ('in_app')),
+    CONSTRAINT notifications_delivery_state_known CHECK (
+        delivery_state IN ('recorded', 'delivered', 'failed')
+    ),
+    -- The hard rule, stated in the schema's own terms: 'delivered' is a fact and
+    -- it is stored with its evidence, and no delivery time may exist without the
+    -- delivered state. This is what makes it impossible to report a notification
+    -- as delivered when it was only recorded.
+    CONSTRAINT notifications_delivered_was_at_a_time CHECK (
+        delivery_state <> 'delivered' OR delivered_at IS NOT NULL
+    ),
+    CONSTRAINT notifications_delivery_time_only_when_delivered CHECK (
+        delivered_at IS NULL OR delivery_state = 'delivered'
+    )
+);
+
+-- The inbox: one user's records, newest first.
+CREATE INDEX IF NOT EXISTS idx_notifications_inbox
+  ON core.notifications (recipient, created_at DESC);
+-- The unread count, without scanning read records.
+CREATE INDEX IF NOT EXISTS idx_notifications_unread
+  ON core.notifications (recipient) WHERE read_at IS NULL;
+-- The worklist a future transport will drain. Inert in slice 1 (every row is
+-- 'recorded'), which is precisely why it is safe to add now.
+CREATE INDEX IF NOT EXISTS idx_notifications_undelivered
+  ON core.notifications (delivery_channel, created_at) WHERE delivery_state <> 'delivered';
+
+-- The producer seam. A plugin's scheduled run executes on its OWN pool, as its
+-- own isolation role, so it cannot INSERT into core.notifications (the table is
+-- REVOKE'd below). It writes through this SECURITY DEFINER function instead, and
+-- **source is derived from session_user, never a parameter** — a plugin can only
+-- ever record a notification as itself. Same discipline as core.outbox_enqueue.
+CREATE OR REPLACE FUNCTION core.notify(
+    p_recipient      UUID,
+    p_message_code   TEXT,
+    p_message_params JSONB,
+    p_locale         TEXT
+) RETURNS BIGINT
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = core, pg_temp
+AS $fn$
+DECLARE
+    caller    TEXT := session_user;
+    source    TEXT;
+    new_id    BIGINT;
+BEGIN
+    IF caller NOT LIKE 'adjutant_plugin_%' THEN
+        RAISE EXCEPTION 'core.notify is for plugin roles: a notification is created by a scheduled run (as its plugin) or by the core directly -- % may not create one', caller;
+    END IF;
+    source := substring(caller FROM length('adjutant_plugin_') + 1);
+
+    -- A notification is addressed to a person. A recipient with no user row is
+    -- the FK's error, reported now, in the producer's own transaction, rather
+    -- than a row nothing can ever address.
+    IF NOT EXISTS (SELECT 1 FROM core.users u WHERE u.id = p_recipient) THEN
+        RAISE EXCEPTION 'recipient % is not a user; a notification is addressed to a person', p_recipient;
+    END IF;
+
+    INSERT INTO core.notifications
+        (recipient, source, message_code, message_params, locale, delivery_channel)
+    VALUES
+        -- The channel is policy, not a producer's choice: the core decides which
+        -- transport a record is for, so a producer cannot name one that does not
+        -- exist.
+        (p_recipient, source, p_message_code, COALESCE(p_message_params, '{}'::jsonb), p_locale, 'in_app')
+    RETURNING id INTO new_id;
+    RETURN new_id;
+END
+$fn$;
+-- EXECUTE on the *function*, never on the table: that is the whole design.
+GRANT EXECUTE ON FUNCTION core.notify(UUID, TEXT, JSONB, TEXT) TO PUBLIC;
+
+-- No plugin reads or writes the table directly; the read path is the core's own
+-- routes. Stated as a REVOKE rather than left implied, so a future blanket GRANT
+-- on the core schema cannot quietly open it.
+REVOKE ALL ON core.notifications FROM PUBLIC;
+"
+    ),
 ];
 
 /// Bootstrap roles + permissions grants. `chief` gets everything (SPEC §9 —

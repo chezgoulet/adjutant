@@ -65,7 +65,10 @@ A timer with notifications needs two things the core has never done:
    which is exactly the mess the host-mediated I/O rule exists to prevent.
 2. **A delivery channel.** There is nowhere to send a notification. No email sender, no push
    registration, no in-app inbox. `announcements` (M6) was flagged as needing a server-side owner
-   for exactly this reason.
+   for exactly this reason. *(Updated: the core now records a per-recipient notification with a
+   per-user read state — #46 slice 1, `core.notifications`, design
+   [`notifications.md`](notifications.md). The record half exists; the transports — Web Push, device
+   push, email — do not, and nothing here sends anything yet.)*
 
 Both are core capabilities, in the same class as the declared-capability model for field plugins:
 the schema change is an afternoon, the plumbing is the work. Which means this requirement, small as

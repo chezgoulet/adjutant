@@ -292,6 +292,18 @@ pub async fn build_app(cfg: &Config) -> Result<(Router, Arc<AppState>), BuildErr
             "/api/outbox/intent/{id}/retry",
             post(crate::outbox::retry_intent),
         )
+        // The notification record (#46, slice 1): the recipient's own inbox and
+        // its read marker. Ownership, not a grant (SPEC §9.2) — the handler
+        // filters on `recipient = caller`, so no permission is declared. See
+        // docs/design/notifications.md.
+        .route(
+            "/api/notifications",
+            get(crate::notifications::list_notifications),
+        )
+        .route(
+            "/api/notifications/{id}/read",
+            post(crate::notifications::mark_notification_read),
+        )
         // Every other METHOD path resolves against the live plugin registry.
         .fallback(dynamic_dispatch)
         .with_state(state.clone());

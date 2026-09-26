@@ -84,6 +84,20 @@ jobs:
           cargo test -p adjutant-server --test host_db --test pool_lifecycle
           -- --ignored --nocapture
 
+      # The notification record (#46, slice 1): a scheduled run records one
+      # through `core.notify` (as a plugin role, its source derived from
+      # `session_user`), the recipient lists and marks it read through the **real
+      # route handlers**, another member is told it does not exist, and the row is
+      # never reported as delivered when it was only recorded — the schema refuses
+      # the lie. Same `#[ignore]` discipline as the host tests above (issue #25).
+      # It sits here rather than with the plugin probes below because it needs
+      # nothing from the plugin ladder: it migrates `core` itself and bootstraps
+      # its own fixture role (so it needs `CREATEROLE`, like the confinement
+      # probes in `host_db.rs`), and it connects as that fixture's role — not as a
+      # staged plugin's.
+      - name: Notification record probes (DB-backed)
+        run: cargo test -p adjutant-server --test notifications -- --ignored --nocapture
+
       # Live evidence: the committed ladder resets the database, boots its own
       # server and writes docs/evidence/m2_probes.json. A failure here means the
       # milestone document's numbers are stale. It refuses any database whose

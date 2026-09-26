@@ -17,6 +17,25 @@ first-party plugin to pick the helpers up.
 
 ### Added
 
+- **The core records notifications** (#46, slice 1): `core.notifications` — one
+  row per message **per recipient**, with a per-user read state, and the
+  **record** kept separate from the **delivery**: `read_at` is a fact about the
+  person, `delivery_channel`/`delivery_state`/`delivered_at` are facts about a
+  transport, and the schema refuses to store a delivery without its evidence
+  (`delivery_state <> 'delivered' OR delivered_at IS NOT NULL`), so a
+  notification is **never reported as delivered when it was only recorded**.
+  Slice 1 writes `recorded` and only `recorded` — nothing sends anything. The
+  channel is a policy the core owns (`DELIVERY_CHANNELS`, one value today), not a
+  call-site assumption, so email and push are later values behind the same row.
+  A message is a **code** (`message_code` + `message_params` + `locale`), never
+  display text: the client renders it in the recipient's language
+  (`docs/design/localization.md` §4). A plugin's **scheduled run** records one
+  through `core.notify`, a `SECURITY DEFINER` function that derives `source` from
+  `session_user`; the core records one directly. Two core routes —
+  `GET /api/notifications` and `POST /api/notifications/{id}/read` — serve the
+  recipient's own inbox, an **ownership check, not a grant** (SPEC §9.2), so no
+  permission is declared. Design: `docs/design/notifications.md`; the background
+  check's policy questions (who is warned, how early) stay open for the owner.
 - **SDK v0.2 route helpers.** `PluginRequest::int_param` (a whole-segment
   capture as an integer, with a missing capture reported as a plugin bug and a
   bad value as a client error), `query_required`, `query_int`, `query_bool`;

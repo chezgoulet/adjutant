@@ -85,10 +85,13 @@ what makes "who has the good tent" and "which tent came back damaged" answerable
 Checkout/checkin is a state machine enforced twice — a `409` naming the holder,
 and a partial unique index as the backstop a race cannot get past.
 
-**Announcements does not pretend to deliver.** No delivery channel exists
-anywhere in Adjutant, so the plugin records the announcement, publishes
+**Announcements does not pretend to deliver.** No push provider is wired anywhere
+in Adjutant, so the plugin records the announcement, publishes
 `announcement.published` with everything a sender would need, and says
-`"delivery": "deferred"` rather than "sent".
+`"delivery": "deferred"` rather than "sent". The core now records notifications
+per recipient (`core.notifications`, #46 slice 1), but that plugin and this one
+are not wired together: an announcement is addressed to a scope, a notification to
+one user. See `docs/design/notifications.md`.
 
 **A plugin that needs host data asks for a method, not a wider grant.** Two read
 routes in `announcements` resolved their audience by querying
@@ -137,10 +140,13 @@ Two exit criteria are not met. Neither is hidden by the checkboxes above.
    than a note: either the work lands in M7, or SPEC §15 M6 is amended to drop
    the criterion. Nothing else in the milestone depended on it — every plugin
    declares permissions and migrations with the 0.2.0 surface.
-2. **Push notification delivery.** Deliberately deferred, not overlooked: there
-   is no delivery channel in the core (`docs/design/bg.md` §4 names it the
-   missing capability), so `announcements` builds the seam and stops at it. A
-   future delivery plugin subscribes to `announcement.published`.
+2. **Push notification delivery.** Deliberately deferred, not overlooked: the core
+   had no delivery channel (`docs/design/bg.md` §4 names it the missing
+   capability), so `announcements` builds the seam and stops at it. The core now
+   has the *record* half — per-recipient notifications with a per-user read state
+   (#46 slice 1, `docs/design/notifications.md`) — but the transports (Web Push,
+   device push, email) are still deferred, and a delivery plugin subscribing to
+   `announcement.published` is a later slice.
 
 ## How to reproduce the evidence
 

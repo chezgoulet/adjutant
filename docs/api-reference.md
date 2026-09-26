@@ -38,6 +38,8 @@ Adjutant's HTTP API is JSON over HTTP. Plugin routes live under
 | GET | `/api/outbox/intents?state=&producer=&limit=` | `core:admin` | The queue: every intent, and the state it is in |
 | GET | `/api/outbox/reconciliation` | `core:admin` | Classify every intent and report the ones that did not land, with both sides of the disagreement |
 | POST | `/api/outbox/intent/{id}/retry` | `core:admin` | Re-arm an exhausted or refused intent (`409` unless it is terminal) |
+| GET | `/api/notifications?unread=&limit=` | authenticated (**ownership**, not a grant) | The caller's own notification records, newest first, with the unread badge. No permission is declared: SPEC §9.2 — a caller reading their own record is an ownership check, not a grant (§ Notifications) |
+| POST | `/api/notifications/{id}/read` | authenticated (**ownership**, not a grant) | Marks the caller's own record read. `404` for a record that is not theirs (not `403`). Does **not** deliver anything |
 
 ### The outbox (`core.outbox`)
 
@@ -75,6 +77,68 @@ claim, so a crash mid-delivery still spends one; exhaustion carries its last err
 and appears in reconciliation as unlanded. A producer reads **its own** intents
 through `core.outbox_producer_view()` without holding any grant on the table, and a
 production plugin holds no grant on `core.outbox` at all — in either direction.
+
+
+### Notifications (`core.notifications`)
+
+The record behind the owner's three delivery surfaces (issue #46, decision
+2026-09-25): **Web Push**, **device push**, and the **in-app board**. The board is
+not a fallback — *it is the record*, and the other two are notifications that
+something is on it. Design: [`design/notifications.md`](design/notifications.md).
+**Slice 1 is the record and only the record**: nothing here sends anything.
+
+**The record is not the delivery.** Two facts, two columns, never collapsed:
+
+- `read_at` — the **read** fact, about the *person*: `NULL` until the recipient
+  opens it.
+- `delivery_channel` / `delivery_state` / `delivered_at` — the **delivery**
+  facts, about a *transport*: `recorded` (nothing was sent — the only state slice
+  1 writes), `delivered`, or `failed`.
+
+The hard rule is *never report a notification as delivered when it was only
+recorded*, and the schema says so itself: `delivery_state <> 'delivered' OR
+delivered_at IS NOT NULL`, and `delivered_at IS NULL OR delivery_state =
+'delivered'`. Marking a record read moves `read_at` and **nothing else**; the two
+facts are separate objects in every response (`read` and `delivery`), so a client
+cannot merge them by accident. `delivery_channel` is a **column** and a policy the
+core owns (`notifications::DELIVERY_CHANNELS`, one value today), and neither route
+branches on it — so adding email or push is a value in that list, one widening of
+the table's `CHECK`, and a relay, never a change to how a member reads their inbox.
+
+**A message is a code, not a sentence.** A row carries `message_code`
+(`bg_check.expiring`), `message_params` (JSON **data** — ISO-8601 dates, ids,
+counts), `locale` (the recipient's BCP-47 language at creation, `und` when the
+producer does not know it) and `source` (the plugin or `core` that recorded it).
+The **client renders** `(code, params, locale)` from its own or the owning
+plugin's catalogue; the core renders nothing, because
+[`localization.md`](design/localization.md) §2 puts plugin strings with the plugin
+and chrome with the client. A French recipient's notice is a French render of the
+same row — no duplicate records.
+
+**Who creates one.** A **plugin's scheduled run** (the scheduler is a plugin-side
+[`Schedule`](../plugins/sdk/src/lib.rs); the background-check sweep is the first
+real consumer) calls `core.notify(recipient, message_code, message_params,
+locale)`, a `SECURITY DEFINER` function that derives `source` from `session_user`
+— never a parameter — so a plugin can only ever record a notification as itself
+and needs **no grant** on `core.notifications` (`REVOKE`d from `PUBLIC`, same
+posture as `core.outbox`). The **core** records one directly
+(`notifications::create`). Neither path may name the channel or the delivery
+state: those are policy and are set by the core.
+
+**No permission is declared, on purpose.** SPEC §9.2 — *"a caller reading their
+own record is an ownership check, not a grant."* There is no scope at which
+reading somebody else's notifications is a sensible authority, so the routes
+require an authenticated member (401) and filter `recipient = caller` **in the
+query**; another member's record is a `404`, not a `403`, because whether somebody
+else has a notification is not the caller's business. An oversight list would be a
+different route with a different permission, and it is not in slice 1.
+
+**What is deliberately not here:** the transports (Web Push / device push /
+email); the client (no service worker, no subscription record, no board screen);
+a link from a notification to a board entry; wiring `announcements` to this
+record; and a per-user language-preference store — so a producer is *told* the
+recipient's locale today. The background-check **policy** questions (who is warned,
+how early) are open for the owner: `design/notifications.md` §8.
 
 
 ## Auth plugin
@@ -1088,12 +1152,16 @@ not landed says so rather than reading as settled (`client/lib/widgets/store_mon
 Troop and Lodge notices in the troop's three categories — `urgent`,
 `informational`, `event` — with an inbox, a per-member unread badge and read
 receipts. SPEC §7.14 also lists push notifications; no push provider is wired
-anywhere in Adjutant and the core has no delivery channel, so this plugin does
-not pretend. It records the announcement, its category, its scope and every
-receipt, publishes `announcement.published` with everything a sender would need,
-and says `"delivery": "deferred…"` in the responses it returns — recorded, never
-"sent". A future notification-delivery plugin subscribes to that event; until one
-exists the event is the seam.
+anywhere in Adjutant, so this plugin does not pretend. It records the
+announcement, its category, its scope and every receipt, publishes
+`announcement.published` with everything a sender would need, and says
+`"delivery": "deferred…"` in the responses it returns — recorded, never "sent".
+The seam has a target now: the core records notifications per recipient (#46
+slice 1, `core.notifications`), but **this plugin is not wired to it** and its
+behaviour is unchanged — an announcement is addressed to a *scope*, a
+notification to *one user*, and the delivery/notification plugin that would
+subscribe to `announcement.published` is a later slice
+(`design/notifications.md` §7).
 
 Authority and audience are two different rules, and the difference is visible on
 every read route. Writing, editing, retracting and reading the receipt list use
