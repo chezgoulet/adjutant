@@ -13,6 +13,7 @@
 //! unreachable URL is a hard failure (issue #25).
 
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use adjutant_server::config::Config;
 
@@ -43,6 +44,36 @@ fn scratch(tag: &str) -> (PathBuf, PathBuf) {
     std::fs::create_dir_all(&plugins).expect("plugin dir");
     std::fs::create_dir_all(&backups).expect("backup dir");
     (plugins, backups)
+}
+
+/// Migrate, then empty the backup ledger and reset the schedule.
+///
+/// The two probes share one test database, and `core.backups` otherwise carries
+/// the other's rows — so a probe reading the list would be asserting on whatever
+/// ran first. (Found exactly that way: the retention probe's list held two runs,
+/// one of them the other probe's, whose bundle was in a different directory.) The
+/// sibling probe file solves the same problem by starting its fixture from
+/// nothing; this is the same discipline for a table rather than a schema.
+async fn fresh_ledger(url: &str, plugins: &Path) -> Arc<sqlx::PgPool> {
+    let cfg = Config {
+        database_url: url.to_string(),
+        plugin_dir: plugins.to_path_buf(),
+        ..Default::default()
+    };
+    let pool = adjutant_server::db::connect_and_migrate(&cfg)
+        .await
+        .expect("core migrations on the test database");
+    sqlx::query("DELETE FROM core.backups")
+        .execute(pool.as_ref())
+        .await
+        .expect("clear the backup ledger");
+    sqlx::query(
+        "UPDATE core.backup_schedule SET cadence_secs = NULL, keep = 14, enabled = false",
+    )
+    .execute(pool.as_ref())
+    .await
+    .expect("reset the schedule");
+    pool
 }
 
 /// Boot the real application on an ephemeral port, with its backup directory
@@ -150,6 +181,7 @@ async fn probe_a_manual_run_produces_a_bundle_the_admin_can_download() {
     let _serial = SERIAL.lock().await;
     let (plugins, backups) = scratch("manual");
     let url = base_url();
+    let _ledger = fresh_ledger(&url, &plugins).await;
     let (base, _serve) = spawn_app(&plugins, &backups, &url).await;
 
     // --- the list, before anything has run ---------------------------------
@@ -266,6 +298,7 @@ async fn probe_retention_prunes_and_the_ledger_does_not_lie() {
     let _serial = SERIAL.lock().await;
     let (plugins, backups) = scratch("prune");
     let url = base_url();
+    let _ledger = fresh_ledger(&url, &plugins).await;
     let (base, _serve) = spawn_app(&plugins, &backups, &url).await;
 
     // Keep one, so a second run has to remove the first.
