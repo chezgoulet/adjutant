@@ -144,6 +144,14 @@ Order within the stage is by dependency, not by size:
    dependency of the community plugin guide in Stage 5.
 7. **#53 — CONTRIBUTING.md, code of conduct, PR process.** Small, but a
    precondition of Stage 5's community contribution, not a courtesy.
+8. **The image is never built in CI, so the deployment is ungraded.** The
+   workflow builds the workspace and stages the plugin libraries, but nothing
+   builds the `Dockerfile` — which is how an image shipping **three plugins of
+   fourteen** stayed green until a human read it (#88). The gate is cheap: build
+   the image and assert the plugin count inside it matches the workspace's
+   `cdylib` count, the same derivation `scripts/stage-plugins.py` already uses.
+   Folded in here rather than beside the probe steps because it needs a Docker
+   runner, not a database.
 
 **Proves it:** M7's eight boxes checked, with the drill transcript, the proxy
 proof and the audit report committed as evidence.
