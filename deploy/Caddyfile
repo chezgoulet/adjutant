@@ -1,0 +1,54 @@
+# Caddy — the default reverse proxy for a troop's own box.
+#
+#   docker compose -f deploy/compose.proxy.yml up -d
+#
+# Certificates are issued and renewed automatically from Let's Encrypt for
+# {$DOMAIN}; nothing here needs a cron job. Only 80 and 443 are published; the
+# second site block listens inside the container on 8080 and is reachable only on
+# the private `edge` network.
+
+{
+	email {$ACME_EMAIL}
+	# Uncomment while bringing a host up, to avoid burning the ACME rate limit
+	# with a typo. Every certificate failure is then visible in the log.
+	# acme_ca https://acme-staging-v02.api.letsencrypt.org/directory
+}
+
+# The public site. Caddy answers the ACME HTTP-01 challenge on :80 and redirects
+# everything else to HTTPS — stated rather than assumed, because "the redirect
+# exists" is one of the things an operator is often told and rarely shows.
+{$DOMAIN} {
+	encode zstd gzip
+
+	header {
+		Strict-Transport-Security "max-age=31536000; includeSubDomains"
+		X-Content-Type-Options "nosniff"
+		Referrer-Policy "strict-origin-when-cross-origin"
+		-Server
+	}
+
+	reverse_proxy {$UPSTREAM} {
+		# Caddy appends the real client address to `x-forwarded-for` and never
+		# strips a client-supplied one. That is why the application walks the
+		# list from the right and only believes it when the direct peer is the
+		# proxy — see deploy/README.md, "The one setting that matters".
+		header_up X-Real-IP {remote_host}
+	}
+
+	log {
+		output stderr
+		format json
+	}
+}
+
+# The origin listener: plain HTTP, inside the container only, for a tunnel
+# (Cloudflare, or any other) or for the proof probes. NOT published to the host —
+# publishing it would be a second way in that skips TLS entirely, which is the
+# failure this whole directory exists to prevent.
+:8080 {
+	reverse_proxy {$UPSTREAM}
+	log {
+		output stderr
+		format json
+	}
+}

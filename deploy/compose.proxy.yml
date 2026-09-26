@@ -1,0 +1,109 @@
+# Adjutant behind a reverse proxy — the stack that terminates TLS.
+#
+#   docker compose -f deploy/compose.proxy.yml up -d --build
+#
+# This is deliberately a **complete** stack rather than an override of
+# `docker-compose.yml`. Compose concatenates `ports` across files, so an override
+# cannot remove the base file's `8787:8787` — and an app reachable directly is an
+# app reachable without TLS, which defeats the point. The duplication is real and
+# `deploy/verify.sh` checks the two `adjutant` services have not drifted apart.
+#
+# Roles: identical to `docker-compose.yml` (see the comment there) — `adjutant` is
+# the one-off bootstrap superuser, `adjutant_app` is the server's runtime role.
+#
+# One thing here is new and load-bearing: the `edge` network has a fixed subnet
+# and the proxy has a **static address**, because `ADJUTANT_TRUSTED_PROXIES` is a
+# literal-address comparison. See deploy/README.md.
+
+services:
+  postgres:
+    image: postgres:18-alpine
+    environment:
+      POSTGRES_USER: adjutant
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD}
+      POSTGRES_DB: adjutant
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U adjutant"]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+    networks: [internal]
+    restart: unless-stopped
+
+  adjutant:
+    # The context is the repository root, `..`, not `.`: Compose resolves relative
+    # paths against the *compose file's* directory, so `build: .` in this file
+    # would look for `deploy/Dockerfile` and fail with "failed to read dockerfile"
+    # — which is exactly what the first real run did.
+    build:
+      context: ..
+      dockerfile: Dockerfile
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      ADJUTANT_DATABASE_URL: postgres://adjutant_app:${ADJUTANT_APP_PASSWORD:?set ADJUTANT_APP_PASSWORD}@postgres:5432/adjutant
+      ADJUTANT_BIND: 0.0.0.0:8787
+      ADJUTANT_LOG_FORMAT: json
+      # The proxy's static address on the `edge` network. Literal string compare
+      # against the direct peer: get this wrong and every client behind the proxy
+      # shares one rate-limit bucket (fail-safe, but wrong). Keep it equal to the
+      # `ipv4_address` below and to `PROXY_IP`.
+      ADJUTANT_TRUSTED_PROXIES: ${PROXY_IP:?set PROXY_IP to the proxy's static address}
+      # The client's origin, if the app is served from a different name than the
+      # API. Same-origin only when unset.
+      ADJUTANT_CORS: ${ADJUTANT_CORS:-}
+      # Leave ADJUTANT_DEV_HEADERS unset (off). Anyone who can reach the port can
+      # claim any role when it is on.
+    # NOTE: no `ports:` — the proxy is the only way in, and verify.sh checks it.
+    networks: [internal, edge]
+    restart: unless-stopped
+
+  caddy:
+    image: caddy:2-alpine
+    depends_on: [adjutant]
+    environment:
+      DOMAIN: ${DOMAIN:?set DOMAIN to the certificate name}
+      ACME_EMAIL: ${ACME_EMAIL:?set ACME_EMAIL}
+      UPSTREAM: adjutant:8787
+    ports:
+      - "80:80"
+      - "443:443"
+      - "443:443/udp"   # HTTP/3
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data       # certificates live here; back this up
+      - caddy_config:/config
+    networks:
+      edge:
+        # Static, because ADJUTANT_TRUSTED_PROXIES above must match it exactly.
+        ipv4_address: ${PROXY_IP:?set PROXY_IP to the proxy's static address}
+    restart: unless-stopped
+
+  # A throwaway curl on the `edge` network, so `verify.sh` can originate requests
+  # from real, distinct client addresses without a second machine: two `run`
+  # invocations are two containers, and therefore two peer addresses. Not started
+  # by `up` (it is behind a profile) and it holds nothing.
+  probe:
+    image: curlimages/curl:8
+    profiles: ["probe"]
+    entrypoint: ["sh", "-c"]
+    networks: [edge]
+    restart: "no"
+
+volumes:
+  pgdata:
+  caddy_data:
+  caddy_config:
+
+networks:
+  # The app and its database, invisible to the host.
+  internal:
+    internal: true
+  # What the proxy is on. A fixed subnet so the static address is meaningful.
+  edge:
+    ipam:
+      config:
+        - subnet: 172.31.7.0/24

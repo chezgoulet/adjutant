@@ -1,0 +1,52 @@
+# Adjutant behind Traefik — the same shape as Caddyfile, as a file-provider
+# router. This is the pattern The House already runs; a troop running Traefik for
+# other reasons can use it instead of Caddy.
+#
+# Load it as a dynamic configuration file (providers.file in traefik.yml), or drop
+# it beside the other routers in the Traefik config directory.
+#
+# The service address depends on where Adjutant runs relative to Traefik:
+#   * both on the same Docker network  -> http://adjutant:8787 (as below)
+#   * Traefik with `network_mode: host` -> http://127.0.0.1:8787, and the app is
+#     published on a host port (The House's convention for custom compose apps is
+#     30xxx). In that case ADJUTANT_TRUSTED_PROXIES must name the proxy's peer
+#     address as the app sees it — 127.0.0.1 for a host-mode proxy, not a
+#     container address.
+
+http:
+  routers:
+    adjutant-http:
+      rule: Host(`adjutant.example.org`)
+      entryPoints: [web]
+      service: adjutant
+      middlewares: [https-redirect]
+
+    adjutant-https:
+      rule: Host(`adjutant.example.org`)
+      entryPoints: [websecure]
+      service: adjutant
+      tls: {}
+      # NO authentik@file forward-auth middleware, and that is deliberate.
+      # Adjutant is its own OIDC client: it runs the authorisation-code flow
+      # against the troop's identity provider itself (points at Authentik in The
+      # House), so it belongs to the OIDC-integrated exception in
+      # deployment-security-standards — the same category as Grafana and
+      # Nextcloud. Adding forward auth on top would put two independent login
+      # flows in front of one session and break the second one.
+
+  services:
+    adjutant:
+      loadBalancer:
+        servers:
+          - url: "http://adjutant:8787"
+        # Do not enable sticky sessions or a health check that hits an
+        # authenticated route: `/` and `/api/hello` are the open ones.
+
+  middlewares:
+    # Present in most Traefik installs already; defined here so this file stands
+    # alone. Remove this block if it is declared elsewhere (a duplicate name is a
+    # Traefik startup error).
+    https-redirect:
+      redirectScheme:
+        scheme: https
+        permanent: true
