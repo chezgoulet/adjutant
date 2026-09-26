@@ -213,34 +213,101 @@ Notes:
 
 ## Backup and restore
 
-Everything lives in PostgreSQL. Back up with `pg_dump`:
+**Everything Adjutant knows lives in PostgreSQL** — the `core` schema, every
+plugin's schema, the roles' grants, and the append-only audit chain. So the
+database dump is the backup, and `deploy/backup.sh` takes it:
 
 ```bash
-# Backup (custom format, restorable selectively)
-docker compose exec -T postgres \
-  pg_dump -U adjutant -Fc adjutant > adjutant-$(date +%F).dump
+./deploy/backup.sh                 # or: ./deploy/backup.sh /other/dir
 ```
 
-Restore into a fresh database:
+| | |
+|---|---|
+| **What** | the `adjutant` database (`pg_dump -Fc`), plus its `.sha256` |
+| **Where** | `$ADJUTANT_BACKUP_DIR`, default `/var/backups/adjutant` |
+| **Retention** | `$ADJUTANT_BACKUP_KEEP_DAYS`, default 14 days, pruned by the script |
+| **Cadence** | daily, and immediately before any upgrade — see below |
+| **NOT in the dump** | `deploy/.env` (it holds `POSTGRES_PASSWORD` and `ADJUTANT_APP_PASSWORD`) and the plugin `.so` files. Back the `.env` up somewhere else and keep it: without it a restore cannot reproduce the credentials the roles were created with. |
+
+The script refuses to call a zero-byte dump a success, and re-reads the archive
+with `pg_restore -l` before trusting it — a dump you cannot list is a dump you
+cannot restore.
+
+### Restoring
 
 ```bash
-# Stop the server first so nothing writes mid-restore.
-docker compose stop adjutant
-
-# Recreate the database and restore.
-docker compose exec -T postgres psql -U adjutant -d postgres \
-  -c 'DROP DATABASE IF EXISTS adjutant' -c 'CREATE DATABASE adjutant OWNER adjutant'
-docker compose exec -T postgres \
-  pg_restore -U adjutant -d adjutant --no-owner < adjutant-2026-09-24.dump
-
-docker compose start adjutant
+./deploy/restore.sh /var/backups/adjutant/adjutant-2026-09-26-153006.dump --yes
 ```
 
-The audit log is append-only and hash-chained; the chain is verified by
-`GET /api/audit/verify` (admin only) after a restore.
+`--yes` because it drops the current database. The script validates the archive
+**before** dropping anything, then: stop the app, recreate the database,
+`pg_restore`, **run `bootstrap-isolation`**, start the app, and refuse to exit
+successfully unless it answers through the proxy and the plugin grants exist.
+
+### The step everyone misses, and why it is the whole reason there is a script
+
+A `pg_dump` of a database contains the database. It does **not** contain the
+cluster's roles, because roles are cluster-level objects — and Adjutant runs
+every plugin as its own role (`adjutant_plugin_<id>`) and the core as
+`adjutant_app`. Restoring a dump onto a clean host therefore produces a database
+whose grantee roles do not exist. Observed, on the first drill:
+
+```
+roles once a CLEAN postgres is up: 1        <- only `adjutant`
+pg_restore: error: could not execute query: ERROR:  role "adjutant_plugin_auth" does not exist
+Command was: GRANT SELECT,INSERT,DELETE ON TABLE core.sessions TO adjutant_plugin_auth;
+pg_restore: warning: errors ignored on restore: 6
+```
+
+**`errors ignored` is the dangerous part.** The restore reports success, the data
+is all there, and the server then crash-loops on
+
+```
+password authentication failed for user "adjutant_app"     (28P01, 7 restarts, exit 1)
+```
+
+which points at a password when the actual fault is a role that was never
+created. `bootstrap-isolation` closes it: it creates the roles, transfers
+ownership of the plugin schemas to them, hands the `core` schema to
+`adjutant_app`, stores each plugin's credential, and **re-asserts the grant
+allowlist** — which is what puts back the six `GRANT`s that `pg_restore` dropped.
+
+### Measured, not asserted
+
+Restore drill, 2026-09-26, on a real host, following the scripted procedure from a
+destroyed volume:
+
+| | |
+|---|---|
+| dump size / time | 242,369 bytes in **1s** |
+| `pg_restore` | 2s |
+| `bootstrap-isolation` | 3s |
+| **`restore.sh` wall clock** | **6s** |
+| after: marker row | present |
+| after: `core.plugins` / `core.permissions` | 15 / 60 |
+| after: roles in the cluster | 17 |
+| after: plugin-role grants | 335 |
+| after: owner of `hello.greetings` / `core` | `adjutant_plugin_hello` / `adjutant_app` |
+| after: the app | `running`, answering through the proxy |
+
+**RTO** is therefore ~6 seconds *for this dataset* — which is schema and
+provisioning, with no troop data in it. Do not read that as the RTO for a troop
+that has been running for a year: the dump grows with content, and the honest
+statement is "seconds of mechanical time plus the time to move the dump", not a
+fixed number.
+
+**RPO** is the backup interval, and the interval is what the cadence above
+decides — nothing is taken automatically yet. Daily means up to a day of loss.
+Automating it (a host cron or systemd timer calling `backup.sh`) belongs with the
+deployment host decision in `docs/release-path.md` Stage 3, and until that exists
+the RPO is whatever the operator actually ran.
 
 > A physical volume snapshot (`pgdata`) also works but requires a consistent
 > Postgres shutdown. `pg_dump` is the portable option.
+
+The audit log is append-only and hash-chained, so it is the one thing a partial
+restore can quietly corrupt. Verify it after a restore with
+`GET /api/audit/verify` (admin only).
 
 ## Releases
 
