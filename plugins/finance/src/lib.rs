@@ -45,6 +45,47 @@
 //! from (that is the treasurer's number), so self-reporting cannot inflate or
 //! deflate an assessment.
 //!
+//! **A receipt is issued from the ledger record, never from a payment
+//! provider.** Finance owns the money, so finance owns the receipt: a `stripe`
+//! Checkout session that funds a donation produces the *transaction*, and the
+//! receipt follows the transaction (`POST /api/finance/receipt`). That keeps one
+//! numbering authority in the system and makes a receipt for money that was
+//! never recorded unrepresentable — `finance.receipts.transaction_id` is `NOT
+//! NULL` and the foreign key is what says so.
+//!
+//! **A receipt is a record, and a correction is a new receipt.** The database
+//! refuses every `UPDATE` and every `DELETE` on `finance.receipts` (a trigger,
+//! as `archive.records` and `conflicts.stage_log` do) — a receipt that can be
+//! quietly edited is not a receipt. A correction is a new row carrying
+//! `supersedes_id` (`POST /api/finance/receipt/{id}/supersede`), so what a giver
+//! was told is never overwritten; `superseded_by` is *derived* rather than
+//! stored, because the superseded row cannot be updated to name its own
+//! successor.
+//!
+//! **A receipt is addressed to the giver, and only to what a receipt needs.** A
+//! member is named by their roster identity; anyone else — a parent, a business
+//! — by the name as they gave it at the time, snapshotted on the receipt. There
+//! is deliberately no donor table: a second receipt for the same person is
+//! issued from the money, not from a profile. A giver reads their own receipts
+//! (`finance:read` at any scope, an ownership check) and the treasurer reads
+//! every receipt (`finance:read_all`), and the Annual Financial Report totals
+//! them.
+//!
+//! **The wording claims nothing about tax unless the troop has declared a
+//! status.** `tax_statement` is the troop's own configurable words
+//! ([`CONFIG_RECEIPT_TAX_STATEMENT`]), snapshotted on the receipt when it is
+//! issued, and empty otherwise: the software invents no acknowledgment, because
+//! a receipt claiming a deduction the troop cannot substantiate is a liability
+//! for the troop, not a courtesy to the giver. [`receipt_wording`] is the one
+//! place the sentence is assembled, and its default says nothing about tax.
+//!
+//! **The scholarship draw is not a receipt, and that is deliberate.** A waiver,
+//! comp or reduction draws on the Scholarship fund (#58); the member sees that
+//! their cost is *covered*, not that they are being helped, because the fund
+//! exists so cost never decides who belongs. The draw is internal — the ledger
+//! and the Annual Financial Report — and this crate issues receipts only for
+//! money the troop *receives*.
+//!
 //! ## The six funds
 //!
 //! Migration 1 seeds General, Scholarship, Equipment, Expedition, Impact and
@@ -75,11 +116,14 @@
 //! ## Schema
 //!
 //! `finance.funds`, `finance.transactions`, `finance.budgets`, `finance.dues`
-//! (SPEC §7.5). Vocabulary that reaches an arithmetic result is a database
-//! constraint rather than a convention: a transaction's `kind`, the sign rule
-//! per kind (`income` is positive, `expense` negative), the transfer pair rule
-//! (group and counterparty present, or neither), a dues row's subject, and the
-//! waive-with-zero rule.
+//! (SPEC §7.5) and `finance.receipts` (migration 3). Vocabulary that reaches an
+//! arithmetic result is a database constraint rather than a convention: a
+//! transaction's `kind`, the sign rule per kind (`income` is positive, `expense`
+//! negative), the transfer pair rule (group and counterparty present, or
+//! neither), a dues row's subject, and the waive-with-zero rule. On a receipt
+//! the rules are the immutability trigger, the correction trigger (a correction
+//! supersedes a receipt for the *same* ledger entry), the one-correction-per-
+//! receipt unique index, and the positive-amount and addressee constraints.
 //!
 //! ## Integration
 //!
@@ -87,7 +131,9 @@
 //! the fund the payment names, keyed on the provider's payment id
 //! (`external_ref`, unique) so a replayed event is a no-op rather than a second
 //! deposit. A daily schedule re-checks the ledger's integrity and publishes
-//! `finance.ledger.imbalanced` only when something is actually wrong.
+//! `finance.ledger.imbalanced` only when something is actually wrong. A receipt
+//! is never issued *by* the provider: the money is booked first, and the receipt
+//! is issued from the ledger row (`POST /api/finance/receipt`).
 
 use std::sync::OnceLock;
 
@@ -320,6 +366,14 @@ pub const CONFIG_FISCAL_YEAR_START_MONTH: &str = "fiscal_year_start_month";
 pub const CONFIG_MEMBERSHIP_COST_CENTS: &str = "membership_cost_cents";
 /// Config key: the fund dues and donations land in by default.
 pub const CONFIG_DUES_FUND_CODE: &str = "dues_fund_code";
+/// Config key: the troop's **own** tax-status wording, printed on a receipt.
+///
+/// Empty by default, and empty means the receipt claims nothing: the software
+/// invents no acknowledgment, because a receipt claiming a deduction the troop
+/// cannot substantiate is a liability for the troop, not a courtesy to the
+/// giver. When a troop has declared a status, the words are the troop's own,
+/// snapshotted on each receipt it issues.
+pub const CONFIG_RECEIPT_TAX_STATEMENT: &str = "receipt_tax_statement";
 
 /// `recorded_by` on the seed rows. Not a user id: no member is called this.
 pub const SEEDED_BY: &str = "finance:seed";
@@ -332,6 +386,10 @@ pub const DEFAULT_LEDGER_LIMIT: i64 = 50;
 pub const RECENT_ENTRIES: i64 = 20;
 /// The most dues rows one list returns.
 pub const MAX_DUES_ROWS: i64 = 500;
+/// The most receipt rows one page returns.
+pub const MAX_RECEIPT_LIMIT: i64 = 200;
+/// The default page size for the receipt list.
+pub const DEFAULT_RECEIPT_LIMIT: i64 = 50;
 
 // ---------------------------------------------------------------------------
 // Money — exact, integer, cents-only
@@ -691,6 +749,60 @@ struct DuesPaymentBody {
     external_ref: Option<String>,
 }
 
+/// `POST /api/finance/receipt` — issue a receipt for one ledger entry.
+///
+/// The ledger entry is named by its own id: a receipt is issued *from* the
+/// record, so there is nothing else to name.
+#[derive(Debug, Deserialize)]
+struct ReceiptBody {
+    /// The income entry the receipt is for. `finance.transactions.id`.
+    transaction_id: i64,
+    /// The addressee, when the giver is a member. Defaults to the entry's own
+    /// `member_id` — the roster identity the payment already carries.
+    #[serde(default)]
+    member_id: Option<String>,
+    /// The addressee's name **as they gave it**, when the giver is not a member
+    /// (a parent, a business). Recorded on the receipt and nowhere else.
+    #[serde(default)]
+    payer_name: Option<String>,
+    /// What the money was for. Defaults to the entry's description.
+    #[serde(default)]
+    purpose: Option<String>,
+    /// The troop's own tax-status wording. Defaults to the configured
+    /// `receipt_tax_statement`; empty when the troop has declared nothing.
+    #[serde(default)]
+    tax_statement: Option<String>,
+    /// `YYYY-MM-DD`; today (UTC) by default.
+    #[serde(default)]
+    issued_on: Option<String>,
+}
+
+/// `POST /api/finance/receipt/{id}/supersede` — issue a correction.
+///
+/// A correction is a **new** receipt that references the one it supersedes; the
+/// original is never touched. Everything the correction does not restate is
+/// carried over from the receipt it supersedes.
+#[derive(Debug, Deserialize)]
+struct ReceiptCorrectionBody {
+    /// Why the receipt is being corrected. Required: a correction that does not
+    /// say what it corrects is a receipt nobody can account for.
+    #[serde(default)]
+    reason: Option<String>,
+    /// A corrected roster identity, when the money came from a member.
+    #[serde(default)]
+    member_id: Option<String>,
+    /// A corrected name, when the giver is not a member — the typo a correction
+    /// most often exists to fix.
+    #[serde(default)]
+    payer_name: Option<String>,
+    #[serde(default)]
+    purpose: Option<String>,
+    #[serde(default)]
+    tax_statement: Option<String>,
+    #[serde(default)]
+    issued_on: Option<String>,
+}
+
 /// The `payment.received` payload (SPEC §5.4) — what the payments integration
 /// publishes and this plugin books.
 ///
@@ -845,6 +957,15 @@ fn configured_membership_cost(config: &Value) -> Option<i64> {
 /// The fund dues and donations land in by default.
 fn configured_dues_fund(config: &Value) -> String {
     config_str(config, CONFIG_DUES_FUND_CODE).unwrap_or_else(|| FUND_GENERAL.to_string())
+}
+
+/// The troop's own tax-status wording, or `None` when it has declared nothing.
+///
+/// A troop that has not declared a status gets no sentence: the receipt says what
+/// the troop received and claims nothing about what the giver may deduct, which
+/// is the only honest thing software can print on the troop's behalf.
+fn configured_tax_statement(config: &Value) -> Option<String> {
+    config_str(config, CONFIG_RECEIPT_TAX_STATEMENT)
 }
 
 // ---------------------------------------------------------------------------
@@ -1148,6 +1269,111 @@ fn sql_annual_collected(c: &PluginContext) -> String {
     )
 }
 
+/// A receipt row as the issuing statement returns it, for `RETURNING` (alias
+/// `r`). The receipt's own columns only — `fund_code` comes from the read the
+/// handler already made, and `superseded_by` cannot exist yet on a row that is
+/// being written.
+const RECEIPT_FIELDS: &str = r#"
+    r.id, r.number, r.fiscal_year, r.transaction_id, r.fund_id, r.amount_cents,
+    r.issued_on::text AS issued_on, r.member_id, r.payer_name, r.purpose, r.tax_statement,
+    r.supersedes_id, r.correction_reason, r.issued_by, r.created_at::text AS created_at
+"#;
+
+/// A receipt as a reader sees it: the row, the fund's code, and the correction
+/// that supersedes it (if any).
+///
+/// `superseded_by` is a subquery rather than a column on purpose — a receipt
+/// cannot be edited to name its own successor, so the successor is derived.
+/// `{receipts}` is a placeholder: see [`receipt_read_fields`].
+const RECEIPT_READ_FIELDS: &str = r#"
+    r.id, r.number, r.fiscal_year, r.transaction_id, f.code AS fund_code, r.fund_id,
+    r.amount_cents, r.issued_on::text AS issued_on, r.member_id, r.payer_name, r.purpose,
+    r.tax_statement, r.supersedes_id, r.correction_reason, r.issued_by,
+    r.created_at::text AS created_at,
+    (SELECT c.id FROM {receipts} c WHERE c.supersedes_id = r.id ORDER BY c.id LIMIT 1)
+        AS superseded_by,
+    (SELECT c.number FROM {receipts} c WHERE c.supersedes_id = r.id ORDER BY c.id LIMIT 1)
+        AS superseded_by_number
+"#;
+
+/// [`RECEIPT_READ_FIELDS`] with the receipts table qualified. The const's
+/// `{receipts}` is in its *value*, so this is a `replace`, not a `format!`.
+fn receipt_read_fields(c: &PluginContext) -> String {
+    RECEIPT_READ_FIELDS.replace("{receipts}", &c.db.table("receipts"))
+}
+
+/// One receipt, with its fund's code and the correction that supersedes it.
+/// `$1` = the receipt id.
+fn sql_receipt_one(c: &PluginContext) -> String {
+    format!(
+        "SELECT {fields} FROM {receipts} r JOIN {funds} f ON f.id = r.fund_id WHERE r.id = $1",
+        fields = receipt_read_fields(c),
+        receipts = c.db.table("receipts"),
+        funds = c.db.table("funds")
+    )
+}
+
+/// The receipts page, newest first, with one row more than asked for (which is
+/// how `has_more` is known without a `COUNT(*)` over the same filters).
+///
+/// `$1` fiscal year (or null), `$2` member id (or null), `$3` transaction id (or
+/// null), `$4` before_id (or null), `$5` limit + 1.
+fn sql_receipts_page(c: &PluginContext) -> String {
+    format!(
+        "SELECT {fields} FROM {receipts} r JOIN {funds} f ON f.id = r.fund_id \
+         WHERE {filter} AND ($4::bigint IS NULL OR r.id < $4) \
+         ORDER BY r.id DESC LIMIT $5",
+        fields = receipt_read_fields(c),
+        receipts = c.db.table("receipts"),
+        funds = c.db.table("funds"),
+        filter = RECEIPT_FILTER
+    )
+}
+
+/// The filters the page and the total it reports share, so they cannot disagree
+/// about what they are counting.
+const RECEIPT_FILTER: &str = r#"
+    ($1::bigint IS NULL OR r.fiscal_year = $1)
+    AND ($2::text IS NULL OR r.member_id = $2)
+    AND ($3::bigint IS NULL OR r.transaction_id = $3)
+"#;
+
+/// What the filtered receipts come to.
+///
+/// Only receipts **nothing supersedes** are summed: a corrected receipt and its
+/// correction are both rows, and a total that counted both would report a
+/// donation twice. `$1`/`$2`/`$3` are the filters above.
+fn sql_receipts_total(c: &PluginContext) -> String {
+    format!(
+        "SELECT COALESCE(SUM(r.amount_cents), 0)::bigint AS total_cents, \
+                COUNT(*)::bigint AS live \
+         FROM {receipts} r WHERE {filter} \
+           AND NOT EXISTS (SELECT 1 FROM {receipts} c WHERE c.supersedes_id = r.id)",
+        receipts = c.db.table("receipts"),
+        filter = RECEIPT_FILTER
+    )
+}
+
+/// The year's receipts for the Annual Financial Report.
+///
+/// `issued` counts every receipt issued in the year (corrections included, they
+/// were issued too); `total_cents` sums only the ones nothing supersedes, so a
+/// correction does not double the money it restates; `corrections` is how many
+/// of the year's receipts correct an earlier one. `$1` = the fiscal year.
+fn sql_annual_receipts(c: &PluginContext) -> String {
+    let live = "NOT EXISTS (SELECT 1 FROM {receipts} c WHERE c.supersedes_id = r.id)";
+    format!(
+        "SELECT COUNT(*)::bigint AS issued, \
+                COUNT(*) FILTER (WHERE {})::bigint AS live, \
+                COALESCE(SUM(r.amount_cents) FILTER (WHERE {}), 0)::bigint AS total_cents, \
+                COUNT(*) FILTER (WHERE r.supersedes_id IS NOT NULL)::bigint AS corrections \
+         FROM {receipts} r WHERE r.fiscal_year = $1",
+        live.replace("{receipts}", &c.db.table("receipts")),
+        live.replace("{receipts}", &c.db.table("receipts")),
+        receipts = c.db.table("receipts")
+    )
+}
+
 // ---------------------------------------------------------------------------
 // The plugin
 // ---------------------------------------------------------------------------
@@ -1304,6 +1530,23 @@ ON CONFLICT (code) DO NOTHING;
 /// names what was funded.
 const DUES_FUNDING_MIGRATION: &str = include_str!("../migrations/002_dues_funding.sql");
 
+/// Migration 3's SQL, embedded at compile time from `migrations/003_receipts.sql`.
+///
+/// It is a **new version**, never an edit to an applied one: the core records
+/// applied versions per schema and skips one it has already run without comparing
+/// its SQL (`server/src/db.rs`, `server/src/plugin_runtime.rs`), so an amended
+/// version would be invisible on every deployed database. Version 2 is the dues
+/// funding migration, so this one is 3 — a receipt and a dues waiver have nothing
+/// to say to each other, and a version number is a position in a sequence that
+/// other work is also appending to.
+///
+/// It adds `finance.receipts` — numbered, addressed, with the troop's own wording
+/// snapshotted — and the three rules that make a receipt a record: the
+/// immutability trigger (no `UPDATE`, no `DELETE`), the correction trigger (a
+/// correction supersedes a receipt for the same ledger entry), and the unique
+/// index that allows a receipt one correction and no more.
+const RECEIPTS_MIGRATION: &str = include_str!("../migrations/003_receipts.sql");
+
 #[async_trait]
 impl AdjutantPlugin for FinancePlugin {
     fn id(&self) -> &str {
@@ -1353,6 +1596,7 @@ impl AdjutantPlugin for FinancePlugin {
         vec![
             Migration::new(1, "finance_schema", MIGRATION_SCHEMA),
             Migration::new(2, "dues_funding", DUES_FUNDING_MIGRATION),
+            Migration::new(3, "receipts", RECEIPTS_MIGRATION),
         ]
     }
 
@@ -1413,6 +1657,10 @@ fn finance_routes(ctx: &PluginContext) -> Vec<RouteDefinition> {
         route_get_member_dues(ctx),
         route_self_report(ctx),
         route_record_dues_payment(ctx),
+        route_issue_receipt(ctx),
+        route_supersede_receipt(ctx),
+        route_list_receipts(ctx),
+        route_get_receipt(ctx),
         route_annual_report(ctx),
         route_health(ctx),
     ]
@@ -3572,16 +3820,392 @@ fn route_record_dues_payment(ctx: &PluginContext) -> RouteDefinition {
 }
 
 // ---------------------------------------------------------------------------
+// Receipts
+//
+// A receipt is issued **from the ledger record**: finance owns the money, so
+// finance owns the receipt, and a receipt follows the transaction the way the
+// transaction followed the payment. Nothing here talks to a payment provider.
+// ---------------------------------------------------------------------------
+
+/// `POST /api/finance/receipt` — issue a receipt for money the troop received.
+///
+/// The entry named by `transaction_id` must exist and must be income; the fund,
+/// the amount, the fiscal year and the category are snapshotted from it *inside
+/// the issuing statement*, so a receipt for money that was never recorded is a
+/// `404` rather than a row. The number is drawn there too, from the one
+/// sequence, so two treasurers issuing at the same instant cannot collide.
+///
+/// Queries: the entry (which is also what explains a refusal), the guarded
+/// insert, then the row as a reader sees it. Then the audit write.
+fn route_issue_receipt(ctx: &PluginContext) -> RouteDefinition {
+    let c = ctx.clone();
+    RouteDefinition::post_protected(
+        "/api/finance/receipt",
+        "finance:write",
+        route_handler(move |req| {
+            let c = c.clone();
+            async move {
+                let body: ReceiptBody = req.json()?;
+                let entry = read_receipt_entry(&c, body.transaction_id).await?;
+                let Some(entry) = entry else {
+                    return PluginResponse::error(
+                        404,
+                        format!(
+                            "no such ledger entry: {}. A receipt is issued from the record of \
+                             money received, never on its own — record the income first.",
+                            body.transaction_id
+                        ),
+                    );
+                };
+                if let Some(refusal) = receipt_refusal(body.transaction_id, &entry) {
+                    return PluginResponse::error(409, refusal);
+                }
+                // A member's receipt is addressed by their roster identity, which
+                // the payment already carries; anyone else needs a name, and the
+                // name is theirs as they gave it — not a donor record.
+                let member_id = trimmed(&body.member_id)
+                    .unwrap_or_else(|| entry["member_id"].as_str().unwrap_or("").to_string());
+                let payer_name = trimmed(&body.payer_name).unwrap_or_default();
+                if member_id.is_empty() && payer_name.is_empty() {
+                    return PluginResponse::error(
+                        400,
+                        "a receipt is addressed to somebody: pass member_id (a member's roster \
+                         identity, which the entry may already carry) or payer_name (the name as \
+                         the giver gave it). This plugin keeps no donor record to look one up in.",
+                    );
+                }
+                let purpose = trimmed(&body.purpose)
+                    .unwrap_or_else(|| entry["description"].as_str().unwrap_or("").to_string());
+                let tax_statement = trimmed(&body.tax_statement)
+                    .or_else(|| configured_tax_statement(&c.config))
+                    .unwrap_or_default();
+                let issue = ReceiptIssue {
+                    transaction_id: body.transaction_id,
+                    member_id,
+                    payer_name,
+                    purpose,
+                    tax_statement,
+                    issued_on: validate(occurred_on(&body.issued_on))?,
+                    supersedes_id: None,
+                    correction_reason: String::new(),
+                    issued_by: caller_of(&req).unwrap_or_default(),
+                };
+                let Some(issued) = insert_receipt(&c, &issue).await? else {
+                    return explain_no_receipt(&c, &issue).await;
+                };
+                let id = issued["id"].as_i64().unwrap_or_default();
+                c.audit
+                    .log(
+                        req.identity.as_ref(),
+                        "receipt.issue",
+                        "receipt",
+                        &id.to_string(),
+                        json!({
+                            "number": issued["number"],
+                            "transaction_id": issued["transaction_id"],
+                            "fund_id": issued["fund_id"],
+                            "amount_cents": issued["amount_cents"],
+                            "fiscal_year": issued["fiscal_year"],
+                            "member_id": issued["member_id"],
+                            "tax_statement_declared": !issue.tax_statement.is_empty(),
+                        }),
+                    )
+                    .await?;
+                c.events
+                    .publish(
+                        "finance.receipt.issued",
+                        json!({
+                            "receipt_id": id,
+                            "number": issued["number"],
+                            "transaction_id": issued["transaction_id"],
+                            "fund_id": issued["fund_id"],
+                            "amount_cents": issued["amount_cents"],
+                            "member_id": issued["member_id"],
+                            "issued_by": issue.issued_by,
+                        }),
+                    )
+                    .await?;
+                let receipt = c
+                    .db
+                    .query_one(sql_receipt_one(&c), vec![SqlValue::Int(id)])
+                    .await?
+                    .unwrap_or(issued);
+                PluginResponse::created(
+                    &format!("/api/finance/receipt/{id}"),
+                    &receipt_view(&receipt),
+                )
+            }
+        }),
+    )
+}
+
+/// `POST /api/finance/receipt/{id}/supersede` — correct a receipt.
+///
+/// A correction is a **new receipt** that references the one it supersedes; the
+/// original is never touched, so what the giver was first told remains. The
+/// correction is issued from the same ledger entry (the same money), and
+/// everything it does not restate is carried over — which is why a name typo is
+/// a one-field correction rather than a re-issue.
+///
+/// Queries: the receipt being corrected, the guarded insert, then the new row as
+/// a reader sees it. Then the audit write.
+fn route_supersede_receipt(ctx: &PluginContext) -> RouteDefinition {
+    let c = ctx.clone();
+    RouteDefinition::post_protected(
+        "/api/finance/receipt/{id}/supersede",
+        "finance:write",
+        route_handler(move |req| {
+            let c = c.clone();
+            async move {
+                let id = req.int_param("id")?;
+                let body: ReceiptCorrectionBody = req.json()?;
+                let Some(reason) = trimmed(&body.reason) else {
+                    return PluginResponse::error(
+                        400,
+                        "a correction must say what it corrects: pass reason. The reason is what \
+                         the next reader of the pair has, and the original cannot be annotated \
+                         after the fact.",
+                    );
+                };
+                let original = c
+                    .db
+                    .query_one(sql_receipt_one(&c), vec![SqlValue::Int(id)])
+                    .await?;
+                let Some(original) = original else {
+                    return PluginResponse::error(404, format!("no such receipt: {id}"));
+                };
+                if !original["superseded_by"].is_null() {
+                    return PluginResponse::error(
+                        409,
+                        format!(
+                            "receipt {} is already superseded by receipt {} — correct the \
+                             correction, not the receipt it replaced",
+                            original["number"].as_str().unwrap_or("?"),
+                            original["superseded_by_number"].as_str().unwrap_or("?")
+                        ),
+                    );
+                }
+                let member_id = trimmed(&body.member_id)
+                    .unwrap_or_else(|| original["member_id"].as_str().unwrap_or("").to_string());
+                let payer_name = trimmed(&body.payer_name)
+                    .unwrap_or_else(|| original["payer_name"].as_str().unwrap_or("").to_string());
+                if member_id.is_empty() && payer_name.is_empty() {
+                    return PluginResponse::error(
+                        400,
+                        "a receipt is addressed to somebody: pass member_id or payer_name, or \
+                         leave the receipt's own addressee in place",
+                    );
+                }
+                let purpose = trimmed(&body.purpose)
+                    .unwrap_or_else(|| original["purpose"].as_str().unwrap_or("").to_string());
+                let tax_statement = trimmed(&body.tax_statement)
+                    .or_else(|| configured_tax_statement(&c.config))
+                    .unwrap_or_default();
+                let issue = ReceiptIssue {
+                    transaction_id: original["transaction_id"].as_i64().unwrap_or_default(),
+                    member_id,
+                    payer_name,
+                    purpose,
+                    tax_statement,
+                    issued_on: validate(occurred_on(&body.issued_on))?,
+                    supersedes_id: Some(id),
+                    correction_reason: reason,
+                    issued_by: caller_of(&req).unwrap_or_default(),
+                };
+                let Some(issued) = insert_receipt(&c, &issue).await? else {
+                    return explain_no_receipt(&c, &issue).await;
+                };
+                let new_id = issued["id"].as_i64().unwrap_or_default();
+                c.audit
+                    .log(
+                        req.identity.as_ref(),
+                        "receipt.supersede",
+                        "receipt",
+                        &new_id.to_string(),
+                        json!({
+                            "supersedes_id": id,
+                            "superseded_number": original["number"],
+                            "number": issued["number"],
+                            "transaction_id": issued["transaction_id"],
+                            "amount_cents": issued["amount_cents"],
+                            "reason": issue.correction_reason,
+                        }),
+                    )
+                    .await?;
+                c.events
+                    .publish(
+                        "finance.receipt.superseded",
+                        json!({
+                            "receipt_id": new_id,
+                            "number": issued["number"],
+                            "supersedes_id": id,
+                            "superseded_number": original["number"],
+                            "transaction_id": issued["transaction_id"],
+                            "amount_cents": issued["amount_cents"],
+                            "issued_by": issue.issued_by,
+                        }),
+                    )
+                    .await?;
+                let receipt = c
+                    .db
+                    .query_one(sql_receipt_one(&c), vec![SqlValue::Int(new_id)])
+                    .await?
+                    .unwrap_or(issued);
+                PluginResponse::created(
+                    &format!("/api/finance/receipt/{new_id}"),
+                    &receipt_view(&receipt),
+                )
+            }
+        }),
+    )
+}
+
+/// `GET /api/finance/receipts` — receipts, filtered and paged.
+///
+/// **A giver sees their own and no one else's; the treasurer sees all.** Naming
+/// yourself as `member_id` is an ownership check (SPEC §9.2), not a grant, and
+/// anything else — another member's, or the whole troop's — needs
+/// `finance:read_all` covering the troop.
+///
+/// Two queries: the page (one row more than asked for, which is how `has_more`
+/// is known without a `COUNT(*)` over the same filters) and the filtered total.
+fn route_list_receipts(ctx: &PluginContext) -> RouteDefinition {
+    let c = ctx.clone();
+    RouteDefinition::get_protected_any_scope(
+        "/api/finance/receipts",
+        "finance:read",
+        route_handler(move |req| {
+            let c = c.clone();
+            async move {
+                let member_id = req
+                    .query_param("member_id")
+                    .map(str::trim)
+                    .filter(|member| !member.is_empty())
+                    .map(str::to_string);
+                let caller = caller_of(&req).unwrap_or_default();
+                if member_id.as_deref() != Some(caller.as_str()) {
+                    c.permissions
+                        .reach(req.identity.as_ref(), "finance:read_all", &Scope::troop())
+                        .await?;
+                }
+                let fiscal_year = req.query_int("fiscal_year").map(|year| year as i32);
+                let transaction_id = req.query_int("transaction_id");
+                let before_id = req.query_int("before_id");
+                let limit = req
+                    .query_int("limit")
+                    .unwrap_or(DEFAULT_RECEIPT_LIMIT)
+                    .clamp(1, MAX_RECEIPT_LIMIT);
+                let filters = vec![
+                    fiscal_year
+                        .map(|year| SqlValue::Int(i64::from(year)))
+                        .unwrap_or(SqlValue::NullInt),
+                    member_id.clone().into(),
+                    transaction_id.map(SqlValue::Int).unwrap_or(SqlValue::NullInt),
+                ];
+                let mut page_params = filters.clone();
+                page_params.push(before_id.map(SqlValue::Int).unwrap_or(SqlValue::NullInt));
+                page_params.push(SqlValue::Int(limit + 1));
+
+                let mut rows = c.db.query(sql_receipts_page(&c), page_params).await?;
+                let has_more = rows.len() as i64 > limit;
+                rows.truncate(limit as usize);
+                let next_before_id = if has_more {
+                    rows.last().and_then(|row| row["id"].as_i64())
+                } else {
+                    None
+                };
+                let totals =
+                    c.db.query_one(sql_receipts_total(&c), filters)
+                        .await?
+                        .unwrap_or_else(|| json!({ "total_cents": 0, "live": 0 }));
+                let receipts: Vec<Value> = rows.iter().map(receipt_view).collect();
+                let live_total = totals["total_cents"].as_i64().unwrap_or(0);
+                PluginResponse::json(
+                    200,
+                    &json!({
+                        "receipts": receipts,
+                        "count": receipts.len(),
+                        "has_more": has_more,
+                        "next_before_id": next_before_id,
+                        "live_total_cents": live_total,
+                        "live_total_display": format_cents(live_total),
+                        "live_receipts": totals["live"],
+                        "filters": {
+                            "fiscal_year": fiscal_year,
+                            "member_id": member_id,
+                            "transaction_id": transaction_id,
+                            "before_id": before_id,
+                            "limit": limit,
+                        },
+                        "note": "live_total_cents sums only receipts nothing supersedes, so a \
+                                 correction does not count its money twice; every row, corrected \
+                                 or not, is in the page with its superseded_by named.",
+                    }),
+                )
+            }
+        }),
+    )
+}
+
+/// `GET /api/finance/receipt/{id}` — one receipt, with its chain.
+///
+/// The giver reads their own with `finance:read` at any scope; anybody else's
+/// needs `finance:read_all` covering the troop. One query, then the permission
+/// check when the caller is not the addressee.
+fn route_get_receipt(ctx: &PluginContext) -> RouteDefinition {
+    let c = ctx.clone();
+    RouteDefinition::get_protected_any_scope(
+        "/api/finance/receipt/{id}",
+        "finance:read",
+        route_handler(move |req| {
+            let c = c.clone();
+            async move {
+                let id = req.int_param("id")?;
+                let Some(receipt) =
+                    c.db.query_one(sql_receipt_one(&c), vec![SqlValue::Int(id)]).await?
+                else {
+                    return PluginResponse::error(404, format!("no such receipt: {id}"));
+                };
+                let caller = caller_of(&req).unwrap_or_default();
+                let addressee = receipt_addressee(
+                    receipt["member_id"].as_str().unwrap_or(""),
+                    receipt["payer_name"].as_str().unwrap_or(""),
+                );
+                // A receipt belongs to the giver it names. Their own is an
+                // ownership check, not a grant; anybody else's is the treasurer's
+                // to read. A giver outside the troop has no account to match, so
+                // their receipt is only ever reachable with `finance:read_all`.
+                if addressee != caller {
+                    c.permissions
+                        .reach(req.identity.as_ref(), "finance:read_all", &Scope::troop())
+                        .await?;
+                }
+                let mut view = receipt_view(&receipt);
+                if let Some(map) = view.as_object_mut() {
+                    map.insert(
+                        "next".into(),
+                        json!("a correction is a new receipt: POST \
+                               /api/finance/receipt/{id}/supersede with a reason"),
+                    );
+                }
+                PluginResponse::json(200, &view)
+            }
+        }),
+    )
+}
+
+// ---------------------------------------------------------------------------
 // Reports
 // ---------------------------------------------------------------------------
 
 /// `GET /api/finance/report/annual` — the Annual Financial Report (SPEC §7.5).
 ///
-/// Seven queries, then arithmetic that is all derived: per-fund opening/income/
+/// Eight queries, then arithmetic that is all derived: per-fund opening/income/
 /// expense/transfers/closing, the budget lines with their variances, the dues
-/// section, and the ledger's integrity verdict. Nothing in the report is stored,
-/// so it cannot disagree with the ledger it describes — and the verdict is
-/// included because this is the document a treasurer hands to an outside body.
+/// section, the receipts the year issued, and the ledger's integrity verdict.
+/// Nothing in the report is stored, so it cannot disagree with the ledger it
+/// describes — and the verdict is included because this is the document a
+/// treasurer hands to an outside body.
 ///
 /// Audited: money leaving the troop as a document is worth a line in the log.
 fn route_annual_report(ctx: &PluginContext) -> RouteDefinition {
@@ -3629,6 +4253,15 @@ fn route_annual_report(ctx: &PluginContext) -> RouteDefinition {
                     )
                     .await?
                     .unwrap_or_else(|| json!({ "collected_cents": 0 }));
+                let receipts =
+                    c.db.query_one(
+                        sql_annual_receipts(&c),
+                        vec![SqlValue::Int(i64::from(fiscal_year))],
+                    )
+                    .await?
+                    .unwrap_or_else(|| {
+                        json!({ "issued": 0, "live": 0, "total_cents": 0, "corrections": 0 })
+                    });
                 // The ledger's own verdict — three queries, the same check
                 // `/api/finance/health` reports.
                 let verdict = ledger_integrity(&c).await?;
@@ -3731,6 +4364,22 @@ fn route_annual_report(ctx: &PluginContext) -> RouteDefinition {
                                         scholarship fund: funded_cents is what the troop spent \
                                         on access, and a draw is a transfer, so it does not \
                                         appear in collected_cents.",
+                        },
+                        "receipts": {
+                            "fiscal_year": fiscal_year,
+                            "issued": receipts["issued"],
+                            "live": receipts["live"],
+                            "corrections": receipts["corrections"],
+                            "total_cents": receipts["total_cents"],
+                            "total_display": format_cents(
+                                receipts["total_cents"].as_i64().unwrap_or(0)
+                            ),
+                            "tax_statement_declared": configured_tax_statement(&c.config).is_some(),
+                            "note": "A receipt is issued from the ledger record, so this total is \
+                                     money the ledger already holds. Only receipts nothing \
+                                     supersedes are summed — a correction restates money, it does \
+                                     not add it. A scholarship draw is not a receipt: a waiver or \
+                                     comp is money the troop did not receive.",
                         },
                         "integrity": verdict,
                         "ledger": {
@@ -4141,6 +4790,194 @@ async fn explain_no_transfer(
             if overdraft { "already set" } else { "not set" }
         ),
     )
+}
+
+// ---------------------------------------------------------------------------
+// Writing a receipt
+// ---------------------------------------------------------------------------
+
+/// One receipt the handlers write. The money is **not** in here: fund, amount,
+/// fiscal year and category are snapshotted from the ledger entry inside the
+/// issuing statement, so a caller cannot state an amount the ledger does not
+/// hold.
+struct ReceiptIssue {
+    transaction_id: i64,
+    member_id: String,
+    payer_name: String,
+    purpose: String,
+    tax_statement: String,
+    issued_on: NaiveDate,
+    supersedes_id: Option<i64>,
+    correction_reason: String,
+    issued_by: String,
+}
+
+/// The ledger entry a receipt is issued from, with its fund's code — what a
+/// handler needs to address the receipt and to explain a refusal.
+///
+/// One query.
+async fn read_receipt_entry(
+    c: &PluginContext,
+    transaction_id: i64,
+) -> Result<Option<Value>, SdkError> {
+    c.db.query_one(
+        format!(
+            "SELECT t.id, t.fund_id, f.code AS fund_code, t.amount_cents, t.kind, t.category, \
+                    t.description, t.member_id, t.fiscal_year, t.occurred_on::text AS occurred_on \
+             FROM {tx} t JOIN {funds} f ON f.id = t.fund_id WHERE t.id = $1",
+            tx = c.db.table("transactions"),
+            funds = c.db.table("funds")
+        ),
+        vec![SqlValue::Int(transaction_id)],
+    )
+    .await
+}
+
+/// Why a ledger entry cannot be receipted, in the words the caller reads, or
+/// `None` when it can be.
+///
+/// A receipt is for money the troop **received**: an expense is money that left,
+/// and it is the ledger's own sign rule (`transactions_income_positive`) that
+/// makes a positive income entry the only thing a receipt can be issued from.
+fn receipt_refusal(entry_id: i64, entry: &Value) -> Option<String> {
+    let kind = entry["kind"].as_str().unwrap_or("");
+    let amount_cents = entry["amount_cents"].as_i64().unwrap_or(0);
+    if kind == KIND_INCOME && amount_cents > 0 {
+        return None;
+    }
+    Some(format!(
+        "a receipt is for money the troop received, and ledger entry {entry_id} is a {kind} of {} \
+         — issue the receipt from the income entry, and correct this one with a transaction, not \
+         with a receipt",
+        format_cents(amount_cents)
+    ))
+}
+
+/// Issue one receipt — **one statement**, guarded.
+///
+/// The guards ride along with the `INSERT … SELECT`, which is what makes them
+/// sound rather than clerical: the ledger entry must exist, must be income and
+/// must be positive; and when this receipt supersedes one, that one must be for
+/// *this* entry and must not already be superseded. The number, the fund, the
+/// amount, the fiscal year and the category are all drawn inside the statement
+/// — `nextval` on the one sequence, and the entry's own columns — so a receipt
+/// cannot restate money the ledger does not hold, and two treasurers issuing at
+/// the same instant cannot collide over a number.
+///
+/// An empty result is therefore one of two things, and [`explain_no_receipt`]
+/// says which.
+async fn insert_receipt(c: &PluginContext, issue: &ReceiptIssue) -> Result<Option<Value>, SdkError> {
+    c.db.query_one(
+        format!(
+            "INSERT INTO {receipts} AS r \
+               (number, fiscal_year, transaction_id, fund_id, amount_cents, issued_on, member_id, \
+                payer_name, purpose, tax_statement, supersedes_id, correction_reason, issued_by) \
+             SELECT 'R-' || lpad(t.fiscal_year::text, 4, '0') || '-' || \
+                      lpad(nextval('{seq}')::text, 6, '0'), \
+                    t.fiscal_year, t.id, t.fund_id, t.amount_cents, $1::date, $2, $3, $4, $5, \
+                    $6, $7, $8 \
+               FROM {tx} t \
+             WHERE t.id = $9 AND t.kind = 'income' AND t.amount_cents > 0 \
+               AND ($6::bigint IS NULL OR EXISTS ( \
+                     SELECT 1 FROM {receipts} o \
+                      WHERE o.id = $6 AND o.transaction_id = t.id \
+                        AND NOT EXISTS (SELECT 1 FROM {receipts} c \
+                                         WHERE c.supersedes_id = o.id))) \
+             RETURNING {RECEIPT_FIELDS}",
+            receipts = c.db.table("receipts"),
+            tx = c.db.table("transactions"),
+            seq = c.db.table("receipts_number_seq")
+        ),
+        vec![
+            SqlValue::Text(issue.issued_on.to_string()),
+            SqlValue::Text(issue.member_id.clone()),
+            SqlValue::Text(issue.payer_name.clone()),
+            SqlValue::Text(issue.purpose.clone()),
+            SqlValue::Text(issue.tax_statement.clone()),
+            issue
+                .supersedes_id
+                .map(SqlValue::Int)
+                .unwrap_or(SqlValue::NullInt),
+            SqlValue::Text(issue.correction_reason.clone()),
+            SqlValue::Text(issue.issued_by.clone()),
+            SqlValue::Int(issue.transaction_id),
+        ],
+    )
+    .await
+}
+
+/// The insert wrote nothing. Say which of the two reasons it was.
+///
+/// One query.
+async fn explain_no_receipt(
+    c: &PluginContext,
+    issue: &ReceiptIssue,
+) -> Result<PluginResponse, SdkError> {
+    let entry = read_receipt_entry(c, issue.transaction_id).await?;
+    let Some(entry) = entry else {
+        return PluginResponse::error(
+            404,
+            format!(
+                "no such ledger entry: {}. A receipt is issued from the record of money received.",
+                issue.transaction_id
+            ),
+        );
+    };
+    if let Some(refusal) = receipt_refusal(issue.transaction_id, &entry) {
+        return PluginResponse::error(409, refusal);
+    }
+    PluginResponse::error(
+        409,
+        format!(
+            "the receipt was not written: the entry it is issued from is still {}, and a \
+             correction supersedes a receipt for the same ledger entry that is not already \
+             superseded. Nothing was written.",
+            format_cents(entry["amount_cents"].as_i64().unwrap_or(0))
+        ),
+    )
+}
+
+/// A receipt as a caller reads it: the row, who it is addressed to, the wording
+/// the giver would read, and the correction that supersedes it.
+///
+/// The wording is assembled here, from what is recorded — never stored — so a
+/// change to the sentence cannot restate a receipt already issued: the receipt's
+/// own `tax_statement` (empty unless the troop declared one) is what is read.
+fn receipt_view(receipt: &Value) -> Value {
+    let number = receipt["number"].as_str().unwrap_or("");
+    let member_id = receipt["member_id"].as_str().unwrap_or("");
+    let payer_name = receipt["payer_name"].as_str().unwrap_or("");
+    let amount_cents = receipt["amount_cents"].as_i64().unwrap_or(0);
+    let addressee = receipt_addressee(member_id, payer_name);
+    let tax_statement = receipt["tax_statement"].as_str().unwrap_or("");
+    json!({
+        "receipt": receipt,
+        "number": number,
+        "issued_to": addressee,
+        "member_id": member_id,
+        "payer_name": payer_name,
+        "amount_cents": amount_cents,
+        "amount_display": format_cents(amount_cents),
+        "issued_on": receipt["issued_on"],
+        "fund_id": receipt["fund_id"],
+        "fund_code": receipt["fund_code"],
+        "purpose": receipt["purpose"],
+        "wording": receipt_wording(
+            number,
+            &addressee,
+            amount_cents,
+            receipt["purpose"].as_str().unwrap_or(""),
+            receipt["fund_code"].as_str().unwrap_or("?"),
+            receipt["issued_on"].as_str().unwrap_or(""),
+            tax_statement,
+        ),
+        "tax_statement": tax_statement,
+        "tax_statement_declared": !tax_statement.trim().is_empty(),
+        "supersedes_id": receipt["supersedes_id"],
+        "superseded_by": receipt["superseded_by"],
+        "superseded_by_number": receipt["superseded_by_number"],
+        "immutable": "a receipt is never edited — a correction is a new receipt that supersedes it",
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -4839,6 +5676,59 @@ pub fn format_percent(bps: i64) -> String {
 }
 
 // ---------------------------------------------------------------------------
+// Receipts (pure)
+// ---------------------------------------------------------------------------
+
+/// Who a receipt is addressed to: **the roster identity for a member**, and the
+/// name as they gave it for anyone else.
+///
+/// A receipt is addressed to a giver, not to a profile: there is no donor record
+/// for this to look up, and nothing to keep in step with one.
+pub fn receipt_addressee(member_id: &str, payer_name: &str) -> String {
+    let member = member_id.trim();
+    if member.is_empty() {
+        payer_name.trim().to_string()
+    } else {
+        member.to_string()
+    }
+}
+
+/// The sentence a receipt carries — assembled here, from what is recorded.
+///
+/// **It claims nothing about tax.** `tax_statement` is appended only when the
+/// troop has declared a status of its own, because the software must not invent
+/// an acknowledgment the troop cannot substantiate; the default says what the
+/// troop received and stops. A treasurer reading the whole sentence is reading
+/// every word the giver will read.
+pub fn receipt_wording(
+    number: &str,
+    issued_to: &str,
+    amount_cents: i64,
+    purpose: &str,
+    fund_code: &str,
+    issued_on: &str,
+    tax_statement: &str,
+) -> String {
+    let purpose = purpose.trim();
+    let acknowledgement = if purpose.is_empty() {
+        String::new()
+    } else {
+        format!(" for {purpose}")
+    };
+    let mut wording = format!(
+        "Receipt {number}: the troop received {} from {issued_to}{acknowledgement}, \
+         credited to the {fund_code} fund on {issued_on}.",
+        format_cents(amount_cents)
+    );
+    let statement = tax_statement.trim();
+    if !statement.is_empty() {
+        wording.push('\n');
+        wording.push_str(statement);
+    }
+    wording
+}
+
+// ---------------------------------------------------------------------------
 // The fiscal year
 // ---------------------------------------------------------------------------
 
@@ -5075,6 +5965,86 @@ mod tests {
         assert_eq!(
             ledger_verdict(70_000, 69_999, &groups)["balanced"],
             json!(false)
+        );
+    }
+
+    #[test]
+    fn a_receipts_default_wording_claims_nothing_about_tax() {
+        // Nothing is configured, so the receipt says what was received and stops.
+        // Every word below would be a claim the troop has not declared and cannot
+        // substantiate, which is a liability rather than a courtesy.
+        let plain = receipt_wording(
+            "R-2026-000001",
+            "probe-payer",
+            2_500,
+            "Annual dues",
+            FUND_GENERAL,
+            "2026-03-15",
+            "",
+        );
+        assert!(plain.starts_with("Receipt R-2026-000001"), "{plain}");
+        assert!(plain.contains("$25.00"), "{plain}");
+        assert!(plain.contains("probe-payer"), "{plain}");
+        assert!(plain.contains("Annual dues"), "{plain}");
+        let lower = plain.to_lowercase();
+        for claim in [
+            "tax",
+            "deduct",
+            "charit",
+            "501(c)",
+            "non-profit",
+            "nonprofit",
+            "write-off",
+            "write off",
+            "donor",
+            "gift aid",
+        ] {
+            assert!(
+                !lower.contains(claim),
+                "{claim:?} is a claim the default wording must not make: {plain}"
+            );
+        }
+
+        // No purpose: the sentence is still whole.
+        let bare = receipt_wording(
+            "R-2026-000002",
+            "probe-payer",
+            100,
+            "",
+            FUND_SCHOLARSHIP,
+            "2026-03-15",
+            "",
+        );
+        assert!(bare.contains("from probe-payer, credited"), "{bare}");
+
+        // A declared status is the troop's own words, verbatim, on its own line —
+        // the software adds nothing of its own.
+        let declared = receipt_wording(
+            "R-2026-000003",
+            "probe-payer",
+            100,
+            "",
+            FUND_GENERAL,
+            "2026-03-15",
+            "Acme Scouts is a registered charity, no. 12345.",
+        );
+        assert!(
+            declared.contains("Acme Scouts is a registered charity, no. 12345."),
+            "{declared}"
+        );
+        assert!(declared.contains('\n'), "{declared}");
+
+        // A member is addressed by their roster identity; anyone else by the name
+        // they gave. Extra whitespace is not a name.
+        assert_eq!(receipt_addressee("anne-scout", "A. Scout"), "anne-scout");
+        assert_eq!(receipt_addressee("", "  Jane Doe "), "Jane Doe");
+        assert_eq!(receipt_addressee("   ", ""), "");
+
+        // The wording comes from config, and a troop that declared nothing has none.
+        assert_eq!(configured_tax_statement(&json!({})), None);
+        assert_eq!(
+            configured_tax_statement(&json!({ "finance": { "receipt_tax_statement": "  ours  " } })),
+            Some("ours".to_string())
         );
     }
 

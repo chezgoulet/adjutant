@@ -219,7 +219,9 @@ ledger on read, so none of them can be stale.
 Config lives in the `finance` row's `core.plugins.config`, under `finance.<key>`
 or the top level: `membership_cost_cents` (the base the sliding scale is a
 fraction of), `dues_fund_code` (the fund dues and donations land in, General by
-default) and `fiscal_year_start_month` (January by default).
+default), `fiscal_year_start_month` (January by default) and
+`receipt_tax_statement` (the troop's **own** tax-status wording, printed on a
+receipt — empty by default, and empty means the receipt claims nothing).
 
 **Money is an integer number of cents** (`BIGINT`), and there is no `f64` in
 this crate — a JSON body that sends a float is refused by the deserializer
@@ -244,6 +246,32 @@ this crate has no field, route or code path for doing so. The mandatory minimum
 is `$0`, so hardship never removes a scout, and a self-report never sets the
 base cost it is a fraction of — that is the treasurer's number.
 
+**A receipt is issued from the ledger record, never from a payment provider.**
+Finance owns the money, so finance owns the receipt: a Stripe Checkout session
+that funds a donation produces the finance *transaction*, and the receipt follows
+the transaction. `finance.receipts.transaction_id` is `NOT NULL` with a foreign
+key, so a receipt for money that was never recorded is unrepresentable. **A
+receipt is a record**: migration 3 installs the rules as database rules rather
+than conventions — a trigger refuses every `UPDATE` and every `DELETE` (as
+`archive.records` and `conflicts.stage_log` do), a **correction is a new receipt**
+carrying `supersedes_id` so both remain (`superseded_by` is derived, because the
+superseded row cannot be updated to name its own successor), a unique index makes
+a second correction of the same receipt unrepresentable, and a trigger refuses a
+correction pointed at another entry's receipt. Numbers come from one sequence
+(`R-<year>-<nnnnnn>`) drawn inside the issuing statement. **Addressed to the
+giver:** a member by their roster identity, anyone else — a parent, a business —
+by the name as they gave it, snapshotted on the receipt; there is deliberately no
+donor table, and nothing to keep in step with one. **The wording claims nothing
+about tax** unless the troop has declared a status of its own
+(`receipt_tax_statement`, empty by default, snapshotted on the row): the software
+invents no acknowledgment, because a receipt claiming a deduction the troop
+cannot substantiate is a liability for the troop. The Annual Financial Report
+totals receipts, counting only the receipts nothing supersedes, so a correction
+never doubles a donation. **A scholarship draw is not a receipt**, and that is
+deliberate: a waiver, comp or reduction draws on the Scholarship fund (#58), and
+the member sees that their cost is *covered*, not that they are being helped —
+the draw stays internal, in the ledger and the report.
+
 | Method | Path | Permission | Body / notes |
 |---|---|---|---|
 | GET | `/api/finance/funds?include_inactive=` | `finance:read` (troop) | The funds and their derived figures, plus `total_cents`; `include_inactive=true` adds retired funds |
@@ -264,13 +292,19 @@ base cost it is a fraction of — that is the treasurer's number.
 | GET | `/api/finance/dues/member/{member}?fiscal_year=` | `finance:read` at any scope for **your own** record; `finance:read_all` (troop) for anybody else's | One scout's assessment, derived standing, and dues payments |
 | POST | `/api/finance/dues/self-report` | `finance:self_report` at any scope — yourself only; a `member_id` naming somebody else needs `finance:manage_dues` | `{tier, fiscal_year?, note?, member_id?}` — the honor system's one write. Never sets the base cost, and `409` when there is no assessment and no configured membership cost. A reduction is a scholarship draw like any other, recorded as `unbooked` (this route never books it), and `409` too when the row's draw is already booked and the report would change its funding — the same rule the assess route carries. Publishes `finance.dues.self_reported` |
 | POST | `/api/finance/dues/payment` | `finance:write` (troop) | `{member_id, amount_cents\|amount, fiscal_year?, fund_id?, occurred_on?, description?, external_ref?}` — an income entry tagged `dues` in the configured dues fund, which is what moves a member's standing. Publishes `finance.dues.payment` |
-| GET | `/api/finance/report/annual?fiscal_year=` | `finance:read_all` (troop) | The Annual Financial Report: per-fund opening/income/expense/transfers/closing, the budget lines with variances, the dues section (which now states `funded_cents` — what the troop spent on access — and the unbooked draws beside the tier counts), and the ledger's integrity verdict. Dues *collected* is still read from the ledger by category, so a draw (a transfer) does not inflate it |
+| POST | `/api/finance/receipt` | `finance:write` (troop) | `{transaction_id, member_id?, payer_name?, purpose?, tax_statement?, issued_on?}` — issue a receipt **from a ledger entry**. The fund, the amount, the fiscal year and the category are snapshotted from that entry inside the issuing statement, and the number (`R-<year>-<nnnnnn>`) is drawn from one sequence there too, so a receipt for money that was never recorded is a `404` and two treasurers issuing at once cannot collide. Address the receipt with `member_id` (which defaults to the entry's own roster identity) or `payer_name` (the name as the giver gave it); `tax_statement` defaults to the configured `receipt_tax_statement`, which is empty unless the troop declared a status. `409` when the entry is not money received (an expense). Publishes `finance.receipt.issued` |
+| POST | `/api/finance/receipt/{id}/supersede` | `finance:write` (troop) | `{reason, member_id?, payer_name?, purpose?, tax_statement?, issued_on?}` — issue a **correction**: a new receipt carrying `supersedes_id`. The original is never touched, so both remain; `reason` is required. Everything not restated is carried over (a name typo is a one-field correction). `409` when the receipt is already superseded — correct the correction. Publishes `finance.receipt.superseded` |
+| GET | `/api/finance/receipts?fiscal_year=&member_id=&transaction_id=&before_id=&limit=` | `finance:read` at any scope for **your own** receipts; `finance:read_all` (troop) for anybody else's or for the whole troop | Receipts, newest first, each with its addressee, its wording and its `superseded_by`; `limit` defaults to 50 and is capped at 200. `live_total_cents` sums only receipts nothing supersedes, so a correction does not count its money twice, while every row — corrected or not — is in the page |
+| GET | `/api/finance/receipt/{id}` | `finance:read` at any scope for **your own** receipt; `finance:read_all` (troop) for anybody else's | One receipt: its number, its addressee, the wording the giver reads, `tax_statement_declared`, and `superseded_by`/`supersedes_id` |
+| GET | `/api/finance/report/annual?fiscal_year=` | `finance:read_all` (troop) | The Annual Financial Report: per-fund opening/income/expense/transfers/closing, the budget lines with variances, the dues section (which now states `funded_cents` — what the troop spent on access — and the unbooked draws beside the tier counts), the receipts the year issued (totalled over the ones nothing supersedes), and the ledger's integrity verdict. Dues *collected* is still read from the ledger by category, so a draw (a transfer) does not inflate it |
 | GET | `/api/finance/health` | `finance:read` (troop) | Re-derives the books: every transfer group two entries summing to zero, and the ledger total equal to the sum of every fund's balance |
 
 **Events:** `finance.fund.created`, `finance.transaction.recorded`,
 `finance.transfer.recorded`, `finance.budget.set`, `finance.dues.assessed` (a
 member assessment and a Lodge levy both), `finance.dues.self_reported`,
-`finance.dues.payment`, `finance.payment.recorded` (a booked
+`finance.dues.payment`, `finance.receipt.issued` and
+`finance.receipt.superseded` (a correction — the number that supersedes, not a
+mutation of the one it replaces), `finance.payment.recorded` (a booked
 `payment.received`), and `finance.ledger.imbalanced` — which the schedule below
 publishes only when the books do not add up.
 
@@ -291,13 +325,15 @@ reserved: the first is what a member's payment standing derives from, the second
 is what both legs of a transfer are filed under.
 
 **Reads are scoped.** Money is sensitive, so balances and the sliding scale are
-`finance:read`, while the ledger, the dues list and the Annual Financial Report
-are `finance:read_all`. A member's own dues are readable with `finance:read` at
-any scope — their own record is an ownership check, not a grant — and anybody
-else's needs `finance:read_all` covering the troop. The two Lodge routes and the
-self-report route declare the permission at *some* scope and check the object in
-the handler; every other route here demands a **troop-covering** grant, and none
-of them is destructive.
+`finance:read`, while the ledger, the dues list, the receipts list and the Annual
+Financial Report are `finance:read_all`. A member's own dues and **their own
+receipts** are readable with `finance:read` at any scope — their own record is an
+ownership check, not a grant — and anybody else's needs `finance:read_all`
+covering the troop. A receipt addressed to someone outside the troop (a parent, a
+business) has no account to match, so it is only ever reachable with
+`finance:read_all`. The two Lodge routes and the self-report route declare the
+permission at *some* scope and check the object in the handler; every other route
+here demands a **troop-covering** grant, and none of them is destructive.
 
 **The fiscal year.** `fiscal_year` is accepted between 2000 and 2200 and derived
 from the entry's date against `fiscal_year_start_month` when it is not stated,

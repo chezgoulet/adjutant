@@ -141,6 +141,24 @@ jobs:
       - name: Finance route SQL probes (DB-backed)
         run: cargo test -p adjutant-finance --test route_sql -- --ignored --nocapture
 
+      # finance's receipts, where the plugin's rules are database rules rather
+      # than a handler's decision: `finance.receipts` is numbered from one
+      # sequence, addressed to the giver, and **immutable** — the triggers refuse
+      # every UPDATE and DELETE, a correction is a new receipt that supersedes the
+      # one it replaces (both rows remain), a second correction of the same
+      # receipt is unrepresentable, and the foreign key makes a receipt for money
+      # that was never recorded impossible. A handler test cannot see any of that:
+      # the rules live in migration 3, and a gate that only drove the routes would
+      # keep passing if the migration lost them. The probes drive the **real route
+      # handlers** (`POST /api/finance/receipt`, `POST
+      # /api/finance/receipt/{id}/supersede`) as `adjutant_plugin_finance` and read
+      # the rows back, and they refuse `UPDATE`/`DELETE` as both the plugin's role
+      # and the operator. Same reason as the three steps above for its position:
+      # they need the roles, the stored plugin secrets and the plugin migrations
+      # the live ladder has just bootstrapped.
+      - name: Finance receipt probes (DB-backed)
+        run: cargo test -p adjutant-finance --test receipt_sql -- --ignored --nocapture
+
       # The dues funding rule on the same rail: a waiver lands with funded_cents
       # equal to its tier's assessment and books its draw as two ledger rows in one
       # group summing to zero; a retry carrying the draw's deterministic

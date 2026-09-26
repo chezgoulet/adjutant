@@ -269,6 +269,31 @@ fn group_row(group: &str, entries: i64, sum_cents: i64) -> Value {
     json!({ "transfer_group": group, "entries": entries, "group_sum_cents": sum_cents })
 }
 
+/// A receipt as `sql_receipt_one` returns one: the row, its fund's code, and the
+/// correction that supersedes it (derived, so it is a column on this row).
+fn receipt_row(member_id: &str, payer_name: &str, amount_cents: i64) -> Value {
+    json!({
+        "id": 7,
+        "number": "R-2026-000007",
+        "fiscal_year": 2026,
+        "transaction_id": 3,
+        "fund_code": FUND_GENERAL,
+        "fund_id": 1,
+        "amount_cents": amount_cents,
+        "issued_on": "2026-03-15",
+        "member_id": member_id,
+        "payer_name": payer_name,
+        "purpose": "Annual dues",
+        "tax_statement": "",
+        "supersedes_id": Value::Null,
+        "correction_reason": "",
+        "issued_by": "treasurer",
+        "created_at": "2026-03-15 12:00:00+00",
+        "superseded_by": Value::Null,
+        "superseded_by_number": Value::Null,
+    })
+}
+
 // ---------------------------------------------------------------------------
 // The declaration the loader validates
 // ---------------------------------------------------------------------------
@@ -358,7 +383,11 @@ async fn declared_manifest_satisfies_the_load_rules() {
     // an applied version without comparing its SQL, so an amended version 1
     // would be invisible on every deployed database. It adds the funding line and
     // swaps the constraint — and the swap keeps the invariant.
-    assert_eq!(migrations.len(), 2, "the funding rule is its own version");
+    assert_eq!(
+        migrations.len(),
+        3,
+        "the funding rule and the receipts are each their own version"
+    );
     assert_eq!(migrations[1].version, 2);
     assert_eq!(migrations[1].name, "dues_funding");
     let swap = &migrations[1].sql;
@@ -401,6 +430,28 @@ async fn declared_manifest_satisfies_the_load_rules() {
         "SQL must not guess a tier's share: the repair is a Rust route"
     );
     assert!(!swap.contains("NUMERIC") && !swap.contains("DECIMAL"));
+
+    // Migration 3 is a version of its own for the same reason — a receipt and a
+    // dues waiver have nothing to say to each other, so neither edits the other's
+    // version. It creates the receipts table and installs the three rules that
+    // make a receipt a record, which is what the DB-backed probe proves on a real
+    // PostgreSQL.
+    assert_eq!(migrations[2].version, 3);
+    assert_eq!(migrations[2].name, "receipts");
+    let receipts = &migrations[2].sql;
+    for expected in [
+        "CREATE TABLE IF NOT EXISTS receipts",
+        "number TEXT NOT NULL UNIQUE",
+        "transaction_id BIGINT NOT NULL REFERENCES transactions(id)",
+        "CREATE OR REPLACE FUNCTION finance_receipts_are_records()",
+        "BEFORE UPDATE OR DELETE ON receipts",
+        "CREATE OR REPLACE FUNCTION finance_receipt_correction_matches()",
+        "BEFORE INSERT ON receipts",
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_receipts_one_correction",
+    ] {
+        assert!(receipts.contains(expected), "migration 3 is missing {expected}");
+    }
+    assert!(!receipts.contains("NUMERIC") && !receipts.contains("DECIMAL"));
 
     let mut seen: Vec<(String, String)> = Vec::new();
     for r in &routes {
@@ -3005,6 +3056,115 @@ async fn a_member_reads_their_own_dues_without_read_all() {
 }
 
 #[tokio::test]
+async fn a_giver_reads_their_own_receipts_and_the_treasurer_reads_all() {
+    let (host, _plugin, routes) = plugin().await;
+    let list = route(&routes, "GET", "/api/finance/receipts");
+    let one = route(&routes, "GET", "/api/finance/receipt/{id}");
+
+    // Your own receipts: an ownership check, so `finance:read` at any scope and
+    // no permission query at all (SPEC §9.2). Just the page and its total.
+    host.db.push_rows(vec![receipt_row("bea", "", 1_000)]);
+    host.db
+        .push_rows(vec![json!({ "total_cents": 1_000, "live": 1 })]);
+    let (status, body) = call(
+        &list.handler,
+        TestRequest::get("/api/finance/receipts")
+            .identity("bea", &["member"])
+            .query_param("member_id", "bea")
+            .build(),
+    )
+    .await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body["count"], json!(1));
+    assert_eq!(body["receipts"][0]["issued_to"], json!("bea"));
+    assert_eq!(body["live_total_cents"], json!(1_000));
+    assert_eq!(body["live_total_display"], json!("$10.00"));
+    assert_eq!(host.db.query_count(), 2, "no permission query for your own");
+
+    // Somebody else's needs `finance:read_all` covering the troop. A Lodge grant
+    // covers no troop scope at all, so this is refused before any query runs —
+    // and the whole troop's list needs the same grant, so it is refused too.
+    for filters in [vec![("member_id", "carl")], vec![]] {
+        let mut request = TestRequest::get("/api/finance/receipts")
+            .identity_grants(
+                "bea",
+                vec![RoleGrant {
+                    role_id: "member".into(),
+                    scope: Scope::lodge("3"),
+                }],
+            );
+        for (key, value) in filters {
+            request = request.query_param(key, value);
+        }
+        let (status, body) = call(&list.handler, request.build()).await;
+        assert_eq!(status, 403, "{body}");
+    }
+
+    // With the grant, the treasurer reads every receipt.
+    host.db.push_rows(vec![json!({ "n": 1 })]);
+    host.db.push_rows(vec![receipt_row("bea", "", 1_000)]);
+    host.db
+        .push_rows(vec![json!({ "total_cents": 1_000, "live": 1 })]);
+    let (status, body) = call(
+        &list.handler,
+        TestRequest::get("/api/finance/receipts")
+            .identity("treasurer", &["chief"])
+            .build(),
+    )
+    .await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body["count"], json!(1));
+
+    // One receipt: a giver reads their own...
+    host.db.push_rows(vec![receipt_row("bea", "", 1_000)]);
+    let (status, body) = call(
+        &one.handler,
+        TestRequest::get("/api/finance/receipt/{id}")
+            .identity("bea", &["member"])
+            .param("id", "7")
+            .build(),
+    )
+    .await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body["issued_to"], json!("bea"));
+    assert_eq!(body["tax_statement_declared"], json!(false));
+    assert!(body["wording"]
+        .as_str()
+        .unwrap_or_default()
+        .contains("R-2026-000007"));
+
+    // ...and no one else's without the grant. The receipt is read first (it is
+    // what names the giver), so the permission query is the second call — and it
+    // is answered "no", which is what the refusal is measured against.
+    host.db.push_rows(vec![receipt_row("carl", "", 1_000)]);
+    host.db.push_rows(vec![json!({ "n": 0 })]);
+    let (status, body) = call(
+        &one.handler,
+        TestRequest::get("/api/finance/receipt/{id}")
+            .identity("bea", &["member"])
+            .param("id", "8")
+            .build(),
+    )
+    .await;
+    assert_eq!(status, 403, "{body}");
+
+    // A receipt addressed to someone outside the troop has no account to match,
+    // so it is the treasurer's to read and never a member's by identity.
+    host.db.push_rows(vec![receipt_row("", "Jane Doe", 1_000)]);
+    host.db.push_rows(vec![json!({ "n": 1 })]);
+    let (status, body) = call(
+        &one.handler,
+        TestRequest::get("/api/finance/receipt/{id}")
+            .identity("treasurer", &["chief"])
+            .param("id", "9")
+            .build(),
+    )
+    .await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body["issued_to"], json!("Jane Doe"));
+}
+
+#[tokio::test]
 async fn a_self_report_chooses_a_tier_and_never_a_price() {
     let (host, _plugin, routes) = plugin().await;
     let report = route(&routes, "POST", "/api/finance/dues/self-report");
@@ -3251,6 +3411,10 @@ async fn the_annual_report_states_the_year_and_the_money_moving_through_it() {
     ]);
     host.db
         .push_rows(vec![json!({ "collected_cents": 85_000 })]);
+    // 5. the year's receipts — only the ones nothing supersedes are summed.
+    host.db.push_rows(vec![json!({
+        "issued": 2, "live": 1, "total_cents": 2_500, "corrections": 1
+    })]);
     host.db.push_rows(vec![
         json!({ "ledger_total_cents": 80_000, "entries": 4, "unpaired_transfers": 0 }),
     ]);
@@ -3337,6 +3501,20 @@ async fn the_annual_report_states_the_year_and_the_money_moving_through_it() {
         "the report states the rule it is applying: {body}"
     );
 
+    // The year's receipts: every one issued in the year, and the money only the
+    // ones nothing supersedes stand for — a correction restates, it never adds.
+    assert_eq!(body["receipts"]["fiscal_year"], json!(2026));
+    assert_eq!(body["receipts"]["issued"], json!(2));
+    assert_eq!(body["receipts"]["live"], json!(1));
+    assert_eq!(body["receipts"]["corrections"], json!(1));
+    assert_eq!(body["receipts"]["total_cents"], json!(2_500));
+    assert_eq!(body["receipts"]["total_display"], json!("$25.00"));
+    assert_eq!(
+        body["receipts"]["tax_statement_declared"],
+        json!(false),
+        "the troop declared no status, so no receipt claims one"
+    );
+
     // The report carries the ledger's own verdict: it is the document handed to
     // an outside body.
     assert_eq!(body["integrity"]["balanced"], json!(true));
@@ -3344,7 +3522,7 @@ async fn the_annual_report_states_the_year_and_the_money_moving_through_it() {
     assert_eq!(body["integrity"]["transfer_groups"], json!(1));
     assert_eq!(body["ledger"]["entries"], json!(4));
 
-    assert_eq!(host.db.query_count(), 7);
+    assert_eq!(host.db.query_count(), 8);
     assert_audited(&host, "report.annual");
 
     // A nonsense year is the caller's mistake.
