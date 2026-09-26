@@ -101,14 +101,19 @@ docker compose -f deploy/compose.proxy.yml run --rm \
 ./deploy/verify.sh
 ```
 
-Requirements: a host with Docker and Compose v2, and DNS pointing at it. For a
-certificate without a domain, see `docs/deployment.md` § Putting it behind TLS —
-that question has three answers and this directory only assumes the first.
+Requirements: a host with Docker and Compose v2. DNS pointing at the host is needed
+for the **public** path — a certificate for a real name — but not for
+`./deploy/verify.sh`, which runs against the origin listener inside the compose
+network and therefore needs neither a domain nor TLS. For a certificate without a
+domain, see `docs/deployment.md` § Putting it behind TLS — that question has three
+answers and this directory only assumes the first.
 
 ## Status — read this before trusting it
 
-**The bring-up is proven; the three proofs are not.** On 2026-09-26 the stack was
-brought up on a real host by following this README, and two things came out of it.
+**The bring-up and all three proofs are proven on a real host** (2026-09-26).
+Getting to that point required five corrections to this directory, and they are
+listed below, because "authored, not yet proven" turned out to be too generous a
+description: the proofs were not *runnable*, and each fix below is why.
 
 * The `bootstrap-isolation` step **as previously documented could not work**: it
   connected as the role it was creating, so it failed and the app crash-looped on
@@ -117,15 +122,55 @@ brought up on a real host by following this README, and two things came out of i
   `adjutant_app` created, core schema ownership transferred — after which the app
   booted and served (`listening 0.0.0.0:8787`, 195 routes, and `/` answering
   `{"service":"adjutant","status":"ok"}` from inside the proxy network).
-* **`verify.sh` has not run green.** It needs a real `DOMAIN` with DNS and a
-  certificate; the host used a placeholder (`adjutant.example.invalid`), so the
-  three proofs could not be executed there. Nothing past the bring-up should be
-  described as working until `verify.sh` runs green on a host with a real name and
-  its output is recorded.
+* **`verify.sh` runs green.** All three proofs pass on a real host against
+  `PROXY_IP=172.31.7.2`:
 
-Neither was a fault in the image or the server: the image built and the server has
-served correctly on this host since the one change above.
+  ```
+  == proof 1 — the proxy is the only way in ==
+    ok — no host port is published for adjutant
+    ok — the app answers through the proxy
+  == proof 2 — the real client is the key, not the proxy ==
+    ok — client A's own budget is one request (200 then 429)
+    ok — client B has its own budget: the forwarded address is the key
+  == proof 3 — a forged header from an untrusted peer buys nothing ==
+    ok — rotating a forged header did not produce a second bucket
 
-When it does run, the transcript belongs in the PR and a line belongs in
-`docs/release-path.md` Stage 3.1 — which is where the deployment host gets chosen,
-now that there is something concrete to choose against.
+  all three proofs passed against PROXY_IP=172.31.7.2
+  ```
+
+  The proofs talk to the **origin listener inside the network**
+  (`THROUGH=http://caddy:8080/api/hello`), so they need no domain, no DNS and no
+  certificate. An earlier revision of this file claimed they required a real
+  `DOMAIN`; that was wrong and is corrected here rather than left standing.
+
+### Four more things had to be fixed before that could pass
+
+"Authored, not yet proven" was the wrong description. The proofs were **not
+runnable** — each of these stopped them before they could test anything:
+
+1. **`curlimages/curl:8` is not a real image tag.** The curator publishes only
+   full versions (`8.22.0`, `8.21.0`, …); there is no bare `:8`. The `probe`
+   service could therefore never start. Now pinned to `8.22.0`.
+2. **Proof 1 failed a correct stack.** It read `docker compose port adjutant 8787`,
+   and on Compose v5.5.1 that prints the literal string `invalid IP:0` and exits 0
+   for a service that publishes nothing — so a `[ -z ]` test on its output refused a
+   configuration that was right. It now reads the rendered configuration
+   (`compose config`), which is authoritative and already used by the drift check.
+3. **The limiter was never turned down.** `verify.sh` set `ADJUTANT_RATE_MAX` and
+   `ADJUTANT_RATE_WINDOW` on the `up` command line, but nothing passed them into the
+   container, so the app kept `RateConfig::default` (120 requests / 60s) and proof
+   2's `200 then 429` was unobtainable. Both compose files now pass them through,
+   defaulting to the app's own values.
+4. **"A second `run` is a second client" was false.** Docker returns a freed address
+   to the next container: four successive `run`s all came up as `172.31.7.4`, so
+   proof 2 could not tell its two clients apart. The probes are now pinned to two
+   distinct addresses, and a short limiter window rolls off the readiness probe's
+   own request before each proof's client uses that address.
+
+Neither the image nor the server was at fault: the server has served correctly
+throughout, and every failure above was in the deployment files or the harness.
+
+The **public TLS path** — a real name, ACME, and the `:443` listener — remains
+unproven, because a certificate is not something a placeholder domain can obtain.
+`verify.sh` does not test it. The deployment host decision in
+`docs/release-path.md` Stage 3 is what that is waiting on.

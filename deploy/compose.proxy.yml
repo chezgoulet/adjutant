@@ -59,6 +59,15 @@ services:
       # The client's origin, if the app is served from a different name than the
       # API. Same-origin only when unset.
       ADJUTANT_CORS: ${ADJUTANT_CORS:-}
+      # verify.sh turns the limiter down to 1 request per 60s so its *choice of
+      # key* is observable as a 200/429 without reading a log. That only works if
+      # the value actually reaches the container, which is what these two do —
+      # without them the app keeps its own default (120 requests / 60s, see
+      # `RateConfig::default`) and a correct stack fails proof 2. Defaults are
+      # written out rather than left empty: an empty string is not a number, and
+      # the app refuses to boot on one.
+      ADJUTANT_RATE_MAX: ${ADJUTANT_RATE_MAX:-120}
+      ADJUTANT_RATE_WINDOW: ${ADJUTANT_RATE_WINDOW:-60}
       # Leave ADJUTANT_DEV_HEADERS unset (off). Anyone who can reach the port can
       # claim any role when it is on.
     # NOTE: no `ports:` — the proxy is the only way in, and verify.sh checks it.
@@ -87,14 +96,32 @@ services:
     restart: unless-stopped
 
   # A throwaway curl on the `edge` network, so `verify.sh` can originate requests
-  # from real, distinct client addresses without a second machine: two `run`
-  # invocations are two containers, and therefore two peer addresses. Not started
-  # by `up` (it is behind a profile) and it holds nothing.
+  # from a real client address without a second machine. Not started by `up` (it
+  # is behind a profile) and it holds nothing.
+  #
+  # The addresses are PINNED, and there are two of them, because the obvious
+  # design does not work: "two `run` invocations are two containers, therefore two
+  # addresses" is false. Docker returns a freed address to the next container, so
+  # four successive `run`s of one service all came up as 172.31.7.4, and proof 2
+  # could not tell two clients apart. `verify.sh` now names which probe it wants.
   probe:
-    image: curlimages/curl:8
+    image: curlimages/curl:8.22.0
     profiles: ["probe"]
     entrypoint: ["sh", "-c"]
-    networks: [edge]
+    networks:
+      edge:
+        ipv4_address: 172.31.7.4
+    restart: "no"
+
+  # The second client. Same image, different pinned address — this is what makes
+  # "a second client gets its own bucket" a real assertion rather than a hope.
+  probe2:
+    image: curlimages/curl:8.22.0
+    profiles: ["probe"]
+    entrypoint: ["sh", "-c"]
+    networks:
+      edge:
+        ipv4_address: 172.31.7.5
     restart: "no"
 
 volumes:
