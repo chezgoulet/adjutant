@@ -6,6 +6,7 @@ import '../theme/app_theme.dart';
 import 'announcements_screen.dart';
 import 'calendar_screen.dart';
 import 'dashboard_screen.dart';
+import 'equipment_screen.dart';
 import 'members_screen.dart';
 import 'missions_screen.dart';
 import 'settings_screen.dart';
@@ -42,6 +43,11 @@ class _HomeShellState extends State<HomeShell> {
     // week they join. Its operator surfaces (the unsettled worklist, adding an
     // item, the comp list) live behind Settings instead — see settings_screen.
     _Destination('Shop', Icons.storefront_outlined, Icons.storefront),
+    // Equipment is the same kind of work — a scout checking a tent out for a
+    // weekend is doing the thing the plugin exists for, not administering it.
+    // Its quartermaster surfaces (maintenance, retirement, replacement) are not
+    // in the client yet; what a scout needs is what is here.
+    _Destination('Equipment', Icons.backpack_outlined, Icons.backpack),
     _Destination('Members', Icons.groups_outlined, Icons.groups),
     // Settings last: the daily work comes first, and the drawer behind it is
     // where you go when something needs changing. Plugins lives inside it.
@@ -63,7 +69,8 @@ class _HomeShellState extends State<HomeShell> {
         2 => const MissionsScreen(),
         3 => const CalendarScreen(),
         4 => const StoreScreen(),
-        5 => const MembersScreen(),
+        5 => const EquipmentScreen(),
+        6 => const MembersScreen(),
         _ => const SettingsScreen(),
       };
 

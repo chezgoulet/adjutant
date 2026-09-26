@@ -4,6 +4,8 @@ import 'package:adjutant_client/api/api_client.dart';
 import 'package:adjutant_client/screens/announcement_detail_screen.dart';
 import 'package:adjutant_client/screens/announcements_screen.dart';
 import 'package:adjutant_client/screens/dues_screen.dart';
+import 'package:adjutant_client/screens/equipment_item_screen.dart';
+import 'package:adjutant_client/screens/equipment_screen.dart';
 import 'package:adjutant_client/screens/home_shell.dart';
 import 'package:adjutant_client/screens/plugins_screen.dart';
 import 'package:adjutant_client/screens/store_admin_screen.dart';
@@ -1551,15 +1553,17 @@ void main() {
       // Daily work sits in the navigation, not behind Settings.
       expect(find.text('Inbox'), findsOneWidget);
       expect(find.text('Shop'), findsOneWidget);
+      expect(find.text('Equipment'), findsOneWidget);
       expect(find.text('Settings'), findsOneWidget);
-      // Seven destinations rather than the five the design language prefers, so
+      // Eight destinations rather than the five the design language prefers, so
       // each one is still a 48dp-wide target on a 390dp phone: that floor is
       // the one that matters outdoors, and it is what makes the extra items
-      // affordable rather than cramped. The shop joined it for the same reason
-      // the inbox did — it is ordinary troop work, not a setting.
+      // affordable rather than cramped. The shop and equipment joined it for
+      // the same reason the inbox did — they are ordinary troop work, not
+      // settings.
       final destinations =
           tester.widgetList(find.byType(NavigationDestination)).length;
-      expect(destinations, 7);
+      expect(destinations, 8);
       final barWidth = tester.getSize(find.byType(NavigationBar)).width;
       expect(
         barWidth / destinations,
@@ -1621,6 +1625,63 @@ void main() {
       // The shop's operator surfaces are not in the scout's navigation: they
       // are behind Settings, where the drawer for things that need changing is.
       expect(find.text('Unsettled'), findsNothing);
+    });
+
+    testWidgets('equipment is a destination, and opens the gear pool',
+        (tester) async {
+      tester.view.physicalSize = const Size(1170, 2532);
+      tester.view.devicePixelRatio = 3.0;
+      addTearDown(tester.view.reset);
+
+      final client = ApiClient(
+        baseUrl: 'http://example.test',
+        httpClient: MockClient((request) async {
+          final path = request.url.path;
+          if (path == '/api/announcements/unread') {
+            return jsonResponse({
+              'member_id': 'u1',
+              'unread': 0,
+              'has_urgent': false,
+              'addressed': {'troop': true, 'lodges': <String>[]},
+            });
+          }
+          if (path == '/api/equipment/items') {
+            return jsonResponse({
+              'items': [
+                {
+                  'id': 1,
+                  'name': 'Camp tent',
+                  'asset_tag': 'AT-001',
+                  'category': 'tent',
+                  'condition': 'good',
+                  'status': 'available',
+                },
+              ],
+              'count': 1,
+            });
+          }
+          return http.Response('[]', 200);
+        }),
+      );
+
+      await tester.pumpWidget(
+        ChangeNotifierProvider<SessionState>(
+          create: (_) => SessionState(client: client)
+            ..user = {'id': 'u1', 'username': 'scout', 'roles': ['scout']},
+          child: const MaterialApp(home: HomeShell()),
+        ),
+      );
+      await tester.pumpAndSettle();
+
+      await tester.tap(find.text('Equipment'));
+      await tester.pumpAndSettle();
+
+      // A scout reaches the gear pool without a curl: the catalogue, and from
+      // it the availability and the checkout log, are one tap from the shell.
+      expect(find.text('Camp tent'), findsOneWidget);
+      expect(find.text('Catalogue'), findsOneWidget);
+      expect(find.text('Available'), findsOneWidget);
+      expect(find.text('I have out'), findsOneWidget);
     });
   });
 
@@ -2470,6 +2531,517 @@ void main() {
         find.textContaining("never a member's charge"),
         findsOneWidget,
       );
+    });
+  });
+
+  // -------------------------------------------------------------------------
+  // Equipment (SPEC §7.6) — the gear pool, from a scout's side
+  // -------------------------------------------------------------------------
+
+  Map<String, dynamic> equipmentItemFixture({
+    int id = 1,
+    String name = 'Camp tent',
+    String status = 'available',
+    String condition = 'good',
+    String category = 'tent',
+  }) =>
+      {
+        'id': id,
+        'name': name,
+        'asset_tag': 'AT-00$id',
+        'category': category,
+        'description': 'Four-season, two-person',
+        'condition': condition,
+        'location': 'Q-store',
+        'acquired_on': '2024-05-01',
+        'source': null,
+        'service_count': 3,
+        'next_service_on': null,
+        'status': status,
+        'maintenance_since': null,
+        'maintenance_until': null,
+        'maintenance_note': null,
+        'replacement_flagged': false,
+        'replacement_note': null,
+        'retired_at': null,
+        'retired_reason': null,
+        'created_by': 'u1',
+        'created_at': '2026-09-01T10:00:00Z',
+        'updated_at': '2026-09-01T10:00:00Z',
+      };
+
+  /// One open checkout row, as `GET /api/equipment/checkouts` returns it.
+  Map<String, dynamic> openCheckoutFixture({
+    int id = 5,
+    int itemId = 3,
+    String itemName = 'Rope 50m',
+    String dueOn = '2026-09-28',
+    bool open = true,
+  }) =>
+      {
+        'id': id,
+        'item_id': itemId,
+        'item_name': itemName,
+        'asset_tag': 'AT-00$itemId',
+        'category': 'rope',
+        'checked_out_by': 'u1',
+        'checked_out_at': '2026-09-20T09:00:00Z',
+        'checked_out_on': '2026-09-20',
+        'due_on': dueOn,
+        'purpose': 'Weekend camp',
+        'mission_id': null,
+        'destination': 'Mount Mansfield',
+        'condition_out': 'good',
+        'note_out': '',
+        'checked_in_at': open ? null : '2026-09-25T09:00:00Z',
+        'checked_in_on': open ? null : '2026-09-25',
+        'checked_in_by': open ? null : 'u1',
+        'condition_in': open ? null : 'good',
+        'note_in': '',
+        'damaged': false,
+        'open': open,
+      };
+
+  /// A full availability page: one item free, one in maintenance, one already
+  /// out to somebody else across the window.
+  Map<String, dynamic> availabilityFixture() => {
+        'from': '2026-09-26',
+        'to': '2026-10-03',
+        'days': 7,
+        'today': '2026-09-26',
+        'available': [
+          equipmentItemFixture(id: 1, name: 'Camp tent'),
+        ],
+        'unavailable': [
+          {
+            'item': equipmentItemFixture(
+              id: 2,
+              name: 'Bear canister',
+              status: 'maintenance',
+            ),
+            'reasons': ['in_maintenance'],
+            'blocking': <Map<String, dynamic>>[],
+          },
+          {
+            'item': equipmentItemFixture(id: 3, name: 'Rope 50m'),
+            'reasons': ['checked_out'],
+            'blocking': [
+              {
+                'checkout_id': 5,
+                'checked_out_on': '2026-09-20',
+                'due_on': '2026-09-28',
+                'held_by': 'u2',
+                'purpose': 'Weekend camp',
+                'mission_id': null,
+                'condition_out': 'good',
+                'open': true,
+                'overdue': false,
+              },
+            ],
+          },
+        ],
+        'out': <Map<String, dynamic>>[],
+        'counts': {
+          'available': 1,
+          'unavailable': 2,
+          'in_pool': 3,
+          'by_reason': {'in_maintenance': 1, 'checked_out': 1},
+        },
+        'thresholds': {'maintenance_lead_days': 14, 'overdue_grace_days': 0},
+        'notice': 'An item is available when it is in the pool, is not '
+            'unserviceable, and no checkout touches the window.',
+      };
+
+  group('Equipment API', () {
+    test('the availability read carries the window it was given', () async {
+      final calls = <String>[];
+      Map<String, String>? query;
+      final client = ApiClient(
+        baseUrl: 'http://example.test',
+        httpClient: MockClient((request) async {
+          calls.add('${request.method} ${request.url.path}');
+          query = request.url.queryParameters;
+          return jsonResponse(availabilityFixture());
+        }),
+      );
+
+      await client.equipmentAvailability(from: '2026-09-26', to: '2026-10-03');
+
+      expect(calls, ['GET /api/equipment/availability']);
+      expect(query?['from'], '2026-09-26');
+      expect(query?['to'], '2026-10-03');
+      // No filter the caller did not ask for is invented on the way out.
+      expect(query?['category'], isNull);
+    });
+
+    test('the checkout body keeps only what the caller supplied', () async {
+      Map<String, dynamic>? body;
+      final client = ApiClient(
+        baseUrl: 'http://example.test',
+        httpClient: MockClient((request) async {
+          body = jsonDecode(request.body) as Map<String, dynamic>;
+          return jsonResponse({'checkout': {}, 'item': {}}, 201);
+        }),
+      );
+
+      await client.checkoutEquipmentItem(
+        '7',
+        dueOn: '2026-10-03',
+        purpose: 'Fall camp',
+        missionId: 9,
+        condition: 'good',
+      );
+
+      expect(body?['due_on'], '2026-10-03');
+      expect(body?['mission_id'], 9);
+      expect(body?['condition'], 'good');
+      // The holder defaults to the caller; the client never names one.
+      expect(body?.containsKey('checked_out_by'), isFalse);
+      expect(body?.containsKey('destination'), isFalse);
+    });
+
+    test('a checkin always states its condition', () async {
+      Map<String, dynamic>? body;
+      final client = ApiClient(
+        baseUrl: 'http://example.test',
+        httpClient: MockClient((request) async {
+          body = jsonDecode(request.body) as Map<String, dynamic>;
+          return jsonResponse({'checkout': {}, 'item': {}});
+        }),
+      );
+
+      await client.checkinEquipmentItem('7', condition: 'fair', damaged: true);
+
+      expect(body?['condition'], 'fair');
+      expect(body?['damaged'], true);
+    });
+  });
+
+  group('EquipmentScreen', () {
+    setUp(() => SharedPreferences.setMockInitialValues({}));
+
+    Future<void> pump(
+      WidgetTester tester,
+      ApiClient client, {
+      Size size = const Size(1000, 2400),
+    }) async {
+      tester.view.physicalSize = size;
+      tester.view.devicePixelRatio = 1.0;
+      addTearDown(tester.view.reset);
+      await tester.pumpWidget(
+        ChangeNotifierProvider<SessionState>(
+          create: (_) => SessionState(client: client)
+            ..user = {'id': 'u1', 'username': 'scout', 'roles': ['scout']},
+          child: MaterialApp(
+            theme: AppTheme.light(),
+            home: const Scaffold(body: EquipmentScreen()),
+          ),
+        ),
+      );
+      await tester.pumpAndSettle();
+    }
+
+    ApiClient clientFor({
+      required List<String> calls,
+      bool refused = false,
+      List<Map<String, dynamic>>? checkouts,
+      String today = '2026-09-26',
+    }) =>
+        ApiClient(
+          baseUrl: 'http://example.test',
+          httpClient: MockClient((request) async {
+            final path = request.url.path;
+            calls.add('${request.method} $path');
+            if (refused) {
+              return http.Response(
+                '{"error":"requires equipment:read at scope troop"}',
+                403,
+              );
+            }
+            if (path == '/api/equipment/items') {
+              return jsonResponse({
+                'items': [
+                  equipmentItemFixture(),
+                  equipmentItemFixture(
+                    id: 2,
+                    name: 'Bear canister',
+                    status: 'maintenance',
+                  ),
+                ],
+                'count': 2,
+              });
+            }
+            if (path == '/api/equipment/availability') {
+              return jsonResponse(availabilityFixture());
+            }
+            if (path == '/api/equipment/checkouts') {
+              return jsonResponse({
+                'checkouts': checkouts ?? [openCheckoutFixture()],
+                'count': (checkouts ?? [openCheckoutFixture()]).length,
+                'open': (checkouts ?? [openCheckoutFixture()]).length,
+                'state': 'open',
+                'overdue_only': false,
+                'today': today,
+              });
+            }
+            return http.Response('[]', 200);
+          }),
+        );
+
+    testWidgets('the catalogue lists what the troop owns', (tester) async {
+      final calls = <String>[];
+      await pump(tester, clientFor(calls: calls));
+
+      expect(calls, contains('GET /api/equipment/items'));
+      expect(find.text('Camp tent'), findsOneWidget);
+      expect(find.text('Bear canister'), findsOneWidget);
+      expect(find.text('AT-001'), findsOneWidget);
+      expect(find.text('Condition: Good'), findsWidgets);
+      // A retired item is not offered unless asked for; the server owns that,
+      // and the control states what it does.
+      expect(find.text('Include retired'), findsOneWidget);
+    });
+
+    testWidgets('availability shows both sides, with the refusal in words',
+        (tester) async {
+      await pump(tester, clientFor(calls: <String>[]));
+
+      await tester.tap(find.text('Available'));
+      await tester.pumpAndSettle();
+
+      expect(find.text('Available (1)'), findsOneWidget);
+      expect(find.text('Not available (2)'), findsOneWidget);
+      expect(find.text('Camp tent'), findsOneWidget);
+      // The reason is the useful part — in words, with the server's code kept
+      // beside it so the two cannot drift.
+      expect(
+        find.text('In maintenance — out of the pool for service'),
+        findsOneWidget,
+      );
+      expect(find.text('in_maintenance'), findsOneWidget);
+      // And when a checkout blocks it, who holds it and the promise.
+      expect(
+        find.textContaining('Checked out — somebody already has it'),
+        findsOneWidget,
+      );
+      expect(find.textContaining('Held by u2 — due back 28/09/2026'),
+          findsOneWidget);
+    });
+
+    testWidgets('a refusal on availability names the permission and the words',
+        (tester) async {
+      await pump(tester, clientFor(calls: <String>[], refused: true));
+
+      await tester.tap(find.text('Available'));
+      await tester.pumpAndSettle();
+
+      expect(find.text('Availability is not yours to read'), findsOneWidget);
+      expect(find.textContaining('equipment:read'), findsOneWidget);
+      expect(find.textContaining('requires equipment:read at scope troop'),
+          findsOneWidget);
+      expect(find.text('Cannot reach the server'), findsNothing);
+    });
+
+    testWidgets('what I am holding shows an open checkout and its due date',
+        (tester) async {
+      final calls = <String>[];
+      await pump(tester, clientFor(calls: calls));
+
+      await tester.tap(find.text('I have out'));
+      await tester.pumpAndSettle();
+
+      // Narrowed to the caller with the server's own vocabulary.
+      expect(calls, contains('GET /api/equipment/checkouts'));
+      expect(find.text('Rope 50m'), findsOneWidget);
+      expect(find.text('Due 28/09/2026'), findsOneWidget);
+      expect(find.text('Out since 20/09/2026'), findsOneWidget);
+      // On time: no overdue badge.
+      expect(find.text('Overdue'), findsNothing);
+    });
+
+    testWidgets('an overdue open checkout is flagged as overdue', (tester) async {
+      await pump(
+        tester,
+        clientFor(
+          calls: <String>[],
+          checkouts: [openCheckoutFixture(dueOn: '2026-09-20')],
+          today: '2026-09-26',
+        ),
+      );
+
+      await tester.tap(find.text('I have out'));
+      await tester.pumpAndSettle();
+
+      expect(find.text('Overdue'), findsOneWidget);
+      expect(find.text('Was due 20/09/2026'), findsOneWidget);
+    });
+  });
+
+  group('EquipmentItemScreen', () {
+    setUp(() => SharedPreferences.setMockInitialValues({}));
+
+    Future<void> pump(WidgetTester tester, ApiClient client) async {
+      tester.view.physicalSize = const Size(1000, 2600);
+      tester.view.devicePixelRatio = 1.0;
+      addTearDown(tester.view.reset);
+      await tester.pumpWidget(
+        ChangeNotifierProvider<SessionState>(
+          create: (_) => SessionState(client: client)
+            ..user = {'id': 'u1', 'username': 'scout', 'roles': ['scout']},
+          child: MaterialApp(
+            theme: AppTheme.light(),
+            home: const EquipmentItemScreen(id: '1'),
+          ),
+        ),
+      );
+      await tester.pumpAndSettle();
+    }
+
+    testWidgets('a checkout posts the mission the app knows and the grade',
+        (tester) async {
+      final calls = <String>[];
+      Map<String, dynamic>? body;
+      final client = ApiClient(
+        baseUrl: 'http://example.test',
+        httpClient: MockClient((request) async {
+          final path = request.url.path;
+          calls.add('${request.method} $path');
+          if (path == '/api/missions/missions') {
+            return jsonResponse({
+              'missions': [
+                {'id': 9, 'title': 'Operation Slipperyskin', 'stage': 'execution'},
+              ],
+            });
+          }
+          if (path == '/api/equipment/item/1/checkout') {
+            body = jsonDecode(request.body) as Map<String, dynamic>;
+            return jsonResponse({'checkout': {}, 'item': {}, 'notes': 'ok'}, 201);
+          }
+          if (path == '/api/equipment/item/1') {
+            return jsonResponse({
+              'item': equipmentItemFixture(),
+              'open_checkout': null,
+              'checkouts': <Map<String, dynamic>>[],
+              'flags': {'replacement': {'candidate': false, 'reasons': []}},
+            });
+          }
+          return http.Response('[]', 200);
+        }),
+      );
+
+      await pump(tester, client);
+
+      await tester.tap(find.text('Check out'));
+      await tester.pumpAndSettle();
+
+      // The mission is a choice from the app's missions, never a free-text id.
+      await tester.tap(find.text('No mission'));
+      await tester.pumpAndSettle();
+      await tester.tap(find.text('#9 — Operation Slipperyskin').last);
+      await tester.pumpAndSettle();
+
+      await tester.tap(find.widgetWithText(FilledButton, 'Check it out'));
+      await tester.pumpAndSettle();
+
+      expect(calls, contains('POST /api/equipment/item/1/checkout'));
+      expect(body?['mission_id'], 9);
+      expect(body?['condition'], 'good');
+      expect(body?.containsKey('checked_out_by'), isFalse);
+    });
+
+    testWidgets('a checkout refusal is the server\'s words, not a hidden error',
+        (tester) async {
+      final client = ApiClient(
+        baseUrl: 'http://example.test',
+        httpClient: MockClient((request) async {
+          final path = request.url.path;
+          if (path == '/api/missions/missions') {
+            return jsonResponse({'missions': <Map<String, dynamic>>[]});
+          }
+          if (path == '/api/equipment/item/1/checkout') {
+            return jsonResponse({
+              'error': 'item 1 is already out to u2 — bring it back before it '
+                  'goes out again',
+            }, 409);
+          }
+          if (path == '/api/equipment/item/1') {
+            return jsonResponse({
+              'item': equipmentItemFixture(),
+              'open_checkout': null,
+              'checkouts': <Map<String, dynamic>>[],
+              'flags': <String, dynamic>{},
+            });
+          }
+          return http.Response('[]', 200);
+        }),
+      );
+
+      await pump(tester, client);
+
+      await tester.tap(find.text('Check out'));
+      await tester.pumpAndSettle();
+
+      await tester.tap(find.widgetWithText(FilledButton, 'Check it out'));
+      await tester.pumpAndSettle();
+
+      // The 409 is the answer: the server's message is kept, not replaced.
+      expect(find.text('The server refused'), findsOneWidget);
+      expect(
+        find.textContaining('already out to u2'),
+        findsOneWidget,
+      );
+      // The sheet stays open so the scout can see why and adjust.
+      expect(find.text('Check it out'), findsWidgets);
+    });
+
+    testWidgets('an item out to me can be checked back in with a grade',
+        (tester) async {
+      final calls = <String>[];
+      Map<String, dynamic>? body;
+      final client = ApiClient(
+        baseUrl: 'http://example.test',
+        httpClient: MockClient((request) async {
+          final path = request.url.path;
+          calls.add('${request.method} $path');
+          if (path == '/api/missions/missions') {
+            return jsonResponse({'missions': <Map<String, dynamic>>[]});
+          }
+          if (path == '/api/equipment/item/1/checkin') {
+            body = jsonDecode(request.body) as Map<String, dynamic>;
+            return jsonResponse({'checkout': {}, 'item': {}, 'notes': 'ok'});
+          }
+          if (path == '/api/equipment/item/1') {
+            return jsonResponse({
+              'item': equipmentItemFixture(),
+              'open_checkout': openCheckoutFixture(itemId: 1),
+              'checkouts': <Map<String, dynamic>>[],
+              'flags': <String, dynamic>{},
+            });
+          }
+          return http.Response('[]', 200);
+        }),
+      );
+
+      await pump(tester, client);
+
+      // The open checkout is visible, with who holds it and when it is due.
+      expect(find.text('Checked out'), findsOneWidget);
+      expect(find.textContaining('HELD BY'), findsOneWidget);
+
+      await tester.tap(find.text('Check in'));
+      await tester.pumpAndSettle();
+
+      // The grade is chosen from the server's vocabulary; the sheet starts at
+      // the item's current grade.
+      await tester.tap(find.text('Good'));
+      await tester.pumpAndSettle();
+      await tester.tap(find.text('Fair').last);
+      await tester.pumpAndSettle();
+      await tester.tap(find.widgetWithText(FilledButton, 'Check it in'));
+      await tester.pumpAndSettle();
+
+      expect(calls, contains('POST /api/equipment/item/1/checkin'));
+      expect(body?['condition'], 'fair');
     });
   });
 }
