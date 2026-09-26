@@ -13,7 +13,7 @@ use std::sync::Arc;
 
 use adjutant_sdk::{async_trait, AdjutantPlugin, PluginContext, RouteDefinition, SdkError};
 use adjutant_server::host;
-use adjutant_server::plugin_runtime::{LoadedPlugin, PluginInfo, PluginRegistry};
+use adjutant_server::plugin_runtime::{LoadedPlugin, PluginInfo, PluginRegistry, PluginSlot};
 
 struct Noop;
 
@@ -36,13 +36,13 @@ impl AdjutantPlugin for Noop {
     }
 }
 
-fn fixture(id: &str, pool: Arc<sqlx::PgPool>) -> LoadedPlugin {
-    LoadedPlugin {
+fn fixture(id: &str, pool: Arc<sqlx::PgPool>) -> PluginSlot {
+    PluginSlot::Live(LoadedPlugin {
         plugin: Box::new(Noop),
         library: None,
         pool: Some(pool),
         routes: Vec::new(),
-        enabled: true,
+        path: std::path::PathBuf::new(),
         info: PluginInfo {
             id: id.into(),
             name: id.into(),
@@ -51,11 +51,13 @@ fn fixture(id: &str, pool: Arc<sqlx::PgPool>) -> LoadedPlugin {
             routes: 0,
             kind: "native".into(),
             isolated: true,
+            loaded: true,
+            last_error: None,
             permissions: Vec::new(),
             schedules: Vec::new(),
             route_list: Vec::new(),
         },
-    }
+    })
 }
 
 /// Connections currently open as `role` (the plugin's own role).

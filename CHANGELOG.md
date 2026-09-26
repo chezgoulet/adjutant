@@ -357,6 +357,31 @@ first-party plugin to pick the helpers up.
   change with a `409` naming the transfer group and the act that settles the
   difference, and writes nothing; re-posting the same funding still passes.
 
+- **`enabled` decides what is *loaded*, not only what answers** (#89). A plugin
+  whose `core.plugins.enabled = false` is no longer loaded at boot: it is skipped
+  *before* the `dlopen` (the staged file name plus the `core.plugins` row give
+  the id), so it has no pool, no `init`, no migrations — **no schema content** —
+  no permission upsert and no routes, and the loader logs *skipped*, not
+  *loaded*. Disabling at runtime tears the executable half down: routing stops,
+  the requests already inside finish (bounded, and the wait is reported), then
+  the pool closes; the library stays mapped (the lifetime rule is unchanged).
+  Enabling is a **load** — `dlopen` + `init` + migrate + register + routes, the
+  same body boot uses — and `core.plugins.enabled` is written only after it
+  succeeds, so there is no state where the flag is on and nothing is loadable.
+  A disabled plugin keeps its **record** (id, name, version, kind,
+  `loaded = false`, routes 0) so the admin surface lists it and
+  `POST /api/plugins/<id>/enable` finds it by id, and its route answers exactly
+  as it does when the library is absent from disk (a plain `404` — the special
+  `Disabled` lookup is gone). Roles, empty schemas and `core.permissions` rows
+  are **provisioning and declarations** and deliberately survive: deleting the
+  permission rows would cascade through `core.role_permissions` and silently
+  revoke grants a troop configured. A declarative minimum cannot be disabled
+  (`REQUIRED_PLUGINS`: `auth`, `membership`) and declared dependencies are
+  enforced (`store` needs `stripe`), each refusing with its reason; every
+  transition **and every refusal** is audited, and `GET /api/plugins` now
+  distinguishes **loaded** from merely **known** (new `loaded`/`last_error`
+  fields).
+
 ### Fixed
 
 - **`POST /api/store/item` answered `500` for every caller — the shop could not

@@ -646,16 +646,10 @@ pub async fn deliver(state: &Arc<AppState>, intent: &Intent) -> Delivery {
             handler,
             params,
         } => (plugin_id, required_permission, required_scope, handler, params),
-        // Retryable, not terminal: a disabled plugin may be enabled again, and a
-        // plugin mid-reload has no routes for a moment. Exhaustion is the floor.
-        RouteLookup::Disabled { plugin_id } => {
-            return Delivery::retry(
-                attempts,
-                max_attempts,
-                None,
-                format!("target plugin {plugin_id} is disabled, so its route does not serve"),
-            )
-        }
+        // Retryable, not terminal: a plugin mid-reload has no routes for a
+        // moment, and a *disabled* plugin has none at all (issue #89: it is not
+        // loaded, so this is the same answer an absent library gives).
+        // Exhaustion is the floor.
         RouteLookup::NotFound => {
             return Delivery::retry(
                 attempts,
@@ -1551,12 +1545,12 @@ mod tests {
             permissions: PermissionService::new(CoreDb::new(pool.clone())),
             audit: AuditService::new(CoreDb::new(pool.clone()), "core".into()),
             registry: tokio::sync::RwLock::new(PluginRegistry {
-                plugins: vec![LoadedPlugin {
+                plugins: vec![crate::plugin_runtime::PluginSlot::Live(LoadedPlugin {
                     plugin: Box::new(ProbePlugin),
                     library: None,
                     pool: None,
                     routes,
-                    enabled: true,
+                    path: std::path::PathBuf::new(),
                     info: PluginInfo {
                         id: PROBE_PLUGIN.into(),
                         name: "Outbox probe".into(),
@@ -1565,11 +1559,13 @@ mod tests {
                         routes: 0,
                         kind: "native".into(),
                         isolated: true,
+                        loaded: true,
+                        last_error: None,
                         permissions: Vec::new(),
                         schedules: Vec::new(),
                         route_list: Vec::new(),
                     },
-                }],
+                })],
                 retired: Vec::new(),
             }),
             bus: EventBus::new(),
@@ -1580,6 +1576,8 @@ mod tests {
             scheduler: Scheduler::new(),
             outbox_mismatches: Mutex::new(0),
             relay: Relay::new(),
+            in_flight: crate::server::InFlight::new(),
+            lifecycles: crate::server::LifecycleLocks::new(),
         })
     }
 
