@@ -1,0 +1,22 @@
+[package]
+# Deliberately NOT `adjutant-broken-init`. The Dockerfile ships every
+# `libadjutant_*.so` the workspace builds — the glob is the point there, so
+# nothing is named by hand — and a fixture that is guaranteed to fail must not be
+# one of the libraries a deployment carries. This name produces
+# `libbroken_init_fixture.so`, which the glob does not match; the test stages it
+# under an `adjutant_`-style name in its own temporary plugin directory, which is
+# where the loader reads it from.
+name = "broken-init-fixture"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Test fixture: a plugin whose init() always fails, so the enable path's 409 can be probed."
+publish = false
+
+[lib]
+# cdylib because the core loads it dynamically; rlib so its own tests link.
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+adjutant-sdk.workspace = true
