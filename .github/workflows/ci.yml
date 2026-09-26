@@ -141,6 +141,20 @@ jobs:
       - name: Finance route SQL probes (DB-backed)
         run: cargo test -p adjutant-finance --test route_sql -- --ignored --nocapture
 
+      # The dues funding rule on the same rail: a waiver lands with funded_cents
+      # equal to its tier's assessment and books its draw as two ledger rows in one
+      # group summing to zero; a retry carrying the draw's deterministic
+      # `external_ref` writes nothing twice; a booked draw's funding cannot be
+      # re-derived in place (the row and the ledger must not be allowed to
+      # disagree); the rows already waived at zero are untouched until the guarded
+      # repair route runs; and migration 2's constraint swap holds on the database
+      # itself. Same position and same reason as the two steps above: the probes
+      # connect AS `adjutant_plugin_finance` (and declare their own
+      # `finance:write` role), so they need the roles, the stored plugin secrets
+      # and the plugin migrations the live ladder above has just bootstrapped.
+      - name: Finance dues funding probes (DB-backed)
+        run: cargo test -p adjutant-finance --test dues_funding -- --ignored --nocapture
+
       # The sandboxed path: build the WASM guest and load it through the same
       # registry/dispatch pipeline (a separate plugin dir keeps the native
       # harnesses above unaffected).

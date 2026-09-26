@@ -286,7 +286,14 @@ first-party plugin to pick the helpers up.
   the tier's share is Rust's, so migration 2 leaves them and a guarded, idempotent
   `finance:manage` route — `POST /api/finance/dues/repair-waivers` — recomputes them
   on demand from each row's own `base_cents` and `tier`, leaving a `base_cents = 0`
-  row alone.
+  row alone. A draw that is already **booked** cannot have its funding re-derived
+  in place: the draw's key is deterministic, so a *different* amount for the same
+  member and year would be answered by the transfer route with the transfer that
+  already exists, and the row would be marked `booked` against a group whose amount
+  is the previous figure — `funded_cents` and the ledger disagreeing, silently. The
+  assess route (and the self-report, which is a re-assessment too) refuses that
+  change with a `409` naming the transfer group and the act that settles the
+  difference, and writes nothing; re-posting the same funding still passes.
 
 ### Notes for plugin authors
 

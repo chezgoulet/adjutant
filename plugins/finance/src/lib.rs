@@ -2585,6 +2585,16 @@ fn route_assess_dues(ctx: &PluginContext) -> RouteDefinition {
                     recorded_by: caller_of(&req).unwrap_or_default(),
                 };
                 let Some(mut dues) = upsert_dues(&c, &assessment).await? else {
+                    // The statement carries one rule that can leave it writing
+                    // nothing on a row that exists: a booked draw whose funding
+                    // would change. Say that in words, not as a 500.
+                    if let Some(row) = existing_dues_row(&c, fiscal_year, member).await? {
+                        if let Some(reason) =
+                            booked_draw_change_refusal(&row, funded_cents, fiscal_year)
+                        {
+                            return PluginResponse::error(409, reason);
+                        }
+                    }
                     return Err(SdkError::Internal("the dues upsert returned no row".into()));
                 };
                 // The draw, booked as this caller when they hold `finance:write`.
@@ -3165,6 +3175,15 @@ fn route_self_report(ctx: &PluginContext) -> RouteDefinition {
                 };
                 let row = upsert_dues(&c, &assessment).await?;
                 let Some(dues) = row else {
+                    // The self-report is a re-assessment too, so it meets the same
+                    // rule: a booked draw's funding is not re-derived in place.
+                    if let Some(existing) = existing_dues_row(&c, fiscal_year, &subject).await? {
+                        if let Some(reason) =
+                            booked_draw_change_refusal(&existing, funded_cents, fiscal_year)
+                        {
+                            return PluginResponse::error(409, reason);
+                        }
+                    }
                     return Err(SdkError::Internal("the dues upsert returned no row".into()));
                 };
                 let standing =
@@ -4283,6 +4302,69 @@ struct Assessment {
     recorded_by: String,
 }
 
+/// The refusal for a re-assessment that would **change** an already-booked draw's
+/// funding, or `None` when the change is safe (nothing booked, or the same amount).
+///
+/// A draw's reference is deterministic (`dues:{year}:{member}`), so a *different*
+/// amount cannot be booked under it: the transfer route would answer the retry
+/// with the transfer that already exists — correctly — and the row would then be
+/// marked `booked` against a group whose amount is the previous figure, leaving
+/// `funded_cents` (and the Annual Report's spend) disagreeing with what
+/// `scholarship` actually moved. The statement refuses that write; this says why,
+/// and what would settle it.
+fn booked_draw_change_refusal(
+    existing: &Value,
+    funded_cents: i64,
+    fiscal_year: i32,
+) -> Option<String> {
+    if existing["draw_status"].as_str() != Some(DRAW_BOOKED) {
+        return None;
+    }
+    let booked = existing["funded_cents"].as_i64().unwrap_or(0);
+    if booked == funded_cents {
+        return None;
+    }
+    let reference = existing["draw_ref"]
+        .as_str()
+        .filter(|reference| !reference.is_empty())
+        .unwrap_or("unrecorded");
+    Some(format!(
+        "this member's {fiscal_year} draw is already booked — transfer group {reference}, {} \
+         funded from scholarship — and re-assessing it at {} would leave the row and the ledger \
+         saying different things, so nothing was written. Move the difference with an explicit \
+         transfer (POST /api/finance/transfer), and record the change against the year the money \
+         belongs to.",
+        format_cents(booked),
+        format_cents(funded_cents)
+    ))
+}
+
+/// The member's row for one year, as the refusal path reads it.
+///
+/// One query, run **only** when the guarded upsert wrote nothing: a row that does
+/// not exist or is not booked is a genuine internal failure by then, and the
+/// caller says so.
+async fn existing_dues_row(
+    c: &PluginContext,
+    fiscal_year: i32,
+    member_id: &str,
+) -> Result<Option<Value>, SdkError> {
+    c.db.query_one(
+        format!(
+            "SELECT d.draw_status, d.draw_ref::text AS draw_ref, d.funded_cents, \
+                    d.assessed_cents, d.status \
+             FROM {dues} d WHERE d.dues_kind = '{DUES_KIND_MEMBER}' \
+               AND d.member_id = $1 AND d.fiscal_year = $2",
+            dues = c.db.table("dues")
+        ),
+        vec![
+            SqlValue::Text(member_id.to_string()),
+            SqlValue::Int(i64::from(fiscal_year)),
+        ],
+    )
+    .await
+}
+
 /// Create or replace one assessment — **one statement**.
 ///
 /// One row per (year, kind, member, lodge): posting again revises, which is what
@@ -4295,6 +4377,15 @@ struct Assessment {
 /// the same funding has not moved money, and the row must not forget that it did
 /// — the draw's deterministic reference makes a re-booking a no-op, but a row
 /// that lost its `booked` state would claim a subsidy twice.
+///
+/// And a re-assessment that would **change** the funded amount of a booked row is
+/// refused by the statement's own `WHERE`, which is the one way this query can
+/// write nothing on a row that exists: the draw's reference is deterministic, so
+/// a different amount cannot be booked under it — the transfer route would answer
+/// the retry with the transfer that already exists, and the row would be marked
+/// `booked` against a group whose amount is the previous figure. The caller that
+/// gets no row asks [`existing_dues_row`] and [`booked_draw_change_refusal`] to
+/// say so in words (a `409`), rather than reporting a `500`.
 async fn upsert_dues(
     c: &PluginContext,
     assessment: &Assessment,
@@ -4323,6 +4414,9 @@ async fn upsert_dues(
                    self_reported = EXCLUDED.self_reported, status = EXCLUDED.status, \
                    note = EXCLUDED.note, recorded_by = EXCLUDED.recorded_by, \
                    updated_at = now() \
+             WHERE NOT (d.draw_status = '{DRAW_BOOKED}' \
+                        AND (d.status <> EXCLUDED.status \
+                             OR d.funded_cents <> EXCLUDED.funded_cents)) \
              RETURNING {DUES_FIELDS}",
             dues = c.db.table("dues")
         ),
