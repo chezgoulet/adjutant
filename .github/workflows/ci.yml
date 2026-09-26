@@ -278,6 +278,45 @@ jobs:
             || { echo "::error::the server never opened 127.0.0.1:8788 — see its output above"; exit 1; }
           ADJUTANT_E2E_BASE=http://127.0.0.1:8788 python3 docs/e2e_m4.py
 
+  # The Flutter client ships to users (Obtainium), yet until this job existed no
+  # CI step ever compiled it: the Rust jobs never look inside client/, so a change
+  # there was green by default — a probe nobody runs. This is the same gate the
+  # workspace itself gets (resolve, analyze, test), on every push and pull
+  # request. It shares nothing with `verify` — no Postgres service, no cargo, no
+  # `needs:` — so it stays independent and fast.
+  client:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        # Every run step below is inside the app, so the intent is `client/` and
+        # not "whatever directory the workspace root happens to be".
+        working-directory: client
+    steps:
+      - uses: actions/checkout@v4
+
+      # The pubspec constrains Dart to ^3.13.4 and the repo commits no Flutter
+      # version pin, so the action follows the stable channel rather than a
+      # hand-copied version that would drift the moment it is bumped.
+      - uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          cache: true
+
+      # Make toolchain drift visible in the log instead of mysterious (the same
+      # reason the Rust job prints rustc/clippy versions).
+      - name: Flutter version
+        run: flutter --version
+
+      - name: Dependencies
+        run: flutter pub get
+
+      # The gate a client change must pass: zero analyzer findings.
+      - name: Analyze
+        run: flutter analyze --no-pub
+
+      - name: Tests
+        run: flutter test --no-pub
+
   # The declared MSRV (workspace rust-version). RUSTUP_TOOLCHAIN overrides the
   # pinned rust-toolchain.toml channel so this job actually uses 1.96.
   msrv:
