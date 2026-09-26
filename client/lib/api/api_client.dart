@@ -791,6 +791,13 @@ Map<String, dynamic> _asMap(dynamic value) {
 /// The API returns bare arrays for collections, but has been observed to wrap
 /// them (`{"items": [...]}`, `{"members": [...]}`) on some routes. Accept both
 /// rather than trusting one shape — and never crash on the other.
+///
+/// `lodges` is in this list because it had to be: `GET /api/membership/lodges`
+/// answers `{"lodges": [{"name": …, "patrols": […]}, …]}`, which this function
+/// silently turned into an empty list — a decode path no mock-client test
+/// covered, and the live harness (`live/live_client_test.dart`) is what found
+/// it. The wrapper the server uses is listed here rather than the route being
+/// special-cased.
 List<Map<String, dynamic>> _asList(dynamic value) {
   if (value is List) {
     return value.whereType<Map>().map((e) => Map<String, dynamic>.from(e)).toList();
@@ -800,6 +807,7 @@ List<Map<String, dynamic>> _asList(dynamic value) {
       'items',
       'data',
       'members',
+      'lodges',
       'missions',
       'events',
       'motions',
