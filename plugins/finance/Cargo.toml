@@ -17,3 +17,9 @@ chrono.workspace = true
 
 [dev-dependencies]
 tokio.workspace = true
+# A **dev**-dependency only: it links into the test binaries, never into the
+# cdylib, so the plugin's no-runtime-in-the-plugin rule (a plugin reaches the
+# database through `ctx.db`, never through sqlx) is untouched. The DB-backed
+# probes connect to a real PostgreSQL as this plugin's own role and drive the
+# real route handlers, so what they prove is what the *plugin's* statements do.
+sqlx.workspace = true
