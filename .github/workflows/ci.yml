@@ -141,6 +141,22 @@ jobs:
       - name: Store outbox probes (DB-backed)
         run: cargo test -p adjutant-store --test outbox_draw -- --ignored --nocapture
 
+      # The store plugin's **catalogue** writes, executed: `POST /api/store/item`
+      # and `PATCH /api/store/item/{id}` are driven through their **real
+      # handlers** and the rows they leave in `store.catalogue_items` are read
+      # back. The store step above covers the order/draw SQL only, so until this
+      # one existed no gate ran the catalogue's own writes — which is how
+      # `POST /api/store/item` shipped answering `500` for every caller: its
+      # `INSERT` carried a `RETURNING` naming an alias its target did not have
+      # (#79). A gate on a handler's *decisions* cannot see a statement
+      # PostgreSQL refuses, so this is where that class of fault is caught on
+      # this plugin. Same reason as the step above for its position: the probes
+      # connect AS `adjutant_plugin_store`, so they need the roles, the stored
+      # plugin secrets and the plugin migrations the live ladder above has just
+      # bootstrapped.
+      - name: Store catalogue SQL probes (DB-backed)
+        run: cargo test -p adjutant-store --test catalogue_sql -- --ignored --nocapture
+
       # finance's write SQL, executed: the transaction and transfer routes are
       # driven through their **real handlers** and the rows they leave in
       # `finance.transactions` are read back — one fund for a code and an id, two

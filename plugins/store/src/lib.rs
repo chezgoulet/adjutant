@@ -1776,7 +1776,7 @@ fn route_create_item(ctx: &PluginContext) -> RouteDefinition {
                     .db
                     .query_one(
                         format!(
-                            "INSERT INTO {items} (kind, sku, name, category, description, \
+                            "INSERT INTO {items} AS i (kind, sku, name, category, description, \
                                  base_price_cents, currency, fund_code, equipment_item_id, \
                                  created_by) \
                              VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10) RETURNING {ITEM_FIELDS}",

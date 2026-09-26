@@ -357,6 +357,31 @@ first-party plugin to pick the helpers up.
   change with a `409` naming the transfer group and the act that settles the
   difference, and writes nothing; re-posting the same funding still passes.
 
+### Fixed
+
+- **`POST /api/store/item` answered `500` for every caller — the shop could not
+  be stocked through the API at all** (#79). The `INSERT` into
+  `store.catalogue_items` carried `RETURNING {ITEM_FIELDS}`, and every column in
+  that list is qualified `i.` — an alias the `INSERT` target did not have, so
+  PostgreSQL refused to prepare the statement (`missing FROM-clause entry for
+  table "i"`) and the client's Add-item screen got an internal error for every
+  body. The statement now names its target the way the sibling `UPDATE` already
+  did — `INSERT INTO … AS i (…) … RETURNING {ITEM_FIELDS}` — which **restores**
+  the documented behaviour rather than changing it. The gap that let it ship is
+  closed by the same change: the store's DB-backed probe covered the
+  **order/draw** SQL only, so the catalogue's own writes ran under no gate. A new
+  `#[ignore]`d, DB-backed probe (`plugins/store/tests/catalogue_sql.rs`, a CI
+  step beside the other DB probes) drives `POST /api/store/item` and
+  `PATCH /api/store/item/{id}` through the **real route handlers** as
+  `adjutant_plugin_store` and reads the rows back — an item is created and reads
+  back with its kind, name, category, sku, price, currency and fund code, a
+  rental carries the equipment item it rents and nothing else about it, the list
+  returns both and hides one once it is deactivated unless `include_inactive` is
+  asked for, an edit corrects the row (an empty string leaves a text field as it
+  is, and the `kind` stays immutable), and an id that names nothing is a `404`
+  that writes no row. It asserts on **rows** and on refusals by their own reason,
+  never on the statement's text.
+
 ### Notes for plugin authors
 
 - Both plugins touch **no** `core.*` table: they keep to their own schema, so
