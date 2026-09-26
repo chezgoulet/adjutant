@@ -203,6 +203,31 @@ fn group_row(group: &str, entries: i64, sum_cents: i64) -> Value {
     json!({ "transfer_group": group, "entries": entries, "group_sum_cents": sum_cents })
 }
 
+/// A receipt as `sql_receipt_one` returns one: the row, its fund's code, and the
+/// correction that supersedes it (derived, so it is a column on this row).
+fn receipt_row(member_id: &str, payer_name: &str, amount_cents: i64) -> Value {
+    json!({
+        "id": 7,
+        "number": "R-2026-000007",
+        "fiscal_year": 2026,
+        "transaction_id": 3,
+        "fund_code": FUND_GENERAL,
+        "fund_id": 1,
+        "amount_cents": amount_cents,
+        "issued_on": "2026-03-15",
+        "member_id": member_id,
+        "payer_name": payer_name,
+        "purpose": "Annual dues",
+        "tax_statement": "",
+        "supersedes_id": Value::Null,
+        "correction_reason": "",
+        "issued_by": "treasurer",
+        "created_at": "2026-03-15 12:00:00+00",
+        "superseded_by": Value::Null,
+        "superseded_by_number": Value::Null,
+    })
+}
+
 // ---------------------------------------------------------------------------
 // The declaration the loader validates
 // ---------------------------------------------------------------------------
@@ -2267,6 +2292,115 @@ async fn a_member_reads_their_own_dues_without_read_all() {
     assert_eq!(status, 200, "{body}");
     assert_eq!(body["dues"], Value::Null);
     assert!(body["next"].as_str().unwrap().contains("self-report"));
+}
+
+#[tokio::test]
+async fn a_giver_reads_their_own_receipts_and_the_treasurer_reads_all() {
+    let (host, _plugin, routes) = plugin().await;
+    let list = route(&routes, "GET", "/api/finance/receipts");
+    let one = route(&routes, "GET", "/api/finance/receipt/{id}");
+
+    // Your own receipts: an ownership check, so `finance:read` at any scope and
+    // no permission query at all (SPEC §9.2). Just the page and its total.
+    host.db.push_rows(vec![receipt_row("bea", "", 1_000)]);
+    host.db
+        .push_rows(vec![json!({ "total_cents": 1_000, "live": 1 })]);
+    let (status, body) = call(
+        &list.handler,
+        TestRequest::get("/api/finance/receipts")
+            .identity("bea", &["member"])
+            .query_param("member_id", "bea")
+            .build(),
+    )
+    .await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body["count"], json!(1));
+    assert_eq!(body["receipts"][0]["issued_to"], json!("bea"));
+    assert_eq!(body["live_total_cents"], json!(1_000));
+    assert_eq!(body["live_total_display"], json!("$10.00"));
+    assert_eq!(host.db.query_count(), 2, "no permission query for your own");
+
+    // Somebody else's needs `finance:read_all` covering the troop. A Lodge grant
+    // covers no troop scope at all, so this is refused before any query runs —
+    // and the whole troop's list needs the same grant, so it is refused too.
+    for filters in [vec![("member_id", "carl")], vec![]] {
+        let mut request = TestRequest::get("/api/finance/receipts")
+            .identity_grants(
+                "bea",
+                vec![RoleGrant {
+                    role_id: "member".into(),
+                    scope: Scope::lodge("3"),
+                }],
+            );
+        for (key, value) in filters {
+            request = request.query_param(key, value);
+        }
+        let (status, body) = call(&list.handler, request.build()).await;
+        assert_eq!(status, 403, "{body}");
+    }
+
+    // With the grant, the treasurer reads every receipt.
+    host.db.push_rows(vec![json!({ "n": 1 })]);
+    host.db.push_rows(vec![receipt_row("bea", "", 1_000)]);
+    host.db
+        .push_rows(vec![json!({ "total_cents": 1_000, "live": 1 })]);
+    let (status, body) = call(
+        &list.handler,
+        TestRequest::get("/api/finance/receipts")
+            .identity("treasurer", &["chief"])
+            .build(),
+    )
+    .await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body["count"], json!(1));
+
+    // One receipt: a giver reads their own...
+    host.db.push_rows(vec![receipt_row("bea", "", 1_000)]);
+    let (status, body) = call(
+        &one.handler,
+        TestRequest::get("/api/finance/receipt/{id}")
+            .identity("bea", &["member"])
+            .param("id", "7")
+            .build(),
+    )
+    .await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body["issued_to"], json!("bea"));
+    assert_eq!(body["tax_statement_declared"], json!(false));
+    assert!(body["wording"]
+        .as_str()
+        .unwrap_or_default()
+        .contains("R-2026-000007"));
+
+    // ...and no one else's without the grant. The receipt is read first (it is
+    // what names the giver), so the permission query is the second call — and it
+    // is answered "no", which is what the refusal is measured against.
+    host.db.push_rows(vec![receipt_row("carl", "", 1_000)]);
+    host.db.push_rows(vec![json!({ "n": 0 })]);
+    let (status, body) = call(
+        &one.handler,
+        TestRequest::get("/api/finance/receipt/{id}")
+            .identity("bea", &["member"])
+            .param("id", "8")
+            .build(),
+    )
+    .await;
+    assert_eq!(status, 403, "{body}");
+
+    // A receipt addressed to someone outside the troop has no account to match,
+    // so it is the treasurer's to read and never a member's by identity.
+    host.db.push_rows(vec![receipt_row("", "Jane Doe", 1_000)]);
+    host.db.push_rows(vec![json!({ "n": 1 })]);
+    let (status, body) = call(
+        &one.handler,
+        TestRequest::get("/api/finance/receipt/{id}")
+            .identity("treasurer", &["chief"])
+            .param("id", "9")
+            .build(),
+    )
+    .await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body["issued_to"], json!("Jane Doe"));
 }
 
 #[tokio::test]
