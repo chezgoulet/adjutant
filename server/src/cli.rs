@@ -365,6 +365,7 @@ pub async fn bootstrap_isolation(
     rotate: bool,
     app_role: Option<&str>,
     app_password: Option<&str>,
+    enable: Option<&[String]>,
 ) -> Result<Vec<String>, String> {
     // Core migrations first: `db_secret` and `core.record_migration` must exist.
     let pool = crate::db::connect_and_migrate(cfg)
@@ -418,6 +419,50 @@ pub async fn bootstrap_isolation(
             .await
             .map_err(|e| format!("transfer core ownership to {app}: {e}"))?;
     }
+
+    // --- which plugins this deployment runs (issue #90) ----------------------
+    //
+    // **Additive, deliberately.** Absent means "leave the flags alone", which is
+    // what every existing script — and this command's own documented usage —
+    // relies on. Defaulting to "start minimal" here would silently turn plugins
+    // off for every deployment that already calls this, and `deploy/verify.sh`
+    // and the probe ladders both need the full set present.
+    //
+    // The wizard gets the same decision with prose, and the *default* of starting
+    // minimal belongs there: it is a preselection a person can see and change,
+    // not a change to a command other things already depend on.
+    if let Some(chosen) = enable {
+        // A typo must not read as "enable nothing". An id that is not on disk is
+        // refused by name, before any flag is touched.
+        let unknown: Vec<&str> = chosen
+            .iter()
+            .map(String::as_str)
+            .filter(|c| !ids.iter().any(|id| id == c))
+            .collect();
+        if !unknown.is_empty() {
+            return Err(format!(
+                "not a plugin on disk: {}. Discovered: {}",
+                unknown.join(", "),
+                ids.join(", ")
+            ));
+        }
+
+        // One statement, both directions: the chosen set is enabled and everything
+        // else discovered is disabled, so the result does not depend on what the
+        // flags happened to be, and an interrupted run cannot leave half the
+        // deployment on. Running it twice converges.
+        sqlx::query(
+            "UPDATE core.plugins
+                SET enabled = (id = ANY($1)), updated_at = now()
+              WHERE id = ANY($2)",
+        )
+        .bind(chosen)
+        .bind(&ids)
+        .execute(pool.as_ref())
+        .await
+        .map_err(|e| format!("set the enabled set: {e}"))?;
+    }
+
     Ok(ids)
 }
 
@@ -449,7 +494,7 @@ pub async fn run_test_plugin(cfg: &Config) -> Result<Vec<Probe>, String> {
 
     // A plugin now loads on its own restricted role/pool, so the pristine test
     // database needs its roles bootstrapped (the runtime cannot create them).
-    bootstrap_isolation(&cfg, false, None, None).await?;
+    bootstrap_isolation(&cfg, false, None, None, None).await?;
 
     let (app, _state) = crate::build_app(&cfg)
         .await

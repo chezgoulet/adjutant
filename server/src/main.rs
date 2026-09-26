@@ -122,6 +122,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let mut rotate = false;
             let mut app_role: Option<String> = None;
             let mut app_password: Option<String> = None;
+            // Which plugins this deployment runs (issue #90). Commas or spaces,
+            // both accepted: `--enable auth,membership` and
+            // `--enable auth, membership` should not mean different things.
+            let mut enable: Option<Vec<String>> = None;
             let mut passthrough: Vec<String> = Vec::new();
             let mut it = args[1..].iter();
             while let Some(a) = it.next() {
@@ -129,11 +133,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     "--rotate" => rotate = true,
                     "--app-role" => app_role = it.next().cloned(),
                     "--app-password" => app_password = it.next().cloned(),
+                    "--enable" => enable = it.next().map(|s| plugin_list(s.as_str())),
                     _ if a.starts_with("--app-role=") => {
                         app_role = Some(a["--app-role=".len()..].to_string())
                     }
                     _ if a.starts_with("--app-password=") => {
                         app_password = Some(a["--app-password=".len()..].to_string())
+                    }
+                    _ if a.starts_with("--enable=") => {
+                        enable = Some(plugin_list(a.trim_start_matches("--enable=")))
                     }
                     _ => passthrough.push(a.clone()),
                 }
@@ -155,6 +163,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 rotate,
                 app_role.as_deref(),
                 app_password.as_deref(),
+                enable.as_deref(),
             )
             .await
             {
@@ -169,6 +178,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             .unwrap_or_default(),
                         ids.join(", ")
                     );
+                    if let Some(chosen) = &enable {
+                        // Printed because it is the one line an operator needs to
+                        // confirm from: this is the whole content of the decision
+                        // the wizard makes with prose.
+                        println!(
+                            "this deployment runs {} plugin(s): {}",
+                            chosen.len(),
+                            chosen.join(", ")
+                        );
+                    }
                     return Ok(());
                 }
                 Err(e) => {
@@ -243,6 +262,19 @@ fn find_repo_root() -> Result<std::path::PathBuf, Box<dyn std::error::Error>> {
             return Err("not inside an adjutant workspace (no [workspace] Cargo.toml found)".into());
         }
     }
+}
+
+/// Split an `--enable` argument into plugin ids.
+///
+/// Commas or whitespace, because both read naturally at a shell and neither
+/// should mean something different. Empty entries are dropped rather than
+/// becoming an id that cannot match: `--enable auth,` is a trailing comma, not
+/// a request for a plugin named "".
+fn plugin_list(raw: &str) -> Vec<String> {
+    raw.split(|c: char| c == ',' || c.is_whitespace())
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .collect()
 }
 
 async fn shutdown_signal() {
