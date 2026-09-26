@@ -161,7 +161,18 @@ as an unreachable server.
 
 ### A troop with no domain name
 
-Three answers, in order of how much we support them:
+**The phone app needs one of the first two**, and it is worth understanding why
+before choosing the third.
+
+The app reaches `https` only, and it trusts exactly what the operating system
+trusts. A server whose certificate comes from a troop's own certificate authority
+is therefore one the app cannot verify: the phone has never heard of that CA. That
+is not a gap to be worked around with a setting — the way around it would be to
+teach the app to accept a certificate it cannot validate, which is the same as
+accepting *any* certificate for that address, and that is worse than not connecting.
+Per-troop pinning (the app trusting one fingerprint, for one address, chosen by
+the admin) is the feature that would change this. It is a trust decision with its
+own interface, it is not built, and it is not needed for either supported path.
 
 1. **Own a name** (or a subdomain of one) and let the proxy obtain a certificate
    automatically — Caddy does this with no cron job and nothing to renew by hand.
@@ -173,7 +184,14 @@ Three answers, in order of how much we support them:
 3. **LAN-only with your own certificate authority.** Browsers will not trust it
    without installing the CA on every device, which for a troop means every phone.
    Workable, and honestly the worst of the three for a group that has to
-   self-serve.
+   self-serve. **A troop that takes this path is choosing a browser client on the
+   LAN**, and should know that is the choice: the phone app will not connect, and
+   it will say so on the sign-in screen rather than pretending the address is
+   unreachable.
+
+Neither of the first two costs money — a subdomain and a Cloudflare tunnel are
+both free — which is why the app can reasonably insist on them rather than
+accommodate an untrusted certificate.
 
 ## Upgrading
 
