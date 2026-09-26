@@ -308,6 +308,31 @@ jobs:
             || { echo "::error::the server never opened 127.0.0.1:8788 — see its output above"; exit 1; }
           ADJUTANT_E2E_BASE=http://127.0.0.1:8788 python3 docs/e2e_m4.py
 
+      # The other half of the client gate. The `client` job runs the suite in
+      # client/test/ — 104 tests, every one of them against a mock `http.Client`,
+      # which proves the client renders the shapes it expects and cannot prove
+      # those shapes are the ones the server sends. This step is the missing
+      # half: it boots a real server on a database of its own with the spoofable
+      # dev-header stub OFF, then runs `client/live/live_client_test.dart`, which
+      # drives the product's own ApiClient over a real socket and asserts on what
+      # the SERVER returned (the session it issued, the identity it resolved, the
+      # roster rows it stored). It refuses to skip: with no server on the port it
+      # fails, loudly, naming the address.
+      #
+      # Flutter, not cargo, does the asserting, so the runtime lives here. The
+      # boot/teardown/readiness logic is in the script rather than inline, so the
+      # same gate can be run by hand.
+      - uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          cache: true
+
+      - name: Flutter version
+        run: flutter --version
+
+      - name: Live client harness (real server, real client)
+        run: scripts/client-live-harness.sh
+
   # The Flutter client ships to users (Obtainium), yet until this job existed no
   # CI step ever compiled it: the Rust jobs never look inside client/, so a change
   # there was green by default — a probe nobody runs. This is the same gate the
