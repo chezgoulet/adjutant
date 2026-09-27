@@ -812,6 +812,47 @@ CREATE TABLE IF NOT EXISTS core.plugin_choice (
 );
 "
     ),
+    (13, "notification_identity_immutable", "
+-- #78: a notification's identity/authority fields are immutable to a plain
+-- UPDATE. The read/delivery facts have legitimate mutations (mark-read writes
+-- `read_at`; a transport writes `delivery_state`/`delivered_at`), so unlike the
+-- receipts record (`finance.receipts`, which has NO legitimate mutation and so
+-- refuses UPDATE outright) this cannot be an unconditional refusal. The shape
+-- is a BEFORE UPDATE trigger that refuses exactly the fields that say *whose
+-- record this is* and *what it says*, and lets the state fields advance.
+--
+-- A trigger, not a CHECK: a CHECK sees only the new row, so it cannot tell a
+-- rewrite of `recipient` from the value that was already there. The guard is
+-- stated for every writer rather than for one role, because the concern is not
+-- today's privilege set (only the core's own role holds UPDATE) but the next
+-- route that writes this table — a manager view, a transport drain, a retention
+-- job — inheriting the ability to re-address a recorded notification instead of
+-- only advancing its state.
+--
+-- Exactly the identity fields, no more: `locale` and `delivery_channel` are
+-- deliberately left out of this version's protected set. They are snapshots of
+-- the record too, but the issue names recipient, source, message_code,
+-- message_params and created_at, and widening a refusal is a separate decision
+-- with its own probe.
+CREATE OR REPLACE FUNCTION core.notification_identity_is_fixed() RETURNS trigger
+LANGUAGE plpgsql AS $fn$
+BEGIN
+    IF NEW.recipient      IS DISTINCT FROM OLD.recipient
+    OR NEW.source         IS DISTINCT FROM OLD.source
+    OR NEW.message_code   IS DISTINCT FROM OLD.message_code
+    OR NEW.message_params IS DISTINCT FROM OLD.message_params
+    OR NEW.created_at     IS DISTINCT FROM OLD.created_at THEN
+        RAISE EXCEPTION 'core.notifications row % is addressed and recorded: recipient, source, message_code, message_params and created_at cannot be changed. A notification may only advance its state (read_at, delivery_state/delivered_at).', OLD.id;
+    END IF;
+    RETURN NEW;
+END
+$fn$;
+
+DROP TRIGGER IF EXISTS notifications_identity_immutable ON core.notifications;
+CREATE TRIGGER notifications_identity_immutable BEFORE UPDATE ON core.notifications
+  FOR EACH ROW EXECUTE FUNCTION core.notification_identity_is_fixed();
+"
+    ),
 ];
 
 /// Bootstrap roles + permissions grants. `chief` gets everything (SPEC §9 —

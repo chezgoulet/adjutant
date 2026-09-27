@@ -407,6 +407,22 @@ first-party plugin to pick the helpers up.
   that writes no row. It asserts on **rows** and on refusals by their own reason,
   never on the statement's text.
 
+- **A notification's identity fields are immutable to a plain `UPDATE`** (#78).
+  `core.notifications` already refused to *store* a delivery without its
+  evidence, but nothing stopped a writer holding `UPDATE` from rewriting
+  **whose record it is or what it says**: `recipient`, `source`,
+  `message_code`, `message_params` and `created_at` were as writable as
+  `read_at`. Core migration 13 adds a `BEFORE UPDATE` trigger
+  (`notifications_identity_immutable`) that refuses a change to any of those
+  five and lets the state fields (`read_at`, `delivery_state`/`delivered_at`)
+  advance, so the next route that writes the table — a manager view, a
+  transport drain, a retention job — inherits the discipline rather than the
+  ability to re-address a recorded notification. The guard names every writer,
+  not one role, because the rule is the schema's, not today's privilege set.
+  A new DB-backed probe (`server/tests/notifications.rs`, probe 4) attempts
+  each rewrite and expects a refusal, then proves mark-read and a real delivery
+  still go through; removing the trigger makes the probe fail.
+
 ### Notes for plugin authors
 
 - Both plugins touch **no** `core.*` table: they keep to their own schema, so
