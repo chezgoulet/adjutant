@@ -1,5 +1,17 @@
 # Adjutant — Development
 
+> ## ⚠️ Alpha software — not ready for a troop's real records
+>
+> Adjutant is **alpha**. It is being built in the open, and it is not yet
+> trustworthy with anything a troop would be upset to lose. Keep your own copy of
+> anything that matters, and expect changes that break things with no migration
+> path until we reach beta.
+>
+> **Every build we publish is unsigned, and will stay unsigned until beta.** We
+> are not buying code-signing certificates for something this early, and we would
+> rather say so plainly than let your operating system spring it on you.
+> [What to do about that ↓](#unsigned-builds)
+
 Sovereignty-first administration for democratic scout troops.
 See [`SPEC.md`](SPEC.md) for the full specification.
 
@@ -7,7 +19,8 @@ See [`SPEC.md`](SPEC.md) for the full specification.
 
 - **Server:** Rust + Axum, single binary, PostgreSQL
 - **Plugins:** Rust `cdylib`s built against `adjutant-sdk`, loaded at boot
-- **Client:** Flutter (all platforms) — not yet started (Milestone 5)
+- **Client:** Flutter — the web, Android and all three desktop targets build
+  today. **iOS is a target for support soon; it is not supported yet.**
 
 ## Repository layout
 
@@ -60,11 +73,10 @@ psql -h 127.0.0.1 -p 5433 -U postgres \
 # 2. build (plugins land as .so files in target/debug)
 cargo build --workspace
 
-# 3. stage the plugins the server scans
-mkdir -p plugins-built
-cp target/debug/libadjutant_hello.so \
-   target/debug/libadjutant_auth.so \
-   target/debug/libadjutant_membership.so plugins-built/
+# 3. stage the plugins the server scans — every plugin on disk, not a hand list
+#    (the old copy-three-.so-files step is how the release tarball came to
+#    ship 3 of 14 plugins; this script asks the manifests instead)
+python3 scripts/stage-plugins.py
 
 # 4. create the per-plugin DB roles/credentials (once, and after adding a plugin)
 ADJUTANT_DATABASE_URL=postgres://adjutant@127.0.0.1:5433/adjutant_dev \
@@ -162,14 +174,93 @@ export POSTGRES_PASSWORD="$(openssl rand -hex 24)"
 docker compose up -d          # server + PostgreSQL
 ```
 
+The compose file builds the server image for you, and the image carries every
+plugin the workspace stages, so there is no Rust toolchain and no plugin staging
+to do by hand. **There is no published image to pull yet** — the container image
+is planned alongside the other per-platform artifacts in
+[#111](https://github.com/chezgoulet/adjutant/issues/111) — so today the image is
+built from this repository's `Dockerfile`.
+
 See [`docs/deployment.md`](docs/deployment.md) for TLS, upgrades, and
-backup/restore. Tagged releases (`v*`) publish a tarball with the binary and
-bundled plugins.
+backup/restore. **This is alpha software — see the note at the top of this file
+before you point a troop at it.**
+
+A tagged release (`v*` on `main`) publishes a Linux tarball and the client's web
+bundle, and nothing per platform — see
+[Releases, artifacts and unsigned builds](#releases-artifacts-and-unsigned-builds).
+
+## Releases, artifacts and unsigned builds
+
+Releases are cut by tagging `main` (`v*`). **What a tag produces today is two
+files:**
+
+- `adjutant-vX.Y.Z-x86_64-unknown-linux-gnu.tar.gz` — the `adjutant` binary, every
+  plugin library the workspace stages (**all fourteen**, plus the `hello_wasm`
+  guest), `README.md` and `LICENSE`, with a `.sha256` beside it;
+- `adjutant-client-vX.Y.Z-web.tar.gz` — the Flutter client built for the web, to
+  serve as static files.
+
+**Nothing else is packaged — not on a pull request, and not on a tag.** There is
+no macOS build, no Windows build, no Android APK or `.aab`, no `.deb`, `.rpm`,
+`.AppImage`, `.snap` or `.flatpak`, no `.dmg`, no `.msi`, and no published
+container image. Building those per platform is
+[#111](https://github.com/chezgoulet/adjutant/issues/111); until it lands, the
+table below is the **plan** rather than a description of the tags that exist:
+
+| Platform | Server (binary + all plugins) | Client |
+|---|---|---|
+| Linux | `.tar.gz` — **shipped today**; `.deb`, `.rpm` planned | web bundle — **shipped today**; `.deb`, `.rpm`, `.AppImage`, `.snap`, `.flatpak` planned |
+| macOS | `.zip` planned | `.dmg`, `.zip` planned |
+| Windows | `.zip` planned | `.msi`, `.zip` planned |
+| Android | — | `.apk`, `.aab` planned |
+| Web | — | a bundle to serve as static files — **shipped today** |
+| Docker | a published image is planned | — |
+
+Every artifact, when it exists, will carry all fourteen plugins rather than a
+hand-written subset: the release derives the plugin set with
+`scripts/stage-plugins.py` instead of naming files, which is the mistake the
+tarball used to make.
+
+Because a pull request packages nothing, a packaging fault surfaces at the tag
+rather than in review — so the release job's own steps are exercised by hand
+before a release is cut (`docs/release-path.md`, Stage 3.10).
+
+### Unsigned builds
+
+**Nothing we publish is signed, and nothing will be signed until beta.** A
+certificate costs money and asserts a level of care this software has not earned
+yet. Today there are two artifacts to receive unsigned (the Linux tarball and the
+client's web bundle, neither of which any platform refuses); as the per-platform
+builds land ([#111](https://github.com/chezgoulet/adjutant/issues/111)), each
+platform will complain in its own way, and none of it will be a fault:
+
+- **macOS** — Gatekeeper quarantines the download. Right-click → **Open**, or
+  clear the flag yourself: `xattr -d com.apple.quarantine <file>`. The builds are
+  neither signed nor notarised, so this is the expected path, not a defect to
+  report.
+- **Windows** — SmartScreen shows "Windows protected your PC". **More info** →
+  **Run anyway**. Expect the same from the `.msi`.
+- **Linux** — a `.tar.gz`, `.deb` or `.rpm` usually installs without a signature
+  check, though some distributions warn. **`.snap` and `.flatpak` refuse it
+  outright**: both formats expect a signature for an ordinary install, so you need
+  the escape hatch (`snap install --dangerous`; `--no-gpg-verify` for flatpak).
+  That inconvenience disappears when signing arrives at beta.
+- **Android** — if you build the client yourself (`flutter build apk`) the
+  platform will not install an unsigned APK at all, so Flutter signs it with a
+  throwaway debug key. It installs from a file manager or Obtainium, but that key
+  is not one we keep — so a properly signed build later may not upgrade over it
+  cleanly. The `.aab` is for the Play Store, not for sideloading. Nothing Android
+  is published yet: the APK is the artifact
+  [#111](https://github.com/chezgoulet/adjutant/issues/111) exists to build.
+
+If any of that surprises you, it is worth repeating: **this is alpha software, and
+a warning from your operating system is the correct response to it.**
 
 ## Writing a plugin
 
 See [`docs/plugin-development.md`](docs/plugin-development.md). The short loop
-(`cargo install adjutant-server` provides the `adjutant` CLI):
+(**the crates are not published yet** — until they are, the `adjutant` CLI is the
+one you built: `cargo build --workspace`, then `./target/debug/adjutant`):
 
 ```bash
 adjutant new-plugin gear_locker
@@ -272,3 +363,10 @@ House standard ([chezgoulet-git-flow]): `testing` = integration target,
 `main` = releases, `feature/*` branches from `testing`, PRs target `testing`.
 
 [chezgoulet-git-flow]: https://github.com/chezgoulet/library
+
+---
+
+**Adjutant is alpha software.** Unsigned, unstable, and not ready for a troop's
+real records — every build will say so again when your operating system stops you
+from opening it. If you are considering putting real scouts into it, wait for
+beta, or keep a backup you have actually restored.
