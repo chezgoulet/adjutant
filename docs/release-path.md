@@ -77,8 +77,9 @@ met, one is partial and four are open — the per-box state and its evidence are
 [`milestones/M5-mcp-and-flutter-mvp.md`](milestones/M5-mcp-and-flutter-mvp.md).
 **Later the same day, item 3 below landed and the boxes read four met, one
 partial, three open** (PR #121); **then item 2 landed on top of it (#120) and they
-read five met, one partial, two open.** The record carries every reading rather
-than rewriting the first.
+read five met, one partial, two open; and then the emulator run closed the
+*client-on-Android* half of item 4, reading six met and two open.** The record
+carries every reading rather than rewriting the first.
 
 1. **The client-in-CI harness — the missing half of the v1.0 gate. — MET.**
    `scripts/client-live-harness.sh` derives its own database, bootstraps the
@@ -127,7 +128,12 @@ than rewriting the first.
    queued; and a queued write the server refuses (a 4xx) is parked with the
    server's own sentence and does not block the queue. `client/test/offline_test.dart`
    is 19 of the branch's **150** client tests (131 before).
-4. **Android and Web** (M5 box 4). Web builds — proven on this host with the
+4. **Android and Web** (M5 box 4) — **the client half is MET as of the emulator
+   run of 2026-09-27**: the APK built by CI's `client` job (from the `testing`
+   tree) was installed on an Android emulator, signed in to a real server and
+   rendered its data, with the offline path exercised on the device too
+   ([`evidence/m5-emulator-run.json`](evidence/m5-emulator-run.json)). What remains
+   is the **artifact**: Web builds — proven on this host with the
    pinned toolchain (`flutter build web --release`, exit 0, 41 MB bundle) — and
    the release workflow now attaches the built bundle to a tag. Android reaches
    the 161st through Obtainium, but **no CI step builds it**, which is #111: the
@@ -153,12 +159,13 @@ than rewriting the first.
 
 **Proves it:** the eight M5 boxes checked in a new `M5` record, each with its run
 id — the record exists as [`milestones/M5-mcp-and-flutter-mvp.md`](milestones/M5-mcp-and-flutter-mvp.md),
-with **five boxes met (offline mode is the fourth, #121; the MCP proof the fifth,
-#120), one partial and two open** — it read three/four before those PRs, and every
-reading is in the record. The plugin set is chosen on a fresh deployment and
-honoured by what the server loads (#89/#90), and the client harness is green on
-`testing` — both done. What this stage is still waiting on is items 5 and 6 and
-the device half of item 4.
+with **six boxes met (offline mode the fourth, #121; the MCP proof the fifth,
+#120; the client on Android the sixth, the emulator run) and two open** — it read
+three/four before those, and every reading is in the record. The plugin set is
+chosen on a fresh deployment and honoured by what the server loads (#89/#90), and
+the client harness is green on `testing` — both done. What this stage is still
+waiting on is items 5 and 6, and the *release-artifact* half of item 4 (the APK a
+tag produces).
 
 ---
 
@@ -351,10 +358,10 @@ crates, the live docs, and the F-Droid listing evidenced rather than asserted.
   owner confirmed this scope on **2026-09-27** rather than re-scoping it. The
   preference is that this is a *deployment-shaped* gate — the 161st runs a tag
   they can also host — not a date and not a branch. As of 2026-09-27: both
-  deployment proofs are met, Stage 1 has five of eight boxes met (offline mode
-  and the MCP↔Hermes proof are the fourth and fifth, #121 and #120), and what is
-  left is the UI/UX review, the device half of the Android artifact, and the
-  deployment itself.
+  deployment proofs are met, Stage 1 has six of eight boxes met (offline mode,
+  the MCP↔Hermes proof and the client on Android are the fourth, fifth and sixth —
+  #121, #120 and the emulator run), and what is left is the UI/UX review, the APK
+  as a release artifact, and the deployment itself.
 - **The artifact a tag produces — decided 2026-09-27.** The tarball's plugin set
   is derived from the workspace rather than listed (it had rotted to three of
   fourteen), the client's **web** bundle is attached, and the **Android** artifact

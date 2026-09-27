@@ -32,6 +32,15 @@ eight exit boxes are met, one is partial and two are open.** The fifth is the
 closed with #119), the owner's UI/UX review (box 7) and the deployment to the
 161st (box 8). Three readings, one page: each is dated, and none is rewritten.
 
+**Status (2026-09-27, later still — the emulator run):** **six of the eight exit
+boxes are met and two are open.** The sixth is **box 4**: its build half closed
+with #119, and its running half was closed on a real Android emulator on this
+host's Thelio — the APK built from `testing` signed in to a real server and
+rendered real data, then did box 5's offline path on the device too. The evidence
+is [`../evidence/m5-emulator-run.json`](../evidence/m5-emulator-run.json) and the
+six screenshots beside it; what is still owed there is the APK as a *release*
+artifact, not the client working. Four readings, one page.
+
 This record exists because M5 had none. Its boxes are SPEC §15's; the ordered work
 against them is [`../release-path.md`](../release-path.md) Stage 1, which owns
 what to do next. Where a number below is a run, it is that run's number and not a
@@ -78,18 +87,36 @@ later figure is added beside the old one rather than replacing it).
   (see the evidence below). Since 2026-09-27 the live harness proves the app's
   own `ApiClient` against a booted server rather than a mock (see the evidence
   table).
-- [~] **Flutter client works on Android and Web (PWA). — PARTIAL.** Web builds:
-  `flutter build web --release` succeeds with the pinned toolchain (exit 0, a
-  41 MB bundle), and the release workflow now attaches that bundle to a tag.
-  The **build half of Android is closed**: #111's defect was that no CI step
-  compiled the client for any platform, and #119 (merged 2026-09-27) appends
-  `flutter build web --release` and `flutter build apk --debug` to the same
-  `client` job, so the APK's build is gated. What is still open is the **running
-  half** — no CI step installs that APK on a device, and a build that has never
-  been launched is a compile, not a working app. The emulator run against the
-  161st-shaped server is what closes it, and its evidence belongs in the file the
-  day it is read. **iOS is deferred entirely** by owner decision (2026-09-26) — no
-  runner, no distribution path, revisit after 1.0 — and SPEC's box says so.
+- [x] **Flutter client works on Android and Web (PWA). — MET** (2026-09-27, the
+  emulator run). This box read PARTIAL in the three readings above, for a reason
+  that was real: the client had been *compiled* for Android since #119, but never
+  *run*, and a build that has never been launched is a compile, not a working app.
+  The running half is evidence now, not a claim. A **debug APK built from the
+  `testing` tree** (the tree of `406c315` is byte-identical to `d613a34`,
+  `git diff --stat` empty; 160,090,535 bytes, sha256 `1c90beeb…31a0`) was installed
+  on Thelio's Android emulator, signed in through the app's own login form to a
+  real server over the LAN, and rendered that server's dashboard and roster. It was
+  then run through the offline story on the device: with the server stopped, the
+  Members screen showed **"Offline — showing data from 08:06"** over the cached
+  roster; a receipt tapped on a notice was **queued rather than applied locally**
+  ("Offline — your receipt is queued and will sync."), and the shell's app bar
+  carried the pending-write badge; when the server came back the retry reported
+  **"1 sent."** and the server held the receipt with `read_via: flutter` — the one
+  the device queued, not a second one. Every step, its on-screen text and the
+  server-side answer are in
+  [`../evidence/m5-emulator-run.json`](../evidence/m5-emulator-run.json), with the
+  six screenshots beside it.
+
+  Three residuals are named rather than glossed: the device is an **x86_64
+  emulator**, not a phone; the build is **debug**, because a release build refuses
+  cleartext `http` by design (`client/lib/api/server_address.dart`); and **nothing
+  in CI installs an APK on a device** — this host has a self-hosted runner with a
+  full Android emulation suite, but this repository has no Android job, so the
+  running half is re-proved by hand and not by the gate. The web half is unchanged:
+  `flutter build web --release` succeeds with the pinned toolchain (exit 0, a 41 MB
+  bundle), and the release workflow attaches that bundle to a tag. **iOS is
+  deferred entirely** by owner decision (2026-09-26) — no runner, no distribution
+  path, revisit after 1.0 — and SPEC's box says so.
 - [x] **Offline mode: client caches data locally, syncs when online. — MET**
   (2026-09-27, PR #121). This box read **NOT MET** at `75981e5`, and that reading
   was right about the branch: the client's `OfflineException` was an error path
@@ -157,9 +184,9 @@ later figure is added beside the old one rather than replacing it).
   follows it and is not answered here — how that box is reached from outside,
   tunnel or port-forward — because it belongs with the troop's network.
 
-**Deliverable:** a working MVP scouts can use. Two boxes and a device run still
-stand between the tree and that sentence; none of them is the application's
-shape, which is what five met boxes and the M6 batch already demonstrate.
+**Deliverable:** a working MVP scouts can use. Two boxes still stand between the
+tree and that sentence; none of them is the application's shape, which is what six
+met boxes and the M6 batch already demonstrate.
 
 ## Evidence
 
@@ -273,6 +300,46 @@ $ flutter test --no-pub test/offline_test.dart
 00:01 +19: All tests passed!
 ```
 
+### The emulator run — box 4's running half, and box 5 on a device (2026-09-27)
+
+Read on Thelio (`sasquatch`) against the **tree of `testing`**, and recorded in
+full in [`../evidence/m5-emulator-run.json`](../evidence/m5-emulator-run.json)
+with six screenshots beside it. The short version, as the device printed it:
+
+```
+$ adb -s emulator-5554 install -r app-debug.apk
+Success                       # 160,090,535 bytes, sha256 1c90beeb…31a0, built
+                              # from `406c315` — the tree of `d613a34`
+
+# signed in to a real server at http://192.168.1.7:8787 through the app's own form
+Dashboard   Active missions 0 · Members 1 · Upcoming events 0 · Open motions 1
+Members     Harness Scout / Harness Patrol · Harness Lodge / Active
+
+# the server stopped:
+Members     Offline — showing data from 08:06        (cached roster still shown)
+Inbox       Offline — your receipt is queued and will sync.   (badge: 1 pending,
+            notice STILL unread — the write was not applied locally)
+
+# the server back, retry tapped:
+Inbox       1 sent.                                   (offline icon gone)
+
+# re-entered the inbox:
+Inbox       0 unread of 1 in this inbox · Mark unread  (agrees with the server)
+
+$ curl … /api/announcements/announcement/1
+is_read=true  read_count=1  my_receipt.read_via="flutter"   # the queued receipt
+```
+
+Three findings from the run are filed as issues rather than left as prose, each
+with its on-screen evidence in the same file: **#122** — the first-run plugin
+wizard's *"Skip for now"* records a choice of the two required plugins and unloads
+the other twelve at runtime, while `GET /api/plugins` still lists them; **#123** —
+the client renders an API **404 as an offline condition** ("Cannot reach the
+server — route not found"); **#124** — after the shell's retry reports "1 sent.",
+**no screen is told to re-read**, so a badge can stay stale until the destination
+is re-entered. None of the three is in this box's way: the write landed, the
+server agreed, and the run is what found them.
+
 ## How to reproduce the evidence
 
 ```bash
@@ -295,23 +362,32 @@ scripts/client-live-harness.sh
 # The offline box (5): the cache, the queue, replay order, and the refusal path.
 cd client && flutter test --no-pub test/offline_test.dart
 
+# The emulator run (box 4's running half, and box 5 on a device). On the Android
+# emulator host, which needs the SDK + JDK + Flutter and a booted AVD; the server
+# side is any Adjutant with the client harness's database.
+~/build-adj-apk.sh <sha>                     # git clone, checkout, flutter build apk --debug
+adb -s emulator-5554 install -r client/build/app/outputs/flutter-apk/app-debug.apk
+
 # The web artifact a tag now carries (box 4's web half)
 cd client && flutter build web --release && ls -la build/web/main.dart.js
 ```
 
 ## Not delivered at this milestone
 
-Two boxes are open and one is partial, and each is a *thing to do* rather than a
-thing to decide — except where the decision is named:
+Two boxes are open — no partial is left — and each is a *thing to do* rather than
+a thing to decide — except where the decision is named:
 
 1. **The UI/UX review (box 7).** Authored by the owner.
 2. **The deployment to the 161st (box 8).** Host decided 2026-09-27 (troop-owned
    hardware); the outside-reach question follows it.
-3. **The device half of Android (box 4).** Its build half closed with #119; what
-   remains is an APK that has been installed and launched, not merely compiled —
-   and the release workflow still attaches only the web bundle, growing the APK
-   artifact when a CI step runs one.
+3. **The APK as a release artifact (box 4's residual).** The client on Android is
+   proven — built by CI (#119), then installed and run on an emulator against a real
+   server (the run in the evidence above). What remains is narrower: the release
+   workflow still attaches only the **web** bundle, so the APK a tag produces is
+   not yet built there; and no CI step installs one on a device, so nothing on the
+   branch re-checks the running half if a change breaks it.
 
-Two entries have left this list, and both left the same way — a decision first,
-then an implementation: **offline mode** (box 5) in #121, and the **Hermes
-connect-and-interact proof** (box 2) in #120.
+Three entries have left this list, and all three left the same way — a decision
+first, then an implementation: **offline mode** (box 5) in #121, the **Hermes
+connect-and-interact proof** (box 2) in #120, and the **device half of Android**
+(box 4) in the emulator run recorded above.
