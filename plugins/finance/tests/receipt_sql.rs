@@ -22,7 +22,12 @@
 //! * a correction through `POST /api/finance/receipt/{id}/supersede`: a second
 //!   row that names the first, both still there, a second correction of the same
 //!   receipt refused, and a correction pointed at another entry's receipt refused
-//!   by the trigger.
+//!   by the trigger;
+//! * what a correction carries over and what is its own: the superseded
+//!   receipt's addressee and `purpose` are kept, while the wording is derived
+//!   from the troop's **current** declaration and `issued_on` is the correction's
+//!   own date — measured with the declaration moved between the issue and the
+//!   correction, which is what tells "carried over" from "derived now".
 //!
 //! ## Running them
 //!
@@ -59,6 +64,7 @@ use adjutant_finance::{FinancePlugin, FUND_GENERAL, FUND_SCHOLARSHIP};
 use adjutant_sdk::async_trait;
 use adjutant_sdk::prelude::*;
 use adjutant_sdk::testing::{response_json, TestRequest};
+use chrono::Utc;
 use serde_json::{json, Value};
 use sqlx::postgres::PgRow;
 use sqlx::{Column, Connection, PgPool, Row, ValueRef};
@@ -257,6 +263,9 @@ struct Receipt {
     member_id: String,
     payer_name: String,
     tax_statement: String,
+    /// The document's own date, read as text so the probe compares it against a
+    /// stated `YYYY-MM-DD` without depending on a date type's decoding.
+    issued_on: String,
     supersedes_id: Option<i64>,
     superseded_by: Option<i64>,
 }
@@ -305,7 +314,7 @@ async fn force_cleanup(url: &str, table: &str, column: &str, mark: &str) {
 async fn receipts_written(admin: &PgPool, mark: &str) -> Vec<Receipt> {
     let rows = sqlx::query(
         "SELECT r.id, r.number, r.transaction_id, r.fund_id, r.amount_cents, r.member_id, \
-                r.payer_name, r.tax_statement, r.supersedes_id, \
+                r.payer_name, r.tax_statement, r.issued_on::text AS issued_on, r.supersedes_id, \
                 (SELECT c.id FROM finance.receipts c WHERE c.supersedes_id = r.id LIMIT 1) \
                     AS superseded_by \
          FROM finance.receipts r WHERE r.purpose LIKE $1 ORDER BY r.id",
@@ -324,6 +333,7 @@ async fn receipts_written(admin: &PgPool, mark: &str) -> Vec<Receipt> {
             member_id: row.get("member_id"),
             payer_name: row.get("payer_name"),
             tax_statement: row.get("tax_statement"),
+            issued_on: row.get("issued_on"),
             supersedes_id: row.get("supersedes_id"),
             superseded_by: row.get("superseded_by"),
         })
@@ -511,11 +521,24 @@ impl IdentityRegistrar for NoIdentity {
 /// **No `receipt_tax_statement`**: the troop in these probes has declared
 /// nothing, which is precisely the case that must print no tax claim.
 fn config_json() -> Value {
-    json!({
+    config_declaring(None)
+}
+
+/// The same block, with the troop declaring a tax-status wording — or not.
+///
+/// The carry-over probe needs both: whether a correction's wording comes from the
+/// receipt it supersedes or from the troop's declaration **now** is only
+/// distinguishable when the declaration has moved between the two writes.
+fn config_declaring(statement: Option<&str>) -> Value {
+    let mut config = json!({
         "fiscal_year_start_month": 1,
         "membership_cost_cents": 25_000,
         "dues_fund_code": FUND_GENERAL,
-    })
+    });
+    if let Some(statement) = statement {
+        config["receipt_tax_statement"] = json!(statement);
+    }
+    config
 }
 
 /// A real `PluginContext`, with the **two** database hosts the core hands a
@@ -524,12 +547,18 @@ fn config_json() -> Value {
 /// no grant on `core.audit_log`, and a probe that ran everything on one pool
 /// would be testing a shape the core never builds.
 fn context(admin: &PgPool, plugin: &PgPool) -> PluginContext {
+    context_with(admin, plugin, config_json())
+}
+
+/// The same context against a stated config — what a probe that moves the troop's
+/// declaration between two writes needs (see [`config_declaring`]).
+fn context_with(admin: &PgPool, plugin: &PgPool, config: Value) -> PluginContext {
     let plugin_db: Arc<dyn HostDb> = Arc::new(PgDb(plugin.clone()));
     let core_db: Arc<dyn HostDb> = Arc::new(PgDb(admin.clone()));
     PluginContext {
         plugin_id: "finance".to_string(),
         db: DbHandle::new(plugin_db, "finance".to_string()),
-        config: config_json(),
+        config,
         events: EventBusHandle::new(Arc::new(InertEvents), "finance".to_string()),
         permissions: PermissionService::new(core_db.clone()),
         audit: AuditService::new(core_db, "finance".to_string()),
@@ -1083,4 +1112,194 @@ async fn a_correction_supersedes_and_both_receipts_remain() {
 
     cleanup(&url, mark).await;
     cleanup(&url, other).await;
+}
+
+// ===========================================================================
+// 4. What a correction carries over, and what is this document's own
+// ===========================================================================
+
+/// **The carry-over probe.** What a correction carries over from the receipt it
+/// supersedes is its **identity** — the addressee (`member_id`, `payer_name`) and
+/// the `purpose` — and this probe measures both halves of that against the real
+/// handlers and the rows they leave:
+///
+/// * the `purpose` and the addressee an un-restated correction keeps are the
+///   superseded receipt's, and a restated name is the one-field typo fix the
+///   route's own comment promises;
+/// * the wording is **not** carried over: `tax_statement` is derived from the
+///   troop's declaration **now**, exactly as issuing derives it — a receipt
+///   issued while the troop declared a wording and corrected after it withdrew
+///   it carries no statement, and one issued with no wording and corrected after
+///   the troop declared one carries the new wording. That is what makes "carried
+///   over from the row" and "derived from the current declaration"
+///   distinguishable: one config could not tell them apart;
+/// * `issued_on` is the correction's own date, not the superseded receipt's;
+/// * the superseded row still reads exactly as it was issued — the wording the
+///   giver first read, and the date it was issued on — so nothing a correction
+///   does rewrites what a giver was told.
+#[tokio::test]
+#[ignore = "DB-gated: needs ADJUTANT_TEST_DATABASE_URL + a ladder-bootstrapped test database"]
+async fn a_correction_carries_the_addressee_and_the_purpose_but_states_its_own_wording() {
+    let _guard = DB.lock().await;
+    let url = test_database_url();
+    let admin = admin_pool().await;
+    ensure_core_ready(&admin).await;
+    let plugin = plugin_pool(&admin).await;
+    ensure_plugin_schema(&admin, &plugin).await;
+
+    const DECLARED: &str = "nothing in this receipt implies a tax deduction";
+    const MEMBER: &str = "probe-carry-member";
+    let withdrawn = "carry-over";
+    let newly_declared = "carry-declared";
+    cleanup(&url, withdrawn).await;
+    cleanup(&url, newly_declared).await;
+    let today = Utc::now().date_naive().to_string();
+
+    // Two route sets over one database, differing only in what the troop
+    // declares: the receipt is issued through one and corrected through the other.
+    let declaring = context_with(&admin, &plugin, config_declaring(Some(DECLARED)));
+    let declaring_routes = routes_of(&declaring).await;
+    let quiet = context_with(&admin, &plugin, config_declaring(None));
+    let quiet_routes = routes_of(&quiet).await;
+
+    // --- 1. declared when the receipt was issued, withdrawn when it is
+    //        corrected. The giver is a member, so the receipt is addressed by
+    //        their roster identity and the correction restates nothing.
+    accepted(
+        &declaring_routes,
+        "/api/finance/transaction",
+        &[],
+        &transaction_body(withdrawn, FUND_GENERAL, 1_500, MEMBER),
+    )
+    .await;
+    let transaction_id = probe_transaction_id(&admin, withdrawn).await;
+    let issued = accepted(
+        &declaring_routes,
+        "/api/finance/receipt",
+        &[],
+        &receipt_body(withdrawn, transaction_id, None),
+    )
+    .await;
+    let original_id = issued["receipt"]["id"].as_i64().expect("the receipt's id");
+    assert_eq!(
+        issued["tax_statement"], DECLARED,
+        "the receipt states what the troop declared when it was issued: {issued}"
+    );
+    assert_eq!(issued["issued_to"], MEMBER, "{issued}");
+    assert_eq!(
+        issued["issued_on"], OCCURRED_ON,
+        "the probe states the date it issued the receipt on: {issued}"
+    );
+
+    let corrected = accepted(
+        &quiet_routes,
+        "/api/finance/receipt/{id}/supersede",
+        &[("id", original_id.to_string())],
+        &json!({ "reason": "the ledger entry was described wrongly" }),
+    )
+    .await;
+    let correction_id = corrected["receipt"]["id"]
+        .as_i64()
+        .expect("the correction's id");
+    assert_eq!(
+        corrected["tax_statement"], "",
+        "a correction is issued now, so it states the troop's current declaration — nothing — \
+         rather than carrying over a wording the troop has withdrawn: {corrected}"
+    );
+    assert_eq!(
+        corrected["tax_statement_declared"], false,
+        "and the view says so, so the sentence the giver reads claims nothing: {corrected}"
+    );
+    assert_eq!(
+        corrected["purpose"],
+        format!("{PROBE_MARK}{withdrawn}"),
+        "the purpose is carried over: the correction restated none: {corrected}"
+    );
+    assert_eq!(
+        corrected["member_id"], MEMBER,
+        "the addressee is carried over, not re-derived: {corrected}"
+    );
+    assert_eq!(
+        corrected["issued_on"], today,
+        "the correction is a document issued now, so its date is its own (today, UTC) and not \
+         the superseded receipt's ({OCCURRED_ON}): {corrected}"
+    );
+
+    // --- both rows stay, each as it was written
+    let rows = receipts_written(&admin, withdrawn).await;
+    assert_eq!(rows.len(), 2, "{rows:?}");
+    let original = rows
+        .iter()
+        .find(|row| row.id == original_id)
+        .expect("the superseded receipt is still there");
+    assert_eq!(
+        original.tax_statement, DECLARED,
+        "the wording the giver first read is untouched: {original:?}"
+    );
+    assert_eq!(
+        original.issued_on, OCCURRED_ON,
+        "so is the date it was issued on: {original:?}"
+    );
+    assert_eq!(original.superseded_by, Some(correction_id), "{original:?}");
+    let correction = rows
+        .iter()
+        .find(|row| row.id == correction_id)
+        .expect("the correction is there");
+    assert!(correction.tax_statement.is_empty(), "{correction:?}");
+    assert_eq!(correction.issued_on, today, "{correction:?}");
+
+    // --- 2. the other direction: nothing declared when issued, declared when
+    //        corrected — so the wording is the declaration in force now. The
+    //        giver is not a member this time, and the correction exists to fix
+    //        the name they gave: the one-field correction.
+    accepted(
+        &quiet_routes,
+        "/api/finance/transaction",
+        &[],
+        &transaction_body(newly_declared, FUND_GENERAL, 900, ""),
+    )
+    .await;
+    let transaction_id = probe_transaction_id(&admin, newly_declared).await;
+    let issued = accepted(
+        &quiet_routes,
+        "/api/finance/receipt",
+        &[],
+        &receipt_body(newly_declared, transaction_id, Some("Jnae Doe")),
+    )
+    .await;
+    let original_id = issued["receipt"]["id"].as_i64().expect("the receipt's id");
+    assert_eq!(
+        issued["tax_statement"], "",
+        "no declaration, no sentence: {issued}"
+    );
+    assert_eq!(issued["issued_to"], "Jnae Doe", "{issued}");
+
+    let corrected = accepted(
+        &declaring_routes,
+        "/api/finance/receipt/{id}/supersede",
+        &[("id", original_id.to_string())],
+        &json!({
+            "reason": "the giver's name was misspelt",
+            "payer_name": "Jane Doe",
+        }),
+    )
+    .await;
+    assert_eq!(
+        corrected["issued_to"], "Jane Doe",
+        "the name the correction restates is the addressee — the one-field typo fix: {corrected}"
+    );
+    assert_eq!(
+        corrected["purpose"],
+        format!("{PROBE_MARK}{newly_declared}"),
+        "and the purpose is carried over even when only the name is restated: {corrected}"
+    );
+    assert_eq!(
+        corrected["tax_statement"], DECLARED,
+        "the correction states the troop's declaration now, not the superseded row's (empty): \
+         {corrected}"
+    );
+    assert_eq!(corrected["issued_on"], today, "{corrected}");
+
+    cleanup(&url, withdrawn).await;
+    cleanup(&url, newly_declared).await;
 }

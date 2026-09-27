@@ -780,25 +780,37 @@ struct ReceiptBody {
 /// `POST /api/finance/receipt/{id}/supersede` — issue a correction.
 ///
 /// A correction is a **new** receipt that references the one it supersedes; the
-/// original is never touched. Everything the correction does not restate is
-/// carried over from the receipt it supersedes.
+/// original is never touched. The addressee (`member_id`, `payer_name`) and the
+/// `purpose` are carried over from the receipt it supersedes unless restated —
+/// a name typo is a one-field correction — while `tax_statement` and `issued_on`
+/// are this document's own and are not carried over.
 #[derive(Debug, Deserialize)]
 struct ReceiptCorrectionBody {
     /// Why the receipt is being corrected. Required: a correction that does not
     /// say what it corrects is a receipt nobody can account for.
     #[serde(default)]
     reason: Option<String>,
-    /// A corrected roster identity, when the money came from a member.
+    /// A corrected roster identity, when the money came from a member. Carried
+    /// over from the superseded receipt when not restated.
     #[serde(default)]
     member_id: Option<String>,
     /// A corrected name, when the giver is not a member — the typo a correction
-    /// most often exists to fix.
+    /// most often exists to fix. Carried over from the superseded receipt when
+    /// not restated.
     #[serde(default)]
     payer_name: Option<String>,
+    /// What the money was for. Carried over from the superseded receipt when not
+    /// restated.
     #[serde(default)]
     purpose: Option<String>,
+    /// The troop's tax-status wording for **this** document. Unlike the addressee
+    /// and the purpose it is not carried over: it defaults to the troop's current
+    /// declaration, exactly as a newly issued receipt defaults to it, so a
+    /// correction never prints a claim the troop has since withdrawn.
     #[serde(default)]
     tax_statement: Option<String>,
+    /// `YYYY-MM-DD`; this document's own date, today (UTC) by default — the
+    /// correction is a new receipt, so its date is not the superseded one's.
     #[serde(default)]
     issued_on: Option<String>,
 }
@@ -3942,10 +3954,20 @@ fn route_issue_receipt(ctx: &PluginContext) -> RouteDefinition {
 /// `POST /api/finance/receipt/{id}/supersede` — correct a receipt.
 ///
 /// A correction is a **new receipt** that references the one it supersedes; the
-/// original is never touched, so what the giver was first told remains. The
-/// correction is issued from the same ledger entry (the same money), and
-/// everything it does not restate is carried over — which is why a name typo is
-/// a one-field correction rather than a re-issue.
+/// original is never touched, so what the giver was first told remains. Issued
+/// from the same ledger entry (the same money), it **carries the receipt's
+/// identity over** — the addressee (`member_id` and `payer_name`) and the
+/// `purpose` — which is why a name typo is a one-field correction rather than a
+/// re-issue.
+///
+/// What the document *says* is deliberately this document's own, not a copy:
+/// `tax_statement` is not carried over but derived exactly as issuing derives it
+/// (the request's, else the troop's **current** declaration, else nothing), so a
+/// correction never prints a tax claim the troop has since withdrawn — the
+/// superseded row still holds the wording the giver first read — and `issued_on`
+/// is the correction's own date (the request's, else today), because a correction
+/// is a document issued now. What carries over identifies the receipt; the
+/// wording and the date belong to the document stating them.
 ///
 /// Queries: the receipt being corrected, the guarded insert, then the new row as
 /// a reader sees it. Then the audit write.
