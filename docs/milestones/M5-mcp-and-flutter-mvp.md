@@ -191,7 +191,7 @@ server *sends*.
 Read on `feature/client-offline-mode` at `32970cc` — the client change; the
 commit above it touches only this document and `README.md`. CI run
 [`36314548805`](https://github.com/chezgoulet/adjutant/actions/runs/36314548805)
-is green on that head: `verify` (33 steps, including *Live client harness (real
+is green on that head: `verify` (41 steps, step 36 being *Live client harness (real
 server, real client)*), `client` and `msrv`, every step success.
 
 | Gate | Result |
@@ -203,9 +203,8 @@ server, real client)*), `client` and `msrv`, every step success.
 
 The live harness is the half that matters for a cache: it drives the app's own
 `ApiClient` against a booted server, so a cache that swallowed a live response
-would fail here rather than pass a mock. It was also run locally on this head
-(`scripts/client-live-harness.sh`, against a server built from this branch) and
-printed the same lines the CI step did:
+would fail here rather than pass a mock. The transcript below is that CI step's
+own output, read from the run's log rather than summarised:
 
 ```
 ==> staging plugins into plugins-built
@@ -225,6 +224,16 @@ PASS  dead session refused  (bogus token -> 401 session expired or invalid)
 PASS  probe tally  (ran=9 expected=9 failed=0)
 🎉 10 tests passed.
 ==> live client gate passed against http://127.0.0.1:8790
+```
+
+It was run on this host against this head's own server as well — the same harness,
+with `ADJUTANT_CLIENT_LIVE_PORT=8795` because another harness held 8790 — and it
+ended the same way:
+
+```
+PASS  probe tally  (ran=9 expected=9 failed=0)
+🎉 10 tests passed.
+==> live client gate passed against http://127.0.0.1:8795
 ```
 
 And the client-side commands, from the same reading:
