@@ -1,5 +1,17 @@
 # Adjutant — Development
 
+> ## ⚠️ Alpha software — not ready for a troop's real records
+>
+> Adjutant is **alpha**. It is being built in the open, and it is not yet
+> trustworthy with anything a troop would be upset to lose. Keep your own copy of
+> anything that matters, and expect changes that break things with no migration
+> path until we reach beta.
+>
+> **Every build we publish is unsigned, and will stay unsigned until beta.** We
+> are not buying code-signing certificates for something this early, and we would
+> rather say so plainly than let your operating system spring it on you.
+> [What to do about that ↓](#unsigned-builds)
+
 Sovereignty-first administration for democratic scout troops.
 See [`SPEC.md`](SPEC.md) for the full specification.
 
@@ -7,7 +19,8 @@ See [`SPEC.md`](SPEC.md) for the full specification.
 
 - **Server:** Rust + Axum, single binary, PostgreSQL
 - **Plugins:** Rust `cdylib`s built against `adjutant-sdk`, loaded at boot
-- **Client:** Flutter (all platforms) — not yet started (Milestone 5)
+- **Client:** Flutter — the web, Android and all three desktop targets build
+  today. **iOS is a target for support soon; it is not supported yet.**
 
 ## Repository layout
 
@@ -60,11 +73,10 @@ psql -h 127.0.0.1 -p 5433 -U postgres \
 # 2. build (plugins land as .so files in target/debug)
 cargo build --workspace
 
-# 3. stage the plugins the server scans
-mkdir -p plugins-built
-cp target/debug/libadjutant_hello.so \
-   target/debug/libadjutant_auth.so \
-   target/debug/libadjutant_membership.so plugins-built/
+# 3. stage the plugins the server scans — every plugin on disk, not a hand list
+#    (the old copy-three-.so-files step is how the release tarball came to
+#    ship 3 of 14 plugins; this script asks the manifests instead)
+python3 scripts/stage-plugins.py
 
 # 4. create the per-plugin DB roles/credentials (once, and after adding a plugin)
 ADJUTANT_DATABASE_URL=postgres://adjutant@127.0.0.1:5433/adjutant_dev \
@@ -162,9 +174,75 @@ export POSTGRES_PASSWORD="$(openssl rand -hex 24)"
 docker compose up -d          # server + PostgreSQL
 ```
 
+**From a release**, pull the published image instead of building it:
+
+```bash
+docker pull chezgoulet/adjutant:0.3.0
+```
+
+The image is published for `linux/amd64` and `linux/arm64` with all plugins inside
+it, which is the intended path for a self-hoster: no Rust toolchain, no plugin
+staging. Pin a version rather than using `latest` — **this is alpha, and `latest`
+is allowed to break you.**
+
 See [`docs/deployment.md`](docs/deployment.md) for TLS, upgrades, and
-backup/restore. Tagged releases (`v*`) publish a tarball with the binary and
-bundled plugins.
+backup/restore. **This is alpha software — see the note at the top of this file
+before you point a troop at it.**
+
+Tagged releases (`v*` on `main`) publish the whole stack for Linux, macOS,
+Windows and Android — see [Releases, artifacts and unsigned builds](#releases-artifacts-and-unsigned-builds).
+
+## Releases, artifacts and unsigned builds
+
+Releases are cut by tagging `main` (`v*`). **Nothing is packaged on a pull
+request** — the platform builds run only when a release is tagged, so a release is
+where the packaged shapes are first exercised. That is a deliberate trade: every
+ordinary PR stays fast, and a bad icon or manifest fails the release instead of a
+review.
+
+| Platform | Server (binary + all plugins) | Client |
+|---|---|---|
+| Linux | `.tar.gz`, `.deb`, `.rpm` | `.deb`, `.rpm`, `.AppImage`, `.snap`, `.flatpak` |
+| macOS | `.zip` | `.dmg`, `.zip` |
+| Windows | `.zip` | `.msi`, `.zip` |
+| Android | — | `.apk`, `.aab` |
+| Web | — | a bundle to serve as static files |
+| Docker | `chezgoulet/adjutant:<version>` — `linux/amd64` and `linux/arm64` | — |
+
+Every artifact carries all fourteen plugins, not a hand-written subset — the
+release asks `scripts/stage-plugins.py` rather than naming files.
+
+The container image is the shortest path from nothing to a running server, and the
+one we expect most self-hosters to take: `docker run` with a database and it is
+up, no Rust toolchain and no plugin staging on their machine. It is also the
+artifact whose *plugins* are hardest to get wrong, because the image is built
+inside the release rather than assembled by hand.
+
+### Unsigned builds
+
+**Nothing we publish is signed, and nothing will be signed until beta.** A
+certificate costs money and asserts a level of care this software has not earned
+yet. Each platform complains in its own way, and none of it is a fault:
+
+- **macOS** — Gatekeeper quarantines the download. Right-click → **Open**, or
+  clear the flag yourself: `xattr -d com.apple.quarantine <file>`. The builds are
+  neither signed nor notarised, so this is the expected path, not a defect to
+  report.
+- **Windows** — SmartScreen shows "Windows protected your PC". **More info** →
+  **Run anyway**. Expect the same from the `.msi`.
+- **Linux** — a `.tar.gz`, `.deb` or `.rpm` usually installs without a signature
+  check, though some distributions warn. **`.snap` and `.flatpak` will refuse it
+  outright**: both formats expect a signature for an ordinary install, so you need
+  the escape hatch (`snap install --dangerous`; `--no-gpg-verify` for flatpak).
+  That inconvenience disappears when signing arrives at beta.
+- **Android** is the exception, and worth stating precisely: the platform will not
+  install an unsigned APK at all, so Flutter signs it with a throwaway debug key.
+  It installs fine from a file manager or Obtainium, but that key is not one we
+  keep — so a properly signed build later may not upgrade over it cleanly. The
+  `.aab` is for the Play Store, not for sideloading.
+
+If any of that surprises you, it is worth repeating: **this is alpha software, and
+a warning from your operating system is the correct response to it.**
 
 ## Writing a plugin
 
@@ -272,3 +350,10 @@ House standard ([chezgoulet-git-flow]): `testing` = integration target,
 `main` = releases, `feature/*` branches from `testing`, PRs target `testing`.
 
 [chezgoulet-git-flow]: https://github.com/chezgoulet/library
+
+---
+
+**Adjutant is alpha software.** Unsigned, unstable, and not ready for a troop's
+real records — every build will say so again when your operating system stops you
+from opening it. If you are considering putting real scouts into it, wait for
+beta, or keep a backup you have actually restored.
