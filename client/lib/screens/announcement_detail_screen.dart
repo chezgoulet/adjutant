@@ -113,14 +113,22 @@ class _AnnouncementDetailScreenState extends State<AnnouncementDetailScreen> {
     if (!quiet) setState(() => _busy = true);
     try {
       final response = read
-          ? await session.api.markAnnouncementRead(widget.id)
-          : await session.api.markAnnouncementUnread(widget.id);
+          ? await session.markAnnouncementRead(widget.id)
+          : await session.markAnnouncementUnread(widget.id);
+      if (!mounted) return;
+      if (response['queued'] == true) {
+        // Offline: the receipt is on this device and goes to the server later.
+        // The read state is *not* flipped locally — the record is the server's,
+        // and a screen that showed it as read would be showing a change that
+        // has not been made anywhere but here.
+        if (!quiet) _say('Offline — your receipt is queued and will sync.');
+        return;
+      }
       // The response carries the fresh badge: the shell's count comes from the
       // server's arithmetic rather than ours.
       session.setAnnouncementBadge(
         (response['unread'] as Map?)?.cast<String, dynamic>(),
       );
-      if (!mounted) return;
       setState(() => _isRead = read);
       // `read_count` moves with a receipt and only the server knows it, so ask
       // again rather than adjusting a number locally.

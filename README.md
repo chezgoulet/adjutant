@@ -324,7 +324,7 @@ python3 docs/e2e_m3.py
 ```
 
 The client has a live harness of its own, and it is the reason the client's
-`flutter test` suite is not the whole v1.0 gate: those 104 tests drive a mock
+`flutter test` suite is not the whole v1.0 gate: those tests drive a mock
 `http.Client`, so a client that has drifted from the API still passes every one
 of them. This one drives the product's `ApiClient` against a real server and
 asserts on what the server returned. It creates its own database, bootstraps the
@@ -343,6 +343,42 @@ scripts/client-live-harness.sh
 cd client && ADJUTANT_LIVE_BASE=http://127.0.0.1:8790 \
   flutter test live/live_client_test.dart
 ```
+
+### Offline mode
+
+A scout in the woods gets the last-known answer rather than a spinner, and their
+own changes are not lost on the way home. M5 exit box 5; the storage decision is
+`docs/plugin-roadmap.md` §6.2 (owner, 2026-09-27): **a plain durable read cache
+plus a queued write list — no schema on the device.** Nothing here needs a
+device-side migration, because the device stores the server's JSON, not a model
+of it.
+
+- **Reads** are cached on every success (`shared_preferences`, one key per
+  resource, with the hour it was written) and served **only when the server
+  cannot be reached** — never in preference to a live answer, so a cached read is
+  never shown as though it were live: the screen says `Offline` and shows when
+  its data is from. There is no TTL, and the cache dies with the session:
+  signing out drops every cached read, because a roster that outlives the session
+  is one member's troop shown to the next.
+- **Writes** go through `SessionState.mutate`. Online they are sent. Offline they
+  are recorded in a durable queue — the request, plus an idempotency key derived
+  from that request — and replayed **in order** when the server answers again (the
+  next read does it, a relaunch does it, and the app bar's cloud button does it on
+  demand). Only writes the server treats as the same act when repeated are queued
+  (a read receipt, a dues tier, a plugin's enable/disable). A write the server
+  would *append* — placing an order, opening a Checkout session, booking a draw —
+  is **refused in words** while offline instead of being queued: a duplicate is
+  worse than a wait, and a queue that pretended otherwise would be a promise this
+  client cannot keep.
+- A queued write the server **refuses** (a 4xx) is parked with the server's own
+  sentence and shown on a strip above whatever screen is open, and it does not
+  hold up the writes behind it. Nothing is dropped quietly, and nothing blocks
+  the queue forever.
+
+`client/test/offline_test.dart` holds its tests: ordering and replay, the
+recorded request matching the one the online path sends, the refusal path, the
+cache surviving a window, and the screens saying "queued" rather than claiming a
+receipt the server has not written.
 
 ## Development milestones
 

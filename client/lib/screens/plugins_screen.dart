@@ -96,8 +96,16 @@ class _PluginsScreenState extends State<PluginsScreen> {
 
     setState(() => _busy = id);
     try {
-      await session.api.setPluginEnabled(id, enable);
+      final sent = await session.setPluginEnabled(id, enable);
       if (!mounted) return;
+      if (!sent) {
+        // Offline: the verb is queued and goes to the server when it can be
+        // reached. The list is *not* re-read — the server has not answered, and
+        // a row flipped here would be this screen's guess at the new state.
+        _say('Offline — $name will be '
+            '${enable ? 'enabled' : 'disabled'} when the server can be reached.');
+        return;
+      }
       _say(enable ? '$name is enabled' : '$name is disabled');
       // Re-read rather than flipping the row locally: enable can change more
       // than the flag (subscriptions re-bind, schedules start), and the list

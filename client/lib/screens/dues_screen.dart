@@ -160,8 +160,16 @@ class _DuesScreenState extends State<DuesScreen> {
     final session = context.read<SessionState>();
     setState(() => _busy = true);
     try {
-      final response = await session.api.selfReportDues(tier: tier);
+      final response = await session.selfReportDues(tier: tier);
       if (!mounted) return;
+      if (response['queued'] == true) {
+        // Offline: the report is on this device and goes to the server when it
+        // can be reached. The standing is *not* re-read — the ledger has not
+        // moved yet, and reading it would show the old tier as though nothing
+        // had happened.
+        _say('Offline — your tier is queued and will sync.');
+        return;
+      }
       final assessed = field(response, ['assessed_display']);
       _say(
         assessed.isEmpty

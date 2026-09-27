@@ -111,6 +111,24 @@ class ApiClient {
     throw ApiException(response.statusCode, _errorMessage(response));
   }
 
+  /// Send one request and hand back the decoded body.
+  ///
+  /// The same path [_send] takes, made public for the queued-write list: a
+  /// replayed write is a request that was recorded earlier, so it is sent by
+  /// method and path — with the body that was recorded — rather than by
+  /// re-running the typed helper that built it, which would build *today's*
+  /// body and quietly send something other than what was queued.
+  ///
+  /// Nothing about the request is special: same headers, same route gate, same
+  /// session. It is exactly as if the call had just been made.
+  Future<dynamic> send(
+    String method,
+    String path, {
+    Map<String, String>? query,
+    Object? body,
+  }) =>
+      _send(method, path, query: query, body: body);
+
   /// The response body as text.
   ///
   /// JSON on the wire is UTF-8 by specification (RFC 8259 §8.1), whatever the
@@ -160,6 +178,11 @@ class ApiClient {
     } on ApiException {
       // A failed logout must not trap the user in a signed-in shell; the local
       // token is cleared by the caller regardless.
+    } on OfflineException {
+      // Neither must an *unreachable* server. Signing out is a local act — this
+      // device stops holding the token — and a scout in the woods with no route
+      // home is exactly who needs it to work. The session's record on the
+      // server simply outlives the app's interest in it.
     } finally {
       _token = null;
     }
