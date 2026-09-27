@@ -113,7 +113,8 @@ jobs:
       - name: Assemble tarball
         run: |
           set -euo pipefail
-          name="adjutant-${GITHUB_REF_NAME}-x86_64-unknown-linux-gnu"
+          ref="${GITHUB_REF_NAME//\//-}"  # a branch name has a "/" in it; a tag does not
+          name="adjutant-${ref}-x86_64-unknown-linux-gnu"
           mkdir -p "dist/$name/plugins"
           cp target/release/adjutant "dist/$name/"
           # Whatever the staging step derived — the assertion below is about this
@@ -134,7 +135,8 @@ jobs:
       - name: Bundle the client for the web
         run: |
           set -euo pipefail
-          name="adjutant-client-${GITHUB_REF_NAME}-web"
+          ref="${GITHUB_REF_NAME//\//-}"
+          name="adjutant-client-${ref}-web"
           tar -C client/build -czf "dist/$name.tar.gz" web
           (cd dist && sha256sum "$name.tar.gz" > "$name.tar.gz.sha256")
 
@@ -145,7 +147,8 @@ jobs:
       - name: Bundle the client for Android
         run: |
           set -euo pipefail
-          name="adjutant-client-${GITHUB_REF_NAME}-android"
+          ref="${GITHUB_REF_NAME//\//-}"
+          name="adjutant-client-${ref}-android"
           cp client/build/app/outputs/flutter-apk/app-release.apk "dist/$name.apk"
           (cd dist && sha256sum "$name.apk" > "$name.apk.sha256")
           ls -l "dist/$name.apk"
