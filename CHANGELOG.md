@@ -9,13 +9,106 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ---
 
-## [Unreleased] — Missions + Governance + SDK v0.2
+---
 
-The SDK stays **0.2.0** and `SDK_ABI_VERSION` stays **4**: every addition below
-is additive, so a plugin built against ABI 4 keeps loading unchanged. Rebuild a
-first-party plugin to pick the helpers up.
+## [Unreleased]
 
-### Added
+---
+
+## [0.3.0] — 2026-09-27 — Milestones 5 and 6: the client, and the operational plugins
+
+The SDK and the core share the version in this release (**0.3.0**, SPEC §13.9);
+`SDK_ABI_VERSION` is **4**, so a plugin built against ABI 4 keeps loading
+unchanged. `[0.2.0]` was the last release and the last tag before this one.
+
+This release closes **Milestone 5** (the permissions-aware MCP server, the
+Flutter client, the calendar) and **Milestone 6** (finance, equipment, archive,
+conflicts, announcements), on top of the M4 batch and the two SDK changes the
+sections below describe. Two of Milestone 5's eight exit boxes were open at the
+cut and neither is claimed by it: the owner's UI/UX review is performed *against*
+this release, and no instance is deployed for the 161st. The release's own record
+is [`docs/release-v0.3.0.md`](docs/release-v0.3.0.md).
+
+**Alpha, and unsigned.** The tag attaches three artifacts — the Linux tarball
+(the `adjutant` binary, every plugin library the workspace stages, the WASM guest,
+`README.md` and `LICENSE`), the client's web bundle, and the Android APK, each
+with a `.sha256`. Nothing published is signed; the APK is built in release mode
+with Flutter's throwaway debug key, which is the only way it installs at all.
+See `README.md` § Unsigned builds.
+
+### Scope enforcement — SDK ABI 3
+
+**Breaking:** `SDK_ABI_VERSION` is bumped to **3**. A plugin built against ABI 2
+is refused at load with the existing actionable handshake error; rebuild it.
+
+#### Changed
+
+- **A scope is a condition the gate checks, not a label on a grant**
+  (SPEC §9.2; design `docs/design/scoped-permissions.md`).
+  `RouteDefinition` gains `required_scope`: the ordinary `*_protected`
+  constructors require a **troop-covering** grant; the new
+  `*_protected_any_scope` constructors require the permission at *some* scope
+  and put the object check in the handler. `delete` always requires troop
+  coverage. The core gate passes the declared scope to `authorize` and logs a
+  denial with the permission, required scope and the caller's grants.
+- **`PermissionService::has` is gone.** The unscoped check is
+  `#[doc(hidden)] has_any_scope` (the core gate's "any scope" branch); plugin
+  authors write `has_in_scope(…, &Scope::troop())` for a troop-wide check, or
+  the new `reach(identity, permission, scope)` which returns a ready 403.
+- **`Identity`:** `grants` is the single source of truth; `roles` is a derived
+  method. An identity payload without `grants` fails to deserialize.
+- **`ScopeType::Personal` is removed.** Reading your own record is an ownership
+  check, not a scope.
+- **`core.user_roles.scope_id` is `TEXT NULL`** (was `UUID NOT NULL`), so a
+  plugin's ids may be bigints, UUIDs or slugs. `NULL` means troop-wide; a
+  non-troop scope requires an id and a troop scope requires `NULL`.
+- **WASM host:** `permissions.has` is troop-only (kept for back-compat); added
+  `permissions.has_in_scope` with `{"permission": …, "scope": {"type": …, "id": …}}`.
+
+#### Migration for plugin authors
+
+Rebuild against ABI 3 (`cargo build -p adjutant-your_plugin`;
+`adjutant validate-plugin` catches a stale build). Replace any
+`permissions.has(id, perm)` with `has_in_scope(id, perm, &Scope::troop())` or
+`reach(...)`; remove any `ScopeType::Personal` use; a hand-built
+`RouteDefinition` needs the new `required_scope` field (the constructors set it:
+troop by default, `None` for `*_protected_any_scope`).
+
+---
+
+### Core scheduler — SDK ABI 4
+
+**Breaking:** `SDK_ABI_VERSION` is bumped to **4**. A plugin built against ABI 3
+is refused at load with the existing actionable handshake error; rebuild it.
+
+#### Added
+
+- **`AdjutantPlugin::schedules()` and `Schedule`** (#45; design
+  `docs/design/core-and-plugin-boundary.md` §4). The core runs plugin-declared
+  scheduled work with the same discipline as a request: on the plugin's own pool
+  (its isolation role), with a per-run timeout and **one attempt per tick** (a
+  failure is recorded, not retried), and one durable row per run in
+  `core.scheduled_runs`. Schedules start on load and are aborted on
+  disable/uninstall/reload. `schedule_handler(...)` wraps the closure;
+  `PluginInfo`/`/api/plugins` show each schedule's last run, last error and next
+  run. Cadence is an **interval** (`Duration`), not cron.
+
+#### Migration for plugin authors
+
+Rebuild against ABI 4. `schedules()` has a default (no schedules), so
+an existing plugin compiles unchanged; add `fn schedules(&self) -> Vec<Schedule>`
+that returns `Schedule::new(name, Duration, schedule_handler(|| async { … }))`
+to run periodic work. Do **not** spawn your own thread.
+
+---
+
+### Missions, governance, and the SDK v0.2 additions
+
+Every addition below is additive and `SDK_ABI_VERSION` stays **4**, so a plugin
+built against ABI 4 keeps loading unchanged. Rebuild a first-party plugin to
+pick the helpers up.
+
+#### Added
 
 - **The core records notifications** (#46, slice 1): `core.notifications` — one
   row per message **per recipient**, with a per-user read state, and the
@@ -204,7 +297,7 @@ first-party plugin to pick the helpers up.
   receipts remain, and a receipt for an entry that does not exist is refused by
   the database.
 
-### Changed
+#### Changed
 
 - **finance's write SQL is now executed by a gate, not only decided by a
   mock.** `POST /api/finance/transaction` and `POST /api/finance/transfer` were
@@ -382,7 +475,7 @@ first-party plugin to pick the helpers up.
   distinguishes **loaded** from merely **known** (new `loaded`/`last_error`
   fields).
 
-### Fixed
+#### Fixed
 
 - **A tagged release would have shipped three plugin libraries out of fourteen,
   and no client at all** (#111's class of defect, in the file that builds what
@@ -470,7 +563,7 @@ first-party plugin to pick the helpers up.
   each rewrite and expects a refusal, then proves mark-read and a real delivery
   still go through; removing the trigger makes the probe fail.
 
-### Notes for plugin authors
+#### Notes for plugin authors
 
 - Both plugins touch **no** `core.*` table: they keep to their own schema, so
   neither appears in `core_grants`. Display names are the client's business; the
@@ -481,69 +574,95 @@ first-party plugin to pick the helpers up.
 
 ---
 
-## [Unreleased] — Core scheduler
+### Milestone 5 and 6 — the client, and the operational plugins
 
-**Breaking:** `SDK_ABI_VERSION` is bumped to **4**. A plugin built against ABI 3
-is refused at load with the existing actionable handshake error; rebuild it.
+#### Added
 
-### Added
+- **`adjutant-calendar`** (SPEC §7.7): events at troop or Lodge scope on the
+  scoped-permission system, iCal `RRULE` recurrence expanded on the event's own
+  timezone, RSVPs per occurrence with `EXDATE`, and `compute_quorum` — the same
+  arithmetic governance uses for a Congress quorum, so the RSVP projection and
+  the attendance-based number agree by construction.
+- **`adjutant-equipment`** (SPEC §7.6): inventory in which three identical tents
+  are three rows, checkout/checkin as a state machine enforced twice (a `409`
+  naming the holder, and a partial unique index as the backstop a race cannot get
+  past), and maintenance schedules.
+- **`adjutant-archive`** (SPEC §7.8): Congress proceedings, minutes, PostgreSQL
+  full-text search, a timeline, and decision → policy → mission tracking. `UPDATE`
+  and `DELETE` on `records` are refused by a `BEFORE` trigger, so a correction is
+  a new record that supersedes the old one — the guarantee, not the good manners.
+- **`adjutant-conflicts`** (SPEC §7.9): the staged pathway with case management
+  and stage transitions, and a case private by its **own visibility list** rather
+  than by role. There is no `conflicts:read`: a handler admits the caller and
+  decides per case against `party_ids`/`facilitator_ids`, and `conflicts:manage`
+  staffs a case without reading it or appointing itself its facilitator.
+- **`adjutant-announcements`** (SPEC §7.14): creation, read receipts and
+  categories. **Delivery is deferred, deliberately and visibly**: the plugin
+  records the announcement, publishes `announcement.published` with everything a
+  sender would need, and answers `"delivery": "deferred"` rather than "sent".
+  Nothing in Adjutant ships push, so nothing claims to.
+- **The Flutter client** (SPEC §6): one codebase for web, Android and the three
+  desktop targets, with twenty-one screens — sign-in, dashboard, missions,
+  membership roster, calendar, governance (motions, a motion's record, casting a
+  vote), announcements inbox and detail, dues, equipment pool and item record,
+  the store (catalogue, item, order, orders, admin), the plugin list, the
+  first-run wizard, backups and settings. `flutter analyze` is clean and the
+  suite is 157 tests.
+- **Offline mode** (client): a durable read cache plus a queued write list, with
+  **no schema on the device**. A cached read is served only when the server
+  cannot be reached, always with a banner saying `Offline` and when its data is
+  from; the cache and the queue die with the session, because a roster that
+  outlives the session is one member's troop shown to the next. Writes are
+  replayed in order when the server answers again, only writes the *server*
+  treats as the same act when repeated are queued at all, a write the server
+  would *append* is refused in words while offline rather than queued, and a
+  queued write the server refuses (4xx) is parked with the server's own sentence
+  without blocking the queue behind it.
+- **The plugin-choice wizard**, and a recorded choice: `GET`/`PUT
+  /api/plugins/choice` lets an operator pick which plugins a deployment runs, the
+  choice is durable, and a deployment that has recorded one does not show the
+  wizard again. A "skip" records nothing rather than recording a choice the
+  operator did not make.
+- **Scheduled backups**, the manual run, and the bundle download
+  (`/api/backups`, `/api/backups/schedule`, `/api/backups/run`,
+  `/api/backups/{filename}/download`), all gated on their own `core:backup`
+  grant rather than on a corner of `core:admin`.
+- **The deployment, proven** rather than described: a proxy-fronted stack with
+  `deploy/verify.sh` proving a real client IP behind the proxy and a spoofed
+  `x-forwarded-for` refused; `bootstrap-isolation --app-role`, so the server can
+  run as a non-superuser app role and still refuse to boot on a superuser
+  connection; the Compose PG18 volume layout fix; and a restore drill from a
+  destroyed volume.
 
-- **`AdjutantPlugin::schedules()` and `Schedule`** (#45; design
-  `docs/design/core-and-plugin-boundary.md` §4). The core runs plugin-declared
-  scheduled work with the same discipline as a request: on the plugin's own pool
-  (its isolation role), with a per-run timeout and **one attempt per tick** (a
-  failure is recorded, not retried), and one durable row per run in
-  `core.scheduled_runs`. Schedules start on load and are aborted on
-  disable/uninstall/reload. `schedule_handler(...)` wraps the closure;
-  `PluginInfo`/`/api/plugins` show each schedule's last run, last error and next
-  run. Cadence is an **interval** (`Duration`), not cron.
+#### Changed
 
-### Migration for plugin authors
+- **The client is built in CI, not only inspected** (#119): the `client` job
+  compiles it for web and for Android, so a fault that exists only at build time
+  — a malformed mipmap, a broken manifest reference — can no longer ship green.
+- **A tag attaches the Android APK** (#126), built in release mode from the tag
+  and asserted to exist and not be a stub; the release workflow also gained a
+  `workflow_dispatch` entry so a packaging fault surfaces before a tag rather
+  than at one.
+- **A push to `release/*` or `hotfix/*` runs no CI until a PR opens** (#127) —
+  found while cutting this release.
 
-Rebuild against SDK 0.2 / ABI 4. `schedules()` has a default (no schedules), so
-an existing plugin compiles unchanged; add `fn schedules(&self) -> Vec<Schedule>`
-that returns `Schedule::new(name, Duration, schedule_handler(|| async { … }))`
-to run periodic work. Do **not** spawn your own thread.
+#### Fixed
 
----
+- **A 404 from the API is no longer rendered as an offline condition** (#123):
+  the screen states the route was not found and keeps Retry only for the case it
+  can help.
+- **A replay that sends something tells the screens to re-read** (#124), so
+  "1 sent." no longer sits beside a badge that still says 1.
+- **The wizard's "Skip for now" no longer switches twelve plugins off at
+  runtime** (#122): a skip records nothing.
 
-## [Unreleased] — Scope enforcement
+#### Notes for plugin authors
 
-**Breaking:** `SDK_ABI_VERSION` is bumped to **3**. A plugin built against ABI 2
-is refused at load with the existing actionable handshake error; rebuild it.
-
-### Changed
-
-- **A scope is a condition the gate checks, not a label on a grant**
-  (SPEC §9.2; design `docs/design/scoped-permissions.md`).
-  `RouteDefinition` gains `required_scope`: the ordinary `*_protected`
-  constructors require a **troop-covering** grant; the new
-  `*_protected_any_scope` constructors require the permission at *some* scope
-  and put the object check in the handler. `delete` always requires troop
-  coverage. The core gate passes the declared scope to `authorize` and logs a
-  denial with the permission, required scope and the caller's grants.
-- **`PermissionService::has` is gone.** The unscoped check is
-  `#[doc(hidden)] has_any_scope` (the core gate's "any scope" branch); plugin
-  authors write `has_in_scope(…, &Scope::troop())` for a troop-wide check, or
-  the new `reach(identity, permission, scope)` which returns a ready 403.
-- **`Identity`:** `grants` is the single source of truth; `roles` is a derived
-  method. An identity payload without `grants` fails to deserialize.
-- **`ScopeType::Personal` is removed.** Reading your own record is an ownership
-  check, not a scope.
-- **`core.user_roles.scope_id` is `TEXT NULL`** (was `UUID NOT NULL`), so a
-  plugin's ids may be bigints, UUIDs or slugs. `NULL` means troop-wide; a
-  non-troop scope requires an id and a troop scope requires `NULL`.
-- **WASM host:** `permissions.has` is troop-only (kept for back-compat); added
-  `permissions.has_in_scope` with `{"permission": …, "scope": {"type": …, "id": …}}`.
-
-### Migration for plugin authors
-
-Rebuild against SDK 0.2 / ABI 3 (`cargo build -p adjutant-your_plugin`;
-`adjutant validate-plugin` catches a stale build). Replace any
-`permissions.has(id, perm)` with `has_in_scope(id, perm, &Scope::troop())` or
-`reach(...)`; remove any `ScopeType::Personal` use; a hand-built
-`RouteDefinition` needs the new `required_scope` field (the constructors set it:
-troop by default, `None` for `*_protected_any_scope`).
+Every plugin in this release is `0.3.0` and every plugin id is namespaced by its
+own id (`announcements:*`, not `announcement:*`). A plugin built against ABI 4
+keeps loading unchanged; rebuild to pick up the SDK v0.2/v0.3 helpers. The
+deployment's plugin set is chosen, not assumed — `bootstrap-isolation --enable`
+names which plugins this deployment runs.
 
 ---
 
@@ -628,6 +747,8 @@ crates.io publication. `SDK_ABI_VERSION` is **2**.
 - Loader validation is factored into shared pure functions
   (`validate_declaration`, `validate_migrations`, `check_sdk_abi`) so the load
   path and `validate-plugin` enforce exactly the same rules.
+
+---
 
 ## [0.1.0] — Milestones 1–3
 
