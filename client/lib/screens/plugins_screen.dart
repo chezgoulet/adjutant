@@ -5,6 +5,7 @@ import '../api/api_client.dart';
 import '../state/session.dart';
 import '../theme/app_theme.dart';
 import '../widgets/common.dart';
+import 'plugin_wizard_screen.dart';
 
 /// Plugins — what the core has loaded, and the switch for each.
 ///
@@ -156,6 +157,23 @@ class _PluginsScreenState extends State<PluginsScreen> {
       appBar: AppBar(
         title: const Text('Plugins'),
         actions: [
+          IconButton(
+            // The first-run flow again, deliberately: #90 makes first-run a
+            // prompt, not a one-time ritual, so a choice can be revisited and a
+            // skipped one is deferred rather than lost.
+            tooltip: 'Which plugins this deployment runs',
+            onPressed: _loading
+                ? null
+                : () async {
+                    final changed = await Navigator.of(context).push<bool>(
+                      MaterialPageRoute(
+                        builder: (_) => const PluginWizardScreen(),
+                      ),
+                    );
+                    if (changed == true) _load();
+                  },
+            icon: const Icon(Icons.checklist_outlined),
+          ),
           IconButton(
             tooltip: 'Refresh',
             onPressed: _loading ? null : _load,

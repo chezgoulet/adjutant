@@ -787,6 +787,42 @@ class ApiClient {
     await _send('POST', '/api/plugins/${Uri.encodeComponent(id)}/$verb');
   }
 
+  /// The recorded choice (`null` when nobody has chosen), and the rules the core
+  /// enforces on a choice: `required` plugins with their reasons, and the
+  /// `dependencies` pairs.
+  ///
+  /// `choice == null` is the only state in which the first-run wizard may appear.
+  /// The *server* answers that rather than the device: a per-device flag would
+  /// re-prompt the second admin, could not be set by a scripted install, and could
+  /// not tell "chose exactly auth and membership" from "never chose".
+  ///
+  /// The rules come from the server for the same reason — a screen that says what
+  /// turning a plugin off costs should be repeating the server's own sentence, not
+  /// a copy of it that drifts the first time the rule changes.
+  ///
+  /// `core:admin`, so a 403 is the answer for anyone else rather than something
+  /// the client should pre-guess.
+  Future<Map<String, dynamic>> pluginChoice() async =>
+      _asMap(await _send('GET', '/api/plugins/choice'));
+
+  /// Choose which plugins this deployment runs.
+  ///
+  /// The same act as `bootstrap-isolation --enable`, through the same server
+  /// function — so the wizard and a scripted install cannot drift apart, and this
+  /// returns what the core then carries.
+  ///
+  /// Refused with 400 and a reason naming what is wrong: an id that is not on
+  /// disk, a required plugin left off, or a dependent without its dependency. The
+  /// screen shows the server's own words rather than pre-judging which sets are
+  /// legal, because the rules live in the core and a second copy would drift.
+  Future<List<String>> setPluginChoice(List<String> ids) async {
+    final body = _asMap(
+      await _send('PUT', '/api/plugins/choice', body: {'plugin_ids': ids}),
+    );
+    final enabled = body['enabled'];
+    return enabled is List ? enabled.cast<String>() : const <String>[];
+  }
+
   // --- backups ---------------------------------------------------------------
 
   /// The picker's options, the schedule, and the recent runs.

@@ -782,6 +782,36 @@ INSERT INTO core.backup_schedule (id, enabled) VALUES (TRUE, FALSE)
 ON CONFLICT (id) DO NOTHING;
 "
     ),
+    (12, "plugin_choice", "
+-- The operator's choice of which plugins this deployment runs — and the fact
+-- that they made one.
+--
+-- Deliberately *not* derived from `core.plugins.enabled`. Choosing only `auth`
+-- and `membership` and never having chosen look identical in the flags unless
+-- something records the act, and issue #90 needs that distinction twice: the
+-- first-run wizard must not appear for an operator who already decided, and a
+-- scripted install must be able to make the choice with no browser. A missing
+-- row is the only state in which the wizard may appear.
+CREATE TABLE IF NOT EXISTS core.plugin_choice (
+    -- One row, and the CHECK is what makes that true rather than a convention
+    -- every reader has to assume.
+    id         BOOLEAN PRIMARY KEY DEFAULT TRUE CHECK (id),
+    chosen_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
+    -- Which door the choice came through. The two paths are required to produce
+    -- the same *state*; recording which one wrote a given state is what makes a
+    -- divergence visible instead of a mystery.
+    source     TEXT NOT NULL CHECK (source IN ('cli', 'wizard')),
+    -- Who made it. NULL from the CLI is correct rather than missing: bootstrap
+    -- runs before there is anybody to attribute the act to, and inventing a
+    -- name there would be a lie the audit repeats.
+    chosen_by  TEXT,
+    -- The set as chosen, so the record says what was decided and not merely that
+    -- something was. A reader should not have to reconstruct intent from flags
+    -- that any later action may have changed.
+    plugin_ids TEXT[] NOT NULL
+);
+"
+    ),
 ];
 
 /// Bootstrap roles + permissions grants. `chief` gets everything (SPEC §9 —
