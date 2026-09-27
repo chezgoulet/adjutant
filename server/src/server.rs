@@ -1373,15 +1373,19 @@ async fn uninstall_plugin(
     .into_response()
 }
 
-/// Hot-reload: rescan `plugin_dir`, load the new set OUTSIDE the lock (old
-/// registry keeps serving meanwhile), then swap and rebind subscriptions.
-/// On failure the old registry stays live — reload is all-or-nothing.
-async fn reload_plugins(State(state): State<Arc<AppState>>, req: Request) -> Response {
-    if let Some(resp) = state.require_admin(req.headers()).await {
-        return resp;
-    }
-    let identity = state.resolve_identity(req.headers()).await;
-
+/// Build a fresh generation of the registry from the flags in the database.
+///
+/// Extracted so that the two doors which change what is live — the reload route
+/// and the wizard's choice (#90) — cannot reconcile the running server in two
+/// different ways. The wizard's door needs this because writing the flags alone
+/// would leave the choice inert until a restart, which is the opposite of
+/// "enabled means loaded".
+///
+/// Returns the ready-to-adopt generation, or the response to send on failure —
+/// the old registry is kept either way.
+pub(crate) async fn load_fresh_generation(
+    state: &AppState,
+) -> Result<(PluginRegistry, crate::scope_hierarchy::ScopeHierarchy), Response> {
     let fresh = match load_all(
         &state.config.plugin_dir,
         &state.config.database_url,
@@ -1396,59 +1400,39 @@ async fn reload_plugins(State(state): State<Arc<AppState>>, req: Request) -> Res
         Ok(r) => r,
         Err(e) => {
             tracing::error!(error = %e, "reload failed; old registry kept");
-            return error_response(
+            return Err(error_response(
                 StatusCode::INTERNAL_SERVER_ERROR,
                 "reload failed; old registry kept",
-            );
+            ));
         }
     };
-    let route_count: usize = fresh
-        .plugins
-        .iter()
-        .filter_map(PluginSlot::live)
-        .map(|p| p.routes.len())
-        .sum();
-    let ids: Vec<String> = fresh.plugins.iter().map(|p| p.info().id.clone()).collect();
-    let versions: HashMap<String, String> = fresh
-        .plugins
-        .iter()
-        .map(|p| (p.info().id.clone(), p.info().version.clone()))
-        .collect();
 
     // `load_all` ran each plugin's `init`, which re-declares its scope edges;
     // refresh the resolution map before the new generation serves.
-    let fresh_hierarchy = match crate::scope_hierarchy::ScopeHierarchy::load(state.pool.as_ref()).await
-    {
-        Ok(h) => h,
-        Err(e) => {
-            tracing::error!(error = %e, "reload failed to load scope hierarchy; old registry kept");
-            return error_response(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "reload failed; old registry kept",
-            );
-        }
-    };
+    let fresh_hierarchy =
+        match crate::scope_hierarchy::ScopeHierarchy::load(state.pool.as_ref()).await {
+            Ok(h) => h,
+            Err(e) => {
+                tracing::error!(error = %e, "reload failed to load scope hierarchy; old registry kept");
+                return Err(error_response(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "reload failed; old registry kept",
+                ));
+            }
+        };
 
-    // Audit, then apply. `load_all` above is the validation/preparation step (it
-    // refuses with a 5xx on a load error, before this point); the live-registry
-    // swap below is the state change this row precedes. Residual: `load_all` has
-    // already run migrations/upserts, so a failed audit can leave an attempt whose
-    // live effect did not land — the accepted trade (see `audit_state_change`).
-    if let Some(resp) = audit_state_change(
-        &state.audit,
-        identity.as_ref(),
-        "plugin.reload",
-        "plugin",
-        "*",
-        json!({ "reloaded": ids, "routes": route_count }),
-    )
-    .await
-    {
-        return resp;
-    }
+    Ok((fresh, fresh_hierarchy))
+}
 
-    // Swap, then rebind subscriptions and schedules: abort every old task first
-    // so no event is handled and no timer fires for both generations.
+/// Swap in a prepared generation: routes, scope map, subscriptions and schedules.
+///
+/// Aborts every old task first, so no event is handled and no timer fires for two
+/// generations at once.
+pub(crate) async fn adopt_generation(
+    state: &AppState,
+    fresh: PluginRegistry,
+    fresh_hierarchy: crate::scope_hierarchy::ScopeHierarchy,
+) {
     {
         let mut reg = state.registry.write().await;
         reg.replace_all(fresh);
@@ -1475,9 +1459,59 @@ async fn reload_plugins(State(state): State<Arc<AppState>>, req: Request) -> Res
             for sub in lp.plugin.subscriptions() {
                 state.bus.subscribe(lp.plugin.id(), sub);
             }
-            state.scheduler.start(lp.plugin.id(), lp.plugin.schedules(), state.pool.clone());
+            state
+                .scheduler
+                .start(lp.plugin.id(), lp.plugin.schedules(), state.pool.clone());
         }
     }
+}
+
+/// Hot-reload: rescan `plugin_dir`, load the new set OUTSIDE the lock (old
+/// registry keeps serving meanwhile), then swap and rebind subscriptions.
+/// On failure the old registry stays live — reload is all-or-nothing.
+async fn reload_plugins(State(state): State<Arc<AppState>>, req: Request) -> Response {
+    if let Some(resp) = state.require_admin(req.headers()).await {
+        return resp;
+    }
+    let identity = state.resolve_identity(req.headers()).await;
+
+    let (fresh, fresh_hierarchy) = match load_fresh_generation(&state).await {
+        Ok(pair) => pair,
+        Err(resp) => return resp,
+    };
+    let route_count: usize = fresh
+        .plugins
+        .iter()
+        .filter_map(PluginSlot::live)
+        .map(|p| p.routes.len())
+        .sum();
+    let ids: Vec<String> = fresh.plugins.iter().map(|p| p.info().id.clone()).collect();
+    let versions: HashMap<String, String> = fresh
+        .plugins
+        .iter()
+        .map(|p| (p.info().id.clone(), p.info().version.clone()))
+        .collect();
+
+    // Audit, then apply. `load_all` above is the validation/preparation step (it
+    // refuses with a 5xx on a load error, before this point); the live-registry
+    // swap below is the state change this row precedes. Residual: `load_all` has
+    // already run migrations/upserts, so a failed audit can leave an attempt whose
+    // live effect did not land — the accepted trade (see `audit_state_change`).
+    if let Some(resp) = audit_state_change(
+        &state.audit,
+        identity.as_ref(),
+        "plugin.reload",
+        "plugin",
+        "*",
+        json!({ "reloaded": ids, "routes": route_count }),
+    )
+    .await
+    {
+        return resp;
+    }
+
+    // Swap, then rebind subscriptions and schedules.
+    adopt_generation(&state, fresh, fresh_hierarchy).await;
 
     tracing::info!(routes = route_count, "registry hot-reloaded");
     Json(json!({

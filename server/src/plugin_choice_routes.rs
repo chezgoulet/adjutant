@@ -89,7 +89,21 @@ pub async fn set(State(state): State<Arc<AppState>>, req: Request) -> Response {
     )
     .await
     {
-        Ok(enabled) => Json(serde_json::json!({ "enabled": enabled })).into_response(),
+        Ok(enabled) => {
+            // The flags are the durable truth, but a running server keeps serving
+            // the registry it loaded at boot. Writing them alone would leave the
+            // operator's choice inert until a restart — the opposite of "enabled
+            // means loaded", and exactly what the acceptance for #90 forbids
+            // ("afterwards the server has those plugins loaded"). So reconcile the
+            // same way the reload route does, through the same two functions.
+            match crate::server::load_fresh_generation(&state).await {
+                Ok((fresh, fresh_hierarchy)) => {
+                    crate::server::adopt_generation(&state, fresh, fresh_hierarchy).await;
+                    Json(serde_json::json!({ "enabled": enabled })).into_response()
+                }
+                Err(resp) => resp,
+            }
+        }
         // Every refusal is a statement about what was asked for — an id that is not
         // on disk, a required plugin left off, a dependent without its dependency —
         // so it is a bad request that names the reason. Not a 500, and not a silent

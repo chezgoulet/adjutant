@@ -70,7 +70,14 @@ pub async fn apply(
 
     // Required plugins first: if a set is wrong in both ways, "you disabled auth"
     // is the more urgent sentence.
-    if let Some((id, why)) = REQUIRED_PLUGINS.iter().find(|(id, _)| !has(id)) {
+    // Only required plugins that are actually on disk. A directory without `auth`
+    // has nothing to protect, and demanding it would make every set illegal for
+    // such a deployment — the rule is "may not be turned off", not "must be
+    // installed", which is how the server's own disable refusal reads it too.
+    if let Some((id, why)) = REQUIRED_PLUGINS
+        .iter()
+        .find(|(id, _)| discovered.iter().any(|d| d == id) && !has(id))
+    {
         return Err(format!("{id} is required and cannot be turned off: {why}"));
     }
 
