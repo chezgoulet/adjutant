@@ -881,10 +881,25 @@ async fn health() -> Json<serde_json::Value> {
 /// Plugin registry + route/permission inventory (SPEC §5.3: admin surface).
 /// Anonymous callers previously got the whole route table; now the same
 /// `core:admin` gate as every other admin route applies.
+///
+/// Carries the **recorded choice** beside the list, because the list alone can
+/// say a plugin is off without saying why (issue #122): a plugin the operator's
+/// choice switched off is `enabled = false` / `loaded = false`, which is the
+/// same shape as one that failed to load. The choice is what turns "off" into
+/// "off because this deployment was told to", so the answer belongs in the same
+/// read as the list rather than one route away.
 async fn list_plugins(State(state): State<Arc<AppState>>, req: Request) -> Response {
     if let Some(resp) = state.require_admin(req.headers()).await {
         return resp;
     }
+    // Read the choice before taking the registry lock, so the guard is never
+    // held across a database round-trip. A failure to read it is a 500, not a
+    // silent `null`: "nobody has chosen" is a claim this route must not make
+    // when it does not know.
+    let choice = match crate::plugin_choice::recorded(state.pool.as_ref()).await {
+        Ok(choice) => choice,
+        Err(e) => return internal_error("recorded plugin choice", &e),
+    };
     let reg = state.registry.read().await;
     let plugins: Vec<serde_json::Value> = reg
         .infos()
@@ -902,6 +917,11 @@ async fn list_plugins(State(state): State<Arc<AppState>>, req: Request) -> Respo
         // Plugin ids with at least one bound event subscription. Disable aborts
         // them and enable re-binds, so this is the observable proof of that.
         "bound_subscriptions": state.bus.subscriber_ids(),
+        // `null` when nobody has chosen — the only state in which the first-run
+        // wizard may appear. Otherwise the ids the recorded choice runs, with
+        // its source and the actor, so a reader can tell a switched-off plugin
+        // from one that is merely not loaded.
+        "choice": choice,
     }))
     .into_response()
 }

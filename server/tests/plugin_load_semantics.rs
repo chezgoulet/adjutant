@@ -964,3 +964,129 @@ async fn probe_both_doors_to_the_choice_land_on_the_same_state() {
 
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+// ============================================================================
+// #122 — a skip records nothing, and the listing says what is recorded
+// ============================================================================
+
+/// One plugin's entry in a `GET /api/plugins` payload.
+fn plugin_entry<'a>(listing: &'a serde_json::Value, id: &str) -> &'a serde_json::Value {
+    listing["plugins"]
+        .as_array()
+        .unwrap_or_else(|| panic!("the listing carries a plugins array: {listing}"))
+        .iter()
+        .find(|p| p["id"] == id)
+        .unwrap_or_else(|| panic!("{id} is listed: {listing}"))
+}
+
+/// Issue #122, both halves, against a running server and a real database.
+///
+/// **A skip records nothing.** "Skip for now" now sends no request at all, so
+/// the state it leaves is the one below: no `core.plugin_choice` row, and every
+/// plugin on disk enabled and loaded — exactly what the wizard's own copy
+/// promises before the tap ("No choice has been recorded, so this deployment is
+/// running everything on disk"). Before the fix the button called Save, so this
+/// state was unreachable from the wizard.
+///
+/// **The listing says what is recorded.** After a real choice switches a plugin
+/// off, `GET /api/plugins` must not leave the operator to discover it from a
+/// 404: the plugin is reported off *and* the payload carries the choice that did
+/// it. The first half was already true of the registry payload (it is asserted
+/// here so the pair cannot drift); the second is what this probe was written to
+/// find missing — the listing named no choice at all.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "DB-gated: needs ADJUTANT_TEST_DATABASE_URL + CREATEROLE; run with `-- --ignored`"]
+async fn probe_the_listing_tells_the_truth_about_the_recorded_choice() {
+    let _serial = SERIAL.lock().await;
+    let dir = fixture_dir_named("listing");
+    let url = base_url();
+    let admin = provision(&dir).await;
+    set_enabled(&admin, STORE, true).await;
+    set_enabled(&admin, FINANCE, true).await;
+    sqlx::query("DELETE FROM core.plugin_choice")
+        .execute(admin.as_ref())
+        .await
+        .expect("clear any recorded choice, so this probe starts where a skip leaves");
+
+    let (base, _state, _serve) = spawn_app(&dir, &url).await;
+
+    // --- what a skip leaves: no record, everything on disk running ----------
+    let (status, before) = admin_req(&base, reqwest::Method::GET, "/api/plugins").await;
+    assert_eq!(status, 200, "the listing answers: {before}");
+    assert!(
+        before["choice"].is_null(),
+        "nobody has chosen, and the listing says so: {before}"
+    );
+    let store_before = plugin_entry(&before, STORE);
+    assert!(
+        store_before["enabled"] == true && store_before["loaded"] == true,
+        "a deployment nobody has chosen for runs everything on disk — which is \
+         what 'Skip for now' must leave: {store_before}"
+    );
+
+    // --- a real choice, through the wizard's door ---------------------------
+    let discovered: Vec<String> = sqlx::query_scalar("SELECT id FROM core.plugins ORDER BY id")
+        .fetch_all(admin.as_ref())
+        .await
+        .expect("the provisioned ids");
+    let chosen: Vec<String> = discovered
+        .iter()
+        .filter(|id| id.as_str() != STORE)
+        .cloned()
+        .collect();
+    let (put, body) = put_json(
+        &base,
+        "/api/plugins/choice",
+        serde_json::json!({ "plugin_ids": chosen }),
+    )
+    .await;
+    assert_eq!(put, 200, "the wizard's door accepts the set: {body}");
+
+    let (status, after) = admin_req(&base, reqwest::Method::GET, "/api/plugins").await;
+    assert_eq!(status, 200);
+
+    // 1. The plugin the choice switched off is reported off, not on.
+    let store_after = plugin_entry(&after, STORE);
+    assert!(
+        store_after["enabled"] == false,
+        "a switched-off plugin must not be reported enabled: {store_after}"
+    );
+    assert!(
+        store_after["loaded"] == false && store_after["routes"] == 0,
+        "and must not be reported loaded, nor hold routes: {store_after}"
+    );
+    assert!(
+        plugin_entry(&after, FINANCE)["loaded"] == true,
+        "the plugin the choice kept is still loaded — the probe is not vacuous: {after}"
+    );
+
+    // 2. The listing names the choice that did it. Without this the operator is
+    //    left to discover it from a 404, which is how issue #122 was filed.
+    let choice = &after["choice"];
+    assert!(
+        !choice.is_null(),
+        "a recorded choice must be visible in the plugin listing, not only at \
+         /api/plugins/choice: {after}"
+    );
+    assert_eq!(choice["source"], "wizard", "the listing names the door: {choice}");
+    assert_eq!(
+        choice["chosen_by"], "christopher",
+        "and the actor: {choice}"
+    );
+    assert_eq!(
+        choice["plugin_ids"],
+        serde_json::json!(chosen),
+        "and the exact set it runs: {choice}"
+    );
+
+    // The observable the issue was filed from: the switched-off plugin's route
+    // is gone, answering exactly as a library absent from disk.
+    let (route_status, route_body) = admin_req(&base, reqwest::Method::GET, "/api/store/items").await;
+    assert_eq!(
+        route_status, 404,
+        "a switched-off plugin answers as a library absent from disk: {route_body}"
+    );
+    assert_eq!(route_body, route_not_found());
+
+    let _ = std::fs::remove_dir_all(&dir);
+}

@@ -169,6 +169,24 @@ class _PluginWizardScreenState extends State<PluginWizardScreen> {
     }
   }
 
+  /// Leave without choosing.
+  ///
+  /// A skip is not a decision, so it records nothing: the deployment keeps
+  /// running what is on disk, which is exactly what the copy above the list
+  /// promised before the tap ("No choice has been recorded, so this deployment
+  /// is running everything on disk"). Recording the minimal set here was not a
+  /// skip — it was a silent choice that switched most of a deployment off behind
+  /// a button labelled "Skip for now", and an operator who tapped it to look
+  /// around had no reason to think anything had changed (issue #122). Choosing
+  /// nothing and being asked again is the honest outcome; the wizard stays
+  /// reachable from Plugins.
+  ///
+  /// It pops `false`, not `true`: nothing changed, so the caller must not
+  /// re-read as though it had.
+  void _skip() {
+    Navigator.of(context).pop(false);
+  }
+
   /// Why `id` cannot be turned off, in the server's words — or null.
   String? _requiredWhy(String id) {
     for (final r in _required) {
@@ -319,9 +337,10 @@ class _PluginWizardScreenState extends State<PluginWizardScreen> {
               ),
               if (widget.firstRun)
                 TextButton(
-                  // Skipping is not "never asked": it records the minimal set,
-                  // which is a decision stated rather than a default inherited.
-                  onPressed: _saving ? null : _save,
+                  // A skip records nothing: it leaves the deployment running what
+                  // is on disk rather than recording the minimal set as though
+                  // the operator had chosen it (issue #122).
+                  onPressed: _saving ? null : _skip,
                   child: const Text('Skip for now'),
                 ),
               const SizedBox(width: AppSpacing.sm),

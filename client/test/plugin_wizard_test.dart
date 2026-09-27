@@ -217,5 +217,72 @@ void main() {
       // And still shows the server's sentence when it refuses.
       expect(find.text('store needs stripe, which is not in the set'), findsOneWidget);
     });
+
+    /// Issue #122. A skip is not a decision: it must record nothing, so the
+    /// deployment keeps running what is on disk — which is exactly what the
+    /// screen's own copy promises before the tap ("No choice has been recorded,
+    /// so this deployment is running everything on disk"). Before this, the
+    /// button called `_save`, so an operator who skipped to look around silently
+    /// switched most of the deployment off.
+    testWidgets('skipping records nothing and leaves without a choice',
+        (tester) async {
+      final calls = <String>[];
+      final client = ApiClient(
+        baseUrl: 'http://example.test',
+        httpClient: MockClient((request) async {
+          calls.add('${request.method} ${request.url.path}');
+          if (request.url.path == '/api/plugins/choice') {
+            return _json(_choicePayload());
+          }
+          return _json(_pluginsPayload());
+        }),
+      );
+
+      // Pushed the way the Plugins screen opens it, so the skip's `pop` is a
+      // real navigation rather than a pop of the only route.
+      await tester.pumpWidget(
+        ChangeNotifierProvider<SessionState>.value(
+          value: SessionState(client: client),
+          child: MaterialApp(
+            theme: AppTheme.light(),
+            home: Builder(
+              builder: (context) => Scaffold(
+                body: Center(
+                  child: TextButton(
+                    onPressed: () => Navigator.of(context).push(
+                      MaterialPageRoute(
+                        builder: (_) => const PluginWizardScreen(firstRun: true),
+                      ),
+                    ),
+                    child: const Text('open the wizard'),
+                  ),
+                ),
+              ),
+            ),
+          ),
+        ),
+      );
+      await tester.tap(find.text('open the wizard'));
+      await tester.pumpAndSettle();
+      _roomForEveryRow(tester);
+      await tester.pumpAndSettle();
+      expect(find.byType(PluginWizardScreen), findsOneWidget);
+
+      // Only the tap's own requests count; the screen's load has already been
+      // paid for above.
+      calls.clear();
+      await tester.tap(find.text('Skip for now'));
+      await tester.pumpAndSettle();
+
+      expect(
+        calls,
+        isEmpty,
+        reason: 'a skip must send nothing: recording the minimal set is a '
+            'choice the operator did not make (issue #122)',
+      );
+      // And it leaves, so the caller does not sit on a wizard whose question the
+      // operator declined.
+      expect(find.byType(PluginWizardScreen), findsNothing);
+    });
   });
 }
