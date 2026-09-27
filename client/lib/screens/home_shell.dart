@@ -1,3 +1,5 @@
+import 'dart:async';
+
 import 'package:flutter/material.dart';
 import 'package:provider/provider.dart';
 
@@ -26,6 +28,9 @@ class HomeShell extends StatefulWidget {
 
 class _HomeShellState extends State<HomeShell> {
   int _index = 0;
+
+  /// The last [SessionState.reloadEpoch] this shell has reacted to.
+  int _seenEpoch = 0;
 
   /// Where the announcements inbox sits in the destinations. It is here rather
   /// than under Settings because it is daily work: the notice that tonight's
@@ -57,22 +62,60 @@ class _HomeShellState extends State<HomeShell> {
   @override
   void initState() {
     super.initState();
+    final session = context.read<SessionState>();
+    // Start from the generation that is already current: a replay that happened
+    // before this shell existed (in `boot`, say) is not this shell's to react
+    // to — the first read here already sees its result.
+    _seenEpoch = session.reloadEpoch;
     // The badge is the server's count, read once when the shell appears. It is
     // cached like every other read, so a scout in the woods still sees the last
     // number the server gave rather than an empty badge that means nothing.
-    context.read<SessionState>().refreshAnnouncementBadge();
+    session.refreshAnnouncementBadge();
   }
 
-  Widget _body() => switch (_index) {
-        0 => const DashboardScreen(),
-        1 => const AnnouncementsScreen(),
-        2 => const MissionsScreen(),
-        3 => const CalendarScreen(),
-        4 => const StoreScreen(),
-        5 => const EquipmentScreen(),
-        6 => const MembersScreen(),
-        _ => const SettingsScreen(),
-      };
+  /// The body of the current destination, re-created whenever a replay pass has
+  /// changed the server's state.
+  ///
+  /// Each destination builds its own screen, and a screen reads the server
+  /// once, in `initState`. Navigating to a destination is therefore what
+  /// re-reads it — which is why a queued write replayed by the app bar's retry
+  /// used to leave the screen that owed it showing the state from before the
+  /// write left, until the destination was re-entered. Keying the body on
+  /// [SessionState.reloadEpoch] makes a replay that sent something one more
+  /// cause of a re-read, alongside navigation: the key changes, the screen is
+  /// re-created, and `initState` reads again. See `reloadEpoch` for the choice
+  /// and its trade-off.
+  Widget _body(SessionState session) => KeyedSubtree(
+        key: ValueKey<int>(session.reloadEpoch),
+        child: switch (_index) {
+          0 => const DashboardScreen(),
+          1 => const AnnouncementsScreen(),
+          2 => const MissionsScreen(),
+          3 => const CalendarScreen(),
+          4 => const StoreScreen(),
+          5 => const EquipmentScreen(),
+          6 => const MembersScreen(),
+          _ => const SettingsScreen(),
+        },
+      );
+
+  /// Re-read the shell's own server state when a replay moves the generation.
+  ///
+  /// The destination body re-reads because it is re-keyed (see [_body]); the
+  /// badge is the shell's, shown above every destination, so it is refreshed
+  /// here rather than left to the inbox being opened. It is the same rule the
+  /// body follows — the server answered, so the read is a live one — and
+  /// `refreshAnnouncementBadge` is already the read that knows how to fall back
+  /// to the cache if the server is gone again.
+  void _onReplayIfMoved(SessionState session) {
+    if (session.reloadEpoch == _seenEpoch) return;
+    _seenEpoch = session.reloadEpoch;
+    // Out of `build`: the refresh notifies listeners, and notifying during a
+    // build is not allowed.
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (mounted) unawaited(session.refreshAnnouncementBadge());
+    });
+  }
 
   /// The queue, stated above whatever screen is showing.
   ///
@@ -235,6 +278,9 @@ class _HomeShellState extends State<HomeShell> {
   Widget build(BuildContext context) {
     final width = MediaQuery.sizeOf(context).width;
     final session = context.watch<SessionState>();
+    // A replay pass that sent something has moved the server's state; re-read
+    // it rather than leaving the screens on the version they loaded first.
+    _onReplayIfMoved(session);
     final title = _destinations[_index].label;
     final unread = session.announcementUnread;
     final urgent = session.announcementUrgent;
@@ -294,7 +340,7 @@ class _HomeShellState extends State<HomeShell> {
     if (width < 600) {
       return Scaffold(
         appBar: AppBar(title: Text(title), actions: actions),
-        body: _withQueue(session, _body()),
+        body: _withQueue(session, _body(session)),
         bottomNavigationBar: NavigationBar(
           selectedIndex: _index,
           onDestinationSelected: (i) => setState(() => _index = i),
@@ -332,7 +378,7 @@ class _HomeShellState extends State<HomeShell> {
               ],
             ),
             const VerticalDivider(width: 1),
-            Expanded(child: _withQueue(session, _body())),
+            Expanded(child: _withQueue(session, _body(session))),
           ],
         ),
       );
@@ -355,7 +401,7 @@ class _HomeShellState extends State<HomeShell> {
           Expanded(
             child: Scaffold(
               appBar: AppBar(title: Text(title), actions: actions),
-              body: _withQueue(session, _body()),
+              body: _withQueue(session, _body(session)),
             ),
           ),
         ],
