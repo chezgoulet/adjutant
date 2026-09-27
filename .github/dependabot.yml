@@ -33,6 +33,11 @@ version: 2
 updates:
   - package-ecosystem: "github-actions"
     directory: "/"
+    # The repository's default branch is `main`, which moves only to cut a
+    # release (CONTRIBUTING.md §Git flow); `testing` is the integration branch
+    # every PR targets. Without this line Dependabot opens its pull requests
+    # against `main` and the repository's own rule is broken by a bot.
+    target-branch: "testing"
     schedule:
       interval: "weekly"
     open-pull-requests-limit: 5
@@ -45,6 +50,8 @@ updates:
 
   - package-ecosystem: "pub"
     directory: "/client"
+    # Same reason as above: `testing`, never `main`.
+    target-branch: "testing"
     schedule:
       interval: "weekly"
     open-pull-requests-limit: 5
