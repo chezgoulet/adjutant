@@ -498,6 +498,11 @@ void main() {
   });
 
   group('PluginsScreen', () {
+    // The screen's writes go through the session, and the session records an
+    // offline write in the durable queue — so this group needs a preferences
+    // store, exactly as the other screen groups do.
+    setUp(() => SharedPreferences.setMockInitialValues({}));
+
     /// Two plugins, as the core reports them.
     String payload() => jsonEncode({
           'plugins': [

@@ -104,7 +104,7 @@ class _StoreItemScreenState extends State<StoreItemScreen> {
     final session = context.read<SessionState>();
     setState(() => _busy = true);
     try {
-      final response = await session.api.placeStoreOrder(
+      final response = await session.placeStoreOrder(
         lines: [
           {'item_id': int.tryParse(field(_item, ['id'])) ?? 0, 'quantity': choice.quantity},
         ],
@@ -132,6 +132,11 @@ class _StoreItemScreenState extends State<StoreItemScreen> {
             : e.message,
         bad: true,
       );
+    } on OfflineWriteRefused catch (e) {
+      if (!mounted) return;
+      // Offline, and not a write that may be queued: the sentence explains why
+      // rather than leaving a shop purchase looking like a network hiccup.
+      _say(e.message, bad: true);
     } on Object catch (e) {
       if (!mounted) return;
       _say('Cannot reach the server — no order was placed.', bad: true);
