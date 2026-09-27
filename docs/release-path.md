@@ -128,12 +128,21 @@ carries every reading rather than rewriting the first.
    queued; and a queued write the server refuses (a 4xx) is parked with the
    server's own sentence and does not block the queue. `client/test/offline_test.dart`
    is 19 of the branch's **150** client tests (131 before).
-4. **Android and Web** (M5 box 4) — **the client half is MET as of the emulator
-   run of 2026-09-27**: the APK built by CI's `client` job (from the `testing`
-   tree) was installed on an Android emulator, signed in to a real server and
-   rendered its data, with the offline path exercised on the device too
-   ([`evidence/m5-emulator-run.json`](evidence/m5-emulator-run.json)). What remains
-   is the **artifact**: Web builds — proven on this host with the
+4. **Android and Web** (M5 box 4) — **MET.** The client half is the emulator run
+   of 2026-09-27: the APK built by CI's `client` job (from the `testing` tree) was
+   installed on an Android emulator, signed in to a real server and rendered its
+   data, with the offline path exercised on the device too
+   ([`evidence/m5-emulator-run.json`](evidence/m5-emulator-run.json)). The
+   **artifact** half closed with **#126**: every tag now attaches
+   `adjutant-client-vX.Y.Z-android.apk`. The **gate** half is written and switched
+   off — `scripts/android-device-gate.sh` plus
+   `client/integration_test/app_test.dart` do the whole run (database, server, APK,
+   device, sign-in) in one script a person can also run by hand, and the
+   `android-device` job carries it, **inert behind `ANDROID_DEVICE_GATE`** because
+   this repository is not in a runner group that includes the House's `android`
+   runner: a `runs-on: [self-hosted, …]` job with no runner queues forever rather
+   than failing. Two clicks turn it on (runner group, then the variable) and no
+   code change. Web builds — proven on this host with the
    pinned toolchain (`flutter build web --release`, exit 0, 41 MB bundle) — and
    the release workflow now attaches the built bundle to a tag. Android reaches
    the 161st through Obtainium, but **no CI step builds it**, which is #111: the
@@ -280,13 +289,15 @@ Order within the stage is by dependency, not by size:
    should not be called met again on the strength of files existing. The evidence
    is a transcript — `docker compose up -d`, the app answering through the proxy,
    and `deploy/verify.sh`'s proofs — on a host that has never run Adjutant before.
-10. **The release workflow is unexercised until a tag.** It runs on `push: tags`
-   only, so nothing in the gate has ever executed it: a fault in the release path
-   — like the three-of-fourteen list that sat in it — is discovered at the moment
-   a release is being cut. Either give it a `workflow_dispatch` entry so it can be
-   run against a scratch ref, or exercise it once on a throwaway tag before the
-   v0.3.0 tag, and record the run. #111's platform build is what makes the client
-   half of this worth re-running.
+10. **The release workflow is unexercised until a tag. — CLOSED in #126.** It ran
+   on `push: tags` only, so nothing in the gate had ever executed it: a fault in
+   the release path — like the three-of-fourteen list that sat in it — was
+   discovered at the moment a release was cut. It now carries a
+   **`workflow_dispatch` entry**: a manual run builds every artifact, uploads them
+   as workflow artifacts and **creates no release** (the publish step is gated on
+   a tag push), so the pipeline is exercised on `main` before `v0.3.0` is tagged —
+   which is the order this item asked for. #111 is closed by the same work: the
+   `client` job compiles web and Android (#119) and the tag carries the APK.
 
 **Proves it:** M7's eight boxes checked, with the drill transcript, the proxy
 proof and the audit report committed as evidence.
@@ -362,12 +373,22 @@ crates, the live docs, and the F-Droid listing evidenced rather than asserted.
   the MCP↔Hermes proof and the client on Android are the fourth, fifth and sixth —
   #121, #120 and the emulator run), and what is left is the UI/UX review, the APK
   as a release artifact, and the deployment itself.
-- **The artifact a tag produces — decided 2026-09-27.** The tarball's plugin set
-  is derived from the workspace rather than listed (it had rotted to three of
-  fourteen), the client's **web** bundle is attached, and the **Android** artifact
-  is attached when #111 gives it a CI build — not before, because a release that
-  attaches an APK nobody built is a claim, not a build. `releasing.md` describes
-  what a tag now produces.
+- **The artifact a tag produces — decided 2026-09-27, and MET in #126.** The
+  tarball's plugin set is derived from the workspace rather than listed (it had
+  rotted to three of fourteen), the client's **web** bundle is attached, and the
+  **Android** APK is attached — from #126 onward, built `--release` from the same
+  tag, so the sentence "a release that attaches an APK nobody built is a claim,
+  not a build" no longer has an APK to describe. `releasing.md` describes what a
+  tag now produces.
+- **`v0.3.0` was cut on 2026-09-27 with two boxes open — owner decision.** The
+  bullet above says the gate is *deployment-shaped*; the owner cut the tag anyway,
+  with **box 7** (the UI/UX review) and **box 8** (deployed for real use by the
+  161st) still open. That is a **code freeze, not the gate the plan described**,
+  and the distinction is recorded in
+  [`release-v0.3.0.md`](release-v0.3.0.md) — which the tag itself carries, so the
+  tag's own tree says what the tag is. Nothing else about the cut is a surprise:
+  six of the eight boxes are met with evidence, both deployment proofs stand, and
+  the artifact set is the three files above.
 - **Final — `v1.0.0`** when Stage 5's list is done. See
   [`releasing.md`](releasing.md) for the mechanics.
 
