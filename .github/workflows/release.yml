@@ -23,8 +23,36 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - uses: dtolnay/rust-toolchain@stable
+      # `github.ref_name` is the branch name on a dispatch run, and every branch
+      # here is `type/name`. A slash is fatal twice over: it turns a `dist/…`
+      # artifact *path* into a directory that may not exist, and `upload-artifact`
+      # rejects it outright in an artifact *name*. Slug it once, here; every site
+      # below uses this one value. For a tag the slug is the tag, unchanged.
+      - name: Slug the ref for artifact names and paths
+        id: ref
+        run: echo "slug=$(echo "${GITHUB_REF_NAME}" | tr '/' '-')" >> "$GITHUB_OUTPUT"
+
+      # The pinned toolchain, read from `rust-toolchain.toml` — the same step
+      # `ci.yml` uses, for the same reason and one more.
+      #
+      # `dtolnay/rust-toolchain@stable` installs the *stable* toolchain and the
+      # target requested below for it. `cargo` then reads `rust-toolchain.toml`
+      # and switches to the pinned 1.96.0, which never got the target, so the
+      # WASM guest failed with `error[E0463]: can't find crate for core` /
+      # "the wasm32-wasip1 target may not be installed". Found by the first
+      # `workflow_dispatch` rehearsal of this workflow, before v0.3.0 was tagged.
+      #
+      # The second reason is the one `ci.yml` records: `@stable` floats forward
+      # while the pin stays put, so a tag could ship a binary built by a
+      # compiler CI never verified. A release artifact should be built by the
+      # toolchain the tests ran on.
+      - name: Read the pinned toolchain
+        id: toolchain
+        run: echo "channel=$(grep -oP '^channel\s*=\s*"\K[^"]+' rust-toolchain.toml)" >> "$GITHUB_OUTPUT"
+
+      - uses: dtolnay/rust-toolchain@master
         with:
+          toolchain: ${{ steps.toolchain.outputs.channel }}
           targets: wasm32-wasip1
 
       - uses: Swatinem/rust-cache@v2
@@ -94,7 +122,8 @@ jobs:
       - name: Assemble tarball
         run: |
           set -euo pipefail
-          name="adjutant-${GITHUB_REF_NAME}-x86_64-unknown-linux-gnu"
+          ref="${{ steps.ref.outputs.slug }}"
+          name="adjutant-${ref}-x86_64-unknown-linux-gnu"
           mkdir -p "dist/$name/plugins"
           cp target/release/adjutant "dist/$name/"
           # Whatever the staging step derived — the assertion below is about this
@@ -115,7 +144,8 @@ jobs:
       - name: Bundle the client for the web
         run: |
           set -euo pipefail
-          name="adjutant-client-${GITHUB_REF_NAME}-web"
+          ref="${{ steps.ref.outputs.slug }}"
+          name="adjutant-client-${ref}-web"
           tar -C client/build -czf "dist/$name.tar.gz" web
           (cd dist && sha256sum "$name.tar.gz" > "$name.tar.gz.sha256")
 
@@ -126,7 +156,8 @@ jobs:
       - name: Bundle the client for Android
         run: |
           set -euo pipefail
-          name="adjutant-client-${GITHUB_REF_NAME}-android"
+          ref="${{ steps.ref.outputs.slug }}"
+          name="adjutant-client-${ref}-android"
           cp client/build/app/outputs/flutter-apk/app-release.apk "dist/$name.apk"
           (cd dist && sha256sum "$name.apk" > "$name.apk.sha256")
           ls -l "dist/$name.apk"
@@ -137,7 +168,7 @@ jobs:
         if: github.event_name == 'workflow_dispatch'
         uses: actions/upload-artifact@v4
         with:
-          name: adjutant-${{ github.ref_name }}-artifacts
+          name: adjutant-${{ steps.ref.outputs.slug }}-artifacts
           path: dist/*
           if-no-files-found: error
 
