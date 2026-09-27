@@ -1212,7 +1212,11 @@ carry the Accords — searchable history and the conflict pathway.
 - [ ] Archive plugin: Congress proceedings, minutes, full-text search, timeline, decision→policy→mission tracking
 - [ ] Conflicts plugin: staged pathway, case management, stage transitions, anti-dropout nudges
 - [ ] Announcements plugin: creation, read receipts, categories, push notifications
-- [ ] SDK v0.3: permission macros, migration helpers
+- [ ] SDK v0.3: permission macros, migration helpers *(delivered 2026-09-27 —
+  `permissions!`/`migrations!`, `SDK_ABI_VERSION` still 4; see the correction in
+  [`docs/milestones/M6-operational-plugins.md`](docs/milestones/M6-operational-plugins.md).
+  The box is left unticked with its siblings: this list is not the per-box ledger,
+  the milestone record is.)*
 - [ ] All plugins built with the SDK, validating the API
 
 **Deliverable:** Eleven plugins covering the full operational scope of a scout troop. Archive, conflicts and announcements were unassigned before this revision; they are in scope for 1.0, not post-1.0 — see [`docs/plugin-roadmap.md`](docs/plugin-roadmap.md) §3.

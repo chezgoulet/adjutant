@@ -384,6 +384,31 @@ first-party plugin to pick the helpers up.
 
 ### Fixed
 
+- **A tagged release would have shipped three plugin libraries out of fourteen,
+  and no client at all** (#111's class of defect, in the file that builds what
+  users download). `.github/workflows/release.yml` assembled its tarball from a
+  hand-written `cp` list — `hello`, `auth`, `membership` — which is the same list
+  #88 found in the Dockerfile after it had rotted, and the same failure mode
+  `scripts/stage-plugins.py` was written to end (issue #55: a hand-kept list falls
+  behind, and the gate stays green while the product is short). The plugin set is
+  now **derived** by that script with `--profile release`, the job fails if the
+  tarball carries fewer libraries than the staging step derived, and the release
+  attaches the Flutter client's **web** bundle built from the same tag with the
+  same pinned toolchain the gates read (`flutter-version-file: client/pubspec.yaml`,
+  issue #76). **Android is deliberately not attached yet**: no CI step builds it,
+  so the artifact waits for #111 rather than shipping an APK nobody built. The
+  release *path* is also documented as it is rather than as it was read:
+  `releasing.md` said the tag publishes the crates — no step does — and
+  `release-path.md` still presented Stage 0 as "do first" and the client-in-CI
+  harness as the highest-leverage item to build, both of which had already landed.
+  The plan of record, `plugin-roadmap.md`'s milestone states and decisions, M6's
+  record (SDK v0.3 was delivered after it was written) and a **new M5 record** now
+  carry dated states with their evidence, including the owner's five decisions of
+  2026-09-27: the v0.3.0 gate keeps its written scope, offline mode uses a plain
+  durable cache rather than drift, the 161st's instance runs on hardware the troop
+  owns or is given, a release attaches the server tarball and the client's web
+  bundle (Android with #111), and the next lane is this honesty pass.
+
 - **The correction route's doc comment promised a carry-over that never held
   for `tax_statement` and `issued_on`** (#71). `POST
   /api/finance/receipt/{id}/supersede`'s comment (and `docs/api-reference.md`,

@@ -1,9 +1,17 @@
 # The release path — ordered work from `testing` to v1.0
 
-**Status:** the plan of record as of **2026-09-26**, `testing` at `c5698f5`.
+**Status:** the plan of record as of **2026-09-27**, `testing` at `75981e5`.
 **Owner:** the same rule as [`plugin-roadmap.md`](plugin-roadmap.md) §7 — this
-document is edited in the same PR that changes a stage's state. The seven owner
-decisions it is built on are recorded in that document's §6.
+document is edited in the same PR that changes a stage's state. The owner
+decisions it is built on are recorded in that document's §6 (2026-09-26 and
+2026-09-27).
+
+> **Read the states, not the intent.** This document lagged its own rule once
+> already: Stage 0's two items and Stage 1's harness all landed while this page
+> still called them "do first" and "highest-leverage", so anyone reading it as
+> status would have been wrong about the branch. Every state line below cites a
+> commit, a run id or a log line; where a state is dated, the date is when it was
+> read and not a claim about today.
 
 [`SPEC.md`](../SPEC.md) §15 owns the milestones and their exit criteria;
 [`plugin-roadmap.md`](plugin-roadmap.md) owns which plugins exist and in what
@@ -41,76 +49,99 @@ narration. A local green is not the branch's gate.
 
 ---
 
-## Stage 0 — the gate's own honesty (do first; it is small)
+## Stage 0 — the gate's own honesty — **both items MET**
 
-Two items, because they protect everything after them and both are one sitting:
+Two items, because they protect everything after them and both were one sitting:
 
-1. **#76 — pin the Flutter version in CI.** The `client` job follows the stable
-   channel, so a local green can differ from the branch's gate for reasons nobody
-   chose.
+1. **#76 — pin the Flutter version in CI. — MET.** Both jobs that touch the
+   client read the same pinned toolchain
+   (`subosito/flutter-action@v2` with `flutter-version-file: client/pubspec.yaml`
+   and `channel: stable`), so a local green and the branch's gate at least agree
+   about which Flutter they mean. The release workflow now reads the same file,
+   for the same reason.
 2. **#83 — the scheduler flake** (`host_db::probe_scheduler_runs_records_and_stops`).
-   A gate that needs a re-run teaches people to wave red through. This is a work
-   item, not noise.
+   **— MET**, merged as `fix/scheduler-probe-flake`. A gate that needs a re-run
+   teaches people to wave red through, and this one no longer does.
 
-**Proves it:** `testing` green without a re-run across a full day.
+**Proves it:** `testing` green without a re-run across a full day — and green on
+run `36288096546` (`75981e5`) with no re-run.
 
 ---
 
 ## Stage 1 — the day-one release (M5's remainder)
 
-**Exit criterion:** SPEC §15 M5 — seven boxes now that iOS is deferred.
+**Exit criterion:** SPEC §15 M5 — **eight** boxes (this page said "seven now that
+iOS is deferred", which was an arithmetic slip: iOS was a clause inside the
+Android-and-Web box, so deferring it moved no box). As of 2026-09-27, three are
+met, one is partial and four are open — the per-box state and its evidence are in
+[`milestones/M5-mcp-and-flutter-mvp.md`](milestones/M5-mcp-and-flutter-mvp.md).
 
-1. **The client-in-CI harness — the missing half of the v1.0 gate.** §1 test 3
-   requires the path to be "exercised by the fresh-machine harness in CI". Today
-   the client's tests run against a **mock** HTTP client and the end-to-end
-   harnesses drive the API, not the app: **no client path is exercised against a
-   live server in CI at all.** One harness — the Flutter app driven against a
-   booted server, on the existing `adjutant test-plugin` rail — converts every
-   client-covered plugin's "usable" claim from a demonstration into a gate, and
-   makes Stage 5.1 mechanical. Highest-leverage item on this page.
+1. **The client-in-CI harness — the missing half of the v1.0 gate. — MET.**
+   `scripts/client-live-harness.sh` derives its own database, bootstraps the
+   plugin roles into it, boots a server with the spoofable dev-header stub
+   **off**, and runs `client/live/live_client_test.dart` against it. On
+   `testing` at `75981e5` (run `36288096546`, `verify`) the step reported
+   `bootstrapped 14 plugin role(s)`, `booting the server on
+   http://127.0.0.1:8790 (dev headers OFF)`, then nine probes — server health,
+   the stub refusing a spoofed `x-dev-user` with `401`, `login`, `me`,
+   `members`, `lodges`, `motions`, `plugins`, and a dead session refused — and
+   `🎉 10 tests passed.` / `==> live client gate passed`. The `client` job beside
+   it passed **131 tests**. This is the gate that converts every client-covered
+   plugin's "usable" claim from a demonstration into a check, and it is what
+   makes Stage 5.1 mechanical.
 2. **The MCP connect-and-interact proof** (M5 box 2). The plugin loads and is
    tested; what is missing is a real Hermes agent connecting through it with
    permissions filtered and invocations logged.
-3. **Offline mode** (M5 box 5) — the client caches locally and syncs. The largest
-   single client item here, and it needs one decision before it starts rather
-   than during: local storage (drift/sqlite) or a plain cache.
-4. **Android and Web** (M5 box 4). Web builds in CI; Android reaches the 161st
-   through Obtainium. **iOS is deferred entirely** by owner decision — no runner,
-   no distribution path, revisit after 1.0 — and SPEC's box now says so.
+3. **Offline mode** (M5 box 5) — the client caches locally and syncs. **The
+   storage decision is taken (owner, 2026-09-27): a plain durable read cache plus
+   a queued write list — no schema on the device.** drift/SQLite stays the
+   answer *if* offline queries turn out to need a schema; it is not the opening
+   move. The work itself has not started.
+4. **Android and Web** (M5 box 4). Web builds — proven on this host with the
+   pinned toolchain (`flutter build web --release`, exit 0, 41 MB bundle) — and
+   the release workflow now attaches the built bundle to a tag. Android reaches
+   the 161st through Obtainium, but **no CI step builds it**, which is #111: the
+   release workflow grows the Android artifact when that gate exists, rather than
+   attaching an APK nobody built. **iOS is deferred entirely** by owner decision —
+   no runner, no distribution path, revisit after 1.0 — and SPEC's box says so.
 5. **The UI/UX review** (M5 box 7). Christopher authors it, as with the other
    deep review docs; the 48 dp finding that put Governance in Settings rather
    than a ninth navigation destination is its first entry.
-6. **Deploy for the 161st** (M5 box 8). Blocked on Stage 3.1 (the proxy-fronted
-   deployment proven) and Stage 3.2 (the restore drill) — *not* on anything in
-   the application. The host is chosen **after** 3.1, deliberately: the owner's
-   decision is to pick a host against a finished, exercised deployment rather
-   than an aspiration.
-7. **Choose the plugin set — and make the choice real (#89, #90).** Owner
-   requirement, 2026-09-26. Two halves that ship together, because either alone
-   is a lie: (a) **`enabled` must decide what is loaded, not just what answers**
-   — today a disabled plugin is still `dlopen`ed, migrated, granted permissions
-   and holding a database pool, with only `resolve()` returning
-   `RouteLookup::Disabled` (#89); and (b) **a first-run flow that lets the
-   operator choose the plugin set from the start** (#90), with the same choice
-   available from the CLI so an unattended install never needs a browser. A
-   plugin that was never enabled has no schema — the truest form of "content not
-   loaded at all" — so the first enable is a migrating operation, and that is the
-   acceptance the core half has to meet. This sits in Stage 1 rather than with
-   the other core work because the day-one release is judged by a leader's first
-   ten minutes, and a deployment that starts by asking what the troop needs is a
-   different product from one that starts with fourteen plugins switched on.
+6. **Deploy for the 161st** (M5 box 8). **The host decision is taken (owner,
+   2026-09-27): hardware the 161st owns or is given.** That closes Stage 3.3 and
+   leaves one open question this document must not answer by assumption — how
+   that box is reached from outside. A Cloudflare Tunnel on the troop's hardware
+   opens no ports and is the shape Stage 3.1's proof exercised; a port-forward
+   with a certificate of their own is the other honest shape, and the choice
+   belongs with the troop's network rather than with this repository. Everything
+   else is unblocked: Stage 3.1 and 3.2 are met.
+7. **Choose the plugin set — and make the choice real (#89, #90). — MET.**
+   `enabled` decides what is loaded rather than what answers, the choice is
+   recorded in the database with both doors (CLI and the first-run wizard)
+   calling one implementation, and a plugin that is enabled for the first time
+   migrates then. Merged as `#110` (`b3999f34`); both issues are closed.
 
-**Proves it:** the seven M5 boxes checked in a new `M5` record, each with its run
-id; the plugin set chosen on a fresh deployment and honoured by what the server
-loads (#89/#90); and the client harness green on `testing`.
+**Proves it:** the eight M5 boxes checked in a new `M5` record, each with its run
+id — the record exists as [`milestones/M5-mcp-and-flutter-mvp.md`](milestones/M5-mcp-and-flutter-mvp.md),
+with **three boxes met, one partial and four open**. The plugin set is chosen on a
+fresh deployment and honoured by what the server loads (#89/#90), and the client
+harness is green on `testing` — both done. What this stage is still waiting on is
+items 2, 3, 5, 6 and the Android half of item 4.
 
 ---
 
 ## Stage 2 — M6's open boxes
 
-1. **SDK v0.3** — permission macros and migration helpers (SPEC §15 M6). The SDK
-   is the product; this is the last additive step before the 1.0 freeze, and it
-   carries the version move (Stage 5).
+1. **SDK v0.3** — permission macros and migration helpers (SPEC §15 M6). **— MET.**
+   `permissions!` and `migrations!` are in `plugins/sdk/src/lib.rs`, each carrying
+   compile-time traps at the invocation (a duplicate permission id, a duplicate or
+   out-of-order migration version, a version below 1, an empty id or description),
+   and `testing::assert_routes_gate_declared` turns the one invariant the macros
+   cannot express into an assertion that names the route. Additive: no ABI bump,
+   `SDK_ABI_VERSION` stays **4**. `adjutant-conflicts` is converted as the proof,
+   with its migration versions, names and SQL byte-identical so no database
+   re-runs anything. M6's record and SPEC's M5 box were written before this landed
+   and said otherwise; both now carry the dated correction.
 2. **Announcements delivery — as channels, not a channel.** The owner's answer is
    *all of them*: in-app (already there through the record and the client's
    badge), **email**, **ntfy**, and native app notifications, with FCM/APNs only
@@ -177,30 +208,46 @@ Order within the stage is by dependency, not by size:
    automated** — the cadence is documented and nothing takes the dump on a
    schedule; that belongs with item 3's host decision, since it is the host that
    would own the timer.
-3. **The host decision**, now against a working deployment rather than a plan —
-   and it follows 3.1, because the deployment is what tells us what the host has
-   to be.
+3. **The host decision — TAKEN (owner, 2026-09-27): hardware the 161st owns or is
+   given.** Against a working deployment rather than a plan, as intended. Two
+   consequences this document records rather than resolves: **RPO is still
+   unautomated** (item 2) and now lands with the troop's box, since the host owns
+   the timer; and **how that box is reached from outside is open** — a Cloudflare
+   Tunnel on it (no ports opened, the shape item 1 proved) or a port-forward with
+   a certificate of their own. The public TLS path is unproven in either shape,
+   which is the same open thread item 1 names.
 4. **#51 — the security audit** (OWASP Top 10 + dependency scanning). The House's
    `aegis-*` audit modules are the tool; run it **after** Stage 4, so it measures
-   the shape that ships.
-5. **#50 — performance at 100+ concurrent users.**
-6. **#52 — the admin guide and the user guide.** The user guide is also the
-   dependency of the community plugin guide in Stage 5.
-7. **#53 — CONTRIBUTING.md, code of conduct, PR process.** Small, but a
-   precondition of Stage 5's community contribution, not a courtesy.
-8. **The image is never built in CI, so the deployment is ungraded.** The
-   workflow builds the workspace and stages the plugin libraries, but nothing
-   builds the `Dockerfile` — which is how an image shipping **three plugins of
-   fourteen** stayed green until a human read it (#88). The gate is cheap: build
-   the image and assert the plugin count inside it matches the workspace's
-   `cdylib` count, the same derivation `scripts/stage-plugins.py` already uses.
-   Folded in here rather than beside the probe steps because it needs a Docker
-   runner, not a database.
+   the shape that ships. **Partly in flight:** the dependency-scanning half is PR
+   #113 (green; not yet merged). The OWASP audit itself is not started.
+5. **#50 — performance at 100+ concurrent users.** Not started.
+6. **#52 — the admin guide and the user guide.** Not started. The user guide is
+   also the dependency of the community plugin guide in Stage 5.
+7. **#53 — CONTRIBUTING.md, code of conduct, PR process.** **In PR #112** (green;
+   not yet merged). Small, but a precondition of Stage 5's community
+   contribution, not a courtesy.
+8. **The image is never built in CI, so the deployment is ungraded. — STILL
+   OPEN.** The workflow builds the workspace and stages the plugin libraries, but
+   nothing builds the `Dockerfile` — which is how an image shipping **three
+   plugins of fourteen** stayed green until a human read it (#88). **The same
+   three-of-fourteen list was in `.github/workflows/release.yml`**, in the one
+   file that builds what users download: fixed 2026-09-27 by deriving the set from
+   `scripts/stage-plugins.py` and failing when the tarball carries fewer libraries
+   than the staging step derived. The gate for the *image* is still the cheap
+   thing to build here: build it and assert the plugin count inside matches the
+   same derivation.
 9. **The compose stack starts on a clean host.** Not a documentation task: the
    first real run is what found the Postgres 18 mount fault above, and the box
    should not be called met again on the strength of files existing. The evidence
    is a transcript — `docker compose up -d`, the app answering through the proxy,
    and `deploy/verify.sh`'s proofs — on a host that has never run Adjutant before.
+10. **The release workflow is unexercised until a tag.** It runs on `push: tags`
+   only, so nothing in the gate has ever executed it: a fault in the release path
+   — like the three-of-fourteen list that sat in it — is discovered at the moment
+   a release is being cut. Either give it a `workflow_dispatch` entry so it can be
+   run against a scratch ref, or exercise it once on a throwaway tag before the
+   v0.3.0 tag, and record the run. #111's platform build is what makes the client
+   half of this worth re-running.
 
 **Proves it:** M7's eight boxes checked, with the drill transcript, the proxy
 proof and the audit report committed as evidence.
@@ -214,12 +261,17 @@ wish. None should be carried into a release as a "known issue" while it is an
 afternoon's fix.
 
 - **#78 — the notification record's identity fields are mutable by whoever holds
-  `UPDATE`.** The sharpest: an integrity hole in what we just shipped, and it sits
-  under the channel work of Stage 2.2.
+  `UPDATE`.** **Fixed in PR #115** (green on `verify`, `client` and `msrv` as of
+  2026-09-27; not yet merged).
 - **#72 — the receipts read routes' ownership branch is proven only by the mock
-  host.** A gate claiming more than it proves.
+  host.** **Fixed in PR #116** (green on the same three jobs; not yet merged).
 - **#71 — a correction's carry-over claim is wrong for `tax_statement` and
-  `issued_on`.** A document that overstates.
+  `issued_on`.** **DONE**, merged as PR #117 (`75981e5`) and closed 2026-09-27.
+  The documents were the wrong side, not the code: the wording is derived from the
+  troop's current declaration and `issued_on` is the correction's own date; what
+  carries over is the receipt's identity. The claim is now measured by a DB-backed
+  probe that moves the declaration between the issue and the correction, and that
+  probe fails against the carry-over variant.
 
 **#74** (a receipt does not yet follow an online payment automatically) is *not*
 on this list: it is a feature, and it belongs with Stage 2's finance work.
@@ -263,34 +315,55 @@ crates, the live docs, and the F-Droid listing evidenced rather than asserted.
 ## The release decision
 
 - **Interim — cut `v0.3.0` ("day one") when it is actually deployable:** Stage 1's
-  boxes, plus Stage 3.1's proxy-fronted proof and Stage 3.2's restore drill. The
-  owner's preference is that this is a *deployment-shaped* gate — the 161st runs a
-  tag they can also host — not a date and not a branch.
+  boxes, plus Stage 3.1's proxy-fronted proof and Stage 3.2's restore drill — the
+  owner confirmed this scope on **2026-09-27** rather than re-scoping it. The
+  preference is that this is a *deployment-shaped* gate — the 161st runs a tag
+  they can also host — not a date and not a branch. As of 2026-09-27: both
+  deployment proofs are met, Stage 1 has three of eight boxes met, and what is
+  left is the MCP↔Hermes proof, offline mode, the UI/UX review, the Android
+  artifact (#111) and the deployment itself.
+- **The artifact a tag produces — decided 2026-09-27.** The tarball's plugin set
+  is derived from the workspace rather than listed (it had rotted to three of
+  fourteen), the client's **web** bundle is attached, and the **Android** artifact
+  is attached when #111 gives it a CI build — not before, because a release that
+  attaches an APK nobody built is a claim, not a build. `releasing.md` describes
+  what a tag now produces.
 - **Final — `v1.0.0`** when Stage 5's list is done. See
   [`releasing.md`](releasing.md) for the mechanics.
 
 ## The one action the owner owes
 
-**The crates.io token.** Generate one, add it as the repository secret the
-publish workflow expects (`CARGO_REGISTRY_TOKEN`, per `releasing.md`
-§One-time setup), and Stage 5.0 can run the same day. Nothing else on this page
-is blocked behind a decision — the seven are answered, and they are recorded in
-`plugin-roadmap.md` §6.
+**The crates.io token.** Generate one and keep it where `cargo publish` can read
+it (`cargo login`), and Stage 5.0's name reservation can run the same day. One
+correction to how this page and `releasing.md` described it: **nothing in CI
+publishes the crates** — the release workflow builds the tarball and the client
+bundle, and has no publish step — so the token is not a repository secret today;
+it is needed the moment someone publishes, and wiring that step is a deliberate
+choice rather than an oversight to assume.
+
+Nothing else on this page is blocked behind a decision: the owner's answers are
+recorded in `plugin-roadmap.md` §6 (both the 2026-09-26 seven and the
+2026-09-27 five).
 
 ## Lanes (how to run it without colliding)
 
 Four lanes run concurrently; they touch different files, so they can go in
 parallel while every PR passes the same gate. The only hard sequence is inside a
-lane.
+lane. State as of 2026-09-27:
 
-- **A — client.** The Stage 1.1 harness first (it gates every other claim), then
-  `finance`'s treasurer view, then `archive`, then `conflicts`' case list and
-  timeline, then offline mode.
-- **B — core and SDK.** Stage 0's #76 and #83, then SDK v0.3, then #78, #72, #71.
-- **C — ops and deployment.** Stage 3.1's proxy-fronted proof, then #54's restore
-  drill, then the host decision, then #51, #50, #52, #53.
-- **D — integration.** The MCP↔Hermes proof, then the notification channels
-  (email, ntfy) with #46 and #78 folded in.
+- **A — client.** The harness (**done**), then `finance`'s treasurer view, then
+  `archive`, then `conflicts`' case list and timeline, then offline mode (storage
+  decided: plain cache plus a queued write list).
+- **B — core and SDK.** Stage 0's #76 and #83 (**both done**), then SDK v0.3
+  (**done**), then #78 and #72 (**both in green PRs**), then #71 (**done,
+  merged**).
+- **C — ops and deployment.** Stage 3.1's proxy-fronted proof and #54's restore
+  drill (**both done**), then the host decision (**taken: troop-owned
+  hardware**), then #51, #50, #52, #53 — with #53 and the dependency-scanning half
+  of #51 in green PRs.
+- **D — integration.** The MCP↔Hermes proof (**not started**; next on the
+  path), then the notification channels (email, ntfy) with #46 and #78 folded in —
+  `DELIVERY_CHANNELS` is still `[in_app]`.
 
 Merge discipline, unchanged: one concern per PR; merge `testing` into the branch
 before opening it; a red check is worked, not re-run past — and if it is a flake,

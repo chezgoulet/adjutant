@@ -19,6 +19,25 @@ exercised against a live server in CI. See
 [`../plugin-roadmap.md`](../plugin-roadmap.md) §3 and
 [`../release-path.md`](../release-path.md) Stage 1.
 
+> **Correction (2026-09-27).** Two of the sentences above are no longer true, and
+> neither is being rewritten — a record's figures are dated
+> (`plugin-roadmap.md` §7), so the current state is added beside them:
+>
+> 1. **SDK v0.3 is delivered**, after this record was written. `permissions!` and
+>    `migrations!` are in `plugins/sdk/src/lib.rs` with compile-time traps at the
+>    invocation, `adjutant-conflicts` is converted as the proof (its migration
+>    versions, names and SQL byte-identical, so no database re-runs anything), and
+>    `testing::assert_routes_gate_declared` covers the invariant the macros cannot
+>    express. Additive: `SDK_ABI_VERSION` remains **4**. So M6 has **one** box
+>    open — announcements' delivery — not two.
+> 2. **No client path is exercised against a live server in CI** was true when
+>    written and is now false: `scripts/client-live-harness.sh` is a step inside
+>    `verify` and reported `🎉 10 tests passed` against a booted server with the
+>    dev-header stub off, on `testing` at `75981e5` (run `36288096546`). The
+>    workspace suite on that head is **573 passed / 0 failed / 65 ignored**, and
+>    M5 now has a record of its own:
+>    [`M5-mcp-and-flutter-mvp.md`](M5-mcp-and-flutter-mvp.md).
+
 ## Goal
 
 > Build the operational plugins that scouts use daily, and the two that carry the
@@ -40,9 +59,10 @@ exercised against a live server in CI. See
   notifications (`announcements.*`, 12 routes, 4 permissions). Three of the four
   are built; **delivery is deferred**, deliberately and visibly — see
   [Not delivered](#not-delivered-at-this-milestone).
-- [ ] **SDK v0.3** — permission macros, migration helpers. **Not delivered.** The
-  SDK is still 0.2.0 with `SDK_ABI_VERSION` 4; the additions this milestone made
-  are additive. See [Not delivered](#not-delivered-at-this-milestone).
+- [x] **SDK v0.3** — permission macros, migration helpers. **Delivered
+  2026-09-27**, after this record was written: `permissions!` and `migrations!`
+  in `plugins/sdk/src/lib.rs`, `adjutant-conflicts` converted as the proof,
+  `SDK_ABI_VERSION` still 4. See the correction above.
 - [x] **All plugins built with the SDK, validating the API** — twelve libraries
   in the workspace (the eleven plugins plus `hello`), every one accepted by
   `validate-plugin` and probed by `test-plugin`.
@@ -147,12 +167,14 @@ DELETE FROM core.permissions      WHERE id            LIKE 'announcement:%';
 
 Two exit criteria are not met. Neither is hidden by the checkboxes above.
 
-1. **SDK v0.3 (permission macros, migration helpers).** The SDK remains 0.2.0
-   with `SDK_ABI_VERSION` 4. No permission macro and no migration helper was
-   added; the SDK's only macro is `export_plugin!`. This needs a decision rather
-   than a note: either the work lands in M7, or SPEC §15 M6 is amended to drop
-   the criterion. Nothing else in the milestone depended on it — every plugin
-   declares permissions and migrations with the 0.2.0 surface.
+1. **SDK v0.3 (permission macros, migration helpers) — delivered 2026-09-27, after
+   this section was written.** `permissions!` and `migrations!` are in
+   `plugins/sdk/src/lib.rs`; `adjutant-conflicts` is converted as the proof, with
+   its migration versions, names and SQL byte-identical so no database re-runs
+   anything; `SDK_ABI_VERSION` stays 4, and the SDK's version moves with the
+   release rather than with the macros. The question this section posed — land in
+   M7, or amend SPEC to drop the criterion — is therefore moot: it landed in M6.
+   The paragraph below is kept as written, because a record's figures are dated.
 2. **Push notification delivery.** Deliberately deferred, not overlooked: the core
    had no delivery channel (`docs/design/bg.md` §4 names it the missing
    capability), so `announcements` builds the seam and stops at it. The core now

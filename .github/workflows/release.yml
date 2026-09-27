@@ -26,18 +26,61 @@ jobs:
       - name: Build WASM guest
         run: cargo build --manifest-path wasm/Cargo.toml --release --target wasm32-wasip1
 
+      # The plugin set is **derived, never listed here**. This step used to be
+      # three hand-written `cp` lines (hello, auth, membership) while the
+      # workspace staged fourteen libraries, so a tarball cut from it would have
+      # shipped eleven plugins short — the same defect #88 found in the
+      # Dockerfile, in the one file that builds what users download. The list was
+      # the bug. `scripts/stage-plugins.py` derives a plugin from `cargo metadata`
+      # (a publishable crate that builds a `cdylib`) and exits non-zero when a
+      # crate built a library that is not on disk, so the count here cannot drift
+      # from the workspace's.
+      - name: Stage the plugin libraries (derived from the workspace)
+        run: python3 scripts/stage-plugins.py --profile release
+
+      # The client half of the product, built from the same tag. Web is built
+      # here because the 161st can open it from anywhere; the Android artifact
+      # (the Obtainium path) lands with #111, which is where the platform build
+      # gets its runner and its proof. Until then a tagged release carries the
+      # web bundle and says so, rather than attaching an APK nobody built.
+      - uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          # The same pinned toolchain the gates read (issue #76): two Flutter
+          # versions in one repository is two answers to "does it build".
+          flutter-version-file: client/pubspec.yaml
+          cache: true
+
+      - name: Build the client for the web
+        run: flutter build web --release
+        working-directory: client
+
       - name: Assemble tarball
         run: |
           set -euo pipefail
           name="adjutant-${GITHUB_REF_NAME}-x86_64-unknown-linux-gnu"
           mkdir -p "dist/$name/plugins"
           cp target/release/adjutant "dist/$name/"
-          cp target/release/libadjutant_hello.so "dist/$name/plugins/"
-          cp target/release/libadjutant_auth.so "dist/$name/plugins/"
-          cp target/release/libadjutant_membership.so "dist/$name/plugins/"
+          # Whatever the staging step derived — the assertion below is about this
+          # directory not being silently smaller than the workspace again.
+          cp plugins-built/*.so "dist/$name/plugins/"
           cp wasm/target/wasm32-wasip1/release/adjutant_hello_wasm.wasm "dist/$name/plugins/"
           cp README.md LICENSE "dist/$name/"
+          staged=$(ls plugins-built/*.so | wc -l)
+          shipped=$(ls "dist/$name/plugins/"*.so | wc -l)
+          if [ "$shipped" -ne "$staged" ] || [ "$shipped" -lt 1 ]; then
+            echo "::error::the tarball carries $shipped plugin libraries but $staged were staged"
+            exit 1
+          fi
+          echo "tarball carries $shipped plugin libraries"
           tar -C dist -czf "dist/$name.tar.gz" "$name"
+          (cd dist && sha256sum "$name.tar.gz" > "$name.tar.gz.sha256")
+
+      - name: Bundle the client for the web
+        run: |
+          set -euo pipefail
+          name="adjutant-client-${GITHUB_REF_NAME}-web"
+          tar -C client/build -czf "dist/$name.tar.gz" web
           (cd dist && sha256sum "$name.tar.gz" > "$name.tar.gz.sha256")
 
       - name: Create release
