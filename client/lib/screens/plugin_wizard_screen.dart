@@ -218,14 +218,10 @@ class _PluginWizardScreenState extends State<PluginWizardScreen> {
                       '${(_error ?? '').isEmpty ? '' : '\n\nThe server said: $_error'}',
                 )
               : (_error != null && !_loadedOnce)
-                  ? EmptyState(
-                      icon: Icons.cloud_off,
-                      title: 'Cannot reach the server',
-                      message: _error!,
-                      action: FilledButton(
-                        onPressed: _load,
-                        child: const Text('Retry'),
-                      ),
+                  ? failureState(
+                      error: _error,
+                      statusCode: _errorStatus,
+                      onRetry: _load,
                     )
                   : _body(),
     );

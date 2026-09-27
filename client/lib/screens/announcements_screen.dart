@@ -192,14 +192,13 @@ class _AnnouncementsScreenState extends State<AnnouncementsScreen> {
                       '${(_error ?? '').isEmpty ? '' : '\n\nThe server said: $_error'}',
                 )
               : _error != null
-                  ? EmptyState(
-                      icon: Icons.cloud_off,
-                      title: 'Cannot reach the server',
-                      message: _error!,
-                      action: FilledButton(
-                        onPressed: _load,
-                        child: const Text('Retry'),
-                      ),
+                  // A 4xx is the server explaining itself (a route this
+                  // deployment does not run answers 404), so it is rendered as
+                  // what it is — with the server's own sentence and no Retry.
+                  ? failureState(
+                      error: _error,
+                      statusCode: _errorStatus,
+                      onRetry: _load,
                     )
                   : _visible.isEmpty
                       ? _emptyInbox()

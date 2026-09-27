@@ -180,14 +180,11 @@ class _StoreItemScreenState extends State<StoreItemScreen> {
                       '${(_error ?? '').isEmpty ? '' : '\n\nThe server said: $_error'}',
                 )
               : _item.isEmpty
-                  ? EmptyState(
-                      icon: Icons.cloud_off,
-                      title: 'Cannot reach the server',
-                      message: _error ?? 'Nothing came back for this item.',
-                      action: FilledButton(
-                        onPressed: _load,
-                        child: const Text('Retry'),
-                      ),
+                  ? failureState(
+                      error: _error,
+                      statusCode: _errorStatus,
+                      onRetry: _load,
+                      missingTitle: 'No such item',
                     )
                   : _body(),
     );

@@ -1,6 +1,7 @@
 import 'package:flutter/material.dart';
 import 'package:provider/provider.dart';
 
+import '../api/api_client.dart';
 import '../state/session.dart';
 import '../theme/app_theme.dart';
 import '../widgets/common.dart';
@@ -21,6 +22,10 @@ class _CalendarScreenState extends State<CalendarScreen> {
   bool _stale = false;
   DateTime? _cachedAt;
   String? _error;
+
+  /// The status the server answered with, when it answered at all — `null` means
+  /// nothing came back, which is the only case that is really offline.
+  int? _errorStatus;
   DateTime _month = DateTime.now();
 
   @override
@@ -34,6 +39,7 @@ class _CalendarScreenState extends State<CalendarScreen> {
     setState(() {
       _loading = true;
       _error = null;
+      _errorStatus = null;
     });
     try {
       final events = await session.cachedList('events', () => session.api.events());
@@ -44,6 +50,13 @@ class _CalendarScreenState extends State<CalendarScreen> {
         _upcoming = upcoming.value;
         _stale = events.isStale;
         _cachedAt = events.cachedAt;
+        _loading = false;
+      });
+    } on ApiException catch (e) {
+      if (!mounted) return;
+      setState(() {
+        _error = e.message;
+        _errorStatus = e.statusCode;
         _loading = false;
       });
     } on Object catch (e) {
@@ -64,11 +77,10 @@ class _CalendarScreenState extends State<CalendarScreen> {
         if (_stale) OfflineBanner(cachedAt: _cachedAt),
         Expanded(
           child: _error != null && _events.isEmpty && _upcoming.isEmpty
-              ? EmptyState(
-                  icon: Icons.cloud_off,
-                  title: 'Cannot reach the server',
-                  message: _error!,
-                  action: FilledButton(onPressed: _load, child: const Text('Retry')),
+              ? failureState(
+                  error: _error,
+                  statusCode: _errorStatus,
+                  onRetry: _load,
                 )
               : RefreshIndicator(
                   onRefresh: _load,

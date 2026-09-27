@@ -120,13 +120,11 @@ class _EquipmentItemScreenState extends State<EquipmentItemScreen> {
       );
     }
     if (_error != null) {
-      return EmptyState(
-        icon: _errorStatus == 404 ? Icons.search_off : Icons.cloud_off,
-        title: _errorStatus == 404 ? 'No such item' : 'Cannot reach the server',
-        message: _error!,
-        action: _errorStatus == 404
-            ? null
-            : FilledButton(onPressed: _load, child: const Text('Retry')),
+      return failureState(
+        error: _error,
+        statusCode: _errorStatus,
+        onRetry: _load,
+        missingTitle: 'No such item',
       );
     }
 

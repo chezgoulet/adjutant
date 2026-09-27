@@ -143,11 +143,10 @@ class _UnsettledTabState extends State<_UnsettledTab> {
       );
     }
     if (_error != null) {
-      return EmptyState(
-        icon: Icons.cloud_off,
-        title: 'Cannot reach the server',
-        message: _error!,
-        action: FilledButton(onPressed: _load, child: const Text('Retry')),
+      return failureState(
+        error: _error,
+        statusCode: _errorStatus,
+        onRetry: _load,
       );
     }
     final scheme = Theme.of(context).colorScheme;
@@ -635,11 +634,10 @@ class _CompsTabState extends State<_CompsTab> {
       );
     }
     if (_error != null) {
-      return EmptyState(
-        icon: Icons.cloud_off,
-        title: 'Cannot reach the server',
-        message: _error!,
-        action: FilledButton(onPressed: _load, child: const Text('Retry')),
+      return failureState(
+        error: _error,
+        statusCode: _errorStatus,
+        onRetry: _load,
       );
     }
     final scheme = Theme.of(context).colorScheme;

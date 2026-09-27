@@ -1,6 +1,7 @@
 import 'package:flutter/material.dart';
 import 'package:provider/provider.dart';
 
+import '../api/api_client.dart';
 import '../state/session.dart';
 import '../theme/app_theme.dart';
 import '../widgets/common.dart';
@@ -19,6 +20,10 @@ class _MissionsScreenState extends State<MissionsScreen> {
   bool _stale = false;
   DateTime? _cachedAt;
   String? _error;
+
+  /// The status the server answered with, when it answered at all — `null` means
+  /// nothing came back, which is the only case that is really offline.
+  int? _errorStatus;
   String _filter = 'all';
 
   static const _stages = [
@@ -42,6 +47,7 @@ class _MissionsScreenState extends State<MissionsScreen> {
     setState(() {
       _loading = true;
       _error = null;
+      _errorStatus = null;
     });
     try {
       final cached = await session.cachedList('missions', session.api.missions);
@@ -50,6 +56,13 @@ class _MissionsScreenState extends State<MissionsScreen> {
         _missions = cached.value;
         _stale = cached.isStale;
         _cachedAt = cached.cachedAt;
+        _loading = false;
+      });
+    } on ApiException catch (e) {
+      if (!mounted) return;
+      setState(() {
+        _error = e.message;
+        _errorStatus = e.statusCode;
         _loading = false;
       });
     } on Object catch (e) {
@@ -96,11 +109,10 @@ class _MissionsScreenState extends State<MissionsScreen> {
         ),
         Expanded(
           child: _error != null && _missions.isEmpty
-              ? EmptyState(
-                  icon: Icons.cloud_off,
-                  title: 'Cannot reach the server',
-                  message: _error!,
-                  action: FilledButton(onPressed: _load, child: const Text('Retry')),
+              ? failureState(
+                  error: _error,
+                  statusCode: _errorStatus,
+                  onRetry: _load,
                 )
               : _visible.isEmpty
                   ? const EmptyState(

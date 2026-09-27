@@ -201,14 +201,10 @@ class _PluginsScreenState extends State<PluginsScreen> {
                       '${(_error ?? '').isEmpty ? '' : '\n\nThe server said: $_error'}',
                 )
               : _error != null
-                  ? EmptyState(
-                      icon: Icons.cloud_off,
-                      title: 'Cannot reach the server',
-                      message: _error!,
-                      action: FilledButton(
-                        onPressed: _load,
-                        child: const Text('Retry'),
-                      ),
+                  ? failureState(
+                      error: _error,
+                      statusCode: _errorStatus,
+                      onRetry: _load,
                     )
                   : _list(),
     );
