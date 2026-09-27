@@ -1,0 +1,103 @@
+{
+  "what": "M5 box 4's running half, and box 5 on a real device: the client's debug APK, built from `testing`, installed and driven on an Android emulator against a real Adjutant server.",
+  "read": "2026-09-27",
+  "host": {
+    "machine": "sasquatch (the Thelio) — 12 cores, /dev/kvm, Ubuntu 24.04",
+    "emulator": "user systemd unit `phonon-emulator`, AVD `phonon_test` (Android API 35, google_apis, x86_64), headless (`-no-window -gpu swiftshader_indirect`)",
+    "serial": "emulator-5554",
+    "java": "jdk-17.0.12+7",
+    "android_sdk": "$HOME/Android/Sdk (platforms 34/35, build-tools 34.0.0/35.0.0)",
+    "flutter": "3.47.5 stable (the version pinned by client/pubspec.yaml)"
+  },
+  "artifact": {
+    "source_commit": "406c315",
+    "note": "the branch head that merged `testing` into the MCP branch; `git diff --stat 406c315 d613a34` is EMPTY, so this APK's source tree is identical to `testing` at d613a34",
+    "build": "git clone https://github.com/chezgoulet/adjutant && git checkout 406c315 && cd client && flutter pub get && flutter build apk --debug",
+    "path": "client/build/app/outputs/flutter-apk/app-debug.apk",
+    "bytes": 160090535,
+    "sha256": "1c90beeb8a30a58d0d90a1a2f40c753ca8a5a5d0d61461ef6020f977e1b731a0",
+    "package": "org.chezgoulet.adjutant_client",
+    "versionName": "0.1.0",
+    "minSdk": 24,
+    "targetSdk": 36,
+    "install": "adb -s emulator-5554 install -r app-debug.apk -> Success"
+  },
+  "server": {
+    "where": "mikoa, LAN 192.168.1.7:8787 — the same ./target/debug/adjutant CI's live harness builds (no Rust differs between 2e5663e and d613a34)",
+    "database": "adjutant_client_live on the local PostgreSQL 18 (the client live harness's own database, bootstrap chief `client-harness-chief`)",
+    "env": "ADJUTANT_DEV_HEADERS=false (the spoofable dev-header stub is off, so the session the app holds is one the server issued), ADJUTANT_RATE_MAX=0 (the run issues a burst), ADJUTANT_ALLOW_SUPERUSER=true (this throwaway test database's role is a superuser)",
+    "address_typed_in_the_app": "http://192.168.1.7:8787 (debug build, so cleartext is allowed — release builds require https by design)"
+  },
+  "observations": [
+    {
+      "step": 1,
+      "screen": "login form",
+      "evidence": "docs/evidence/m5-emulator-1-dashboard.png",
+      "saw": "Server / Username / Password on the login form; the app then reached the server and signed in as `client-harness-chief` (the first-run plugin wizard appeared next, and the dashboard after it)"
+    },
+    {
+      "step": 2,
+      "screen": "Dashboard",
+      "evidence": "docs/evidence/m5-emulator-1-dashboard.png",
+      "saw": "server data rendered on the device: Active missions 0, Members 1, Upcoming events 0, Open motions 1; 'No missions yet'; snackbar 'This deployment now runs 2 plugin(s).' — see finding F1 for that number",
+      "nav": "8 destinations: Dashboard, Inbox, Missions, Calendar, Shop, Equipment, Members, Settings"
+    },
+    {
+      "step": 3,
+      "screen": "Members",
+      "evidence": "docs/evidence/m5-emulator-2-members.png",
+      "saw": "the roster row the server stored: 'Harness Scout' / 'Beacon' / 'Harness Patrol · Harness Lodge' / Active"
+    },
+    {
+      "step": 4,
+      "screen": "Members, with the server STOPPED",
+      "evidence": "docs/evidence/m5-emulator-3-offline-cached-members.png",
+      "saw": "amber banner 'Offline — showing data from 08:06' and the same roster row from the cache — the read cache on a real device, not a mock"
+    },
+    {
+      "step": 5,
+      "screen": "Inbox, with the server STOPPED, after tapping 'Mark read' on a published notice",
+      "evidence": "docs/evidence/m5-emulator-4-queued-receipt-offline.png",
+      "saw": "snackbar 'Offline — your receipt is queued and will sync.'; the shell's app bar carries the pending-write badge (1) beside the offline icon; the notice is STILL shown unread ('1 unread of 1 in this inbox', 'Mark read') — the client did not apply the write locally"
+    },
+    {
+      "step": 6,
+      "screen": "Inbox, with the server back, after tapping the app bar's retry",
+      "evidence": "docs/evidence/m5-emulator-5-replay-1-sent.png",
+      "saw": "snackbar '1 sent.' and the offline icon gone — the queue replayed the recorded request"
+    },
+    {
+      "step": 7,
+      "screen": "Inbox, re-entered",
+      "evidence": "docs/evidence/m5-emulator-6-after-replay-read.png",
+      "saw": "'0 unread of 1 in this inbox', the card now offering 'Mark unread', and the inbox badge gone — the device agrees with the server again"
+    }
+  ],
+  "server_side_proof": {
+    "request": "GET /api/announcements/announcement/1 (as `client-harness-chief`)",
+    "response_fields": {
+      "is_read": true,
+      "my_receipt": {
+        "announcement_id": 1,
+        "id": 1,
+        "member_id": "3f76bb0e-a7c0-46f3-9e90-59504e238392",
+        "read_at": "2026-09-27 12:08:49.895718+00",
+        "read_via": "flutter"
+      },
+      "read_count": 1
+    },
+    "note": "`read_via: flutter` is the body the queued entry recorded ({'via': 'flutter'}), so the receipt the server holds is the one the device queued while offline — not a second one written after reconnecting."
+  },
+  "findings": {
+    "F1": "The first-run plugin wizard's 'Skip for now' RECORDS a choice: `GET /api/plugins/choice` then read {\"plugin_ids\":[\"auth\",\"membership\"],\"source\":\"wizard\"}, and the twelve other plugins' routes stopped answering at runtime (GET /api/announcements/announcements -> 404 {\"error\":\"route not found\"}) while `GET /api/plugins` still listed all fourteen as loaded. On a real deployment this is a footgun: a skip is not a skip, and the plugin list contradicts what is running. Restoring the choice (PUT /api/plugins/choice with all fourteen) brought every route back, 200.",
+    "F2": "A 404 from the API is rendered by the client as an offline condition: the announcements screen showed 'Cannot reach the server — route not found' for an ApiException(404). A route that is gone is not a network that is down, and the Retry button cannot fix it.",
+    "F3": "After the shell's queue retry reported '1 sent.', no screen was told to re-read: the Inbox still said '1 unread of 1' (and the nav badge still showed 1) until the destination was re-entered, at which point the truth appeared. Nothing is lost — the counts are the server's and the next read is right — but the interval is user-visible.",
+    "F4": "The emulator's clock is UTC-4 against the server's UTC, so the cache banner's '08:06' is 12:06 server time: the banner is honest about when the data was written, in the device's own local time."
+  },
+  "not_proven": [
+    "A physical device. This is an x86_64 emulator with a debug build; no phone held it.",
+    "A release-signed APK. The release build refuses cleartext http by design (client/lib/api/server_address.dart), so a release APK needs the https deployment to be useful.",
+    "That CI performs any of this. The `client` job builds web + a debug APK (#119) and never installs one on a device — the self-hosted runner on this host has no Android job in this repository today.",
+    "The APK being attached to a release. The release workflow still attaches only the web bundle."
+  ]
+}
