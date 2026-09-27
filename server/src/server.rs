@@ -510,6 +510,13 @@ pub async fn build_app(cfg: &Config) -> Result<(Router, Arc<AppState>), BuildErr
         .route("/api/plugins/{name}/disable", post(disable_plugin))
         .route("/api/plugins/{name}", delete(uninstall_plugin))
         .route("/api/plugins/reload", post(reload_plugins))
+        // The wizard's door (#90). A literal segment beside `{name}` is already
+        // the shape here — `reload` above sits the same way — so this does not
+        // shadow the uninstall route.
+        .route(
+            "/api/plugins/choice",
+            get(crate::plugin_choice_routes::get).put(crate::plugin_choice_routes::set),
+        )
         .route("/api/events/recent", get(recent_events))
         .route("/api/audit/verify", get(audit_verify))
         // Backups: the picker's options and recent runs, the schedule, the

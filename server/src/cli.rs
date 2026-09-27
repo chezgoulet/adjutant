@@ -432,61 +432,19 @@ pub async fn bootstrap_isolation(
     // minimal belongs there: it is a preselection a person can see and change,
     // not a change to a command other things already depend on.
     if let Some(chosen) = enable {
-        // A typo must not read as "enable nothing". An id that is not on disk is
-        // refused by name, before any flag is touched.
-        let unknown: Vec<&str> = chosen
-            .iter()
-            .map(String::as_str)
-            .filter(|c| !ids.iter().any(|id| id == c))
-            .collect();
-        if !unknown.is_empty() {
-            return Err(format!(
-                "not a plugin on disk: {}. Discovered: {}",
-                unknown.join(", "),
-                ids.join(", ")
-            ));
-        }
-
-        // The same two rules the API already enforces — and the wizard drives that
-        // API, so a CLI that could reach a state the wizard refuses would make the
-        // two paths disagree. That equivalence is #90's acceptance criterion, and
-        // this is where it would have broken: the first version of this flag wrote
-        // every row unconditionally and could disable `auth`.
-        //
-        // 1. A required plugin cannot be left off.
-        if let Some((id, why)) = crate::server::REQUIRED_PLUGINS
-            .iter()
-            .find(|(id, _)| !chosen.iter().any(|c| c == id))
-        {
-            return Err(format!("{id} is required and cannot be turned off: {why}"));
-        }
-
-        // 2. A dependent cannot be on without its dependency, or it is left
-        //    configured to call something that is not loaded.
-        for (dependent, dependency) in crate::server::PLUGIN_DEPENDENCIES {
-            if chosen.iter().any(|c| c == dependent)
-                && !chosen.iter().any(|c| c == dependency)
-            {
-                return Err(format!(
-                    "{dependent} needs {dependency}, which is not in the set"
-                ));
-            }
-        }
-
-        // One statement, both directions: the chosen set is enabled and everything
-        // else discovered is disabled, so the result does not depend on what the
-        // flags happened to be, and an interrupted run cannot leave half the
-        // deployment on. Running it twice converges.
-        sqlx::query(
-            "UPDATE core.plugins
-                SET enabled = (id = ANY($1)), updated_at = now()
-              WHERE id = ANY($2)",
+        // The refusals and the write both live in `plugin_choice::apply`, which the
+        // wizard's endpoint also calls. Restating the rules here is what let the
+        // CLI reach a state the API refused; one implementation is what makes
+        // "both paths produce the same state" structural instead of a hope.
+        let _enabled = crate::plugin_choice::apply(
+            pool.as_ref(),
+            chosen,
+            crate::plugin_choice::SOURCE_CLI,
+            // None rather than a name: bootstrap runs before there is an identity
+            // to attribute the act to. `source` records which door it came through.
+            None,
         )
-        .bind(chosen)
-        .bind(&ids)
-        .execute(pool.as_ref())
-        .await
-        .map_err(|e| format!("set the enabled set: {e}"))?;
+        .await?;
     }
 
     Ok(ids)

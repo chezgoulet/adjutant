@@ -13,6 +13,8 @@ pub mod middleware;
 pub mod notifications;
 pub mod outbox;
 pub mod permissions;
+pub mod plugin_choice;
+pub mod plugin_choice_routes;
 pub mod plugin_runtime;
 pub mod schema;
 pub mod scheduler;
