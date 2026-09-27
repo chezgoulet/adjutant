@@ -379,9 +379,14 @@ jobs:
   # The Flutter client ships to users (Obtainium), yet until this job existed no
   # CI step ever compiled it: the Rust jobs never look inside client/, so a change
   # there was green by default — a probe nobody runs. This is the same gate the
-  # workspace itself gets (resolve, analyze, test), on every push and pull
-  # request. It shares nothing with `verify` — no Postgres service, no cargo, no
-  # `needs:` — so it stays independent and fast.
+  # workspace itself gets (resolve, analyze, test, **build**), on every push and
+  # pull request. It shares nothing with `verify` — no Postgres service, no cargo,
+  # no `needs:` — so it stays independent.
+  #
+  # Since issue #111 it also builds the app for the two platforms the product
+  # actually ships on — Android (Obtainium) and web (a static bundle) — because
+  # analyze and test between them never compile a resource. See the build steps
+  # at the end of this job for what that covers and what it deliberately does not.
   client:
     runs-on: ubuntu-latest
     defaults:
@@ -419,6 +424,69 @@ jobs:
 
       - name: Tests
         run: flutter test --no-pub
+
+      # ----- Issue #111: build the client, don't just inspect it. -----
+      #
+      # Analyze and test are real gates, but between them they compile no
+      # resource: nothing under android/app/src/main/res/, no AndroidManifest
+      # merge, no Gradle. Everything that exists only at build time therefore
+      # shipped green. Concretely ungated before this change:
+      #
+      #   * the adaptive launcher icon (#97): five densities of
+      #     foreground/background plus the legacy square and round icons, the
+      #     `anydpi-v26` pair and its monochrome layer. A malformed mipmap, a
+      #     wrong density or a broken manifest reference is invisible to the
+      #     analyzer.
+      #   * the debug-only cleartext config — android/app/src/debug/
+      #     AndroidManifest.xml and its res/xml/network_security_config.xml.
+      #     A malformed debug manifest would first surface as a developer whose
+      #     app cannot reach their own server.
+      #   * the web build, which is half of #90's acceptance: a self-hoster with
+      #     no app installed opens the wizard in a browser. A web-incompatible
+      #     import (`dart:io` and friends) was caught by nobody.
+      #   * the whole class of Gradle / dependency-resolution / manifest-merge
+      #     failures, which is what a contributor is most likely to hit first.
+      #
+      # These two builds are exactly the platforms the client ships on today —
+      # Android through Obtainium, web as a static bundle. iOS is deferred by
+      # owner decision and the desktop runners are unproven, so macOS, iOS,
+      # Windows and Linux are deliberately NOT built here; adding them would be
+      # scope creep, not coverage.
+      #
+      # They live in this job rather than a job of their own. They are the same
+      # question this job already asks ("does the client build?"), they reuse the
+      # same pinned Flutter and the same `pub get`, and `verify` already dominates
+      # the run's wall clock — so the added minutes here stay off the critical
+      # path instead of buying a second Flutter setup and a second pub resolve.
+      # Cost, measured on this change's own runs: web ~1 min; the APK debug build
+      # ~4–6 min cold and well under that once the Gradle caches below are warm.
+
+      # The runner image carries the Android SDK and a Java 17 JDK, so the APK
+      # build needs no setup — only its downloads cached. Gradle (dependencies,
+      # wrapper distribution) is the slow part of a cold APK build.
+      - name: Gradle caches (for the APK build)
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.gradle/caches
+            ~/.gradle/wrapper
+          # Keyed on the Gradle inputs, not the whole client: a Dart-only change
+          # must not invalidate a half-gigabyte of downloaded artifacts.
+          key: gradle-${{ runner.os }}-${{ hashFiles('client/android/**/*.gradle*', 'client/android/gradle/wrapper/gradle-wrapper.properties') }}
+          restore-keys: |
+            gradle-${{ runner.os }}-
+
+      - name: Build web (release)
+        run: flutter build web --release
+
+      # The only step in this repository that compiles Android resources and the
+      # merged manifest. Debug, not release: the project has no release signing
+      # config yet, and `release` in android/app/build.gradle.kts already falls
+      # back to the debug keystore — release-vs-debug changes only the Dart
+      # compilation mode, not whether the resources and manifest are valid, and
+      # debug is the faster of the two.
+      - name: Build Android APK (debug)
+        run: flutter build apk --debug
 
   # The declared MSRV (workspace rust-version). RUSTUP_TOOLCHAIN overrides the
   # pinned rust-toolchain.toml channel so this job actually uses 1.96.
