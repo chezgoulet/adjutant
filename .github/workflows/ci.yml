@@ -241,6 +241,34 @@ jobs:
       - name: Finance dues funding probes (DB-backed)
         run: cargo test -p adjutant-finance --test dues_funding -- --ignored --nocapture
 
+      # The MCP gate (SPEC §7.10, M5 box 2): a client through the bridge, two
+      # identities, and the audit rows. The plugin's surface is HTTP + JSON and
+      # its own docs call the JSON-RPC facade "a client concern" — the bridge in
+      # `tools/mcp-bridge/` is that concern, and this step drives it with the
+      # `mcp` SDK so the protocol path is exercised by a client that is not the
+      # implementation under test. It asserts what the milestone box says as a
+      # *comparison*: a chief sees and uses the tools their grants reach (`ok` in
+      # `mcp.invocations`), a scout with three permissions sees one tool rather
+      # than eleven and is refused by name for one they lack (`denied`).
+      #
+      # It gets its own database (`adjutant_mcp_live`, derived) because it
+      # registers users and a role of its own — a fixture this step creates.
+      #
+      # The bridge is stdlib-only on purpose, but the *client* is the SDK, and the
+      # SDK's 2.x removed `fastmcp` — so it is installed here, at a pinned
+      # version, into a venv of its own: the runner's system python is
+      # externally managed and `pip install` into it is refused.
+      #
+      # Where `hermes` is absent (this runner) the harness reports `SKIP` for the
+      # real-host half rather than passing quietly; the MCP host half is proven on
+      # a developer machine and written down in `docs/mcp-hermes.md`.
+      - name: MCP live harness (DB-backed)
+        run: |
+          set -euo pipefail
+          python3 -m venv /tmp/mcp-probe-venv
+          /tmp/mcp-probe-venv/bin/pip install --quiet "mcp==2.0.0"
+          ADJUTANT_MCP_PYTHON=/tmp/mcp-probe-venv/bin/python3 scripts/mcp-live-harness.sh
+
       # The sandboxed path: build the WASM guest and load it through the same
       # registry/dispatch pipeline (a separate plugin dir keeps the native
       # harnesses above unaffected).

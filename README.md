@@ -39,6 +39,9 @@ scripts/probes.py           Committed M1+M2 probe harness (live server)
 docs/e2e_m3.py              Committed M3 end-to-end harness (live server)
 scripts/client-live-harness.sh  Boots a server and runs the live client harness
 client/live/live_client_test.dart  The client against a real server (not mocked)
+tools/mcp-bridge/           Stdio MCP bridge + probe: what an MCP host talks to
+scripts/mcp-live-harness.sh  Boots a server and proves the MCP path (two identities)
+docs/mcp-hermes.md          Wiring an MCP host (Hermes) to Adjutant's MCP plugin
 docs/architecture.md        How the core, plugins, and sandbox fit together
 docs/api-reference.md       Core + plugin HTTP API and the SDK surface
 docs/plugin-development.md  Plugin author guide (start here to write one)

@@ -89,9 +89,18 @@ met, one is partial and four are open — the per-box state and its evidence are
    it passed **131 tests**. This is the gate that converts every client-covered
    plugin's "usable" claim from a demonstration into a check, and it is what
    makes Stage 5.1 mechanical.
-2. **The MCP connect-and-interact proof** (M5 box 2). The plugin loads and is
-   tested; what is missing is a real Hermes agent connecting through it with
-   permissions filtered and invocations logged.
+2. **The MCP connect-and-interact proof** (M5 box 2). **— MET (2026-09-27).**
+   `tools/mcp-bridge/adjutant_mcp_bridge.py` is the JSON-RPC facade the plugin's
+   own documentation calls "a client concern" — stdlib only, because the Python
+   SDK's 2.x dropped `fastmcp` — and `scripts/mcp-live-harness.sh` drives it with
+   two identities: a chief sees and uses the tools their grants reach (`ok` in
+   `mcp.invocations`), a scout with three permissions sees one tool rather than
+   eleven and is refused by name for one they lack (`denied`). A real Hermes host
+   is exercised when `hermes` is on `PATH`: the harness registers the bridge in a
+   scratch `HERMES_HOME` and `hermes mcp test adjutant` discovers all 11 tools.
+   Wiring: [`docs/mcp-hermes.md`](../mcp-hermes.md). CI runs the SDK half
+   (`MCP live harness (DB-backed)`); the Hermes half reports `SKIP` where Hermes
+   is absent rather than passing quietly.
 3. **Offline mode** (M5 box 5) — the client caches locally and syncs. **The
    storage decision is taken (owner, 2026-09-27): a plain durable read cache plus
    a queued write list — no schema on the device.** drift/SQLite stays the
