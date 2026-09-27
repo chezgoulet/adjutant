@@ -23,6 +23,15 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # `github.ref_name` is the branch name on a dispatch run, and every branch
+      # here is `type/name`. A slash is fatal twice over: it turns a `dist/…`
+      # artifact *path* into a directory that may not exist, and `upload-artifact`
+      # rejects it outright in an artifact *name*. Slug it once, here; every site
+      # below uses this one value. For a tag the slug is the tag, unchanged.
+      - name: Slug the ref for artifact names and paths
+        id: ref
+        run: echo "slug=$(echo "${GITHUB_REF_NAME}" | tr '/' '-')" >> "$GITHUB_OUTPUT"
+
       # The pinned toolchain, read from `rust-toolchain.toml` — the same step
       # `ci.yml` uses, for the same reason and one more.
       #
@@ -113,7 +122,7 @@ jobs:
       - name: Assemble tarball
         run: |
           set -euo pipefail
-          ref="${GITHUB_REF_NAME//\//-}"  # a branch name has a "/" in it; a tag does not
+          ref="${{ steps.ref.outputs.slug }}"
           name="adjutant-${ref}-x86_64-unknown-linux-gnu"
           mkdir -p "dist/$name/plugins"
           cp target/release/adjutant "dist/$name/"
@@ -135,7 +144,7 @@ jobs:
       - name: Bundle the client for the web
         run: |
           set -euo pipefail
-          ref="${GITHUB_REF_NAME//\//-}"
+          ref="${{ steps.ref.outputs.slug }}"
           name="adjutant-client-${ref}-web"
           tar -C client/build -czf "dist/$name.tar.gz" web
           (cd dist && sha256sum "$name.tar.gz" > "$name.tar.gz.sha256")
@@ -147,7 +156,7 @@ jobs:
       - name: Bundle the client for Android
         run: |
           set -euo pipefail
-          ref="${GITHUB_REF_NAME//\//-}"
+          ref="${{ steps.ref.outputs.slug }}"
           name="adjutant-client-${ref}-android"
           cp client/build/app/outputs/flutter-apk/app-release.apk "dist/$name.apk"
           (cd dist && sha256sum "$name.apk" > "$name.apk.sha256")
@@ -159,7 +168,7 @@ jobs:
         if: github.event_name == 'workflow_dispatch'
         uses: actions/upload-artifact@v4
         with:
-          name: adjutant-${{ github.ref_name }}-artifacts
+          name: adjutant-${{ steps.ref.outputs.slug }}-artifacts
           path: dist/*
           if-no-files-found: error
 
