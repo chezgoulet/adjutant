@@ -75,6 +75,9 @@ iOS is deferred", which was an arithmetic slip: iOS was a clause inside the
 Android-and-Web box, so deferring it moved no box). As of 2026-09-27, three are
 met, one is partial and four are open — the per-box state and its evidence are in
 [`milestones/M5-mcp-and-flutter-mvp.md`](milestones/M5-mcp-and-flutter-mvp.md).
+**Later the same day, item 3 below landed and the boxes read four met, one
+partial, three open** (PR #121); the record carries both readings rather than
+rewriting the first.
 
 1. **The client-in-CI harness — the missing half of the v1.0 gate. — MET.**
    `scripts/client-live-harness.sh` derives its own database, bootstraps the
@@ -92,11 +95,20 @@ met, one is partial and four are open — the per-box state and its evidence are
 2. **The MCP connect-and-interact proof** (M5 box 2). The plugin loads and is
    tested; what is missing is a real Hermes agent connecting through it with
    permissions filtered and invocations logged.
-3. **Offline mode** (M5 box 5) — the client caches locally and syncs. **The
-   storage decision is taken (owner, 2026-09-27): a plain durable read cache plus
-   a queued write list — no schema on the device.** drift/SQLite stays the
-   answer *if* offline queries turn out to need a schema; it is not the opening
-   move. The work itself has not started.
+3. **Offline mode** (M5 box 5) — the client caches locally and syncs. **— MET**
+   (2026-09-27, PR #121). Built on the storage decision taken 2026-09-27: a plain
+   durable read cache plus a queued write list, no schema on the device,
+   drift/SQLite still the answer only if offline *queries* need one. Reads are
+   cached per resource and served **only** when the server cannot be reached, so a
+   cache is never preferred to a live answer and age alone never makes stale data
+   look live; invalidation is the end of the session (signing out drops the cache
+   and the queue). Writes are queued **in order** and replayed when the server
+   answers again, and only where the server treats a repeat as the same act — a
+   receipt, a dues tier, a plugin's enable/disable; a write the server would
+   *append* (an order, a Checkout session, a draw) is refused in words instead of
+   queued; and a queued write the server refuses (a 4xx) is parked with the
+   server's own sentence and does not block the queue. `client/test/offline_test.dart`
+   is 19 of the branch's **150** client tests (131 before).
 4. **Android and Web** (M5 box 4). Web builds — proven on this host with the
    pinned toolchain (`flutter build web --release`, exit 0, 41 MB bundle) — and
    the release workflow now attaches the built bundle to a tag. Android reaches
@@ -123,10 +135,12 @@ met, one is partial and four are open — the per-box state and its evidence are
 
 **Proves it:** the eight M5 boxes checked in a new `M5` record, each with its run
 id — the record exists as [`milestones/M5-mcp-and-flutter-mvp.md`](milestones/M5-mcp-and-flutter-mvp.md),
-with **three boxes met, one partial and four open**. The plugin set is chosen on a
-fresh deployment and honoured by what the server loads (#89/#90), and the client
-harness is green on `testing` — both done. What this stage is still waiting on is
-items 2, 3, 5, 6 and the Android half of item 4.
+with **four boxes met (offline mode is the fourth, PR #121), one partial and
+three open** — it read three/four before that PR, and both readings are in the
+record. The plugin set is chosen on a fresh deployment and honoured by what the
+server loads (#89/#90), and the client harness is green on `testing` — both done.
+What this stage is still waiting on is items 2, 5, 6 and the Android half of
+item 4.
 
 ---
 
@@ -319,9 +333,9 @@ crates, the live docs, and the F-Droid listing evidenced rather than asserted.
   owner confirmed this scope on **2026-09-27** rather than re-scoping it. The
   preference is that this is a *deployment-shaped* gate — the 161st runs a tag
   they can also host — not a date and not a branch. As of 2026-09-27: both
-  deployment proofs are met, Stage 1 has three of eight boxes met, and what is
-  left is the MCP↔Hermes proof, offline mode, the UI/UX review, the Android
-  artifact (#111) and the deployment itself.
+  deployment proofs are met, Stage 1 has four of eight boxes met (offline mode
+  is the fourth, PR #121), and what is left is the MCP↔Hermes proof, the UI/UX
+  review, the Android artifact (#111) and the deployment itself.
 - **The artifact a tag produces — decided 2026-09-27.** The tarball's plugin set
   is derived from the workspace rather than listed (it had rotted to three of
   fourteen), the client's **web** bundle is attached, and the **Android** artifact
@@ -352,8 +366,9 @@ parallel while every PR passes the same gate. The only hard sequence is inside a
 lane. State as of 2026-09-27:
 
 - **A — client.** The harness (**done**), then `finance`'s treasurer view, then
-  `archive`, then `conflicts`' case list and timeline, then offline mode (storage
-  decided: plain cache plus a queued write list).
+  `archive`, then `conflicts`' case list and timeline, then offline mode
+  (**done**, PR #121: the plain cache plus the queued write list the storage
+  decision called for).
 - **B — core and SDK.** Stage 0's #76 and #83 (**both done**), then SDK v0.3
   (**done**), then #78 and #72 (**both in green PRs**), then #71 (**done,
   merged**).
