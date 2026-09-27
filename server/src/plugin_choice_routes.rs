@@ -22,15 +22,36 @@ const PERM: &str = "core:admin";
 
 /// Has an operator chosen, and what did they choose? `null` means nobody has.
 ///
-/// The server answers this rather than the device, because a per-device flag would
-/// re-prompt the second admin, could not be set by a scripted install, and could
-/// not tell "chose exactly auth and membership" from "never chose".
+/// Also reports the rules the core enforces on a choice — which plugins are
+/// required and *why*, and which depend on which. The wizard needs those words to
+/// tell a leader what turning something off costs, and it should render the
+/// server's own sentences rather than a second copy in the client: the reason a
+/// plugin is required is a statement about the server's behaviour, and a copy in
+/// Dart would drift the first time a rule changed.
+///
+/// The server answers whether a choice exists rather than the device, because a
+/// per-device flag would re-prompt the second admin, could not be set by a
+/// scripted install, and could not tell "chose exactly auth and membership" from
+/// "never chose".
 pub async fn get(State(state): State<Arc<AppState>>, req: Request) -> Response {
     if let Some(resp) = state.require_permission(req.headers(), PERM).await {
         return resp;
     }
     match crate::plugin_choice::recorded(state.pool.as_ref()).await {
-        Ok(choice) => Json(serde_json::json!({ "choice": choice })).into_response(),
+        Ok(choice) => Json(serde_json::json!({
+            "choice": choice,
+            "required": crate::server::REQUIRED_PLUGINS
+                .iter()
+                .map(|(id, why)| serde_json::json!({ "id": id, "why": why }))
+                .collect::<Vec<_>>(),
+            "dependencies": crate::server::PLUGIN_DEPENDENCIES
+                .iter()
+                .map(|(dependent, dependency)| {
+                    serde_json::json!({ "dependent": dependent, "dependency": dependency })
+                })
+                .collect::<Vec<_>>(),
+        }))
+        .into_response(),
         Err(e) => internal_error("recorded plugin choice", &e),
     }
 }

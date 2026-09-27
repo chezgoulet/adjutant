@@ -787,21 +787,23 @@ class ApiClient {
     await _send('POST', '/api/plugins/${Uri.encodeComponent(id)}/$verb');
   }
 
-  /// Has an operator chosen which plugins this deployment runs — and what?
+  /// The recorded choice (`null` when nobody has chosen), and the rules the core
+  /// enforces on a choice: `required` plugins with their reasons, and the
+  /// `dependencies` pairs.
   ///
-  /// `null` means nobody has, which is the only state in which the first-run
-  /// wizard may appear. The *server* answers this rather than the device: a
-  /// per-device flag would re-prompt the second admin, could not be set by a
-  /// scripted install, and could not tell "chose exactly auth and membership"
-  /// from "never chose" — the two states a local flag cannot separate.
+  /// `choice == null` is the only state in which the first-run wizard may appear.
+  /// The *server* answers that rather than the device: a per-device flag would
+  /// re-prompt the second admin, could not be set by a scripted install, and could
+  /// not tell "chose exactly auth and membership" from "never chose".
   ///
-  /// `core:admin`, so a 403 here is the answer for anyone else, not something the
-  /// client should pre-guess.
-  Future<Map<String, dynamic>?> pluginChoice() async {
-    final body = _asMap(await _send('GET', '/api/plugins/choice'));
-    final choice = body['choice'];
-    return choice is Map<String, dynamic> ? choice : null;
-  }
+  /// The rules come from the server for the same reason — a screen that says what
+  /// turning a plugin off costs should be repeating the server's own sentence, not
+  /// a copy of it that drifts the first time the rule changes.
+  ///
+  /// `core:admin`, so a 403 is the answer for anyone else rather than something
+  /// the client should pre-guess.
+  Future<Map<String, dynamic>> pluginChoice() async =>
+      _asMap(await _send('GET', '/api/plugins/choice'));
 
   /// Choose which plugins this deployment runs.
   ///
