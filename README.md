@@ -194,28 +194,35 @@ bundle, and nothing per platform — see
 
 ## Releases, artifacts and unsigned builds
 
-Releases are cut by tagging `main` (`v*`). **What a tag produces today is two
+Releases are cut by tagging `main` (`v*`). **What a tag produces today is three
 files:**
 
 - `adjutant-vX.Y.Z-x86_64-unknown-linux-gnu.tar.gz` — the `adjutant` binary, every
   plugin library the workspace stages (**all fourteen**, plus the `hello_wasm`
   guest), `README.md` and `LICENSE`, with a `.sha256` beside it;
 - `adjutant-client-vX.Y.Z-web.tar.gz` — the Flutter client built for the web, to
-  serve as static files.
+  serve as static files;
+- `adjutant-client-vX.Y.Z-android.apk` — the same client as an APK: the file a
+  phone installs, which is how a scout receives it (Obtainium). It is built in
+  **release** mode from the same tag, signed with Flutter's throwaway debug key
+  (see *Unsigned builds* below), and carries a `.sha256` like the rest. The job
+  fails rather than attach an APK that is missing or a stub.
 
 **Nothing else is packaged — not on a pull request, and not on a tag.** There is
-no macOS build, no Windows build, no Android APK or `.aab`, no `.deb`, `.rpm`,
-`.AppImage`, `.snap` or `.flatpak`, no `.dmg`, no `.msi`, and no published
-container image. Building those per platform is
-[#111](https://github.com/chezgoulet/adjutant/issues/111); until it lands, the
-table below is the **plan** rather than a description of the tags that exist:
+no macOS build, no Windows build, no `.aab`, no `.deb`, `.rpm`, `.AppImage`,
+`.snap` or `.flatpak`, no `.dmg`, no `.msi`, and no published container image.
+Those rows below stay **planned**, and a plan is not a promise. What *is* closed
+is [#111](https://github.com/chezgoulet/adjutant/issues/111) — that nothing in CI
+compiled the client and no tag carried a client artifact — by the `client` job's
+own build steps (`flutter build web --release`, `flutter build apk --debug`) and
+by the three artifacts above:
 
 | Platform | Server (binary + all plugins) | Client |
 |---|---|---|
 | Linux | `.tar.gz` — **shipped today**; `.deb`, `.rpm` planned | web bundle — **shipped today**; `.deb`, `.rpm`, `.AppImage`, `.snap`, `.flatpak` planned |
 | macOS | `.zip` planned | `.dmg`, `.zip` planned |
 | Windows | `.zip` planned | `.msi`, `.zip` planned |
-| Android | — | `.apk`, `.aab` planned |
+| Android | — | `.apk` — **shipped today**; `.aab` planned |
 | Web | — | a bundle to serve as static files — **shipped today** |
 | Docker | a published image is planned | — |
 
@@ -225,17 +232,21 @@ hand-written subset: the release derives the plugin set with
 tarball used to make.
 
 Because a pull request packages nothing, a packaging fault surfaces at the tag
-rather than in review — so the release job's own steps are exercised by hand
-before a release is cut (`docs/release-path.md`, Stage 3.10).
+rather than in review. So the workflow carries a **`workflow_dispatch` entry**: a
+manual run builds every artifact, uploads them as workflow artifacts, and
+**creates no release** (the publish step is gated on a tag push). That is what
+`docs/release-path.md` Stage 3.10 asked for, and what the pipeline is now
+exercised with before a tag is cut.
 
 ### Unsigned builds
 
 **Nothing we publish is signed, and nothing will be signed until beta.** A
 certificate costs money and asserts a level of care this software has not earned
-yet. Today there are two artifacts to receive unsigned (the Linux tarball and the
-client's web bundle, neither of which any platform refuses); as the per-platform
-builds land ([#111](https://github.com/chezgoulet/adjutant/issues/111)), each
-platform will complain in its own way, and none of it will be a fault:
+yet. Today there are three artifacts to receive unsigned — the Linux tarball, the
+client's web bundle, and the **Android APK**, the one platform that refuses an
+unsigned install outright (hence the debug key, below). As the remaining
+per-platform builds land, each will complain in its own way, and none of it will
+be a fault:
 
 - **macOS** — Gatekeeper quarantines the download. Right-click → **Open**, or
   clear the flag yourself: `xattr -d com.apple.quarantine <file>`. The builds are
@@ -252,9 +263,9 @@ platform will complain in its own way, and none of it will be a fault:
   platform will not install an unsigned APK at all, so Flutter signs it with a
   throwaway debug key. It installs from a file manager or Obtainium, but that key
   is not one we keep — so a properly signed build later may not upgrade over it
-  cleanly. The `.aab` is for the Play Store, not for sideloading. Nothing Android
-  is published yet: the APK is the artifact
-  [#111](https://github.com/chezgoulet/adjutant/issues/111) exists to build.
+  cleanly. The `.aab` is for the Play Store, not for sideloading. **The APK every
+  tag attaches is that debug-signed file**: install it, use it, and expect to
+  uninstall it before a signed build can take its place.
 
 If any of that surprises you, it is worth repeating: **this is alpha software, and
 a warning from your operating system is the correct response to it.**

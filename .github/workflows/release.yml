@@ -1,9 +1,18 @@
 name: Release
 
-# Cut a release by pushing a version tag (e.g. `git tag v0.2.0 && git push origin v0.2.0`).
+# Cut a release by pushing a version tag (e.g. `git tag v0.3.0 && git push origin v0.3.0`).
+#
+# `workflow_dispatch` is here so the pipeline can be **exercised without
+# releasing**. A packaging fault otherwise surfaces only at the tag — in the one
+# place nothing gates — which is how the tarball shipped eleven plugins short and
+# how the Dockerfile shipped three (#88, #118; `docs/release-path.md` Stage 3.10
+# asks for exactly this entry). A manual run builds every artifact and uploads
+# them as workflow artifacts, and **creates no release**: the release step is
+# gated on a tag push.
 on:
   push:
     tags: ["v*"]
+  workflow_dispatch:
 
 permissions:
   contents: write
@@ -40,9 +49,7 @@ jobs:
 
       # The client half of the product, built from the same tag. Web is built
       # here because the 161st can open it from anywhere; the Android artifact
-      # (the Obtainium path) lands with #111, which is where the platform build
-      # gets its runner and its proof. Until then a tagged release carries the
-      # web bundle and says so, rather than attaching an APK nobody built.
+      # (the Obtainium path) is attached below, from the same tag.
       - uses: subosito/flutter-action@v2
         with:
           channel: stable
@@ -54,6 +61,35 @@ jobs:
       - name: Build the client for the web
         run: flutter build web --release
         working-directory: client
+
+      # The Android half of the client. `--release` and not `--debug`: this is
+      # the artifact a scout sideloads (Obtainium), and it is built from the same
+      # commit the rest of the tarball is. It is signed with Flutter's throwaway
+      # debug key because **nothing we publish is signed until beta** — which
+      # means it installs, and that a properly signed build later may not upgrade
+      # over it cleanly. README's "Unsigned builds" says the same thing to whoever
+      # receives it.
+      - name: Build the client for Android (the Obtainium path)
+        run: flutter build apk --release
+        working-directory: client
+
+      - name: Assert the Android artifact exists and is not a stub
+        run: |
+          set -euo pipefail
+          apk=client/build/app/outputs/flutter-apk/app-release.apk
+          if [ ! -f "$apk" ]; then
+            echo "::error::$apk was not produced — a tag that attaches no APK is the claim #111 exists to stop"
+            exit 1
+          fi
+          size=$(stat -c %s "$apk")
+          echo "app-release.apk is $size bytes"
+          # A Flutter release APK for one ABI is tens of MB; anything under a
+          # megabyte is an empty shell, and a release nobody can install is worse
+          # than a release that says it has none.
+          if [ "$size" -lt 1000000 ]; then
+            echo "::error::app-release.apk is $size bytes — that is not a client anyone can install"
+            exit 1
+          fi
 
       - name: Assemble tarball
         run: |
@@ -83,10 +119,35 @@ jobs:
           tar -C client/build -czf "dist/$name.tar.gz" web
           (cd dist && sha256sum "$name.tar.gz" > "$name.tar.gz.sha256")
 
+      # The APK is copied out of the build tree under an artifact name that says
+      # which tag and which platform, and given the same `.sha256` as everything
+      # else, because it is the one artifact a phone installs and the one nobody
+      # can verify by eye.
+      - name: Bundle the client for Android
+        run: |
+          set -euo pipefail
+          name="adjutant-client-${GITHUB_REF_NAME}-android"
+          cp client/build/app/outputs/flutter-apk/app-release.apk "dist/$name.apk"
+          (cd dist && sha256sum "$name.apk" > "$name.apk.sha256")
+          ls -l "dist/$name.apk"
+
+      # A manual run's whole point: the artifacts exist somewhere the person who
+      # ran it can look at them, without a release having been created.
+      - name: Upload the artifacts of a manual run
+        if: github.event_name == 'workflow_dispatch'
+        uses: actions/upload-artifact@v4
+        with:
+          name: adjutant-${{ github.ref_name }}-artifacts
+          path: dist/*
+          if-no-files-found: error
+
+      # Only a tag creates a release. A dispatch run must never publish.
       - name: Create release
+        if: github.event_name == 'push'
         uses: softprops/action-gh-release@v2
         with:
           files: |
             dist/*.tar.gz
             dist/*.sha256
+            dist/*.apk
           generate_release_notes: true
