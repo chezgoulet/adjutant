@@ -99,6 +99,38 @@ class SessionState extends ChangeNotifier {
   int get pendingWriteCount => pendingWrites.length;
   int get refusedWriteCount => refusedWrites.length;
 
+  /// Bumped whenever a replay pass actually hands the server something —
+  /// [syncOutbox] returning with `sent > 0`.
+  ///
+  /// The problem this exists for: a screen reads the server's state once, in
+  /// its `initState`, and holds it. Nothing told it that the state had moved.
+  /// So when a queued write finally went through — the retry in the shell's app
+  /// bar, or a read that landed and drained the queue behind it — the screen
+  /// that owed the write went on showing what it had loaded *before* it left.
+  /// The notice whose receipt had just been recorded still offered "Mark read";
+  /// the inbox still said "1 unread of 1"; the shell's badge still showed 1,
+  /// until the destination was re-entered. Nothing was lost and the next read
+  /// was right, but the window lands on the person who just watched their
+  /// change go through and is told it did not.
+  ///
+  /// So a pass that sent at least one entry bumps this, and the shell keys a
+  /// destination's body on it ([HomeShell]): the body is re-created, its
+  /// `initState` reads again, and the server's fresh answer replaces the state
+  /// it loaded first. A reload *generation*, deliberately, rather than dropping
+  /// cache keys: the cache rule is untouched — a cached read is still served
+  /// only when the server cannot be reached — and a pass that sent something
+  /// has just proved the server reachable, so the next read is a live one.
+  ///
+  /// The trade-off, stated plainly: re-keying rebuilds the screen, so transient
+  /// screen state (the inbox's "Unread only" toggle, a scroll position) resets —
+  /// the same thing that already happens every time a destination is re-entered.
+  /// A refresh-in-place would keep that state, but would need every screen to
+  /// watch this itself; the codebase already re-creates a destination to re-read
+  /// it, so this makes a replay one more cause of that rather than a second,
+  /// parallel mechanism. No timer and no poller: this fires only because the
+  /// server answered a write the person caused.
+  int reloadEpoch = 0;
+
   bool get isAuthenticated => user != null;
   String get displayName =>
       (user?['display_name'] as String?)?.trim().isNotEmpty == true
@@ -310,7 +342,16 @@ class SessionState extends ChangeNotifier {
       final report = await outbox.flush(
         send: (entry) => api.send(entry.method, entry.path, body: entry.body),
       );
-      if (report.sent > 0) offline = false;
+      if (report.sent > 0) {
+        offline = false;
+        // The server has just recorded something it did not have before, so
+        // every screen showing its state is out of date. Bump the generation
+        // the shell keys a destination's body on ([reloadEpoch]) and say so —
+        // the read that follows is a live one, because this proves the server
+        // is reachable again.
+        reloadEpoch++;
+        notifyListeners();
+      }
       await refreshOutbox();
       return report;
     } finally {
