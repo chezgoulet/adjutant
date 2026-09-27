@@ -1,0 +1,71 @@
+# Dependabot — the automated half of issue #51's dependency scan.
+#
+# Scope is decided ecosystem by ecosystem, not copied wholesale:
+#
+#   * Rust crates — NOT here. `cargo-deny` already runs on every push and every
+#     pull request (`.github/workflows/ci.yml`, step `cargo-deny`,
+#     `EmbarkStudios/cargo-deny-action@v2`, config `deny.toml`) and fails the
+#     build on a RustSec advisory or a yanked crate, so the Rust tree already
+#     has a continuous vulnerability gate. The policy that surrounds it is
+#     edited by hand on purpose — the licence allowlist in `deny.toml` says a
+#     new licence is a deliberate act — and the toolchain is pinned, so weekly
+#     version-bump PRs across ~400 transitive crates would be churn the repo has
+#     chosen to avoid rather than a gap.
+#
+#   * GitHub Actions — here. Every `uses:` in ci.yml and release.yml was frozen
+#     at the tag it was written with; two are floating (`dtolnay/rust-toolchain`
+#     `@master` and `@stable`), which is both a supply-chain risk and the silent
+#     drift issue #76 fixed for the toolchains. Nothing else watches these, so
+#     Dependabot is the maintained way to keep them current.
+#
+#   * Flutter / pub — here. `client/pubspec.lock` is committed and the `client`
+#     CI job resolves it with `flutter pub get`, but resolving is not auditing:
+#     nothing checks it against known vulnerabilities. Dependabot covers it, and
+#     its security updates cover it too.
+#
+# Container base images (the Dockerfile's `rust:`/`debian:` stages and the
+# `postgres:18-alpine` CI service) are deliberately OUT of scope. Those pins are
+# coupled on purpose — the image's `postgresql-client-18` must match the
+# `postgres:18` server it dumps, or the backup button fails in the least
+# diagnosable way — so an automatic base-image bump is a change to be made by
+# hand, with that coupling in view, not by a bot.
+version: 2
+updates:
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    # The repository's default branch is `main`, which moves only to cut a
+    # release (CONTRIBUTING.md §Git flow); `testing` is the integration branch
+    # every PR targets. Without this line Dependabot opens its pull requests
+    # against `main` and the repository's own rule is broken by a bot.
+    target-branch: "testing"
+    schedule:
+      interval: "weekly"
+    open-pull-requests-limit: 5
+    groups:
+      # One PR a week rather than one per action.
+      github-actions:
+        patterns: ["*"]
+    commit-message:
+      prefix: "ci"
+
+  - package-ecosystem: "pub"
+    directory: "/client"
+    # Same reason as above: `testing`, never `main`.
+    target-branch: "testing"
+    schedule:
+      interval: "weekly"
+    open-pull-requests-limit: 5
+    groups:
+      # The client's dependencies are few and small; batch them.
+      pub-dependencies:
+        patterns: ["*"]
+    commit-message:
+      prefix: "client"
+    ignore:
+      # A major bump in the client is an integration task, not a drop-in: the
+      # app is a thin renderer and majors here are breaking by construction.
+      # This filters *version* updates only — Dependabot security updates are a
+      # separate path and still open a PR when a vulnerable version is in range,
+      # so no fix is hidden.
+      - dependency-name: "*"
+        update-types: ["version-update:semver-major"]
