@@ -516,6 +516,39 @@ jobs:
       - name: Build Android APK (debug)
         run: flutter build apk --debug
 
+  # The client on a **real Android device**, against a **real server** — the one
+  # half a build cannot reach. #119 made the `client` job compile the APK; it
+  # still never installed one, so "the APK a scout installs works" rested on a
+  # hand-run on somebody's emulator (see `docs/evidence/m5-emulator-run.json`).
+  # This is that run, as a gate.
+  #
+  # **It is inert until this repository is granted the `android` runner.**
+  # Registered on the House's build host (`sasquatch-runner`, labels
+  # `self-hosted, linux, x64, android`) but not yet in a runner group that
+  # includes this repo, and a `runs-on: [self-hosted, ...]` job with no matching
+  # runner does not fail — it **queues forever**, which would block every pull
+  # request behind it. The variable is the switch, so turning the gate on needs no
+  # code change: add the repo to the runner group, then set the repository
+  # variable `ANDROID_DEVICE_GATE` to `true`.
+  android-device:
+    if: vars.ANDROID_DEVICE_GATE == 'true'
+    needs: [client]
+    runs-on: [self-hosted, linux, x64, android]
+    steps:
+      - uses: actions/checkout@v4
+
+      # One script does the whole gate — a throwaway database, the server with the
+      # dev-header stub off, the APK installed and launched on the device, then
+      # the integration test driving the app through its own sign-in screen. It is
+      # the same script a person runs by hand on that host, which is the point:
+      # the gate and the hand-run cannot drift apart.
+      - name: The device gate (database, server, APK, device, sign-in)
+        # No `timeout-minutes` here on purpose: the first run on a cold host
+        # builds the workspace and downloads the emulator's image, and a job that
+        # kills its own setup halfway is a flake with a delay fuse. The script
+        # fails loudly on its own whenever a stage never arrives.
+        run: scripts/android-device-gate.sh
+
   # The declared MSRV (workspace rust-version). RUSTUP_TOOLCHAIN overrides the
   # pinned rust-toolchain.toml channel so this job actually uses 1.96.
   msrv:
