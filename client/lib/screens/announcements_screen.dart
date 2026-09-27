@@ -110,12 +110,21 @@ class _AnnouncementsScreenState extends State<AnnouncementsScreen> {
     setState(() => _busy = id);
     try {
       final response = read
-          ? await session.api.markAnnouncementRead(id)
-          : await session.api.markAnnouncementUnread(id);
+          ? await session.markAnnouncementRead(id)
+          : await session.markAnnouncementUnread(id);
+      if (!mounted) return;
+      if (response['queued'] == true) {
+        // Offline. The receipt is recorded on this device and goes to the
+        // server when it can be reached — said in words rather than left as a
+        // silent no-op. The badge is not moved: that count is the server's
+        // arithmetic, and inventing a decrement here would be this screen
+        // guessing at it.
+        _say('Offline — your receipt is queued and will sync.');
+        return;
+      }
       session.setAnnouncementBadge(
         (response['unread'] as Map?)?.cast<String, dynamic>(),
       );
-      if (!mounted) return;
       await _load(silent: true);
     } on ApiException catch (e) {
       if (!mounted) return;

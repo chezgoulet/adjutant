@@ -74,6 +74,140 @@ class _HomeShellState extends State<HomeShell> {
         _ => const SettingsScreen(),
       };
 
+  /// The queue, stated above whatever screen is showing.
+  ///
+  /// A write the server refused is the one case the client must not leave to a
+  /// snackbar: it will never send itself, and the person is the only one who
+  /// can act on the reason. So it gets a strip that stays until it is read.
+  Widget _withQueue(SessionState session, Widget body) => Column(
+        children: [
+          if (session.refusedWriteCount > 0) _refusedStrip(session),
+          Expanded(child: body),
+        ],
+      );
+
+  Widget _refusedStrip(SessionState session) {
+    final count = session.refusedWriteCount;
+    return Material(
+      color: AppColors.error,
+      child: InkWell(
+        onTap: () => _showRefused(session),
+        child: Padding(
+          padding: const EdgeInsets.symmetric(
+            horizontal: AppSpacing.md,
+            vertical: 6,
+          ),
+          child: Row(
+            children: [
+              const Icon(Icons.error_outline, size: 16, color: Colors.white),
+              const SizedBox(width: AppSpacing.sm),
+              Expanded(
+                child: Text(
+                  count == 1
+                      ? 'A change could not be sent — tap to read why'
+                      : '$count changes could not be sent — tap to read why',
+                  style: AppText.labelMedium.copyWith(color: Colors.white),
+                ),
+              ),
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+
+  Future<void> _showRefused(SessionState session) async {
+    await showDialog<void>(
+      context: context,
+      builder: (context) => AlertDialog(
+        title: const Text('Could not be sent'),
+        content: SingleChildScrollView(
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              const Text(
+                'The server refused these, in its own words. They are still '
+                'recorded on this device — nothing is dropped until you '
+                'dismiss it.',
+              ),
+              const SizedBox(height: AppSpacing.md),
+              for (final write in session.refusedWrites)
+                Padding(
+                  padding: const EdgeInsets.only(bottom: AppSpacing.sm),
+                  child: Text(write.summary, style: AppText.bodySmall),
+                ),
+            ],
+          ),
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.of(context).pop(),
+            child: const Text('Keep them'),
+          ),
+          FilledButton(
+            onPressed: () async {
+              await session.clearRefusedWrites();
+              if (context.mounted) Navigator.of(context).pop();
+            },
+            child: const Text('Dismiss'),
+          ),
+        ],
+      ),
+    );
+  }
+
+  /// Try the queue now, and say what happened — the person pressed a button,
+  /// so silence would be worse than a short sentence.
+  Future<void> _syncNow(SessionState session) async {
+    final report = await session.syncOutbox();
+    if (!mounted) return;
+    final message = report.unreachable
+        ? 'Still offline — your changes stay queued.'
+        : report.refused > 0
+            ? '${report.sent} sent; ${report.refused} could not be sent.'
+            : '${report.sent} sent.';
+    ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text(message)));
+  }
+
+  /// Sign out — after asking, when something is still owed.
+  ///
+  /// The session's end takes the read cache and the queue with it ([SessionState
+  /// .signOut] says why). A queue discarded without a word is the one thing the
+  /// queued-write list promises never to do, so when writes are owed this asks
+  /// first, and names how many.
+  Future<void> _signOut(SessionState session) async {
+    final owed = session.pendingWriteCount;
+    if (owed > 0) {
+      final go = await showDialog<bool>(
+        context: context,
+        builder: (context) => AlertDialog(
+          title: const Text('Changes have not been sent'),
+          content: Text(
+            owed == 1
+                ? 'One change is still waiting for the server. Signing out '
+                    'discards it: it was never sent, and it will not be sent.'
+                : '$owed changes are still waiting for the server. Signing out '
+                    'discards them: they were never sent, and they will not be '
+                    'sent.',
+          ),
+          actions: [
+            TextButton(
+              onPressed: () => Navigator.of(context).pop(false),
+              child: const Text('Not yet'),
+            ),
+            FilledButton(
+              onPressed: () => Navigator.of(context).pop(true),
+              child: const Text('Sign out anyway'),
+            ),
+          ],
+        ),
+      );
+      if (go != true) return;
+    }
+    await session.signOut();
+  }
+
   /// A destination's icon, carrying the unread count when it is the inbox.
   ///
   /// The badge is red only when an *unread urgent* announcement exists — that is
@@ -114,10 +248,27 @@ class _HomeShellState extends State<HomeShell> {
             child: Icon(Icons.cloud_off, color: AppColors.warning, size: 20),
           ),
         ),
+      // What is still owed to the server, as a count that can be acted on:
+      // "syncs when online" is a promise, and this is the button that makes it
+      // one the person can also keep themselves.
+      if (session.pendingWriteCount > 0)
+        Padding(
+          padding: const EdgeInsets.only(right: AppSpacing.sm),
+          child: IconButton(
+            tooltip: session.pendingWriteCount == 1
+                ? '1 change waiting to sync — tap to send it now'
+                : '${session.pendingWriteCount} changes waiting to sync — tap to send them now',
+            onPressed: () => _syncNow(session),
+            icon: Badge(
+              label: Text('${session.pendingWriteCount}'),
+              child: const Icon(Icons.cloud_upload_outlined),
+            ),
+          ),
+        ),
       PopupMenuButton<String>(
         tooltip: 'Account',
         onSelected: (value) {
-          if (value == 'signout') context.read<SessionState>().signOut();
+          if (value == 'signout') _signOut(context.read<SessionState>());
         },
         itemBuilder: (context) => [
           PopupMenuItem(enabled: false, child: Text(session.displayName)),
@@ -143,7 +294,7 @@ class _HomeShellState extends State<HomeShell> {
     if (width < 600) {
       return Scaffold(
         appBar: AppBar(title: Text(title), actions: actions),
-        body: _body(),
+        body: _withQueue(session, _body()),
         bottomNavigationBar: NavigationBar(
           selectedIndex: _index,
           onDestinationSelected: (i) => setState(() => _index = i),
@@ -181,7 +332,7 @@ class _HomeShellState extends State<HomeShell> {
               ],
             ),
             const VerticalDivider(width: 1),
-            Expanded(child: _body()),
+            Expanded(child: _withQueue(session, _body())),
           ],
         ),
       );
@@ -204,7 +355,7 @@ class _HomeShellState extends State<HomeShell> {
           Expanded(
             child: Scaffold(
               appBar: AppBar(title: Text(title), actions: actions),
-              body: _body(),
+              body: _withQueue(session, _body()),
             ),
           ),
         ],
