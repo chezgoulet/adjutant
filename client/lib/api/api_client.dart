@@ -787,6 +787,40 @@ class ApiClient {
     await _send('POST', '/api/plugins/${Uri.encodeComponent(id)}/$verb');
   }
 
+  /// Has an operator chosen which plugins this deployment runs — and what?
+  ///
+  /// `null` means nobody has, which is the only state in which the first-run
+  /// wizard may appear. The *server* answers this rather than the device: a
+  /// per-device flag would re-prompt the second admin, could not be set by a
+  /// scripted install, and could not tell "chose exactly auth and membership"
+  /// from "never chose" — the two states a local flag cannot separate.
+  ///
+  /// `core:admin`, so a 403 here is the answer for anyone else, not something the
+  /// client should pre-guess.
+  Future<Map<String, dynamic>?> pluginChoice() async {
+    final body = _asMap(await _send('GET', '/api/plugins/choice'));
+    final choice = body['choice'];
+    return choice is Map<String, dynamic> ? choice : null;
+  }
+
+  /// Choose which plugins this deployment runs.
+  ///
+  /// The same act as `bootstrap-isolation --enable`, through the same server
+  /// function — so the wizard and a scripted install cannot drift apart, and this
+  /// returns what the core then carries.
+  ///
+  /// Refused with 400 and a reason naming what is wrong: an id that is not on
+  /// disk, a required plugin left off, or a dependent without its dependency. The
+  /// screen shows the server's own words rather than pre-judging which sets are
+  /// legal, because the rules live in the core and a second copy would drift.
+  Future<List<String>> setPluginChoice(List<String> ids) async {
+    final body = _asMap(
+      await _send('PUT', '/api/plugins/choice', body: {'plugin_ids': ids}),
+    );
+    final enabled = body['enabled'];
+    return enabled is List ? enabled.cast<String>() : const <String>[];
+  }
+
   // --- backups ---------------------------------------------------------------
 
   /// The picker's options, the schedule, and the recent runs.
