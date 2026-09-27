@@ -7,20 +7,30 @@ in particular the interim `v0.3.0` recommendation and the v1.0 gate.
 
 ## What a release contains
 
-- A Git tag `vX.Y.Z` on `main`, which triggers
+- A Git tag `vX.Y.Z`, which triggers
   [`.github/workflows/release.yml`](../.github/workflows/release.yml): it builds
-  the workspace and the WASM guest, and publishes a tarball with the `adjutant`
-  binary, the bundled plugin `.so` files, the `hello_wasm.wasm` guest,
-  `README.md`, and `LICENSE`.
-- Published crates: **`adjutant-sdk` first**, then **`adjutant-server`** (the
-  server depends on the SDK by version, so the SDK must exist on crates.io
-  before the server can be published).
+  the workspace and the WASM guest, and publishes **two** artifacts —
+  - `adjutant-vX.Y.Z-x86_64-unknown-linux-gnu.tar.gz`, carrying the `adjutant`
+    binary, **every plugin library the workspace stages** (derived by
+    `scripts/stage-plugins.py`, never a hand-written list), the `hello_wasm.wasm`
+    guest, `README.md` and `LICENSE`;
+  - `adjutant-client-vX.Y.Z-web.tar.gz`, the Flutter client built for the web,
+    which is how a troop opens Adjutant from anywhere.
+- **Android is not in the tarball yet.** It is the Obtainium path, and it lands
+  when #111 gives the client a CI build for the platform — the release attaches
+  what was built, not what was hoped for.
+- **Published crates are a separate act.** Nothing in CI publishes to crates.io:
+  `adjutant-sdk` and then `adjutant-server` are published by hand, in that order
+  (the server depends on the SDK by version, so the SDK must exist first). The
+  release workflow does not do it, which is why the token below is not a
+  repository secret today.
 
 ## One-time setup (repository owner)
 
 1. Create or use a crates.io account and generate an API token.
-2. Add the token as a repository secret (e.g. `CARGO_REGISTRY_TOKEN`) for the
-   publish workflow, or run the publish steps locally with `cargo login`.
+2. `cargo login` with it where you will publish — **or**, if you would rather CI
+   published, add the token as the repository secret `CARGO_REGISTRY_TOKEN` **and
+   the publish step that reads it**, because no step does today.
 3. Confirm the crate names `adjutant-sdk` and `adjutant-server` are available.
 
 ## Version bump

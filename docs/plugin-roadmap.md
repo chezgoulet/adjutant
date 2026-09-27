@@ -166,18 +166,29 @@ The exit criteria in SPEC §15 and in `docs/milestones/*` remain the authority f
 [`release-path.md`](release-path.md) owns the ordered work remaining.
 
 - **M1, M2, M3, M3-S, M4 — done**, each with a record and live evidence.
-- **M5 — partially met.** `calendar` is shipped and the client MVP's named screens
-  exist and go beyond them; `mcp` is built, loading and tested. Open: the MCP
-  connect-and-interact proof, offline mode, the client exercised against a live
-  server in CI, the UI/UX review, and the deployment to The House.
-- **M6 — built, two boxes open.** The five plugins exist and are probed; `SDK v0.3`
-  is not delivered and announcements' delivery is deferred by decision (#46). A
-  third of M6's boxes are about the *client* surface, which release-path Stage 2.3
-  carries.
-- **M7 — two of eight met** (Docker Compose, CI/CD); the other six are open issues
-  #49–#54.
+- **M5 — partially met: three of eight boxes, one partial, four open**, and it now
+  has a record ([`milestones/M5-mcp-and-flutter-mvp.md`](milestones/M5-mcp-and-flutter-mvp.md)).
+  `calendar` is shipped with recurrence, RSVPs and quorum; the client's named
+  screens exist and go well beyond them; `mcp` is built, loading and tested; and
+  the two things this line used to name as missing — the client exercised against
+  a live server in CI, and the plugin set chosen rather than assumed — both landed
+  on 2026-09-27 (the harness is a `verify` step; #89/#90 closed with #110). Open:
+  the MCP connect-and-interact proof, offline mode (storage decided: a plain cache
+  plus a queued write list), the UI/UX review, the Android artifact (#111), and
+  the deployment to the 161st (host decided: troop-owned hardware).
+- **M6 — built, one box open.** **SDK v0.3 landed after this line was written**
+  (`permissions!` and `migrations!`, `SDK_ABI_VERSION` still 4, `conflicts`
+  converted as the proof; the record carries the dated correction), so what is
+  open is announcements' delivery, deferred by decision (#46 — `DELIVERY_CHANNELS`
+  is still `[in_app]`). A third of M6's boxes are about the *client* surface,
+  which release-path Stage 2.3 carries.
+- **M7 — three of eight met** (CI/CD; the proxy-fronted deployment proven; the
+  restore drill from a destroyed volume). The compose stack's "met" was withdrawn
+  on 2026-09-26 when it had never actually started, and the other boxes are the
+  open issues #49–#54, ordered in [`release-path.md`](release-path.md) Stage 3.
 - **M8 — not started**, and gated on M5–M7 plus one decision only the owner can
-  make (the crates.io token — release-path Stage 5).
+  make (the crates.io token — release-path Stage 5). Nothing in CI publishes the
+  crates today; the release workflow builds a tarball and the client's web bundle.
 
 ### The day-one release (M5)
 
@@ -219,11 +230,13 @@ built on top of it, because both plugins are full of scope decisions:
 
 ---
 
-## 6. Decisions taken (2026-09-26)
+## 6. Decisions taken (2026-09-26 and 2026-09-27)
 
 This section used to list what the document did not settle. Those questions were
 put to the owner on **2026-09-26** and answered; the answers are recorded here so
-the reasoning survives the commits that implement them.
+the reasoning survives the commits that implement them. Five more were put and
+answered on **2026-09-27** (below), against the release-path question "are we
+ready to release 0.3?".
 
 1. **Announcements: plugin or client, and which channel? — the plugin owns
    delivery, and delivery is not one channel.** The vocabulary is the notification
@@ -252,12 +265,48 @@ the reasoning survives the commits that implement them.
    nginx or Traefik; the M7 box is the proven proxy-fronted deployment, not a
    certificate inside the binary.
 7. **The deployment host stays undecided** until the proxy-fronted deployment is
-   finished and exercised, then it is chosen against something real.
+   finished and exercised, then it is chosen against something real. **Answered
+   2026-09-27 (below): hardware the 161st owns or is given.**
 
 **One action the owner owes, and nothing is blocked behind anything else:** the
 crates.io token. Both crate names are free today, and reserving them at the
 current `0.2.x` — with the API promise starting at 1.0 — is a five-minute errand
-that unblocks SPEC M3's publication box and M8's.
+that unblocks SPEC M3's publication box and M8's. *(Corrected 2026-09-27: nothing
+in CI publishes the crates — the release workflow builds a tarball and the
+client's web bundle — so this token is read by a human running `cargo publish`,
+not by a workflow step.)*
+
+### Decisions taken (2026-09-27)
+
+Put to the owner against the question "are we ready to release 0.3?", and answered
+in one sitting. Each gates work rather than describing it.
+
+1. **The v0.3.0 gate stays as written.** Stage 1's boxes plus Stage 3.1's
+   proxy-fronted proof and Stage 3.2's restore drill — no re-scoping, and no
+   earlier tag on the deployment path alone. Two of the eight Stage 1 boxes were
+   already met by the time the question was asked, and the rest are the work.
+2. **Offline mode uses a plain cache, not drift.** A durable read cache plus a
+   queued write list, with no schema on the device. drift/SQLite stays the answer
+   *if* offline queries turn out to need one; it is not the opening move, because
+   a client-side schema is a second migration story to keep in step with the
+   server's.
+3. **The 161st's instance runs on hardware the troop owns or is given.** Familiar
+   and theirs, which is the point — the troop's data and the troop's box. One
+   question follows it and belongs with their network rather than this repository:
+   how that box is reached from outside (a Cloudflare Tunnel, which opens no ports
+   and is the shape the proxy proof exercised, or a port-forward with a
+   certificate of their own).
+4. **A release attaches both the server and the client.** The tarball's plugin set
+   is derived from the workspace — it had rotted to three of fourteen libraries,
+   the same defect #88 found in the Dockerfile — and the client's **web** bundle
+   is attached now. The **Android** artifact is attached when #111 gives it a CI
+   build, not before: a release that attaches an APK nobody built is a claim
+   rather than a build.
+5. **The next lane is the honesty pass**, ahead of #111 and the MCP proof: the
+   release workflow's plugin set, this document's stage states, `release-path.md`
+   and the missing M5 record. The plan of record had drifted from the branch
+   (three landed items still described as "do first"), which is the failure the
+   document's own update rule exists to prevent.
 
 ---
 
