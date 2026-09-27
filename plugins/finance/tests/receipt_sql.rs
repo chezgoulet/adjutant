@@ -22,7 +22,12 @@
 //! * a correction through `POST /api/finance/receipt/{id}/supersede`: a second
 //!   row that names the first, both still there, a second correction of the same
 //!   receipt refused, and a correction pointed at another entry's receipt refused
-//!   by the trigger.
+//!   by the trigger;
+//! * the two **read** routes' ownership branch — "a giver sees their own and no
+//!   one else's; the treasurer sees all" — against real `core.roles` /
+//!   `core.role_permissions` rows, asserting the refusals (another member's
+//!   receipt, and the whole troop, reach a member as nothing) as hard as the
+//!   grants.
 //!
 //! ## Running them
 //!
@@ -77,6 +82,15 @@ const PROBE_MARK: &str = "probe:finance-receipt-sql:";
 const OCCURRED_ON: &str = "2026-03-15";
 /// The fiscal year `OCCURRED_ON` falls in — what a receipt number carries.
 const FISCAL_YEAR: i64 = 2026;
+/// A role the probe declares for its member caller: `finance:read`, and nothing
+/// else. It is what makes "your own, and no one else's" a real refusal rather
+/// than a claim — the member holds no `finance:read_all` row for the read
+/// routes' authority branch to find.
+const MEMBER_ROLE: &str = "probe_receipt_member";
+/// A role the probe declares for the treasurer: `finance:read` **and**
+/// `finance:read_all`, evaluated by the same `PermissionService` a deployment's
+/// `core.role_permissions` rows feed.
+const TREASURER_ROLE: &str = "probe_receipt_treasurer";
 
 /// Serialises the probes: they assert on values the whole table shares (the
 /// number sequence, and how many receipts a transaction has), so two running at
@@ -166,7 +180,9 @@ async fn plugin_pool(admin: &PgPool) -> PgPool {
 }
 
 /// The core's own preconditions, stated rather than assumed. The issue route
-/// audits its write, so `core.audit_log` has to exist.
+/// audits its write, so `core.audit_log` has to exist — and the read routes'
+/// authority branch is checked against real grant rows, so the vocabulary the
+/// plugin declares must be registered for those grants to mean anything.
 async fn ensure_core_ready(admin: &PgPool) {
     let audit: Option<String> = sqlx::query_scalar("SELECT to_regclass('core.audit_log')::text")
         .fetch_one(admin)
@@ -178,6 +194,68 @@ async fn ensure_core_ready(admin: &PgPool) {
          here could be audited — run the live ladder against it: \
          `ADJUTANT_PLUGIN_DIR=plugins-built ./target/debug/adjutant test-plugin`"
     );
+    let registered: Vec<String> =
+        sqlx::query_scalar("SELECT id FROM core.permissions WHERE id = ANY($1)")
+            .bind(vec!["finance:read".to_string(), "finance:read_all".to_string()])
+            .fetch_all(admin)
+            .await
+            .expect("read the registered finance permissions");
+    for permission in ["finance:read", "finance:read_all"] {
+        assert!(
+            registered.iter().any(|id| id == permission),
+            "`{permission}` is not registered in core.permissions — run the live ladder \
+             (`ADJUTANT_PLUGIN_DIR=plugins-built ./target/debug/adjutant test-plugin`) against \
+             this database so the finance plugin's vocabulary is registered"
+        );
+    }
+}
+
+/// Declare the probe's two callers and their grants — real `core.roles` and
+/// `core.role_permissions` rows, evaluated by `PermissionService` exactly as a
+/// deployment's are.
+///
+/// The member holds `finance:read` and **not** `finance:read_all`: that absence
+/// is the whole refusal. The treasurer holds both.
+async fn ensure_probe_roles(admin: &PgPool) {
+    for (role, display_name, permissions) in [
+        (MEMBER_ROLE, "probe receipt member", &["finance:read"][..]),
+        (
+            TREASURER_ROLE,
+            "probe receipt treasurer",
+            &["finance:read", "finance:read_all"][..],
+        ),
+    ] {
+        sqlx::query(
+            "INSERT INTO core.roles (id, display_name) VALUES ($1, $2) ON CONFLICT (id) DO NOTHING",
+        )
+        .bind(role)
+        .bind(display_name)
+        .execute(admin)
+        .await
+        .expect("declare the probe's role");
+        for permission in permissions {
+            sqlx::query(
+                "INSERT INTO core.role_permissions (role_id, permission_id) VALUES ($1, $2) \
+                 ON CONFLICT DO NOTHING",
+            )
+            .bind(role)
+            .bind(*permission)
+            .execute(admin)
+            .await
+            .expect("grant the probe's permission");
+        }
+    }
+}
+
+/// Remove the probe's roles. `core.role_permissions.role_id` is
+/// `ON DELETE CASCADE`, so the grants go with them and the probe leaves nothing.
+async fn clear_probe_roles(admin: &PgPool) {
+    for role in [MEMBER_ROLE, TREASURER_ROLE] {
+        let _ = sqlx::query("DELETE FROM core.roles WHERE id = $1")
+            .bind(role)
+            .execute(admin)
+            .await;
+    }
 }
 
 /// Apply this plugin's migrations, as the plugin role, in its own schema — the
@@ -617,6 +695,121 @@ async fn refused(
             reason: e.to_string(),
         },
     }
+}
+
+/// One **GET** through a real read handler, as an explicit caller holding a real
+/// troop-scoped grant — the identity shape the authority branch is checked
+/// against. The route is called out of the plugin's own list, so an edit to the
+/// branch is what is exercised, not a copy of it.
+async fn read(
+    routes: &[RouteDefinition],
+    path: &str,
+    caller: &str,
+    role: &str,
+    params: &[(&str, String)],
+    query: &[(&str, String)],
+) -> Result<PluginResponse, SdkError> {
+    let route = routes
+        .iter()
+        .find(|r| r.path == path)
+        .unwrap_or_else(|| panic!("the plugin serves no route {path:?}"));
+    let mut request = TestRequest::get(path).identity_grants(
+        caller,
+        vec![RoleGrant {
+            role_id: role.into(),
+            scope: Scope::troop(),
+        }],
+    );
+    for (key, value) in params {
+        request = request.param(key, value);
+    }
+    for (key, value) in query {
+        request = request.query_param(key, value);
+    }
+    (route.handler)(request.build()).await
+}
+
+/// A read that must be **answered**: a 2xx, decoded as JSON.
+async fn read_ok(
+    routes: &[RouteDefinition],
+    path: &str,
+    caller: &str,
+    role: &str,
+    params: &[(&str, String)],
+    query: &[(&str, String)],
+) -> Value {
+    match read(routes, path, caller, role, params, query).await {
+        Ok(response) if (200..300).contains(&response.status) => response_json(&response),
+        Ok(response) => panic!(
+            "{path} answered {} as {caller} — expected it to be accepted: {}",
+            response.status,
+            String::from_utf8_lossy(&response.body)
+        ),
+        Err(e) => panic!("{path} returned an error as {caller} — expected it to be accepted: {e}"),
+    }
+}
+
+/// A read that must be **refused**, with its status and its own reason — a
+/// guarded read returns `SdkError::Forbidden` (a 403), so the permission the
+/// caller lacked is named rather than a generic failure.
+async fn read_refused(
+    routes: &[RouteDefinition],
+    path: &str,
+    caller: &str,
+    role: &str,
+    params: &[(&str, String)],
+    query: &[(&str, String)],
+) -> Refusal {
+    match read(routes, path, caller, role, params, query).await {
+        Ok(response) if response.status >= 400 => Refusal {
+            status: response.status,
+            reason: response_json(&response)["error"]
+                .as_str()
+                .map(str::to_string)
+                .unwrap_or_else(|| String::from_utf8_lossy(&response.body).to_string()),
+        },
+        Ok(response) => panic!(
+            "{path} answered {} as {caller} — expected a refusal: {}",
+            response.status,
+            String::from_utf8_lossy(&response.body)
+        ),
+        Err(e) => Refusal {
+            status: e.status(),
+            reason: e.to_string(),
+        },
+    }
+}
+
+/// An income entry and the receipt issued from it, through the real routes — the
+/// money first, then the receipt — with the marker that makes both this probe's.
+///
+/// `payer_name` addresses a giver outside the troop (no roster identity), which
+/// is the case a member can never reach by identity.
+async fn issue_receipt(
+    routes: &[RouteDefinition],
+    admin: &PgPool,
+    mark: &str,
+    member_id: &str,
+    payer_name: Option<&str>,
+) -> Receipt {
+    accepted(
+        routes,
+        "/api/finance/transaction",
+        &[],
+        &transaction_body(mark, FUND_GENERAL, 1_000, member_id),
+    )
+    .await;
+    let transaction_id = probe_transaction_id(admin, mark).await;
+    accepted(
+        routes,
+        "/api/finance/receipt",
+        &[],
+        &receipt_body(mark, transaction_id, payer_name),
+    )
+    .await;
+    let rows = receipts_written(admin, mark).await;
+    assert_eq!(rows.len(), 1, "one receipt for {mark}: {rows:?}");
+    rows.into_iter().next().expect("the receipt")
 }
 
 /// An income entry, with the marker that makes it this probe's row, recorded
@@ -1083,4 +1276,197 @@ async fn a_correction_supersedes_and_both_receipts_remain() {
 
     cleanup(&url, mark).await;
     cleanup(&url, other).await;
+}
+
+// ===========================================================================
+// 4. The read routes' ownership branch, against real core.roles rows
+// ===========================================================================
+
+/// **The ownership probe.** "A giver sees their own and no one else's; the
+/// treasurer sees all" is a *handler* decision, made by
+/// `PermissionService.reach(identity, "finance:read_all", &Scope::troop())`,
+/// which reads `core.roles` / `core.role_permissions`. The mock-host test
+/// (`finance.rs::a_giver_reads_their_own_receipts_and_the_treasurer_reads_all`)
+/// answers that query from a scripted row; this one answers it from real grant
+/// rows the probe declares, and drives the same two read routes.
+///
+/// It asserts the refusals as hard as the grants: a member asking for another
+/// member's receipts — by id or by `member_id` — and for the whole troop gets
+/// nothing, and a receipt addressed to a giver outside the troop (by
+/// `payer_name`) is only ever the treasurer's to read.
+#[tokio::test]
+#[ignore = "DB-gated: needs ADJUTANT_TEST_DATABASE_URL + a ladder-bootstrapped test database"]
+async fn the_read_routes_honour_the_receipt_ownership_rule_against_real_roles() {
+    let _guard = DB.lock().await;
+    let url = test_database_url();
+    let admin = admin_pool().await;
+    ensure_core_ready(&admin).await;
+    let plugin = plugin_pool(&admin).await;
+    ensure_plugin_schema(&admin, &plugin).await;
+    ensure_probe_roles(&admin).await;
+    let ctx = context(&admin, &plugin);
+    let routes = routes_of(&ctx).await;
+
+    let list = "/api/finance/receipts";
+    let one = "/api/finance/receipt/{id}";
+
+    let bea_mark = "access-bea";
+    let carl_mark = "access-carl";
+    let outside_mark = "access-outside";
+    let marks = [bea_mark, carl_mark, outside_mark];
+    for mark in marks {
+        cleanup(&url, mark).await;
+    }
+
+    // --- three receipts, issued through the ledger and receipt routes: one for
+    // each of two members, and one for a giver outside the troop with no account.
+    let bea = issue_receipt(&routes, &admin, bea_mark, "probe-receipt-bea", None).await;
+    let carl = issue_receipt(&routes, &admin, carl_mark, "probe-receipt-carl", None).await;
+    let outside = issue_receipt(&routes, &admin, outside_mark, "", Some("Jane Doe")).await;
+    assert_eq!(bea.member_id, "probe-receipt-bea", "{bea:?}");
+    assert_eq!(carl.member_id, "probe-receipt-carl", "{carl:?}");
+    assert!(
+        outside.member_id.is_empty() && outside.payer_name == "Jane Doe",
+        "{outside:?}"
+    );
+
+    // --- the list: a member naming themselves is an ownership check, not a grant,
+    // so it is answered — and the page holds only their own receipt.
+    let page = read_ok(
+        &routes,
+        list,
+        "probe-receipt-bea",
+        MEMBER_ROLE,
+        &[],
+        &[("member_id", "probe-receipt-bea".to_string())],
+    )
+    .await;
+    assert_eq!(page["count"], json!(1), "the giver sees their own: {page}");
+    assert_eq!(page["receipts"][0]["number"], json!(bea.number), "{page}");
+    assert_eq!(
+        page["receipts"][0]["issued_to"], json!("probe-receipt-bea"),
+        "{page}"
+    );
+
+    // --- a member asking for someone else's receipts is refused, and so is the
+    // whole troop's list: both need `finance:read_all`, which the member lacks.
+    let refusal = read_refused(
+        &routes,
+        list,
+        "probe-receipt-bea",
+        MEMBER_ROLE,
+        &[],
+        &[("member_id", "probe-receipt-carl".to_string())],
+    )
+    .await;
+    assert_eq!(refusal.status, 403, "another member's receipts: {refusal:?}");
+    assert!(refusal.reason.contains("finance:read_all"), "{refusal:?}");
+
+    let refusal = read_refused(&routes, list, "probe-receipt-bea", MEMBER_ROLE, &[], &[]).await;
+    assert_eq!(refusal.status, 403, "the whole troop's receipts: {refusal:?}");
+    assert!(refusal.reason.contains("finance:read_all"), "{refusal:?}");
+
+    // --- the treasurer holds `finance:read_all`, so the whole troop's list is
+    // answered and the page carries every giver's receipt — the members' and the
+    // outsider's.
+    let page = read_ok(
+        &routes,
+        list,
+        "probe-receipt-treasurer",
+        TREASURER_ROLE,
+        &[],
+        &[],
+    )
+    .await;
+    let numbers: Vec<&str> = page["receipts"]
+        .as_array()
+        .expect("a page of receipts")
+        .iter()
+        .filter_map(|row| row["number"].as_str())
+        .collect();
+    for receipt in [&bea, &carl, &outside] {
+        assert!(
+            numbers.contains(&receipt.number.as_str()),
+            "the treasurer sees every giver's receipt, including {}: {page}",
+            receipt.number
+        );
+    }
+    let page = read_ok(
+        &routes,
+        list,
+        "probe-receipt-treasurer",
+        TREASURER_ROLE,
+        &[],
+        &[("member_id", "probe-receipt-carl".to_string())],
+    )
+    .await;
+    assert_eq!(page["receipts"][0]["number"], json!(carl.number), "{page}");
+
+    // --- one receipt: a giver reads their own...
+    let body = read_ok(
+        &routes,
+        one,
+        "probe-receipt-bea",
+        MEMBER_ROLE,
+        &[("id", bea.id.to_string())],
+        &[],
+    )
+    .await;
+    assert_eq!(body["issued_to"], json!("probe-receipt-bea"), "{body}");
+    assert_eq!(body["number"], json!(bea.number), "{body}");
+
+    // --- ...and no one else's without the grant: another member's by id...
+    let refusal = read_refused(
+        &routes,
+        one,
+        "probe-receipt-bea",
+        MEMBER_ROLE,
+        &[("id", carl.id.to_string())],
+        &[],
+    )
+    .await;
+    assert_eq!(refusal.status, 403, "another member's receipt: {refusal:?}");
+    assert!(refusal.reason.contains("finance:read_all"), "{refusal:?}");
+
+    // --- ...the treasurer reads another member's by id...
+    let body = read_ok(
+        &routes,
+        one,
+        "probe-receipt-treasurer",
+        TREASURER_ROLE,
+        &[("id", carl.id.to_string())],
+        &[],
+    )
+    .await;
+    assert_eq!(body["issued_to"], json!("probe-receipt-carl"), "{body}");
+
+    // --- ...and a receipt addressed to a giver outside the troop has no account to
+    // match, so it is the treasurer's and never a member's by identity.
+    let refusal = read_refused(
+        &routes,
+        one,
+        "probe-receipt-bea",
+        MEMBER_ROLE,
+        &[("id", outside.id.to_string())],
+        &[],
+    )
+    .await;
+    assert_eq!(refusal.status, 403, "an outsider's receipt: {refusal:?}");
+    assert!(refusal.reason.contains("finance:read_all"), "{refusal:?}");
+
+    let body = read_ok(
+        &routes,
+        one,
+        "probe-receipt-treasurer",
+        TREASURER_ROLE,
+        &[("id", outside.id.to_string())],
+        &[],
+    )
+    .await;
+    assert_eq!(body["issued_to"], json!("Jane Doe"), "{body}");
+
+    for mark in marks {
+        cleanup(&url, mark).await;
+    }
+    clear_probe_roles(&admin).await;
 }
