@@ -126,11 +126,10 @@ class _GovernanceScreenState extends State<GovernanceScreen> {
       );
     }
     if (_error != null && _motions.isEmpty) {
-      return EmptyState(
-        icon: Icons.cloud_off,
-        title: 'Cannot reach the server',
-        message: _error!,
-        action: FilledButton(onPressed: _load, child: const Text('Retry')),
+      return failureState(
+        error: _error,
+        statusCode: _errorStatus,
+        onRetry: _load,
       );
     }
 
@@ -415,13 +414,11 @@ class _MotionDetailScreenState extends State<MotionDetailScreen> {
       );
     }
     if (_error != null) {
-      return EmptyState(
-        icon: _errorStatus == 404 ? Icons.search_off : Icons.cloud_off,
-        title: _errorStatus == 404 ? 'No such motion' : 'Cannot reach the server',
-        message: _error!,
-        action: _errorStatus == 404
-            ? null
-            : FilledButton(onPressed: _load, child: const Text('Retry')),
+      return failureState(
+        error: _error,
+        statusCode: _errorStatus,
+        onRetry: _load,
+        missingTitle: 'No such motion',
       );
     }
 

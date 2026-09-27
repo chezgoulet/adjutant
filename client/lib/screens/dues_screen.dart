@@ -252,21 +252,25 @@ class _DuesScreenState extends State<DuesScreen> {
                             'at what was withheld.'
                             '${(_error ?? '').isEmpty ? '' : '\n\nThe server said: $_error'}',
                       )
-                    : _error != null || _nothingKnown
-                        ? EmptyState(
-                            icon: Icons.cloud_off,
-                            title: _nothingKnown
-                                ? 'Offline — nothing cached yet'
-                                : 'Cannot reach the server',
-                            message: _error ??
-                                'This record has not been read successfully yet, '
-                                    'so there is no last-known answer to show.',
-                            action: FilledButton(
-                              onPressed: _load,
-                              child: const Text('Retry'),
-                            ),
+                    : _error != null
+                        ? failureState(
+                            error: _error,
+                            statusCode: _errorStatus,
+                            onRetry: _load,
                           )
-                        : _content(),
+                        : _nothingKnown
+                            ? EmptyState(
+                                icon: Icons.cloud_off,
+                                title: 'Offline — nothing cached yet',
+                                message: 'This record has not been read '
+                                    'successfully yet, so there is no last-known '
+                                    'answer to show.',
+                                action: FilledButton(
+                                  onPressed: _load,
+                                  child: const Text('Retry'),
+                                ),
+                              )
+                            : _content(),
           ),
         ],
       ),

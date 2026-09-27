@@ -212,6 +212,113 @@ class OfflineBanner extends StatelessWidget {
   }
 }
 
+/// The one place a failed read becomes words — and the one place the decision
+/// about Retry is made.
+///
+/// A failure has exactly two shapes, and folding them together is the bug this
+/// exists to prevent:
+///
+///  * **The server answered** ([ApiException]): it holds a status *and its own
+///    sentence about what went wrong*. Rendering that as "Cannot reach the
+///    server" is a claim the reader cannot act on, and Retry cannot change an
+///    answer already given. A 404 is most often a route this deployment does
+///    not run — a plugin that is switched off answers exactly that — so it is
+///    named as not-found, the server's own sentence is kept verbatim beneath it,
+///    and no Retry is offered. Every other 4xx is the server refusing this
+///    request for a reason only it knows, so its sentence is the message and
+///    again there is nothing to retry. A 5xx is the server failing to answer
+///    something it does run, which may well work on a second attempt, so Retry
+///    stays.
+///  * **Nothing answered** (no status: [OfflineException], or anything
+///    unrecognised): the transport failed and the same request may well succeed
+///    next time. This is the only case that reads "Cannot reach the server", and
+///    the only case where Retry is honest.
+class FailureView {
+  const FailureView({
+    required this.icon,
+    required this.title,
+    required this.message,
+    required this.retryable,
+  });
+
+  final IconData icon;
+  final String title;
+  final String message;
+
+  /// Whether offering Retry is honest — see the class doc.
+  final bool retryable;
+}
+
+/// Classify a failed read: the status and sentence the screen already holds in,
+/// the words to render and whether Retry means anything out.
+///
+/// [error] is the message the screen already holds — `ApiException.message`,
+/// i.e. the server's own words, or a transport failure's text — and
+/// [statusCode] is `null` when no HTTP answer arrived at all. [missingTitle]
+/// lets a screen that reads one named record say what is missing ("No such
+/// item", "No such motion"); a collection keeps the honest, non-committal
+/// default rather than inventing a reason for the absence.
+FailureView describeFailure(
+  String? error,
+  int? statusCode, {
+  String missingTitle = 'Not found on this server',
+}) {
+  final said = (error ?? '').trim();
+  if (statusCode == null) {
+    return FailureView(
+      icon: Icons.cloud_off,
+      title: 'Cannot reach the server',
+      message: said.isEmpty ? 'No answer came back from the server.' : said,
+      retryable: true,
+    );
+  }
+  if (statusCode == 404) {
+    return FailureView(
+      icon: Icons.search_off,
+      title: missingTitle,
+      message: said.isEmpty ? 'The server has nothing at this route.' : said,
+      retryable: false,
+    );
+  }
+  if (statusCode < 500) {
+    return FailureView(
+      icon: Icons.report_problem_outlined,
+      title: 'The server refused this request',
+      message: said.isEmpty ? 'The server refused this request.' : said,
+      retryable: false,
+    );
+  }
+  return FailureView(
+    icon: Icons.cloud_off,
+    title: 'The server could not answer',
+    message: said.isEmpty ? 'The server answered with $statusCode.' : said,
+    retryable: true,
+  );
+}
+
+/// The empty state for a failed read: [describeFailure]'s words, with Retry
+/// offered only where it can change the answer.
+///
+/// Screens with a refusal of their own to state (401/403, named in words with
+/// the permission that would fix it) branch before this; everything else that
+/// folds a failure into "Cannot reach the server" uses this one rule.
+EmptyState failureState({
+  required String? error,
+  required int? statusCode,
+  VoidCallback? onRetry,
+  String missingTitle = 'Not found on this server',
+}) {
+  final view = describeFailure(error, statusCode, missingTitle: missingTitle);
+  return EmptyState(
+    icon: view.icon,
+    title: view.title,
+    message: view.message,
+    action: view.retryable && onRetry != null
+        ? FilledButton(onPressed: onRetry, child: const Text('Retry'))
+        : null,
+  );
+}
+
 /// A labelled value pair, for detail screens. Keeps detail layouts honest:
 /// label above, value below, no invented decoration.
 class DetailField extends StatelessWidget {

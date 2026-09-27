@@ -322,14 +322,11 @@ class _StoreOrderScreenState extends State<StoreOrderScreen> {
                       '${(_error ?? '').isEmpty ? '' : '\n\nThe server said: $_error'}',
                 )
               : _order.isEmpty
-                  ? EmptyState(
-                      icon: Icons.cloud_off,
-                      title: 'Cannot reach the server',
-                      message: _error ?? 'Nothing came back for this order.',
-                      action: FilledButton(
-                        onPressed: _load,
-                        child: const Text('Retry'),
-                      ),
+                  ? failureState(
+                      error: _error,
+                      statusCode: _errorStatus,
+                      onRetry: _load,
+                      missingTitle: 'No such order',
                     )
                   : _body(),
     );

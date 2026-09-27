@@ -182,11 +182,10 @@ class _CatalogueTabState extends State<_CatalogueTab> {
       );
     }
     if (_error != null && _items.isEmpty) {
-      return EmptyState(
-        icon: Icons.cloud_off,
-        title: 'Cannot reach the server',
-        message: _error!,
-        action: FilledButton(onPressed: _load, child: const Text('Retry')),
+      return failureState(
+        error: _error,
+        statusCode: _errorStatus,
+        onRetry: _load,
       );
     }
 
@@ -437,11 +436,10 @@ class _AvailabilityTabState extends State<_AvailabilityTab> {
       );
     }
     if (_error != null) {
-      return EmptyState(
-        icon: Icons.cloud_off,
-        title: 'Cannot reach the server',
-        message: _error!,
-        action: FilledButton(onPressed: _load, child: const Text('Retry')),
+      return failureState(
+        error: _error,
+        statusCode: _errorStatus,
+        onRetry: _load,
       );
     }
 
@@ -690,11 +688,10 @@ class _HoldingTabState extends State<_HoldingTab> {
       );
     }
     if (_error != null) {
-      return EmptyState(
-        icon: Icons.cloud_off,
-        title: 'Cannot reach the server',
-        message: _error!,
-        action: FilledButton(onPressed: _load, child: const Text('Retry')),
+      return failureState(
+        error: _error,
+        statusCode: _errorStatus,
+        onRetry: _load,
       );
     }
     if (_member.isEmpty) {
