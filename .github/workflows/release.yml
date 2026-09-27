@@ -21,7 +21,7 @@ jobs:
   release:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       # `github.ref_name` is the branch name on a dispatch run, and every branch
       # here is `type/name`. A slash is fatal twice over: it turns a `dist/…`
@@ -166,7 +166,7 @@ jobs:
       # ran it can look at them, without a release having been created.
       - name: Upload the artifacts of a manual run
         if: github.event_name == 'workflow_dispatch'
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: adjutant-${{ steps.ref.outputs.slug }}-artifacts
           path: dist/*
@@ -175,7 +175,7 @@ jobs:
       # Only a tag creates a release. A dispatch run must never publish.
       - name: Create release
         if: github.event_name == 'push'
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@v3
         with:
           files: |
             dist/*.tar.gz

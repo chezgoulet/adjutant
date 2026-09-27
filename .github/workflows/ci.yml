@@ -32,7 +32,7 @@ jobs:
       # test, not by CI.
       ADJUTANT_ALLOW_SUPERUSER: "true"
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       # The toolchain version lives in exactly one place. `dtolnay/rust-toolchain@stable`
       # does NOT read rust-toolchain.toml, so it floated forward while local stable
@@ -423,7 +423,7 @@ jobs:
         # not "whatever directory the workspace root happens to be".
         working-directory: client
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       # Issue #76: the toolchain is pinned, not followed. `client/pubspec.yaml`'s
       # `environment.flutter` is the single source of truth — the same shape as
@@ -493,7 +493,7 @@ jobs:
       # build needs no setup — only its downloads cached. Gradle (dependencies,
       # wrapper distribution) is the slow part of a cold APK build.
       - name: Gradle caches (for the APK build)
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: |
             ~/.gradle/caches
@@ -535,7 +535,7 @@ jobs:
     needs: [client]
     runs-on: [self-hosted, linux, x64, android]
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       # One script does the whole gate — a throwaway database, the server with the
       # dev-header stub off, the APK installed and launched on the device, then
@@ -556,8 +556,8 @@ jobs:
     env:
       RUSTUP_TOOLCHAIN: "1.96.0"
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@1.96.0
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@1.120.0
       - uses: Swatinem/rust-cache@v2
       - name: cargo check on MSRV
         run: cargo check --workspace
