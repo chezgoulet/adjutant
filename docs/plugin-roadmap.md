@@ -82,9 +82,9 @@ changed, it is a mechanical follow-up across the records, not a decision.
 |---|---|---|---|---|
 | `auth` | §7.1 | Authentication, sessions, roles, OIDC | M3 | **Shipped** (v0.2.0) |
 | `membership` | §7.2 | Roster, lodges, patrols, proficiency, OSG import | M3 | **Shipped** (v0.2.0) |
-| `missions` | §7.3 | Six-stage mission lifecycle, mentor matching, Lodge Commander approval | M4 | **Shipped** (v0.2.0) |
-| `governance` | §7.4 | Motion lifecycle, voting, amendments, Accords versioning | M4 | **Shipped** (v0.2.0) |
-| `calendar` | §7.7 | Events, RSVPs, recurrence, quorum tracking | M5 | **Shipped** (v0.2.0) |
+| `missions` | §7.3 | Six-stage mission lifecycle, mentor matching, Lodge Commander approval | M4 | **Shipped** (v0.3.0) |
+| `governance` | §7.4 | Motion lifecycle, voting, amendments, Accords versioning | M4 | **Shipped** (v0.3.0) |
+| `calendar` | §7.7 | Events, RSVPs, recurrence, quorum tracking | M5 | **Shipped** (v0.3.0) |
 | `mcp` | §7.10 | Permissions-aware MCP server for Hermes | M5 | **Built** (loading, tested; M5 client exit criteria pending) |
 | `finance` | §7.5 | Funds, transactions, budget vs. actuals, sliding-scale dues | M6 | **Built** (routes and permissions in `docs/api-reference.md`; a member's own dues — assessment, self-report, pay — are in the client, the treasurer's ledger and budgets are not) |
 | `equipment` | §7.6 | Inventory, checkout/checkin, maintenance | M6 | **Built** (routes and permissions in `docs/api-reference.md`; the pool, the item record, checkout and checkin are in the client) |
@@ -120,7 +120,7 @@ changed, it is a mechanical follow-up across the records, not a decision.
 > exception, rather than as a silent omission.
 >
 > **The version bar is unmet too.** Test 2 requires a plugin version `>= 1.0.0`
-> with `sdk-compatibility.md` applied; every plugin is `0.2.0` today, so the
+> with `sdk-compatibility.md` applied; every plugin is `0.3.0` today, so the
 > version move and the SDK's own v1.0 are one step (release-path Stage 5), not a
 > formality to be waved through at the end.
 

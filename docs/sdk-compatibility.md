@@ -49,13 +49,14 @@ new helper constructors, new `testing` mocks) do **not** bump the ABI version.
 3. Pin the SDK in your `Cargo.toml`. For now, plugins in this workspace use a
    path dependency; published plugins should pin a version:
    ```toml
-   adjutant-sdk = "0.2"
+   adjutant-sdk = "0.3"
    ```
 
 ## Additive helpers do not bump the ABI (SDK v0.3)
 
-`SDK_ABI_VERSION` stays **4** for the v0.3 additions, and the SDK version stays
-`0.2.0`:
+`SDK_ABI_VERSION` stays **4** for the v0.3 additions. They ship in the `0.3.0`
+release, so the SDK version is `0.3.0` — the version moves with the release, not
+with the macros:
 
 - the `permissions!` and `migrations!` declaration macros;
 - the types they generate from — `PermissionDecl`, `PermissionSet`,
@@ -85,9 +86,9 @@ byte-for-byte as they were.
 |---|---|---|
 | 0.1.0 | pre-handshake (no symbol) | M1–M3; refused by 0.2+ until rebuilt |
 | 0.2.0 (M4 target) | 2 | First version with the handshake and scoped identity (`Identity.grants`) |
-| 0.2.x (scope enforcement) | 3 | Scopes are enforced: `required_scope` on routes, `Identity.grants` is the source of truth (`roles` is derived), `ScopeType::Personal` removed, `PermissionService::has` → `has_any_scope`/`has_in_scope`/`reach` |
-| 0.2.x (core scheduler) | 4 | `AdjutantPlugin::schedules()` + `Schedule`/`schedule_handler`: the core runs plugin-declared periodic work on the plugin's pool, with a timeout, one attempt per tick, and a `core.scheduled_runs` record |
-| 0.2.x (SDK v0.3 helpers) | 4 | `permissions!` / `migrations!` declaration macros, `PermissionDecl` / `PermissionSet` / `MigrationSource`, and the `testing::assert_routes_gate_declared` / `undeclared_route_gates` assertions. **Additive** — see [above](#additive-helpers-do-not-bump-the-abi-sdk-v03); nothing the core enforces changed and no plugin needs rebuilding to keep working |
+| 0.3.0 (scope enforcement) | 3 | Scopes are enforced: `required_scope` on routes, `Identity.grants` is the source of truth (`roles` is derived), `ScopeType::Personal` removed, `PermissionService::has` → `has_any_scope`/`has_in_scope`/`reach` |
+| 0.3.0 (core scheduler) | 4 | `AdjutantPlugin::schedules()` + `Schedule`/`schedule_handler`: the core runs plugin-declared periodic work on the plugin's pool, with a timeout, one attempt per tick, and a `core.scheduled_runs` record |
+| 0.3.0 (SDK v0.3 helpers) | 4 | `permissions!` / `migrations!` declaration macros, `PermissionDecl` / `PermissionSet` / `MigrationSource`, and the `testing::assert_routes_gate_declared` / `undeclared_route_gates` assertions. **Additive** — see [above](#additive-helpers-do-not-bump-the-abi-sdk-v03); nothing the core enforces changed and no plugin needs rebuilding to keep working |
 
 ## Migrating a plugin from ABI 3 to 4
 

@@ -9,16 +9,21 @@ in particular the interim `v0.3.0` recommendation and the v1.0 gate.
 
 - A Git tag `vX.Y.Z`, which triggers
   [`.github/workflows/release.yml`](../.github/workflows/release.yml): it builds
-  the workspace and the WASM guest, and publishes **two** artifacts —
+  the workspace and the WASM guest, and publishes **three** artifacts —
   - `adjutant-vX.Y.Z-x86_64-unknown-linux-gnu.tar.gz`, carrying the `adjutant`
     binary, **every plugin library the workspace stages** (derived by
     `scripts/stage-plugins.py`, never a hand-written list), the `hello_wasm.wasm`
     guest, `README.md` and `LICENSE`;
   - `adjutant-client-vX.Y.Z-web.tar.gz`, the Flutter client built for the web,
-    which is how a troop opens Adjutant from anywhere.
-- **Android is not in the tarball yet.** It is the Obtainium path, and it lands
-  when #111 gives the client a CI build for the platform — the release attaches
-  what was built, not what was hoped for.
+    which is how a troop opens Adjutant from anywhere;
+  - `adjutant-client-vX.Y.Z-android.apk`, the same client as an APK — the
+    Obtainium path, and the file a phone installs. It is built in **release**
+    mode, signed with Flutter's throwaway debug key (the one platform that
+    refuses an unsigned install outright), and the workflow fails rather than
+    attach an APK that is missing or a stub.
+- **Every artifact carries a `.sha256` beside it**, and a manual
+  `workflow_dispatch` run builds all three without creating a release — so a
+  packaging fault can surface before a tag rather than at one.
 - **Published crates are a separate act.** Nothing in CI publishes to crates.io:
   `adjutant-sdk` and then `adjutant-server` are published by hand, in that order
   (the server depends on the SDK by version, so the SDK must exist first). The
@@ -82,13 +87,13 @@ release.
 Prefer crates.io:
 
 ```toml
-adjutant-sdk = "0.2"
+adjutant-sdk = "0.3"
 ```
 
 To track an unreleased commit, pin a Git tag (not a branch):
 
 ```toml
-adjutant-sdk = { git = "https://github.com/chezgoulet/adjutant", tag = "v0.2.0" }
+adjutant-sdk = { git = "https://github.com/chezgoulet/adjutant", tag = "v0.3.0" }
 ```
 
 Rebuild and `adjutant validate-plugin <so>` after any core upgrade — a plugin
