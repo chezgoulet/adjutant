@@ -384,6 +384,28 @@ first-party plugin to pick the helpers up.
 
 ### Fixed
 
+- **The correction route's doc comment promised a carry-over that never held
+  for `tax_statement` and `issued_on`** (#71). `POST
+  /api/finance/receipt/{id}/supersede`'s comment (and `docs/api-reference.md`,
+  and the request body's own doc) said "everything it does not restate is carried
+  over" — which the code has never done: the addressee and the `purpose` are
+  carried over, but the wording is derived from the troop's **current**
+  declaration (exactly as issuing a receipt derives it), and `issued_on` is the
+  correction's own date, today by default, because a correction is a document
+  issued now. The **documents** were corrected to say precisely that; the
+  behaviour is right as it stands, and the reasoning is in the route's comment:
+  the section (`tax_statement`) must not print a claim the troop no longer makes
+  (SPEC §7.5), and the superseded row keeps the wording the giver first read, so
+  nothing a correction does rewrites what a giver was told. `issued_on`'s
+  today-default was always right for a new document, and a blanket carry-over
+  could never have described it. Proved rather than asserted: the receipts'
+  DB-backed probe gains a probe that moves the troop's declaration between the
+  issue and the correction — a correction of a receipt issued while a wording was
+  declared and corrected after it was withdrawn carries no statement, and one
+  issued while nothing was declared and corrected after a declaration carries the
+  new wording — and that the carried addressee and `purpose`, the correction's own
+  `issued_on` and the untouched superseded row are what the rows hold.
+
 - **`POST /api/store/item` answered `500` for every caller — the shop could not
   be stocked through the API at all** (#79). The `INSERT` into
   `store.catalogue_items` carried `RETURNING {ITEM_FIELDS}`, and every column in
