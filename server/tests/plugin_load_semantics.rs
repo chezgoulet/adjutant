@@ -796,3 +796,171 @@ async fn probe_a_failed_init_is_a_409_and_records_the_reason() {
 
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+// ============================================================================
+// #90 — the choice, and the two doors to it
+// ============================================================================
+
+/// The enabled flags, as the database holds them.
+async fn enabled_ids(admin: &sqlx::PgPool) -> Vec<String> {
+    let mut ids: Vec<String> =
+        sqlx::query_scalar("SELECT id FROM core.plugins WHERE enabled ORDER BY id")
+            .fetch_all(admin)
+            .await
+            .expect("enabled ids");
+    ids.sort();
+    ids
+}
+
+fn sorted(set: std::collections::HashSet<String>) -> Vec<String> {
+    let mut v: Vec<String> = set.into_iter().collect();
+    v.sort();
+    v
+}
+
+/// One admin request with a JSON body, as the chief.
+async fn put_json(base: &str, path: &str, body: serde_json::Value) -> (u16, serde_json::Value) {
+    let resp = reqwest::Client::new()
+        .put(format!("{base}{path}"))
+        .header("x-dev-user", "christopher")
+        .header("x-dev-role", "chief")
+        .json(&body)
+        .send()
+        .await
+        .unwrap_or_else(|e| panic!("PUT {path}: {e}"));
+    let status = resp.status().as_u16();
+    (status, resp.json().await.unwrap_or(serde_json::Value::Null))
+}
+
+/// #90's acceptance, as **one probe rather than two**.
+///
+/// "A scripted install can make the same choice without a browser, and the two
+/// paths produce the same state." Asserting each path separately would prove only
+/// that each is self-consistent — which is exactly the mistake this feature made
+/// twice: `--enable` restated the rules instead of sharing them and could reach
+/// states the API refused, and the wizard's door wrote flags that a running
+/// server did not adopt. Both were found by trying to write this test, and both
+/// are invisible to a probe that exercises one door.
+///
+/// So: drive both doors to the same set, from the same starting point, and
+/// compare what a reader can observe — the durable flags, and what the running
+/// server is carrying. `source` is the one field that *must* differ, and
+/// asserting that is what proves both doors ran rather than one being driven
+/// twice.
+#[tokio::test]
+#[ignore = "needs a database and a plugin dir: ADJUTANT_TEST_DATABASE_URL + ADJUTANT_PLUGIN_DIR"]
+async fn probe_both_doors_to_the_choice_land_on_the_same_state() {
+    let _serial = SERIAL.lock().await;
+    let url = base_url();
+    // Its own directory: loading maps a library once per path for the life of the
+    // process, and this probe loads the fixture twice — once per door.
+    let dir = fixture_dir_named("choice");
+    let chosen = vec![FINANCE.to_string()];
+
+    let cfg = Config {
+        database_url: url.clone(),
+        plugin_dir: dir.clone(),
+        ..Default::default()
+    };
+
+    // ---- door A: the scripted install, with no browser --------------------
+    let admin = provision(&dir).await;
+    assert!(
+        adjutant_server::plugin_choice::recorded(admin.as_ref())
+            .await
+            .expect("read the record")
+            .is_none(),
+        "a freshly provisioned deployment has no recorded choice, so the wizard may appear"
+    );
+
+    cli::bootstrap_isolation(&cfg, false, None, None, Some(&chosen))
+        .await
+        .expect("bootstrap-isolation --enable finance");
+
+    let cli_flags = enabled_ids(&admin).await;
+    let cli_loaded = sorted(boot(&dir, &url, &admin).await.live_ids());
+    let cli_choice = adjutant_server::plugin_choice::recorded(admin.as_ref())
+        .await
+        .expect("read the record")
+        .expect("door A records a choice");
+    assert_eq!(
+        cli_choice.source, "cli",
+        "the record names the door it came through"
+    );
+    assert!(
+        cli_choice.chosen_by.is_none(),
+        "bootstrap runs before there is an identity to attribute the act to, so the \
+         actor is absent rather than invented"
+    );
+    assert_eq!(cli_choice.plugin_ids, chosen);
+
+    // ---- back to "nobody has chosen" --------------------------------------
+    //
+    // Without this the second door would be measured against the first one's
+    // leftovers, and the comparison would be between two states sharing a cause
+    // instead of two doors reaching the same state independently.
+    sqlx::query("DELETE FROM core.plugin_choice")
+        .execute(admin.as_ref())
+        .await
+        .expect("clear the record");
+    for id in [STORE, FINANCE] {
+        set_enabled(&admin, id, true).await;
+    }
+    assert!(
+        adjutant_server::plugin_choice::recorded(admin.as_ref())
+            .await
+            .expect("read the record")
+            .is_none(),
+        "the wizard may only appear while nothing is recorded"
+    );
+
+    // ---- door B: the wizard, against a running server ---------------------
+    let (base, state, _serve) = spawn_app(&dir, &url).await;
+    let (status, body) = put_json(
+        &base,
+        "/api/plugins/choice",
+        serde_json::json!({ "plugin_ids": chosen }),
+    )
+    .await;
+    assert_eq!(status, 200, "the wizard's door accepts the set: {body}");
+
+    let wizard_flags = enabled_ids(&admin).await;
+    let wizard_loaded = sorted(state.registry.read().await.live_ids());
+    let wizard_choice = adjutant_server::plugin_choice::recorded(admin.as_ref())
+        .await
+        .expect("read the record")
+        .expect("door B records a choice");
+    assert_eq!(wizard_choice.source, "wizard");
+    assert_eq!(
+        wizard_choice.chosen_by.as_deref(),
+        Some("christopher"),
+        "the wizard knows who asked"
+    );
+
+    // ---- the acceptance itself --------------------------------------------
+    assert_eq!(
+        cli_flags, wizard_flags,
+        "both doors leave the same durable flags"
+    );
+    assert_eq!(
+        cli_loaded, wizard_loaded,
+        "both doors leave the same plugins loaded"
+    );
+    assert_eq!(
+        wizard_loaded, wizard_flags,
+        "and what is loaded matches what is enabled — the choice took effect on the \
+         running server without a restart (otherwise it would answer success and \
+         change nothing an operator could see)"
+    );
+    assert_eq!(
+        cli_choice.plugin_ids, wizard_choice.plugin_ids,
+        "both doors record the same set"
+    );
+    assert_ne!(
+        cli_choice.source, wizard_choice.source,
+        "the doors are distinguishable — which is what proves both were driven, rather \
+         than one of them being exercised twice"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
