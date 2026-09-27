@@ -485,3 +485,148 @@ async fn probe_recorded_is_never_reported_as_delivered() {
         "core.notifications is not a plugin-readable table: {denied:?}"
     );
 }
+
+// ---------------------------------------------------------------------------
+// 4. The identity fields are immutable to a plain UPDATE (#78).
+// ---------------------------------------------------------------------------
+
+/// #78. A notification may **advance its state**, never be **re-addressed or
+/// rewritten**. Every identity field — `recipient`, `source`, `message_code`,
+/// `message_params`, `created_at` — is refused by a schema-level guard, while
+/// the legitimate state transitions (mark-read, a transport's delivery) still
+/// go through. The write path here is the core's own pool, because that is
+/// exactly the privilege the issue is about: whoever holds UPDATE may only
+/// move the state, not change whose record it is or what it says.
+#[tokio::test]
+#[ignore = "DB-gated: needs ADJUTANT_TEST_DATABASE_URL (+ CREATEROLE); run with `-- --ignored`"]
+async fn probe_identity_fields_are_immutable_to_an_update() {
+    let _guard = SETUP.lock().await;
+    let admin = admin_pool().await;
+    make_user(admin.as_ref(), BEA, "Bea").await;
+    make_user(admin.as_ref(), CAL, "Cal").await;
+    sqlx::query("DELETE FROM core.notifications WHERE recipient IN ($1::uuid, $2::uuid)")
+        .bind(BEA)
+        .bind(CAL)
+        .execute(admin.as_ref())
+        .await
+        .expect("clear the probe's records");
+
+    let id = notifications::create(
+        admin.as_ref(),
+        notifications::SOURCE_CORE,
+        BEA,
+        "core.dues_overdue",
+        json!({ "amount_cents": 4200 }),
+        "fr-CA",
+    )
+    .await
+    .expect("a record for Bea");
+
+    // Each identity field, rewritten on its own: the schema refuses every one.
+    // A list rather than five copy-pasted blocks, so the probe names the set it
+    // protects and a field added to the guard later fails here until it is
+    // added here too. The flag says whether the statement takes the second
+    // (recipient) parameter; a statement must not be handed a bind it does not
+    // use, which would fail for the wrong reason.
+    let rewrites: [(&str, bool); 5] = [
+        (
+            "UPDATE core.notifications SET recipient = $2::uuid WHERE id = $1",
+            true,
+        ),
+        ("UPDATE core.notifications SET source = 'forged' WHERE id = $1", false),
+        (
+            "UPDATE core.notifications SET message_code = 'core.forged' WHERE id = $1",
+            false,
+        ),
+        (
+            "UPDATE core.notifications SET message_params = '{\"amount_cents\":999999}'::jsonb WHERE id = $1",
+            false,
+        ),
+        (
+            "UPDATE core.notifications SET created_at = now() - interval '10 years' WHERE id = $1",
+            false,
+        ),
+    ];
+    for (sql, binds_recipient) in rewrites {
+        let mut query = sqlx::query(sql).bind(id);
+        if binds_recipient {
+            query = query.bind(CAL);
+        }
+        let refused = query.execute(admin.as_ref()).await;
+        assert!(
+            refused.is_err(),
+            "a notification's identity must not be rewritable by UPDATE: `{sql}` was accepted"
+        );
+        let err = refused.unwrap_err().to_string();
+        assert!(
+            err.contains("cannot be changed"),
+            "the refusal should name the rule, not surface as a bare constraint error: {err}"
+        );
+    }
+
+    // The row is exactly as recorded — the attempts changed no identity field.
+    let (recipient, source, code, locale, params): (String, String, String, String, Value) =
+        sqlx::query_as(
+            "SELECT recipient::text, source, message_code, locale, message_params \
+             FROM core.notifications WHERE id = $1",
+        )
+        .bind(id)
+        .fetch_one(admin.as_ref())
+        .await
+        .expect("the row after the refused rewrites");
+    assert_eq!(recipient, BEA, "still addressed to Bea");
+    assert_eq!(source, "core");
+    assert_eq!(code, "core.dues_overdue");
+    assert_eq!(locale, "fr-CA");
+    assert_eq!(params["amount_cents"], json!(4200), "the message body is intact");
+
+    // **And legitimate writes still work** — the guard refuses a rewrite, not a
+    // state change. Mark-read is the core's own path and must be accepted.
+    let read = notifications::mark_notification_read(
+        AxumState(probe_state(admin.clone())),
+        Path(id),
+        request(BEA),
+    )
+    .await;
+    assert_eq!(read.status(), 200, "mark-read is a legitimate mutation");
+
+    // A transport's real delivery, too: both state fields advance together.
+    sqlx::query(
+        "UPDATE core.notifications SET delivery_state = 'delivered', delivered_at = now() WHERE id = $1",
+    )
+    .bind(id)
+    .execute(admin.as_ref())
+    .await
+    .expect("a real delivery is a legitimate mutation");
+
+    // The state moved; the identity did not, in the same rows.
+    let (read_at, state, delivered, recipient): (Option<String>, String, Option<String>, String) =
+        sqlx::query_as(
+            "SELECT read_at::text, delivery_state, delivered_at::text, recipient::text \
+             FROM core.notifications WHERE id = $1",
+        )
+        .bind(id)
+        .fetch_one(admin.as_ref())
+        .await
+        .expect("the row after the legitimate writes");
+    assert!(read_at.is_some(), "the read fact advanced");
+    assert_eq!(state, "delivered");
+    assert!(delivered.is_some(), "the delivery evidence advanced with it");
+    assert_eq!(recipient, BEA, "and it is still Bea's record");
+
+    // The guard is a trigger on the table, not a route-level check: the
+    // identity refusal holds for *any* writer with UPDATE, which is the point.
+    let trigger: Option<String> = sqlx::query_scalar(
+        "SELECT tgname FROM pg_trigger \
+         WHERE tgrelid = 'core.notifications'::regclass AND NOT tgisinternal \
+           AND tgname = 'notifications_identity_immutable'",
+    )
+    .fetch_optional(admin.as_ref())
+    .await
+    .expect("the trigger catalog is readable");
+    assert_eq!(
+        trigger.as_deref(),
+        Some("notifications_identity_immutable"),
+        "the guard is installed in the schema, not only in the probe"
+    );
+}
