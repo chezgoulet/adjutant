@@ -5,14 +5,16 @@ permissions-aware MCP server, the Flutter client, and the calendar they actually
 plan their lives in. It is the first release to real users, so its exit criteria
 are the ones a troop can feel rather than a developer can assert.
 
-**Status (2026-09-27, `testing` at `75981e5`):** **three of the eight exit boxes
-are met, one is partial, four are open.** The two halves that were missing at the
-last reading have landed: the client is now exercised against a **live server in
-CI** (`scripts/client-live-harness.sh`, a step inside `verify`), and the plugin
-set is something an operator chooses rather than something the server decides.
-What remains is the MCP proof against a real Hermes agent, offline mode, the
-owner's UI/UX review, and the deployment to the 161st — whose host decision is
-now taken (troop-owned hardware, `plugin-roadmap.md` §6, 2026-09-27).
+**Status (2026-09-27, `testing` at `2e5663e`, updated the same day):** **four of
+the eight exit boxes are met, one is partial, three are open.** The three halves
+that were missing at the last reading have landed one by one: the client is
+exercised against a **live server in CI** (`scripts/client-live-harness.sh`, a
+step inside `verify`), the plugin set is something an operator chooses rather than
+something the server decides, and the **MCP connect-and-interact proof** now runs
+against two identities with a real MCP host in the loop
+([`../mcp-hermes.md`](../mcp-hermes.md)). What remains is offline mode, the
+Android artifact, the owner's UI/UX review, and the deployment to the 161st —
+whose host decision is taken (troop-owned hardware, `plugin-roadmap.md` §6).
 
 **Status (2026-09-27, later the same day, PR #121 on `feature/client-offline-mode`):**
 **four of the eight exit boxes are met, one is partial, three are open.** The
@@ -22,6 +24,13 @@ section, below. Read the two lines together: the first is the branch at
 `75981e5`, the second is the branch with the client's offline work on it, and
 neither is rewritten (`plugin-roadmap.md` §7: a later figure is added beside the
 old one).
+
+**Status (2026-09-27, `testing` with #119, #120 and #121 merged):** **five of the
+eight exit boxes are met, one is partial and two are open.** The fifth is the
+**MCP connect-and-interact proof** (box 2, #120), beside offline mode (box 5,
+#121); what remains is the **device half** of Android/Web (box 4 — its build half
+closed with #119), the owner's UI/UX review (box 7) and the deployment to the
+161st (box 8). Three readings, one page: each is dated, and none is rewritten.
 
 This record exists because M5 had none. Its boxes are SPEC §15's; the ordered work
 against them is [`../release-path.md`](../release-path.md) Stage 1, which owns
@@ -49,11 +58,18 @@ later figure is added beside the old one rather than replacing it).
   MCP tool *is* an API call: each tool names the permission its own route
   requires, the caller's credentials are forwarded rather than substituted, and
   the core's route gate checks the same permission a second time.
-- [ ] **Hermes agent can connect and interact through the MCP server. — NOT
-  MET.** The plugin is proven through its own handlers; nothing in this
-  repository, and no open pull request, shows a real Hermes agent connecting,
-  listing the tools its identity permits, and invoking one. This is the box the
-  evidence for the *server* cannot stand in for, and Stage 1.2 carries it.
+- [x] **Hermes agent can connect and interact through the MCP server. — MET
+  (2026-09-27).** The plugin's HTTP surface is what a host speaks through
+  `tools/mcp-bridge/adjutant_mcp_bridge.py` — the JSON-RPC facade the plugin's own
+  docs name as "a client concern" — and `scripts/mcp-live-harness.sh` proves the
+  path with it: a **chief** connects and sees the tools their grants reach, calls
+  one and the API answers (`ok` in `mcp.invocations`); a **scout** holding only
+  `mcp:connect`, `mcp:invoke` and `membership:read` sees **one** tool rather than
+  eleven, and invoking `missions_create_mission` by name is refused with the
+  permission the route requires, recorded `denied`. A real MCP host is in the
+  loop too: the harness registers the bridge with Hermes in a scratch
+  `HERMES_HOME` and `hermes mcp test adjutant` discovers all 11 tools. Wiring and
+  notes: [`../mcp-hermes.md`](../mcp-hermes.md).
 - [x] **Flutter client: login screen, mission list, membership roster, calendar,
   basic navigation.** The named screens exist and the app has outgrown them —
   announcements, dues, equipment, governance, store and the admin screens are in
@@ -65,10 +81,14 @@ later figure is added beside the old one rather than replacing it).
 - [~] **Flutter client works on Android and Web (PWA). — PARTIAL.** Web builds:
   `flutter build web --release` succeeds with the pinned toolchain (exit 0, a
   41 MB bundle), and the release workflow now attaches that bundle to a tag.
-  Android is how the app reaches the 161st (Obtainium), but **no CI step builds
-  it for any platform** — that is #111, and it is a gate defect rather than a
-  client defect: nothing here proves the APK a scout installs is the tree we
-  tagged. **iOS is deferred entirely** by owner decision (2026-09-26) — no
+  The **build half of Android is closed**: #111's defect was that no CI step
+  compiled the client for any platform, and #119 (merged 2026-09-27) appends
+  `flutter build web --release` and `flutter build apk --debug` to the same
+  `client` job, so the APK's build is gated. What is still open is the **running
+  half** — no CI step installs that APK on a device, and a build that has never
+  been launched is a compile, not a working app. The emulator run against the
+  161st-shaped server is what closes it, and its evidence belongs in the file the
+  day it is read. **iOS is deferred entirely** by owner decision (2026-09-26) — no
   runner, no distribution path, revisit after 1.0 — and SPEC's box says so.
 - [x] **Offline mode: client caches data locally, syncs when online. — MET**
   (2026-09-27, PR #121). This box read **NOT MET** at `75981e5`, and that reading
@@ -137,9 +157,9 @@ later figure is added beside the old one rather than replacing it).
   follows it and is not answered here — how that box is reached from outside,
   tunnel or port-forward — because it belongs with the troop's network.
 
-**Deliverable:** a working MVP scouts can use. Three boxes still stand between the
-tree and that sentence; none of them is the application's shape, which is what
-four met boxes and the M6 batch already demonstrate.
+**Deliverable:** a working MVP scouts can use. Two boxes and a device run still
+stand between the tree and that sentence; none of them is the application's
+shape, which is what five met boxes and the M6 batch already demonstrate.
 
 ## Evidence
 
@@ -281,18 +301,17 @@ cd client && flutter build web --release && ls -la build/web/main.dart.js
 
 ## Not delivered at this milestone
 
-Three boxes are open and one is partial, and each is a *thing to do* rather than a
+Two boxes are open and one is partial, and each is a *thing to do* rather than a
 thing to decide — except where the decision is named:
 
-1. **The Hermes connect-and-interact proof (box 2).** Nothing here can stand in
-   for it: the server is proven, the agent's path is not.
-2. **The UI/UX review (box 7).** Authored by the owner.
-3. **The deployment to the 161st (box 8).** Host decided 2026-09-27 (troop-owned
+1. **The UI/UX review (box 7).** Authored by the owner.
+2. **The deployment to the 161st (box 8).** Host decided 2026-09-27 (troop-owned
    hardware); the outside-reach question follows it.
-4. **Android's artifact (box 4's other half).** Deferred to #111 rather than
-   faked: the release workflow attaches the web bundle today and grows the APK
-   when a CI step actually builds one.
+3. **The device half of Android (box 4).** Its build half closed with #119; what
+   remains is an APK that has been installed and launched, not merely compiled —
+   and the release workflow still attaches only the web bundle, growing the APK
+   artifact when a CI step runs one.
 
-Offline mode (box 5) was item 2 of this list until 2026-09-27; it left it in PR
-#121, and it is the one entry this list has had that was a decision followed by
-an implementation rather than a thing still owed.
+Two entries have left this list, and both left the same way — a decision first,
+then an implementation: **offline mode** (box 5) in #121, and the **Hermes
+connect-and-interact proof** (box 2) in #120.

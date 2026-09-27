@@ -76,8 +76,9 @@ Android-and-Web box, so deferring it moved no box). As of 2026-09-27, three are
 met, one is partial and four are open — the per-box state and its evidence are in
 [`milestones/M5-mcp-and-flutter-mvp.md`](milestones/M5-mcp-and-flutter-mvp.md).
 **Later the same day, item 3 below landed and the boxes read four met, one
-partial, three open** (PR #121); the record carries both readings rather than
-rewriting the first.
+partial, three open** (PR #121); **then item 2 landed on top of it (#120) and they
+read five met, one partial, two open.** The record carries every reading rather
+than rewriting the first.
 
 1. **The client-in-CI harness — the missing half of the v1.0 gate. — MET.**
    `scripts/client-live-harness.sh` derives its own database, bootstraps the
@@ -92,6 +93,23 @@ rewriting the first.
    it passed **131 tests**. This is the gate that converts every client-covered
    plugin's "usable" claim from a demonstration into a check, and it is what
    makes Stage 5.1 mechanical.
+2. **The MCP connect-and-interact proof** (M5 box 2). **— MET (2026-09-27).**
+   `tools/mcp-bridge/adjutant_mcp_bridge.py` is the JSON-RPC facade the plugin's
+   own documentation calls "a client concern" — stdlib only, because the Python
+   SDK's 2.x dropped `fastmcp` — and `scripts/mcp-live-harness.sh` drives it with
+   two identities: a chief sees and uses the tools their grants reach (`ok` in
+   `mcp.invocations`), a scout with three permissions sees one tool rather than
+   eleven and is refused by name for one they lack (`denied`). A real Hermes host
+   is exercised when `hermes` is on `PATH`: the harness registers the bridge in a
+   scratch `HERMES_HOME` and `hermes mcp test adjutant` discovers all 11 tools.
+   Wiring: [`docs/mcp-hermes.md`](../mcp-hermes.md). CI runs the SDK half
+   (`MCP live harness (DB-backed)`); the Hermes half reports `SKIP` where Hermes
+   is absent rather than passing quietly.
+3. **Offline mode** (M5 box 5) — the client caches locally and syncs. **The
+   storage decision is taken (owner, 2026-09-27): a plain durable read cache plus
+   a queued write list — no schema on the device.** drift/SQLite stays the
+   answer *if* offline queries turn out to need a schema; it is not the opening
+   move. The work itself has not started.
 2. **The MCP connect-and-interact proof** (M5 box 2). The plugin loads and is
    tested; what is missing is a real Hermes agent connecting through it with
    permissions filtered and invocations logged.
@@ -135,12 +153,12 @@ rewriting the first.
 
 **Proves it:** the eight M5 boxes checked in a new `M5` record, each with its run
 id — the record exists as [`milestones/M5-mcp-and-flutter-mvp.md`](milestones/M5-mcp-and-flutter-mvp.md),
-with **four boxes met (offline mode is the fourth, PR #121), one partial and
-three open** — it read three/four before that PR, and both readings are in the
-record. The plugin set is chosen on a fresh deployment and honoured by what the
-server loads (#89/#90), and the client harness is green on `testing` — both done.
-What this stage is still waiting on is items 2, 5, 6 and the Android half of
-item 4.
+with **five boxes met (offline mode is the fourth, #121; the MCP proof the fifth,
+#120), one partial and two open** — it read three/four before those PRs, and every
+reading is in the record. The plugin set is chosen on a fresh deployment and
+honoured by what the server loads (#89/#90), and the client harness is green on
+`testing` — both done. What this stage is still waiting on is items 5 and 6 and
+the device half of item 4.
 
 ---
 
@@ -333,9 +351,10 @@ crates, the live docs, and the F-Droid listing evidenced rather than asserted.
   owner confirmed this scope on **2026-09-27** rather than re-scoping it. The
   preference is that this is a *deployment-shaped* gate — the 161st runs a tag
   they can also host — not a date and not a branch. As of 2026-09-27: both
-  deployment proofs are met, Stage 1 has four of eight boxes met (offline mode
-  is the fourth, PR #121), and what is left is the MCP↔Hermes proof, the UI/UX
-  review, the Android artifact (#111) and the deployment itself.
+  deployment proofs are met, Stage 1 has five of eight boxes met (offline mode
+  and the MCP↔Hermes proof are the fourth and fifth, #121 and #120), and what is
+  left is the UI/UX review, the device half of the Android artifact, and the
+  deployment itself.
 - **The artifact a tag produces — decided 2026-09-27.** The tarball's plugin set
   is derived from the workspace rather than listed (it had rotted to three of
   fourteen), the client's **web** bundle is attached, and the **Android** artifact
@@ -376,8 +395,9 @@ lane. State as of 2026-09-27:
   drill (**both done**), then the host decision (**taken: troop-owned
   hardware**), then #51, #50, #52, #53 — with #53 and the dependency-scanning half
   of #51 in green PRs.
-- **D — integration.** The MCP↔Hermes proof (**not started**; next on the
-  path), then the notification channels (email, ntfy) with #46 and #78 folded in —
+- **D — integration.** The MCP↔Hermes proof (**done**, PR #120: the bridge, the
+two-identity harness, and `hermes mcp test` discovering all eleven tools), then
+the notification channels (email, ntfy) with #46 and #78 folded in —
   `DELIVERY_CHANNELS` is still `[in_app]`.
 
 Merge discipline, unchanged: one concern per PR; merge `testing` into the branch
