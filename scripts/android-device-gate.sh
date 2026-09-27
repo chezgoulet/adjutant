@@ -41,6 +41,7 @@ PORT="${ADJUTANT_DEVICE_PORT:-8790}"
 BASE="http://10.0.2.2:$PORT"
 AVD="${ADJUTANT_DEVICE_AVD:-phonon_test}"
 USER_NAME="${ADJUTANT_DEVICE_USER:-client-harness-chief}"
+SCOUT="${ADJUTANT_DEVICE_SCOUT:-harness-scout}"
 PASSWORD="${ADJUTANT_DEVICE_PASSWORD:-client-harness-bootstrap-pass}"
 DB_PORT="${ADJUTANT_DEVICE_DB_PORT:-54329}"
 DB_CONTAINER="adjutant-device-gate-db"
@@ -204,19 +205,42 @@ echo "==> server is listening (pid $SERVER_PID); its log is $SERVER_LOG"
 # reused. Both paths are checked here rather than assumed, because "login failed"
 # would otherwise be the only symptom of a database this gate did not create.
 step "creating the gate's identity"
-REGISTER=$(curl -s -o /tmp/adjutant-gate-register.json -w '%{http_code}' \
+REGISTER=$(curl -s -o /tmp/adjutant-gate-identity.json -w '%{http_code}' \
   -X POST "http://127.0.0.1:$PORT/api/auth/register" -H 'content-type: application/json' \
   -d "{\"username\":\"$USER_NAME\",\"password\":\"$PASSWORD\"}")
 case "$REGISTER" in
   201) echo "==> registered $USER_NAME as the bootstrap chief" ;;
   403)
-    LOGIN=$(curl -s -o /dev/null -w '%{http_code}' -X POST "http://127.0.0.1:$PORT/api/auth/login" \
+    LOGIN=$(curl -s -o /tmp/adjutant-gate-identity.json -w '%{http_code}' -X POST "http://127.0.0.1:$PORT/api/auth/login" \
       -H 'content-type: application/json' \
       -d "{\"username\":\"$USER_NAME\",\"password\":\"$PASSWORD\"}")
     [ "$LOGIN" = "200" ] || die "the database is already bootstrapped and $USER_NAME cannot sign in ($LOGIN) — point ADJUTANT_DEVICE_DATABASE_URL at a fresh database, or set ADJUTANT_DEVICE_USER/PASSWORD to an identity it has"
     echo "==> $USER_NAME already exists; reusing that identity" ;;
   *) die "POST /api/auth/register answered $REGISTER — see the server log ($SERVER_LOG)" ;;
 esac
+TOKEN=$(python3 -c "import json;print(json.load(open('/tmp/adjutant-gate-identity.json'))['token'])") \
+  || die "no token in the identity response — the server did not hand one out"
+
+# The fixture the integration test asserts on. Without it, "the roster came from
+# the server" would be a claim about an empty list — the first run of this gate
+# failed on exactly that, which is why the fixture lives here and not in the test.
+step "creating the fixture: a lodge, a patrol, and a scout"
+api() { # method path json-body -> status
+  curl -s -o /tmp/adjutant-gate-api.json -w '%{http_code}' -X "$1" \
+    "http://127.0.0.1:$PORT$2" -H "authorization: Bearer $TOKEN" \
+    -H 'content-type: application/json' -d "$3"
+}
+expect201() {
+  local what="$1"; shift
+  local status
+  status=$(api "$@")
+  [ "$status" = "201" ] || die "$what answered $status: $(head -c 300 /tmp/adjutant-gate-api.json)"
+  echo "==> $what"
+}
+expect201 "lodge created" POST /api/membership/lodge '{"name":"Harness Lodge"}'
+expect201 "patrol created" POST /api/membership/patrol '{"name":"Harness Patrol","lodge":"Harness Lodge"}'
+expect201 "scout created" POST /api/membership/member \
+  "{\"username\":\"$SCOUT\",\"display_name\":\"Harness Scout\",\"trail_name\":\"Beacon\",\"patrol\":\"Harness Patrol\"}"
 
 # --- 3. the APK, on the device ------------------------------------------------
 step "building the client's APK from this tree"
@@ -239,10 +263,15 @@ echo "==> the APK installs and launches (mCurrentFocus is $PACKAGE)"
 
 # --- 4. the app, driven against the server ------------------------------------
 step "running the integration test on $SERIAL (the behaviour half)"
+# The app's data is cleared first so the first-run path is the path taken: a
+# session restored from a previous run would skip the sign-in screen this test
+# exists to walk.
+adb -s "$SERIAL" shell pm clear "$PACKAGE" >/dev/null
 (cd client && flutter test integration_test/app_test.dart -d "$SERIAL" \
   --dart-define=ADJUTANT_DEVICE_BASE="$BASE" \
   --dart-define=ADJUTANT_DEVICE_USER="$USER_NAME" \
-  --dart-define=ADJUTANT_DEVICE_PASSWORD="$PASSWORD")
+  --dart-define=ADJUTANT_DEVICE_PASSWORD="$PASSWORD" \
+  --dart-define=ADJUTANT_DEVICE_SCOUT="$SCOUT")
 
 echo
 echo "==> device gate passed: $APK installed and driven on $SERIAL against $BASE"
