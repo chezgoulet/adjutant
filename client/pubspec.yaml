@@ -33,7 +33,7 @@ dependencies:
 
   # Local cache for offline-first reads and the queued-write outbox. Available
   # on every target including web.
-  shared_preferences: ^2.3.2
+  shared_preferences: ^2.5.6
 
   # Backups: write a bundle to a real file and hand it to the platform's share
   # sheet. Without these the download could only land in app-private storage,
