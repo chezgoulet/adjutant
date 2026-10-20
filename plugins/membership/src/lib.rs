@@ -424,6 +424,252 @@ mod csv_tests {
         adjutant_sdk::testing::TestHost::new()
     }
 
+    // --- #146: collection routes narrow to the caller's lodge scopes ----------
+
+    /// Call a GET collection route with an explicit scoped identity.
+    ///
+    /// A handler may refuse with `Err(SdkError)` or `Ok(PluginResponse::error)`;
+    /// both are collapsed here so a `?`-refusal is a test failure, not a panic.
+    async fn call_collection(
+        host: &adjutant_sdk::testing::TestHost,
+        path: &str,
+        identity: Identity,
+    ) -> (u16, serde_json::Value) {
+        use adjutant_sdk::testing::{response_json, TestRequest};
+
+        let mut plugin = MembershipPlugin::new();
+        plugin.init(host.context("membership")).await.unwrap();
+        let route = plugin
+            .routes()
+            .into_iter()
+            .find(|r| r.method.as_str() == "GET" && r.path == path)
+            .unwrap_or_else(|| panic!("route {path}"));
+        let mut req = TestRequest::get(path).build();
+        req.identity = Some(identity);
+        match (route.handler)(req).await {
+            Ok(resp) => (resp.status, response_json(&resp)),
+            Err(e) => (e.status(), serde_json::json!({ "error": e.to_string() })),
+        }
+    }
+
+    /// One row as `PermissionService::scopes_for` returns it.
+    fn held_at(scope_type: &str, scope_id: &str) -> serde_json::Value {
+        serde_json::json!({
+            "permission": "membership:read_lodge",
+            "scope_type": scope_type,
+            "scope_id": scope_id,
+        })
+    }
+
+    /// The rendered bind parameters of the last query containing `needle`.
+    /// `SqlValue` deliberately has no `PartialEq`, so its `Debug` form is the
+    /// house way to assert a bind.
+    fn param_text(host: &adjutant_sdk::testing::TestHost, needle: &str) -> String {
+        let params = host
+            .db
+            .last_query_params(needle)
+            .unwrap_or_else(|| panic!("no query whose SQL contains {needle:?}"));
+        params.iter().map(|p| format!("{p:?}")).collect::<Vec<_>>().join(" | ")
+    }
+
+    /// A lodge-scoped grant sees its own lodge's stewards and **not** another
+    /// lodge's.
+    ///
+    /// `MockDb` replays rows in call order and never evaluates SQL, so the rows
+    /// below are what PostgreSQL returns *after* the predicate is applied:
+    /// `scopes_for` first, then the stewards query. The negative half of the
+    /// assertion is therefore guarded by the bind check — a predicate weakened
+    /// to "all" would bind `Bool(true)` / no lodge id and fail here.
+    #[tokio::test]
+    async fn stewards_are_filtered_to_the_callers_lodge() {
+        let host = adjunct_sdk_test_host();
+        host.db.push_rows(vec![held_at("lodge", "1")]); // scopes_for
+        host.db.push_rows(vec![serde_json::json!({
+            "id": 10, "position": "Steward-1", "appointed_on": "2026-01-01",
+            "vacant": false, "display_name": "Bea", "trail_name": null,
+            "lodge": "Lodge One",
+        })]); // stewards, as the filtered query returns them
+
+        let (status, body) = call_collection(
+            &host,
+            "/api/membership/stewards",
+            grant("lodge_commander", Scope::lodge("1")),
+        )
+        .await;
+
+        assert_eq!(status, 200);
+        let rows = body["stewards"].as_array().expect("stewards");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0]["lodge"], serde_json::json!("Lodge One"));
+        assert!(
+            rows.iter().all(|r| r["lodge"] != serde_json::json!("Lodge Two")),
+            "lodge 2's stewards must not be in the response: {rows:?}"
+        );
+        assert!(
+            host.db.queried_sql().iter().any(|s| s.contains("s.lodge_id = ANY(")),
+            "the stewards query must filter on the steward's lodge"
+        );
+        let binds = param_text(&host, "FROM stewards");
+        assert!(binds.contains("Bool(false)"), "not a troop audience: {binds}");
+        assert!(binds.contains("IntArray([1])"), "only lodge 1: {binds}");
+    }
+
+    /// The lodges list is narrowed the same way: one lodge grant names one
+    /// lodge, and two grants bind both ids.
+    #[tokio::test]
+    async fn lodges_are_filtered_to_the_callers_lodges() {
+        let host = adjunct_sdk_test_host();
+        host.db.push_rows(vec![held_at("lodge", "1"), held_at("lodge", "2")]); // scopes_for
+        host.db.push_rows(vec![
+            serde_json::json!({ "id": 1, "name": "Lodge One", "patrols": [] }),
+            serde_json::json!({ "id": 2, "name": "Lodge Two", "patrols": [] }),
+        ]); // lodges, as the filtered query returns them
+
+        let (status, body) = call_collection(
+            &host,
+            "/api/membership/lodges",
+            Identity::from_grants(
+                "bea",
+                vec![
+                    RoleGrant { role_id: "lodge_commander".into(), scope: Scope::lodge("1") },
+                    RoleGrant { role_id: "lodge_commander".into(), scope: Scope::lodge("2") },
+                ],
+            ),
+        )
+        .await;
+
+        assert_eq!(status, 200);
+        assert_eq!(body["lodges"].as_array().expect("lodges").len(), 2);
+        assert!(
+            host.db.queried_sql().iter().any(|s| s.contains("l.id = ANY(")),
+            "the lodges query must filter on the lodge id"
+        );
+        let binds = param_text(&host, "FROM lodges");
+        assert!(binds.contains("Bool(false)"), "not a troop audience: {binds}");
+        assert!(binds.contains("IntArray([1, 2])"), "both lodges: {binds}");
+
+        // A caller granted only lodge 1 must not receive lodge 2's row. The
+        // replay is what PostgreSQL returns with the predicate (`WHERE … l.id =
+        // ANY($2)`), so the bind above is the guard that the predicate exists.
+        let host = adjunct_sdk_test_host();
+        host.db.push_rows(vec![held_at("lodge", "1")]);
+        host.db
+            .push_rows(vec![serde_json::json!({ "id": 1, "name": "Lodge One", "patrols": [] })]);
+        let (status, body) = call_collection(
+            &host,
+            "/api/membership/lodges",
+            grant("lodge_commander", Scope::lodge("1")),
+        )
+        .await;
+        assert_eq!(status, 200);
+        let rows = body["lodges"].as_array().expect("lodges");
+        assert_eq!(rows.len(), 1);
+        assert!(
+            rows.iter().all(|r| r["name"] != serde_json::json!("Lodge Two")),
+            "lodge 2 must not be in the response: {rows:?}"
+        );
+    }
+
+    /// A troop-scoped grant keeps the old behaviour: no row filter at all.
+    #[tokio::test]
+    async fn a_troop_scope_grant_sees_every_steward_and_every_lodge() {
+        let host = adjunct_sdk_test_host();
+        host.db.push_rows(vec![held_at("troop", "")]); // scopes_for
+        host.db.push_rows(vec![
+            serde_json::json!({ "id": 10, "lodge": "Lodge One" }),
+            serde_json::json!({ "id": 11, "lodge": "Lodge Two" }),
+        ]);
+        let (status, body) = call_collection(
+            &host,
+            "/api/membership/stewards",
+            grant("chief", Scope::troop()),
+        )
+        .await;
+        assert_eq!(status, 200);
+        assert_eq!(body["stewards"].as_array().expect("stewards").len(), 2);
+        let binds = param_text(&host, "FROM stewards");
+        assert!(binds.contains("Bool(true)"), "troop audience sees all: {binds}");
+
+        let host = adjunct_sdk_test_host();
+        host.db.push_rows(vec![held_at("troop", "")]);
+        host.db.push_rows(vec![
+            serde_json::json!({ "id": 1, "name": "Lodge One", "patrols": [] }),
+            serde_json::json!({ "id": 2, "name": "Lodge Two", "patrols": [] }),
+        ]);
+        let (status, body) = call_collection(
+            &host,
+            "/api/membership/lodges",
+            grant("chief", Scope::troop()),
+        )
+        .await;
+        assert_eq!(status, 200);
+        assert_eq!(body["lodges"].as_array().expect("lodges").len(), 2);
+        let binds = param_text(&host, "FROM lodges");
+        assert!(binds.contains("Bool(true)"), "troop audience sees all: {binds}");
+    }
+
+    /// The proficiency catalogue has no lodge column, so it is troop curriculum:
+    /// a troop grant sees it, a lodge-only grant addresses none of it, and the
+    /// predicate fails closed instead of leaking the catalogue.
+    #[tokio::test]
+    async fn proficiencies_are_troop_curriculum_not_a_lodge_list() {
+        let host = adjunct_sdk_test_host();
+        host.db.push_rows(vec![held_at("troop", "")]); // scopes_for
+        host.db
+            .push_rows(vec![serde_json::json!({ "id": 1, "code": "T-1", "title": "Knots", "domain": "troop" })]);
+        let (status, body) = call_collection(
+            &host,
+            "/api/membership/proficiencies",
+            grant("chief", Scope::troop()),
+        )
+        .await;
+        assert_eq!(status, 200);
+        assert_eq!(body["proficiencies"].as_array().expect("proficiencies").len(), 1);
+        let binds = param_text(&host, "FROM proficiencies");
+        assert!(binds.contains("Bool(true)"), "troop audience sees the catalogue: {binds}");
+
+        let host = adjunct_sdk_test_host();
+        host.db.push_rows(vec![held_at("lodge", "1")]); // scopes_for
+        host.db.push_rows(vec![]); // `WHERE $1::bool` with false matches nothing
+        let (status, body) = call_collection(
+            &host,
+            "/api/membership/proficiencies",
+            grant("lodge_commander", Scope::lodge("1")),
+        )
+        .await;
+        assert_eq!(status, 200);
+        assert_eq!(body["proficiencies"], serde_json::json!([]));
+        let binds = param_text(&host, "FROM proficiencies");
+        assert!(binds.contains("Bool(false)"), "lodge-only sees none: {binds}");
+    }
+
+    /// A grant that names no membership lodge opens nothing, and the handler
+    /// refuses rather than returning an empty 200.
+    #[tokio::test]
+    async fn a_grant_with_no_usable_lodge_scope_is_refused() {
+        // (identity, the scopes_for rows it resolves to)
+        let cases = [
+            // A patrol grant covers patrols, never the lodge that contains it.
+            (grant("patrol_leader", Scope::patrol("3")), vec![held_at("patrol", "3")]),
+            // A scope id that is not a membership lodge id names no row.
+            (
+                grant("lodge_commander", Scope::lodge("not-a-lodge-id")),
+                vec![held_at("lodge", "not-a-lodge-id")],
+            ),
+            // No grants at all: scopes_for answers without a query.
+            (Identity::from_grants("bea", vec![]), Vec::new()),
+        ];
+        for (identity, held) in cases {
+            let host = adjunct_sdk_test_host();
+            if !identity.grants.is_empty() {
+                host.db.push_rows(held); // scopes_for
+            }
+            let (status, body) =
+                call_collection(&host, "/api/membership/stewards", identity).await;
+            assert_eq!(status, 403, "no usable scope must be refused: {body}");
+        }
+    }
+
     /// The hierarchy declaration replaces our own lodge→patrol edges from
     /// `patrols.lodge_id` (scoped DELETE, then the checked declare function).
     #[tokio::test]
