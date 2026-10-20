@@ -515,11 +515,12 @@ jobs:
         run: flutter build web --release
 
       # The only step in this repository that compiles Android resources and the
-      # merged manifest. Debug, not release: the project has no release signing
-      # config yet, and `release` in android/app/build.gradle.kts already falls
-      # back to the debug keystore — release-vs-debug changes only the Dart
-      # compilation mode, not whether the resources and manifest are valid, and
-      # debug is the faster of the two.
+      # merged manifest. Debug, not release: the release signing config reads
+      # `android/key.properties`, which CI deliberately does not have (#168), and
+      # release-vs-debug changes only the Dart compilation mode, not whether the
+      # resources and manifest are valid — debug is the faster of the two. The
+      # debug keystore here signs a CI build nobody ships; the release workflow
+      # is the one that must never use it.
       - name: Build Android APK (debug)
         run: flutter build apk --debug
 

@@ -97,16 +97,34 @@ jobs:
         run: flutter build web --release
         working-directory: client
 
+      # The real release keystore lives in four repository secrets. This step
+      # decodes it and writes `android/key.properties`; it never prints a secret
+      # value. When any secret is missing the step fails the job — it does not
+      # fall back to the debug key (#168). The local `flutter run` fallback in
+      # `build.gradle.kts` is reachable only on a machine with no key.properties,
+      # never here.
+      - name: Configure Android release signing
+        env:
+          ANDROID_KEYSTORE_BASE64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+          ANDROID_KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          ANDROID_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+          ANDROID_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
+        run: scripts/android-release-signing.sh client/android
+
       # The Android half of the client. `--release` and not `--debug`: this is
       # the artifact a scout sideloads (Obtainium), and it is built from the same
-      # commit the rest of the tarball is. It is signed with Flutter's throwaway
-      # debug key because **nothing we publish is signed until beta** — which
-      # means it installs, and that a properly signed build later may not upgrade
-      # over it cleanly. README's "Unsigned builds" says the same thing to whoever
-      # receives it.
+      # commit the rest of the tarball is. It is signed with the troop's release
+      # key, configured above; the debug key it used to carry was a public
+      # artefact anybody could sign a compatible update with (#168).
       - name: Build the client for Android (the Obtainium path)
         run: flutter build apk --release
         working-directory: client
+
+      # Prove the artefact, rather than trusting the build. `apksigner` prints
+      # the signer DN; a DN containing `CN=Android Debug` fails the job. This is
+      # the check that would have caught the debug-signed APKs we shipped.
+      - name: Verify the APK's signer is not the debug key
+        run: scripts/verify-apk-signer.sh client/build/app/outputs/flutter-apk/app-release.apk
 
       - name: Assert the Android artifact exists and is not a stub
         run: |
