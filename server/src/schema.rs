@@ -29,20 +29,83 @@ pub fn role_for(plugin_id: &str) -> String {
     format!("adjutant_plugin_{plugin_id}")
 }
 
+/// One `core.*` privilege set a plugin role may hold at runtime.
+///
+/// `columns: None` is a whole-table grant. `columns: Some(&[…])` is a
+/// **column-level** grant, which PostgreSQL stores separately from a table
+/// grant: it permits exactly the named columns and nothing else, and a `SELECT
+/// *` (or a column not named) fails with `permission denied for table …`.
+///
+/// The allowlist is authoritative rather than additive: [`bootstrap_role`]
+/// revokes every table- and column-level privilege the role holds on `core.*`
+/// before applying these entries. A table or column that is not named here is
+/// therefore not merely ungranted — it is actively revoked, including on an
+/// installation bootstrapped by an older release.
+pub struct CoreGrant {
+    pub table: &'static str,
+    pub columns: Option<&'static [&'static str]>,
+    pub privileges: &'static str,
+}
+
 /// Core tables a plugin may touch at runtime, and the privileges it needs.
 ///
 /// Everything a plugin requires from another plugin's schema is a bug in the
 /// plugin; everything extra it wants from `core.*` must be added here
-/// deliberately. Tables without an entry are unreachable to the plugin.
-pub fn core_grants(plugin_id: &str) -> Option<&'static [(&'static str, &'static str)]> {
-    const AUTH: &[(&str, &str)] = &[
-        ("users", "SELECT, INSERT, UPDATE"),
-        ("sessions", "SELECT, INSERT, DELETE"),
-        ("user_roles", "SELECT, INSERT, DELETE"),
+/// deliberately. Tables and columns without an entry are unreachable.
+pub fn core_grants(plugin_id: &str) -> Option<&'static [CoreGrant]> {
+    // `core.users` holds the argon2 password hashes, so the two plugins that
+    // need it get column-level grants rather than table-level ones. Auth reads
+    // the hash to verify a login and inserts hashes for new users; membership
+    // needs only the roster-identity columns and must never see the hash.
+    // `avatar_url`, `created_at` and `updated_at` are read by neither plugin.
+    const AUTH_USERS_SELECT: &[&str] = &[
+        "id",
+        "external_id",
+        "username",
+        "email",
+        "display_name",
+        "is_active",
+        "password_hash",
+    ];
+    // Columns named by auth's INSERTs (password registration, admin create,
+    // OIDC first login). `id` is a defaulted column, but `RETURNING id`
+    // additionally needs SELECT on it, which `AUTH_USERS_SELECT` supplies.
+    const AUTH_USERS_INSERT: &[&str] = &[
+        "external_id",
+        "username",
+        "email",
+        "display_name",
+        "password_hash",
+    ];
+    const AUTH: &[CoreGrant] = &[
+        CoreGrant {
+            table: "users",
+            columns: Some(AUTH_USERS_SELECT),
+            privileges: "SELECT",
+        },
+        CoreGrant {
+            table: "users",
+            columns: Some(AUTH_USERS_INSERT),
+            privileges: "INSERT",
+        },
+        CoreGrant {
+            table: "sessions",
+            columns: None,
+            privileges: "SELECT, INSERT, DELETE",
+        },
+        CoreGrant {
+            table: "user_roles",
+            columns: None,
+            privileges: "SELECT, INSERT, DELETE",
+        },
         // The one bootstrap slot: `POST /api/auth/register` claims it before it
         // creates the first user, so exactly one anonymous caller can win the
         // race (#173). DELETE is the give-back on a failed registration.
-        ("bootstrap_claim", "SELECT, INSERT, DELETE"),
+        CoreGrant {
+            table: "bootstrap_claim",
+            columns: None,
+            privileges: "SELECT, INSERT, DELETE",
+        },
     ];
     // Membership reads users (to map a session to a roster entry) but must not
     // write `core.user_roles`: role assignment belongs to auth (#19). It had
@@ -54,9 +117,19 @@ pub fn core_grants(plugin_id: &str) -> Option<&'static [(&'static str, &'static 
     // table-level, so it can write any row: the residual is called out in the PR
     // and the loader rejects cycles/self-edges/unknown types, but per-row
     // ownership is not expressible with a table grant alone.
-    const MEMBERSHIP: &[(&str, &str)] = &[
-        ("users", "SELECT"),
-        ("scope_hierarchy", "SELECT, INSERT, DELETE"),
+    const MEMBERSHIP_USERS_SELECT: &[&str] =
+        &["id", "username", "email", "display_name", "is_active"];
+    const MEMBERSHIP: &[CoreGrant] = &[
+        CoreGrant {
+            table: "users",
+            columns: Some(MEMBERSHIP_USERS_SELECT),
+            privileges: "SELECT",
+        },
+        CoreGrant {
+            table: "scope_hierarchy",
+            columns: None,
+            privileges: "SELECT, INSERT, DELETE",
+        },
     ];
     match plugin_id {
         "auth" => Some(AUTH),
@@ -154,14 +227,30 @@ pub async fn bootstrap_role(
         .execute(pool)
         .await?;
 
-    // Explicit cross-schema allowlist (unchanged contents).
+    // The allowlist is authoritative, not additive. Start from an empty
+    // privilege set on `core.*` and re-apply [`core_grants`]: an installation
+    // bootstrapped by the old table-level code still holds `SELECT` on all of
+    // `core.users`, and `GRANT SELECT (cols)` does not remove that. PostgreSQL
+    // also keeps table and column grants separately, so `REVOKE … ON table`
+    // alone would leave an older column grant standing. Revoking both layers
+    // first is what makes the fix reach existing databases and what makes a
+    // column dropped from the allowlist actually disappear.
+    revoke_core_grants(pool, &role).await?;
+
     if let Some(grants) = core_grants(plugin_id) {
-        for (table, privs) in grants {
-            // `table`/`privs` come from the static allowlist above — never user
+        for grant in grants {
+            // Every field comes from the static allowlist above — never user
             // input.
-            sqlx::query(&format!("GRANT {privs} ON core.{table} TO \"{role}\""))
-                .execute(pool)
-                .await?;
+            let privileges = match grant.columns {
+                Some(columns) => format!("{} ({})", grant.privileges, columns.join(", ")),
+                None => grant.privileges.to_string(),
+            };
+            sqlx::query(&format!(
+                "GRANT {privileges} ON core.{} TO \"{role}\"",
+                grant.table
+            ))
+            .execute(pool)
+            .await?;
         }
     }
 
@@ -173,6 +262,35 @@ pub async fn bootstrap_role(
 
     tracing::info!(plugin = plugin_id, role = %role, "plugin role bootstrapped");
     Ok(secret)
+}
+
+/// Remove every table- and column-level privilege `role` holds on `core.*`.
+///
+/// PostgreSQL stores table and column grants as separate ACL entries:
+/// `REVOKE ALL ON core.users` does **not** clear `GRANT SELECT (password_hash)
+/// ON core.users`, and a table-level grant masks any column grants beneath it.
+/// A DO block walks both layers so [`bootstrap_role`] can rebuild the grant set
+/// from [`core_grants`] alone. `schema`/`table` names come from `pg_tables` and
+/// `pg_attribute`, and `role` is core-validated before this is called.
+async fn revoke_core_grants(pool: &PgPool, role: &str) -> Result<(), sqlx::Error> {
+    let sql = format!(
+        "DO $revoke$
+         DECLARE r RECORD; c RECORD;
+         BEGIN
+           FOR r IN SELECT tablename FROM pg_tables WHERE schemaname = 'core' LOOP
+             EXECUTE format('REVOKE ALL ON core.%I FROM %I', r.tablename, '{role}');
+             FOR c IN SELECT attname FROM pg_attribute
+                      WHERE attrelid = format('core.%I', r.tablename)::regclass
+                        AND attnum > 0 AND NOT attisdropped
+             LOOP
+               EXECUTE format('REVOKE ALL (%I) ON core.%I FROM %I',
+                              c.attname, r.tablename, '{role}');
+             END LOOP;
+           END LOOP;
+         END $revoke$;"
+    );
+    sqlx::query(&sql).execute(pool).await?;
+    Ok(())
 }
 
 /// A fresh 256-bit hex password from `pgcrypto` (already installed; no Rust RNG
@@ -302,31 +420,85 @@ mod tests {
         let auth = core_grants("auth").expect("auth has a core allowlist");
         assert!(auth
             .iter()
-            .any(|(t, p)| *t == "users" && p.contains("INSERT")));
+            .any(|g| g.table == "users" && g.privileges.contains("INSERT")));
+        assert!(
+            !auth.iter().any(|g| g.privileges.contains("UPDATE")),
+            "auth has no password-change route; UPDATE on core.users would be unused authority (#148)"
+        );
+
         let membership = core_grants("membership").expect("membership has a core allowlist");
         assert!(
-            !membership.iter().any(|(t, _)| *t == "user_roles"),
+            !membership.iter().any(|g| g.table == "user_roles"),
             "membership must not write/read core.user_roles (role assignment is auth's, #19)"
         );
         assert!(
             membership
                 .iter()
-                .any(|(t, p)| *t == "scope_hierarchy" && p.contains("INSERT")),
+                .any(|g| g.table == "scope_hierarchy" && g.privileges.contains("INSERT")),
             "membership declares the lodge->patrol hierarchy"
         );
         assert!(
             membership
                 .iter()
-                .filter(|(t, _)| *t != "scope_hierarchy")
-                .all(|(_, p)| !p.contains("DELETE")),
+                .filter(|g| g.table != "scope_hierarchy")
+                .all(|g| !g.privileges.contains("DELETE")),
             "membership is read-only on the data tables it touches"
         );
+
+        // `core.users` carries password hashes, so both plugins get
+        // column-level grants. `SELECT *` must not work for either role, and
+        // the hash is reachable only by auth.
+        let users = |plugin: &str| -> Vec<&CoreGrant> {
+            core_grants(plugin)
+                .expect("allowlist")
+                .iter()
+                .filter(|g| g.table == "users")
+                .collect()
+        };
+        for id in ["auth", "membership"] {
+            assert!(
+                users(id).iter().all(|g| g.columns.is_some()),
+                "{id} must hold column-level, not table-level, privileges on core.users (#148)"
+            );
+        }
+        let membership_cols = users("membership")[0].columns.expect("columns");
+        assert_eq!(
+            membership_cols,
+            &["id", "username", "email", "display_name", "is_active"],
+            "membership gets only the roster-identity columns"
+        );
+        for forbidden in [
+            "password_hash",
+            "external_id",
+            "avatar_url",
+            "created_at",
+            "updated_at",
+        ] {
+            assert!(
+                !membership_cols.contains(&forbidden),
+                "membership must not be granted core.users.{forbidden}"
+            );
+        }
+        let auth_select = users("auth")
+            .into_iter()
+            .find(|g| g.privileges == "SELECT")
+            .and_then(|g| g.columns)
+            .expect("auth has a column-level SELECT");
+        assert!(
+            auth_select.contains(&"password_hash"),
+            "login verifies the hash, so auth keeps SELECT on that column"
+        );
+        assert!(
+            !auth_select.contains(&"avatar_url"),
+            "auth reads no column it was not checked to read"
+        );
+
         // The ownership map is the trust anchor for hierarchy edges: no plugin
         // may hold a grant on it (issue #37).
         for id in ["auth", "membership", "hello"] {
             if let Some(grants) = core_grants(id) {
                 assert!(
-                    !grants.iter().any(|(t, _)| *t == "scope_owners"),
+                    !grants.iter().any(|g| g.table == "scope_owners"),
                     "{id} must not be granted core.scope_owners"
                 );
             }
