@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
-# Restore an Adjutant deployment from a dump produced by ./deploy/backup.sh.
+# Restore an Adjutant deployment from a bundle produced by ./deploy/backup.sh.
 #
-#   ./deploy/restore.sh <dump> --yes
+#   ./deploy/restore.sh <dump|dump.age> --yes
 #
 # This DROPS the current database. `--yes` is required so it cannot be run by
 # accident or by a loop that meant to do something else.
@@ -19,15 +19,24 @@
 #     Command was: GRANT SELECT,INSERT,DELETE ON TABLE core.sessions TO adjutant_plugin_auth;
 #     pg_restore: warning: errors ignored on restore: 6
 #
-#   `errors ignored` is the dangerous part: the restore reports success, and the
-#   server then crash-loops on `password authentication failed for user
+#   `errors ignored` is the dangerous part: the old script reported success, and
+#   the server then crash-looped on `password authentication failed for user
 #   "adjutant_app"` — a message that points at a password when the actual fault
 #   is a role that was never created.
 #
-#   `bootstrap-isolation` is what closes it. It creates the roles, transfers
-#   ownership of the plugin schemas to them, hands the core schema to
-#   `adjutant_app`, stores each plugin's credential and re-asserts the grant
-#   allowlist. Measured at 1s on a 15-plugin deployment.
+#   This script now makes the order right instead of calling the error normal:
+#   restore with `--no-owner --no-acl` (there is no role to own or grant to yet),
+#   run `bootstrap-isolation` to create the roles and re-assert ownership and the
+#   grant allowlist, then run `verify-isolation` — which checks every installed
+#   plugin's role, its schema/table ownership, its allowlist, and a live
+#   connection as that role. A restore that cannot answer the probes fails and
+#   names the missing role or table; it never prints `ok`.
+#
+# **Encrypted bundles.** A `.dump.age` is decrypted with
+# `ADJUTANT_BACKUP_AGE_IDENTITY` before anything is dropped. No identity means no
+# restore — never drop a database whose bundle you cannot read. A plaintext
+# `.dump` is accepted (older bundles exist) and is called out as credential
+# material.
 set -euo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -35,7 +44,7 @@ COMPOSE=(docker compose -f "$HERE/compose.proxy.yml")
 
 DUMP="${1:-}"
 ASSUME_YES="${2:-}"
-[ -n "$DUMP" ] || { echo "usage: $0 <dump> --yes" >&2; exit 2; }
+[ -n "$DUMP" ] || { echo "usage: $0 <dump|dump.age> --yes" >&2; exit 2; }
 [ -f "$DUMP" ] || { echo "FAIL: no such dump: $DUMP" >&2; exit 1; }
 [ "$ASSUME_YES" = "--yes" ] || {
   echo "FAIL: this DROPS the current database. Re-run with --yes if that is what you want." >&2
@@ -44,6 +53,11 @@ ASSUME_YES="${2:-}"
 
 fail() { echo "FAIL: $*" >&2; exit 1; }
 ok()   { echo "  ok — $*"; }
+warn() { echo "  WARN — $*" >&2; }
+
+DECRYPTED=""
+cleanup() { [ -n "$DECRYPTED" ] && rm -f "$DECRYPTED"; return 0; }
+trap cleanup EXIT
 
 : "${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD (see deploy/README.md)}"
 : "${ADJUTANT_APP_PASSWORD:?set ADJUTANT_APP_PASSWORD (see deploy/README.md)}"
@@ -56,41 +70,126 @@ ADMIN_URL="postgres://adjutant:${POSTGRES_PASSWORD}@postgres:5432/adjutant"
 
 psql_admin() { "${COMPOSE[@]}" exec -T postgres psql -U adjutant -d "${1:-adjutant}" "${@:2}" </dev/null; }
 
-echo "== 0. stop the application so nothing writes mid-restore =="
-"${COMPOSE[@]}" stop adjutant </dev/null >/dev/null 2>&1 || true
-ok "adjutant stopped"
+age_decrypt() {
+  local src="$1"
+  local identity="$2"
+  if command -v age >/dev/null 2>&1; then
+    age --decrypt --identity "$identity" < "$src"
+  else
+    # `docker compose run` is how the deploy stack already runs one-off commands;
+    # mounting the identity read-only keeps it out of the image and out of /app.
+    local identity_abs
+    identity_abs="$(readlink -f "$identity" 2>/dev/null || printf '%s' "$identity")"
+    "${COMPOSE[@]}" run --rm -T --no-deps --entrypoint age \
+      -v "$identity_abs:/run/adjutant-age-identity:ro" adjutant \
+      --decrypt --identity /run/adjutant-age-identity < "$src"
+  fi
+}
 
-echo "== 1. recreate the database =="
-# Validate the dump BEFORE dropping anything. The first run of this script got
+echo "== 0. open the bundle before dropping anything =="
+INPUT="$DUMP"
+case "$DUMP" in
+  *.age)
+    IDENTITY="${ADJUTANT_BACKUP_AGE_IDENTITY:-}"
+    [ -n "$IDENTITY" ] || fail \
+      "$DUMP is encrypted; set ADJUTANT_BACKUP_AGE_IDENTITY to the age identity file. \
+Refusing to drop the database for a bundle this host cannot read."
+    [ -f "$IDENTITY" ] || fail \
+      "ADJUTANT_BACKUP_AGE_IDENTITY=$IDENTITY does not exist. Refusing to drop the database."
+    DECRYPTED="$(mktemp "${TMPDIR:-/tmp}/adjutant-restore.XXXXXX")"
+    chmod 600 "$DECRYPTED"
+    if ! age_decrypt "$DUMP" "$IDENTITY" > "$DECRYPTED"; then
+      fail "cannot decrypt $DUMP with $IDENTITY — refusing to drop the database"
+    fi
+    INPUT="$DECRYPTED"
+    ok "decrypted $DUMP with $IDENTITY"
+    ;;
+  *)
+    warn "$DUMP is a PLAINTEXT bundle: it is credential material (every plugin role's password)."
+    ;;
+esac
+
+# Validate the archive BEFORE dropping anything. The first run of this script got
 # this wrong in a way worth keeping: it dropped the database, then handed
 # pg_restore an empty stdin (a trailing `</dev/null` silently overrode the
 # `< "$DUMP"` redirect, because the last redirect wins), and left an empty
 # database behind with a perfectly good dump on disk. A restore script must fail
 # before the destructive step, not after it.
-"${COMPOSE[@]}" exec -T postgres pg_restore -l < "$DUMP" >/dev/null 2>&1 \
-  || fail "$DUMP is not a readable pg_restore archive — refusing to drop the database for it"
-ok "the dump is readable; safe to proceed"
+"${COMPOSE[@]}" exec -T postgres pg_restore -l < "$INPUT" >/dev/null 2>&1 \
+  || fail "$INPUT is not a readable pg_restore archive — refusing to drop the database for it"
+ok "the bundle is readable; safe to proceed"
 
+echo "== 1. stop the application so nothing writes mid-restore =="
+"${COMPOSE[@]}" stop adjutant </dev/null >/dev/null 2>&1 || true
+ok "adjutant stopped"
+
+echo "== 2. recreate the database =="
 psql_admin postgres -c 'DROP DATABASE IF EXISTS adjutant' -c 'CREATE DATABASE adjutant OWNER adjutant' >/dev/null
 ok "dropped and recreated"
 
-echo "== 2. restore the dump =="
+echo "== 3. restore the dump (no owner, no ACL: neither exists yet) =="
+# `--no-owner --no-acl` is the ordering fix, not a convenience. A role that does
+# not exist yet has no ACL to restore, and ownership is re-established by
+# bootstrap-isolation below. The errors that used to be "expected" here were the
+# ACLs failing against roles that did not exist — after this flag they are real
+# data loss, which is why the exit code and the literal `errors ignored` are both
+# checked.
+restore_log="$(mktemp "${TMPDIR:-/tmp}/adjutant-restore-log.XXXXXX")"
 start=$(date +%s)
-"${COMPOSE[@]}" exec -T postgres pg_restore -U adjutant -d adjutant --no-owner < "$DUMP" 2>&1 | tail -20
-# pg_restore exits non-zero on warnings, and "errors ignored" is expected here
-# *before* the roles exist. The check that matters is step 3 and step 5: if the
-# roles are missing, the server will not answer.
+set +e
+"${COMPOSE[@]}" exec -T postgres pg_restore -U adjutant -d adjutant --no-owner --no-acl \
+  < "$INPUT" 2>&1 | tee "$restore_log" | tail -20
+rc=("${PIPESTATUS[@]}")
+set -e
 elapsed_restore=$(( $(date +%s) - start ))
-ok "pg_restore finished in ${elapsed_restore}s"
 
-echo "== 3. create the roles, ownership and grants (THE STEP A DUMP CANNOT DO) =="
+if [ "${rc[0]}" -ne 0 ]; then
+  fail "pg_restore exited ${rc[0]} — the restore is partial, not successful. Re-run after reading the output above."
+fi
+if grep -q 'errors ignored' "$restore_log"; then
+  fail "pg_restore reported 'errors ignored' — after --no-acl those errors are data loss, not pre-role noise. Read the output above."
+fi
+rm -f "$restore_log"
+ok "pg_restore finished in ${elapsed_restore}s with no ignored errors"
+
+echo "== 4. create the roles, ownership and grants (THE STEP A DUMP CANNOT DO) =="
 start=$(date +%s)
+boot_log="$(mktemp "${TMPDIR:-/tmp}/adjutant-bootstrap-log.XXXXXX")"
+set +e
 "${COMPOSE[@]}" run --rm -e ADJUTANT_DATABASE_URL="$ADMIN_URL" adjutant \
-  bootstrap-isolation --app-role adjutant_app --app-password "$ADJUTANT_APP_PASSWORD" </dev/null 2>&1 | tail -3
+  bootstrap-isolation --app-role adjutant_app --app-password "$ADJUTANT_APP_PASSWORD" \
+  </dev/null >"$boot_log" 2>&1
+boot_rc=$?
+set -e
+tail -3 "$boot_log"
+if [ "$boot_rc" -ne 0 ]; then
+  tail -30 "$boot_log" >&2
+  rm -f "$boot_log"
+  fail "bootstrap-isolation failed (exit $boot_rc) — the roles, ownership or grants were not established"
+fi
+rm -f "$boot_log"
 elapsed_bootstrap=$(( $(date +%s) - start ))
 ok "bootstrap-isolation finished in ${elapsed_bootstrap}s"
 
-echo "== 4. start the application =="
+echo "== 5. verify the isolation boundary before calling this a restore =="
+# The runtime's own check: every installed plugin's role, schema/table ownership,
+# allowlist grants, no privilege on an unlisted core table, and a live connection
+# as the plugin role using the stored credential. It names the missing role or
+# table, which is the difference between a diagnosable failure and another
+# `password authentication failed`.
+set +e
+verify_log="$("${COMPOSE[@]}" run --rm -e ADJUTANT_DATABASE_URL="$ADMIN_URL" adjutant \
+  verify-isolation --app-role adjutant_app </dev/null 2>&1)"
+verify_rc=$?
+set -e
+if [ "$verify_rc" -ne 0 ]; then
+  printf '%s\n' "$verify_log" >&2
+  fail "the restore did not produce a working isolation boundary (exit $verify_rc). The missing role or table is named above."
+fi
+printf '%s\n' "$verify_log" | tail -5
+ok "roles, ownership, grants and isolation probes pass"
+
+echo "== 6. start the application =="
 "${COMPOSE[@]}" up -d adjutant caddy </dev/null >/dev/null 2>&1
 
 ready=0
@@ -115,7 +214,7 @@ if [ "$ready" != "1" ]; then
 fi
 ok "the app answers through the proxy"
 
-echo "== 5. the restore is not complete until the roles can do their jobs =="
+echo "== 7. readiness checks (the server answers and the grants exist) =="
 grants="$(psql_admin adjutant -tAc "select count(*) from information_schema.role_table_grants where grantee like 'adjutant_plugin%'")"
 [ "${grants:-0}" -gt 0 ] || fail "no plugin-role grants exist — the runtime will refuse to work"
 ok "$grants plugin-role grant(s) present"

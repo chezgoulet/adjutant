@@ -24,6 +24,13 @@ FROM debian:bookworm-slim AS runtime
 # would look like the button doing nothing at all — the least diagnosable shape a
 # failure can take. Match the client to the server, and if the deployment's
 # Postgres ever moves, this line moves with it.
+#
+# `age` for the in-app backup button's other half: a `pg_dump -Fc` contains every
+# plugin role's password in clear text, and compression is not encryption. The
+# server encrypts each bundle to ADJUTANT_BACKUP_AGE_RECIPIENT before it reaches
+# the backups volume. Only the public key is here — the private key must not live
+# on the server, which is the whole point. `age` is in bookworm, so this is a
+# package, not a vendored binary.
 RUN apt-get update \
     && apt-get install -y --no-install-recommends ca-certificates curl gnupg \
     && install -d /usr/share/postgresql-common/pgdg \
@@ -33,7 +40,7 @@ RUN apt-get update \
 https://apt.postgresql.org/pub/repos/apt bookworm-pgdg main" \
          > /etc/apt/sources.list.d/pgdg.list \
     && apt-get update \
-    && apt-get install -y --no-install-recommends postgresql-client-18 \
+    && apt-get install -y --no-install-recommends postgresql-client-18 age \
     && apt-get purge -y --auto-remove curl gnupg \
     && rm -rf /var/lib/apt/lists/*
 WORKDIR /app

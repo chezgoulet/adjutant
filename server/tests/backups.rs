@@ -79,9 +79,15 @@ async fn fresh_ledger(url: &str, plugins: &Path) -> Arc<sqlx::PgPool> {
 /// Boot the real application on an ephemeral port, with its backup directory
 /// pointed at `backups`.
 async fn spawn_app(plugins: &Path, backups: &Path, url: &str) -> (String, tokio::task::JoinHandle<()>) {
-    // Process-wide, because `backup::backup_dir()` reads the environment the same
-    // way the server does. The caller holds SERIAL for the whole test.
+    // Process-wide, because `backup::backup_dir()` and the encryption settings
+    // read the environment the same way the server does. The caller holds SERIAL
+    // for the whole test.
     std::env::set_var("ADJUTANT_BACKUP_DIR", backups);
+    // These probes assert the dump/retention/download mechanics, not age; a test
+    // host is not required to have a key pair. The opt-in is explicit, and the
+    // fail-closed default has its own probe below.
+    std::env::remove_var("ADJUTANT_BACKUP_AGE_RECIPIENT");
+    std::env::set_var("ADJUTANT_BACKUP_ALLOW_PLAINTEXT", "true");
 
     let cfg = Config {
         database_url: url.to_string(),
@@ -288,6 +294,85 @@ async fn probe_a_manual_run_produces_a_bundle_the_admin_can_download() {
     assert_eq!(status, 200, "{body}");
     assert_eq!(body["schedule"]["cadence_secs"], serde_json::Value::Null);
     assert_eq!(body["schedule"]["enabled"], serde_json::json!(false));
+
+    let _ = std::fs::remove_dir_all(backups.parent().expect("root"));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "DB-gated: needs ADJUTANT_TEST_DATABASE_URL + CREATEROLE + age"]
+async fn probe_an_encrypted_run_writes_dump_age() {
+    // A throwaway public key: encryption needs no private key, which is the
+    // property being asserted. Never a real deployment's key.
+    const RECIPIENT: &str = "age1jxz8v8fphxqj8qhpew3akhwsyvqug2fr8fu5n46u26ux624svujqplk9ez";
+    if std::process::Command::new("age")
+        .arg("--version")
+        .output()
+        .is_err()
+    {
+        eprintln!("age is not installed; skipping the encrypted-bundle probe");
+        return;
+    }
+
+    let _serial = SERIAL.lock().await;
+    let (plugins, backups) = scratch("enc");
+    let url = base_url();
+    let _ledger = fresh_ledger(&url, &plugins).await;
+    let (base, _serve) = spawn_app(&plugins, &backups, &url).await;
+    std::env::remove_var("ADJUTANT_BACKUP_ALLOW_PLAINTEXT");
+    std::env::set_var("ADJUTANT_BACKUP_AGE_RECIPIENT", RECIPIENT);
+
+    let (status, body) = post(&base, "/api/backups/run").await;
+    assert_eq!(status, 200, "the encrypted run succeeds: {body}");
+    let run = &body["run"];
+    assert_eq!(run["status"], serde_json::json!("done"), "{run}");
+    let filename = run["filename"].as_str().expect("a filename");
+    assert!(
+        filename.ends_with(".dump.age"),
+        "the name makes the encryption state visible: {filename}"
+    );
+    let path = backups.join(filename);
+    let bytes = std::fs::read(&path).expect("the encrypted bundle");
+    assert!(
+        bytes.starts_with(b"age-encryption.org/v1"),
+        "the bundle is age ciphertext, not a plaintext pg_dump"
+    );
+    assert!(
+        Path::new(&format!("{}.sha256", path.display())).is_file(),
+        "the checksum sidecar follows the artifact name"
+    );
+
+    let (status, got) = download(&base, filename).await;
+    assert_eq!(status, 200, "the encrypted bundle downloads");
+    assert_eq!(got, bytes, "and is the whole ciphertext");
+
+    let _ = std::fs::remove_dir_all(backups.parent().expect("root"));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "DB-gated: needs ADJUTANT_TEST_DATABASE_URL + CREATEROLE; run with `-- --ignored`"]
+async fn probe_a_run_without_a_recipient_fails_closed() {
+    let _serial = SERIAL.lock().await;
+    let (plugins, backups) = scratch("nokey");
+    let url = base_url();
+    let _ledger = fresh_ledger(&url, &plugins).await;
+    let (base, _serve) = spawn_app(&plugins, &backups, &url).await;
+
+    // No key pair, no opt-in: the one thing this must not do is write a plaintext
+    // bundle because the configuration was absent.
+    std::env::remove_var("ADJUTANT_BACKUP_AGE_RECIPIENT");
+    std::env::remove_var("ADJUTANT_BACKUP_ALLOW_PLAINTEXT");
+
+    let (status, body) = post(&base, "/api/backups/run").await;
+    assert_eq!(status, 409, "a run without a recipient is refused: {body}");
+    let error = body["error"].as_str().unwrap_or_default();
+    assert!(
+        error.contains("ADJUTANT_BACKUP_AGE_RECIPIENT"),
+        "the refusal names the variable to set: {body}"
+    );
+    assert!(
+        bundles(&backups).is_empty(),
+        "no bundle — and no zero-byte placeholder — was left behind"
+    );
 
     let _ = std::fs::remove_dir_all(backups.parent().expect("root"));
 }

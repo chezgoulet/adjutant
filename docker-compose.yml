@@ -66,6 +66,12 @@ services:
       # time the container is replaced, which is precisely when someone wants
       # it. `docs/backup-and-restore` is the host-side producer, if any.
       ADJUTANT_BACKUP_DIR: /app/backups
+      # The age public key every bundle is encrypted to. No default: with this
+      # unset the in-app backup fails closed rather than writing every plugin
+      # role's password in clear text. ADJUTANT_BACKUP_ALLOW_PLAINTEXT=true is
+      # the explicit, loud opt-out for a development box with no key.
+      ADJUTANT_BACKUP_AGE_RECIPIENT: ${ADJUTANT_BACKUP_AGE_RECIPIENT:-}
+      ADJUTANT_BACKUP_ALLOW_PLAINTEXT: ${ADJUTANT_BACKUP_ALLOW_PLAINTEXT:-false}
     ports:
       - "8787:8787"
     # The bundles survive the container. Named rather than a bind mount so the
