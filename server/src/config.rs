@@ -169,6 +169,11 @@ USAGE:
                                    create/refresh per-plugin DB roles, schema
                                    ownership, grants and stored credentials
                                    (run once by the operator, against an admin URL)
+    adjutant verify-isolation [--app-role <NAME>] [OPTIONS]
+                                   assert the roles, ownership, allowlist grants
+                                   and session identities a restore must produce
+                                   (exits non-zero and names the missing role or
+                                   table; used by deploy/restore.sh)
     adjutant grant-role <username> <role> [OPTIONS]
                                    grant a role directly in the database — the
                                    recovery path when the last admin is gone or
