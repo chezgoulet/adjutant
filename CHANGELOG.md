@@ -22,6 +22,12 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - **`adjutant grant-role <username> <role>`** — writes `core.user_roles`
   directly, so it recovers a troop whose last admin has been removed and whose
   API is therefore unreachable (#147).
+- **Session management routes** (#149 AUTH-3). `GET /api/auth/sessions` lists
+  the caller's live sessions and marks the current one; `DELETE
+  /api/auth/sessions/{id}` revokes one of them (another user's id is a `404`,
+  never a `403`); `POST /api/auth/password` changes the password and revokes
+  every other session. Session validation now rejects `core.sessions.revoked_at`
+  everywhere, not only at login.
 
 ### Changed
 
@@ -36,6 +42,18 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   nobody holding `core:admin` or `auth:manage_users` at troop scope; the roles
   route reports it as `409`. `POST /api/auth/roles` now grants before it revokes,
   so a valid replacement is not caught between two statements (#147).
+- **The session cookie is `Secure` by default** (#149 AUTH-4). Local plain-HTTP
+  development must set `ADJUTANT_INSECURE_COOKIES=true`; the flag is never
+  inferred from the bind address and is documented as development-only.
+- **Local authentication is audited** (#149 AUTH-5). Login success and failure,
+  logout, registration, session revocation and password change now append to
+  `core.audit_log`; failures record the attempted username and a reason
+  category, never the submitted secret or a session token.
+- **Auth's `core.users` UPDATE is column-level.** The password-change route
+  needs to write one column, so the allowlist grants `UPDATE (password_hash)`
+  and still no table-level `UPDATE`; `core.sessions` keeps its whole-table grant
+  with `UPDATE` added for `revoked_at` (#149). Re-run `bootstrap-isolation` on
+  upgrade so the role picks up both changes.
 
 ---
 

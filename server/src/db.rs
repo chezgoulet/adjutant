@@ -916,6 +916,22 @@ CREATE TRIGGER user_roles_keep_an_admin
   FOR EACH ROW EXECUTE FUNCTION core.refuse_last_admin_removal();
 "
     ),
+    (16, "session_revocation", "
+-- #149 AUTH-3: a session can be revoked without deleting the row, so a leaked
+-- token stops working before its 30-day expiry and the fact of revocation is
+-- kept for the audit trail. NULL means live; a timestamp means revoked at
+-- that instant.
+--
+-- The identity lookup filters on `revoked_at IS NULL`; the existing
+-- `idx_core_sessions_hash` (token_hash) already serves that equality lookup, so
+-- this migration adds no second index for it. The route that lists a caller's
+-- sessions and the password-change revocation both filter by user_id, which had
+-- no index at all.
+ALTER TABLE core.sessions ADD COLUMN IF NOT EXISTS revoked_at TIMESTAMPTZ;
+CREATE INDEX IF NOT EXISTS idx_core_sessions_user_live
+  ON core.sessions (user_id) WHERE revoked_at IS NULL;
+"
+    ),
 ];
 
 /// Bootstrap roles + permissions grants. `chief` gets everything (SPEC §9 —

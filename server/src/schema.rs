@@ -77,6 +77,10 @@ pub fn core_grants(plugin_id: &str) -> Option<&'static [CoreGrant]> {
         "display_name",
         "password_hash",
     ];
+    // AUTH-3's password-change route rewrites exactly one column. It gets a
+    // column-level UPDATE, never a table-level one: `bootstrap_role` revokes the
+    // whole privilege set first, so an upgrade drops any older table grant (#148).
+    const AUTH_USERS_UPDATE: &[&str] = &["password_hash"];
     const AUTH: &[CoreGrant] = &[
         CoreGrant {
             table: "users",
@@ -89,9 +93,20 @@ pub fn core_grants(plugin_id: &str) -> Option<&'static [CoreGrant]> {
             privileges: "INSERT",
         },
         CoreGrant {
+            table: "users",
+            columns: Some(AUTH_USERS_UPDATE),
+            privileges: "UPDATE",
+        },
+        // Revoking a session writes `revoked_at`. The grant stays whole-table
+        // because auth already holds whole-table SELECT/INSERT/DELETE on this
+        // table (it creates and deletes sessions), so a column-level UPDATE
+        // would narrow nothing that is not already exposed — and it would be
+        // the only mixed-layer grant here. The narrower `users` grant is where
+        // the meaningful boundary is.
+        CoreGrant {
             table: "sessions",
             columns: None,
-            privileges: "SELECT, INSERT, DELETE",
+            privileges: "SELECT, INSERT, UPDATE, DELETE",
         },
         CoreGrant {
             table: "user_roles",
@@ -421,9 +436,28 @@ mod tests {
         assert!(auth
             .iter()
             .any(|g| g.table == "users" && g.privileges.contains("INSERT")));
+        // #149: the password-change route makes UPDATE real, but only on the
+        // hash column. A table-level UPDATE would also allow rewriting usernames,
+        // emails and `is_active`, which no auth route does.
         assert!(
-            !auth.iter().any(|g| g.privileges.contains("UPDATE")),
-            "auth has no password-change route; UPDATE on core.users would be unused authority (#148)"
+            !auth.iter().any(|g| g.table == "users"
+                && g.privileges.contains("UPDATE")
+                && g.columns.is_none()),
+            "auth must not re-introduce a table-level UPDATE on core.users (#148)"
+        );
+        let hash_update = auth
+            .iter()
+            .find(|g| g.table == "users" && g.privileges == "UPDATE")
+            .expect("the password-change route needs an UPDATE grant");
+        assert_eq!(
+            hash_update.columns,
+            Some(&["password_hash"][..]),
+            "UPDATE is narrowed to the one column the route writes"
+        );
+        assert!(
+            auth.iter()
+                .any(|g| g.table == "sessions" && g.privileges.contains("UPDATE")),
+            "revoking a session writes core.sessions.revoked_at"
         );
 
         let membership = core_grants("membership").expect("membership has a core allowlist");

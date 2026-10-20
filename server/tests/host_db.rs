@@ -245,7 +245,10 @@ async fn probe_reset_role_is_inert_and_set_role_is_refused() {
         .await
         .expect("RESET ROLE is allowed but must be inert");
     let rows = plugin
-        .query("SELECT session_user AS u, current_user AS c".to_string(), vec![])
+        .query(
+            "SELECT session_user AS u, current_user AS c".to_string(),
+            vec![],
+        )
         .await
         .expect("session_user query");
     assert_eq!(rows[0]["u"], serde_json::json!(expected));
@@ -501,15 +504,16 @@ async fn probe_rebootstrap_revokes_the_legacy_table_grant() {
         .expect("roster columns still readable after the upgrade");
 }
 
-/// #148: auth needs the hash to verify a login and INSERT to create users, but
-/// no handler UPDATEs `core.users` (there is no password-change route). The
-/// unused authority is gone; the used column grant remains.
+/// #148 + #149: auth needs the hash to verify a login and INSERT to create
+/// users. The password-change route needs UPDATE, but only on `password_hash`;
+/// a table-level UPDATE would also permit rewriting identity and status columns.
 #[tokio::test]
 #[ignore = "DB-gated: needs ADJUTANT_TEST_DATABASE_URL + CREATEROLE; run with `-- --ignored`"]
-async fn probe_auth_keeps_hash_select_but_loses_unused_update() {
+async fn probe_auth_hash_update_is_column_narrow() {
     let (admin, pools) = setup(&["auth"]).await;
     let role = schema::role_for("auth");
     let auth = host::CoreDb::new(pools[0].clone());
+    let uid = "9f000000-0000-4000-8000-000000000149";
 
     let table_update: bool =
         sqlx::query_scalar("SELECT has_table_privilege($1::name, 'core.users', 'UPDATE')")
@@ -519,8 +523,35 @@ async fn probe_auth_keeps_hash_select_but_loses_unused_update() {
             .expect("has_table_privilege");
     assert!(
         !table_update,
-        "auth must not hold the unused UPDATE on core.users (#148)"
+        "auth must not hold a table-level UPDATE on core.users (#148)"
     );
+    for (column, expected, why) in [
+        (
+            "password_hash",
+            true,
+            "the password-change route writes the hash",
+        ),
+        (
+            "display_name",
+            false,
+            "no auth route writes the display name",
+        ),
+        (
+            "is_active",
+            false,
+            "no auth route activates or deactivates a user",
+        ),
+    ] {
+        let granted: bool = sqlx::query_scalar(
+            "SELECT has_column_privilege($1::name, 'core.users', $2::text, 'UPDATE')",
+        )
+        .bind(&role)
+        .bind(column)
+        .fetch_one(admin.as_ref())
+        .await
+        .expect("has_column_privilege");
+        assert_eq!(granted, expected, "UPDATE on users.{column}: {why}");
+    }
     let hash_select: bool = sqlx::query_scalar(
         "SELECT has_column_privilege($1::name, 'core.users', 'password_hash', 'SELECT')",
     )
@@ -544,15 +575,65 @@ async fn probe_auth_keeps_hash_select_but_loses_unused_update() {
         "user creation inserts the columns named in the allowlist"
     );
 
-    // Login's query shape works under the new grants (empty result is fine).
-    auth.query(
-        "SELECT id::text AS id, username, password_hash, is_active \
-         FROM core.users WHERE lower(username) = lower($1)"
-            .to_string(),
-        vec![SqlValue::Text("nobody".into())],
+    // The positive probe: the statement the route actually runs works.
+    sqlx::query(
+        "INSERT INTO core.users (id, display_name, username) VALUES ($1::uuid, 'Probe', 'auth_probe_149') \
+         ON CONFLICT (id) DO NOTHING",
+    )
+    .bind(uid)
+    .execute(admin.as_ref())
+    .await
+    .expect("fixture user");
+    auth.execute(
+        "UPDATE core.users SET password_hash = $1 WHERE id = $2::uuid".to_string(),
+        vec![
+            SqlValue::Text("$argon2id$v=19$m=19456,t=2,p=1$c2FsdA$cmVwbGFjZWQ".into()),
+            SqlValue::Uuid(uid.into()),
+        ],
     )
     .await
-    .expect("login's column list is granted");
+    .expect("auth's role can update the hash column (AUTH-3)");
+
+    // The negative probe: the same table, a column auth was not granted. Assert
+    // *why* it fails — a column privilege denial, not a missing row or table.
+    let err = auth
+        .execute(
+            "UPDATE core.users SET display_name = 'Pwned' WHERE id = $1::uuid".to_string(),
+            vec![SqlValue::Uuid(uid.into())],
+        )
+        .await
+        .expect_err("a table-level UPDATE must remain impossible")
+        .to_string();
+    assert!(
+        err.contains("permission denied") && err.contains("display_name"),
+        "expected a column-privilege error on users.display_name, got: {err}"
+    );
+
+    // Sessions are revoked by writing `revoked_at`; auth's grant is whole-table
+    // because it already held whole-table SELECT/INSERT/DELETE there.
+    let sid = "9f000000-0000-4000-8000-00000000014a";
+    sqlx::query(
+        "INSERT INTO core.sessions (id, user_id, token_hash, expires_at) \
+         VALUES ($1::uuid, $2::uuid, 'probe-hash', now() + interval '1 hour') \
+         ON CONFLICT (id) DO NOTHING",
+    )
+    .bind(sid)
+    .bind(uid)
+    .execute(admin.as_ref())
+    .await
+    .expect("fixture session");
+    auth.execute(
+        "UPDATE core.sessions SET revoked_at = now() WHERE id = $1::uuid".to_string(),
+        vec![SqlValue::Uuid(sid.into())],
+    )
+    .await
+    .expect("auth's role can revoke a session");
+
+    sqlx::query("DELETE FROM core.users WHERE id = $1::uuid")
+        .bind(uid)
+        .execute(admin.as_ref())
+        .await
+        .expect("cleanup");
 }
 
 /// #33: `scope_id` is opaque TEXT owned by the plugin, `NULL` means troop-wide,
@@ -565,12 +646,17 @@ async fn probe_scope_id_is_opaque_text_and_round_trips() {
     let (admin, _pools) = setup(&[]).await;
     let uid = "11111111-1111-1111-1111-111111111111";
 
-    sqlx::query("DELETE FROM core.user_roles").execute(admin.as_ref()).await.expect("clear");
-    sqlx::query("INSERT INTO core.users (id, display_name) VALUES ($1::uuid, 'Bea') ON CONFLICT DO NOTHING")
-        .bind(uid)
+    sqlx::query("DELETE FROM core.user_roles")
         .execute(admin.as_ref())
         .await
-        .expect("user");
+        .expect("clear");
+    sqlx::query(
+        "INSERT INTO core.users (id, display_name) VALUES ($1::uuid, 'Bea') ON CONFLICT DO NOTHING",
+    )
+    .bind(uid)
+    .execute(admin.as_ref())
+    .await
+    .expect("user");
     // The role must hold a permission for `has_in_scope` to allow.
     sqlx::query(
         "INSERT INTO core.role_permissions (role_id, permission_id) VALUES ('scout', 'core:admin') \
@@ -599,24 +685,37 @@ async fn probe_scope_id_is_opaque_text_and_round_trips() {
     .expect("read the row back");
     assert_eq!(role_id, "scout");
     assert_eq!(scope_type, "lodge");
-    assert_eq!(scope_id.as_deref(), Some("1"), "the opaque id round-trips verbatim");
+    assert_eq!(
+        scope_id.as_deref(),
+        Some("1"),
+        "the opaque id round-trips verbatim"
+    );
 
     // Build the identity the way a session would and check coverage.
     let identity = Identity::from_grants(
         uid,
-        vec![RoleGrant { role_id, scope: Scope::lodge(scope_id.expect("id")) }],
+        vec![RoleGrant {
+            role_id,
+            scope: Scope::lodge(scope_id.expect("id")),
+        }],
     );
     let perms = PermissionService::new(host::CoreDb::new(admin.clone()));
     assert!(
-        perms.has_in_scope(Some(&identity), "core:admin", &Scope::lodge("1")).await,
+        perms
+            .has_in_scope(Some(&identity), "core:admin", &Scope::lodge("1"))
+            .await,
         "a lodge-scoped grant covers its own lodge"
     );
     assert!(
-        !perms.has_in_scope(Some(&identity), "core:admin", &Scope::lodge("2")).await,
+        !perms
+            .has_in_scope(Some(&identity), "core:admin", &Scope::lodge("2"))
+            .await,
         "and not another lodge"
     );
     assert!(
-        !perms.has_in_scope(Some(&identity), "core:admin", &Scope::troop()).await,
+        !perms
+            .has_in_scope(Some(&identity), "core:admin", &Scope::troop())
+            .await,
         "a lodge grant does not cover troop"
     );
 
@@ -627,7 +726,10 @@ async fn probe_scope_id_is_opaque_text_and_round_trips() {
     .bind(uid)
     .execute(admin.as_ref())
     .await;
-    assert!(lodge_without_id.is_err(), "a non-troop scope needs a scope_id");
+    assert!(
+        lodge_without_id.is_err(),
+        "a non-troop scope needs a scope_id"
+    );
 
     let troop_with_id = sqlx::query(
         "INSERT INTO core.user_roles (user_id, role_id, scope_type, scope_id) \
@@ -636,7 +738,10 @@ async fn probe_scope_id_is_opaque_text_and_round_trips() {
     .bind(uid)
     .execute(admin.as_ref())
     .await;
-    assert!(troop_with_id.is_err(), "a troop scope must have a NULL scope_id");
+    assert!(
+        troop_with_id.is_err(),
+        "a troop scope must have a NULL scope_id"
+    );
 
     let troop_with_null = sqlx::query(
         "INSERT INTO core.user_roles (user_id, role_id, scope_type, scope_id) \
@@ -657,7 +762,10 @@ async fn probe_scope_id_is_opaque_text_and_round_trips() {
 async fn probe_scope_hierarchy_lodge_covers_its_patrols() {
     let _h = HIERARCHY.lock().await;
     let (admin, _pools) = setup(&[]).await;
-    sqlx::query("DELETE FROM core.scope_hierarchy").execute(admin.as_ref()).await.expect("clear");
+    sqlx::query("DELETE FROM core.scope_hierarchy")
+        .execute(admin.as_ref())
+        .await
+        .expect("clear");
     sqlx::query(
         "INSERT INTO core.scope_hierarchy (parent_type, parent_id, child_type, child_id) \
          VALUES ('lodge', '3', 'patrol', '7')",
@@ -673,7 +781,10 @@ async fn probe_scope_hierarchy_lodge_covers_its_patrols() {
     )
     .execute(admin.as_ref())
     .await;
-    assert!(self_edge.is_err(), "a self-edge must be rejected by the CHECK");
+    assert!(
+        self_edge.is_err(),
+        "a self-edge must be rejected by the CHECK"
+    );
 
     sqlx::query(
         "INSERT INTO core.role_permissions (role_id, permission_id) \
@@ -683,30 +794,44 @@ async fn probe_scope_hierarchy_lodge_covers_its_patrols() {
     .await
     .expect("permissions");
 
-    let hierarchy = ScopeHierarchy::load(admin.as_ref()).await.expect("load the hierarchy");
+    let hierarchy = ScopeHierarchy::load(admin.as_ref())
+        .await
+        .expect("load the hierarchy");
     let perms = PermissionService::new(host::CoreDb::new(admin.clone()));
 
     let lodge_grant = Identity::from_grants(
         "u",
-        vec![RoleGrant { role_id: "chief".into(), scope: Scope::lodge("3") }],
+        vec![RoleGrant {
+            role_id: "chief".into(),
+            scope: Scope::lodge("3"),
+        }],
     );
     let expanded = hierarchy.expand(&lodge_grant);
     assert!(
-        perms.has_in_scope(Some(&expanded), "core:admin", &Scope::patrol("7")).await,
+        perms
+            .has_in_scope(Some(&expanded), "core:admin", &Scope::patrol("7"))
+            .await,
         "a lodge grant covers the patrol declared inside it"
     );
     assert!(
-        !perms.has_in_scope(Some(&expanded), "core:admin", &Scope::patrol("8")).await,
+        !perms
+            .has_in_scope(Some(&expanded), "core:admin", &Scope::patrol("8"))
+            .await,
         "and not a patrol that is not declared inside it"
     );
 
     let patrol_grant = Identity::from_grants(
         "u",
-        vec![RoleGrant { role_id: "scout".into(), scope: Scope::patrol("7") }],
+        vec![RoleGrant {
+            role_id: "scout".into(),
+            scope: Scope::patrol("7"),
+        }],
     );
     let patrol_expanded = hierarchy.expand(&patrol_grant);
     assert!(
-        !perms.has_in_scope(Some(&patrol_expanded), "core:admin", &Scope::lodge("3")).await,
+        !perms
+            .has_in_scope(Some(&patrol_expanded), "core:admin", &Scope::lodge("3"))
+            .await,
         "covering is downward only: a patrol grant does not cover its lodge"
     );
 }
@@ -740,7 +865,10 @@ async fn probe_scope_edge_ownership_is_enforced() {
             vec![],
         )
         .await;
-    assert!(map_write.is_err(), "a plugin has no grant on core.scope_owners");
+    assert!(
+        map_write.is_err(),
+        "a plugin has no grant on core.scope_owners"
+    );
 
     // Simulate a future plugin granted the edge table but owning no scope type.
     sqlx::query("GRANT SELECT, INSERT, DELETE ON core.scope_hierarchy TO adjutant_plugin_hello")
@@ -759,7 +887,10 @@ async fn probe_scope_edge_ownership_is_enforced() {
         .await
         .expect_err("hello does not own lodge/patrol")
         .to_string();
-    assert!(raw_err.contains("may not declare"), "clear trigger error: {raw_err}");
+    assert!(
+        raw_err.contains("may not declare"),
+        "clear trigger error: {raw_err}"
+    );
     println!("[edge-ownership] trigger refusal: {raw_err}");
 
     // The declare API refuses it too, with its own clear message.
@@ -771,7 +902,10 @@ async fn probe_scope_edge_ownership_is_enforced() {
         .await
         .expect_err("the declare API refuses a type the plugin does not own")
         .to_string();
-    assert!(api_err.contains("may not declare"), "clear API error: {api_err}");
+    assert!(
+        api_err.contains("may not declare"),
+        "clear API error: {api_err}"
+    );
     println!("[edge-ownership] declare-API refusal: {api_err}");
 
     // Query the table, not only the errors: the refused edge must be absent.
@@ -828,7 +962,9 @@ async fn probe_scheduler_runs_records_and_stops() {
     let fail_sched = Schedule::new(
         "boom",
         std::time::Duration::from_millis(100),
-        schedule_handler(|| async { Err::<(), _>(adjutant_sdk::SdkError::Internal("boom".into())) }),
+        schedule_handler(|| async {
+            Err::<(), _>(adjutant_sdk::SdkError::Internal("boom".into()))
+        }),
     );
 
     let (tx, mut rx) = tokio::sync::mpsc::channel::<String>(16);
@@ -840,7 +976,9 @@ async fn probe_scheduler_runs_records_and_stops() {
             let db = db.clone();
             let tx = tx.clone();
             async move {
-                let rows = db.query("SELECT session_user AS u".to_string(), vec![]).await?;
+                let rows = db
+                    .query("SELECT session_user AS u".to_string(), vec![])
+                    .await?;
                 let who = rows[0]["u"].as_str().unwrap_or_default().to_string();
                 let _ = tx.send(who).await;
                 Ok(())
@@ -873,12 +1011,18 @@ async fn probe_scheduler_runs_records_and_stops() {
         }
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
     }
-    assert!(ok_runs >= 2, "at least two successful runs recorded, got {ok_runs}");
+    assert!(
+        ok_runs >= 2,
+        "at least two successful runs recorded, got {ok_runs}"
+    );
 
     // The admin view (what PluginInfo reports) has last_run and next_run.
     let infos = scheduler.infos("sched_probe");
     assert_eq!(infos.len(), 2, "both schedules listed");
-    let tick_info = infos.iter().find(|s| s.name == "tick").expect("tick listed");
+    let tick_info = infos
+        .iter()
+        .find(|s| s.name == "tick")
+        .expect("tick listed");
     assert!(tick_info.last_run.is_some(), "last_run is reported");
     assert!(tick_info.next_run.is_some(), "next_run is reported");
 
@@ -907,7 +1051,11 @@ async fn probe_scheduler_runs_records_and_stops() {
         bad_after <= bad_runs + 8,
         "a failing schedule must not spin: {bad_runs} -> {bad_after} in ~0.45s"
     );
-    let boom = scheduler.infos("sched_probe").into_iter().find(|s| s.name == "boom").unwrap();
+    let boom = scheduler
+        .infos("sched_probe")
+        .into_iter()
+        .find(|s| s.name == "boom")
+        .unwrap();
     assert!(boom.last_error.is_some(), "last_error is reported");
 
     // Stop: the shutdown aborts the plugin's tasks, and what it *promises* is
@@ -919,7 +1067,10 @@ async fn probe_scheduler_runs_records_and_stops() {
     // *started* before it.
     scheduler.stop("sched_probe");
     assert!(
-        scheduler.infos("sched_probe").iter().all(|s| s.next_run.is_none()),
+        scheduler
+            .infos("sched_probe")
+            .iter()
+            .all(|s| s.next_run.is_none()),
         "a stopped plugin's schedules report no next run"
     );
     // `JoinHandle::abort` cancels the task at its next await point rather than

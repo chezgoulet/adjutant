@@ -152,6 +152,9 @@ Config lives in the `auth` row's `core.plugins.config` (`{"oidc": {…},
 | POST | `/api/auth/login` | — | `{username, password}` → session token + `adjutant_session` cookie |
 | POST | `/api/auth/logout` | — | Ends the session |
 | GET | `/api/auth/me` | session | Current user and scoped role grants |
+| GET | `/api/auth/sessions` | session | The caller's live sessions: `id`, `created_at`, `expires_at`, `device_info`, and `current` on the one the request presented |
+| DELETE | `/api/auth/sessions/{id}` | session | Revokes one of the caller's own sessions (sets `revoked_at`). Another user's session id and a missing id are indistinguishable: both answer `404` |
+| POST | `/api/auth/password` | session | `{current_password, new_password}` (min 8). Verifies the current password, replaces the hash, revokes every **other** session, and leaves the presented one alive |
 | POST | `/api/auth/register` | — | `{username, email?, password}`; **open only while no users exist**; first user becomes `chief` (min 8-char password). The bootstrap slot is a single row, so concurrent first registrations have exactly one winner; the loser gets `403` |
 | POST | `/api/auth/users` | `auth:manage_users` | `{username, email?, password, roles?}` |
 | POST | `/api/auth/roles` | `auth:manage_users` | `{username, roles: string[]}` (replaces grants). Refuses with `409` when the write would leave no user holding `core:admin` or `auth:manage_users` at troop scope — grant another chief first |
