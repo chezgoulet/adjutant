@@ -1552,10 +1552,10 @@ void main() {
       // A scout in the woods with no signal: the last-known answer, and the
       // hour it is from, and no empty ledger implying nothing is owed.
       SharedPreferences.setMockInitialValues({
-        'cache.dues.u1': jsonEncode(standing()),
-        'cache.dues.u1.at': DateTime(2026, 9, 25, 6, 30).toIso8601String(),
-        'cache.dues.scale': jsonEncode(scale()),
-        'cache.dues.scale.at': DateTime(2026, 9, 25, 6, 30).toIso8601String(),
+        'cache.u1.dues.u1': jsonEncode(standing()),
+        'cache.u1.dues.u1.at': DateTime(2026, 9, 25, 6, 30).toIso8601String(),
+        'cache.u1.dues.scale': jsonEncode(scale()),
+        'cache.u1.dues.scale.at': DateTime(2026, 9, 25, 6, 30).toIso8601String(),
       });
 
       final client = ApiClient(
