@@ -12,7 +12,10 @@ use sqlx::PgPool;
 use crate::config::Config;
 
 /// Core schema DDL (SPEC §8.1). Idempotent — `IF NOT EXISTS` throughout.
-const CORE_MIGRATIONS: &[(i64, &str, &str)] = &[(1, "core_schema", "
+///
+/// Public so the DB-gated upgrade test can re-run one migration's SQL against a
+/// database that already has rows (the one path a fresh migration never takes).
+pub const CORE_MIGRATIONS: &[(i64, &str, &str)] = &[(1, "core_schema", "
 CREATE SCHEMA IF NOT EXISTS core;
 
 CREATE TABLE IF NOT EXISTS core.users (
@@ -930,6 +933,110 @@ CREATE TRIGGER user_roles_keep_an_admin
 ALTER TABLE core.sessions ADD COLUMN IF NOT EXISTS revoked_at TIMESTAMPTZ;
 CREATE INDEX IF NOT EXISTS idx_core_sessions_user_live
   ON core.sessions (user_id) WHERE revoked_at IS NULL;
+"
+    ),
+    (17, "audit_chain_v2_and_keyed", "
+-- #159: the v1 digest covered id/action/resource_type/resource_id/details/source.
+-- Changing user_id or created_at (who and when — the two things an audit log
+-- exists to establish) left the chain verifying. v2 adds both, as a new
+-- migration so an applied v1 is never edited.
+--
+-- #160: keyed_hash is an HMAC-SHA256 computed by the server over the same
+-- canonical payload. The database role that owns this table never holds the
+-- key, so it can recompute the unkeyed chain but not this column. Rows that
+-- predate the key (and every deployment without ADJUTANT_AUDIT_KEY) keep it
+-- NULL; the app verifier reports them as unkeyed, never as protected.
+ALTER TABLE core.audit_log ADD COLUMN IF NOT EXISTS keyed_hash TEXT;
+
+-- The canonical form, in one place so the trigger, the verifier and the
+-- migration's recompute cannot drift apart. The Rust twin is
+-- adjutant_sdk::canonical_payload; change both together.
+--
+--   prev_hash | id | action | resource_type | resource_id | details::text |
+--   source | coalesce(user_id::text,'') |
+--   to_char(created_at AT TIME ZONE 'UTC','YYYY-MM-DD\"T\"HH24:MI:SS.US')||'+00:00'
+--
+-- details::text is jsonb's rendering (sorted keys), not the caller's JSON
+-- text: jsonb normalises on the way in, and both sides hash what is stored.
+CREATE OR REPLACE FUNCTION core.audit_canonical(
+    p_prev_hash     TEXT,
+    p_id            BIGINT,
+    p_action        TEXT,
+    p_resource_type TEXT,
+    p_resource_id   TEXT,
+    p_details       JSONB,
+    p_source        TEXT,
+    p_user_id       UUID,
+    p_created_at    TIMESTAMPTZ
+) RETURNS TEXT
+LANGUAGE sql IMMUTABLE AS $fn$
+SELECT p_prev_hash || '|' || p_id::text || '|' || p_action || '|' ||
+       p_resource_type || '|' || p_resource_id || '|' || p_details::text || '|' ||
+       p_source || '|' || COALESCE(p_user_id::text, '') || '|' ||
+       to_char(p_created_at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS.US') || '+00:00'
+$fn$;
+
+-- Recompute the chain over existing rows with the v2 formula, or an upgrade
+-- would leave every row reporting as bad. The append-only trigger would refuse
+-- these UPDATEs, so it is disabled for the recompute and re-enabled in the same
+-- transaction: an error anywhere rolls the disable back too.
+ALTER TABLE core.audit_log DISABLE TRIGGER audit_append_only;
+
+DO $fn$
+DECLARE r RECORD; prev TEXT := repeat('0', 64); h TEXT;
+BEGIN
+  FOR r IN
+    SELECT id, user_id, action, resource_type, resource_id, details, source, created_at
+    FROM core.audit_log ORDER BY id
+  LOOP
+    h := encode(public.digest(core.audit_canonical(
+        prev, r.id, r.action, r.resource_type, r.resource_id, r.details, r.source,
+        r.user_id, r.created_at), 'sha256'), 'hex');
+    UPDATE core.audit_log SET prev_hash = prev, entry_hash = h WHERE id = r.id;
+    prev := h;
+  END LOOP;
+END
+$fn$;
+
+ALTER TABLE core.audit_log ENABLE TRIGGER audit_append_only;
+
+CREATE OR REPLACE FUNCTION core.audit_chain_fill() RETURNS trigger
+LANGUAGE plpgsql AS $fn$
+DECLARE prev TEXT;
+BEGIN
+  PERFORM pg_advisory_xact_lock(918273645);
+  SELECT entry_hash INTO prev FROM core.audit_log ORDER BY id DESC LIMIT 1;
+  NEW.prev_hash := COALESCE(prev, repeat('0', 64));
+  -- The canonical form is pinned in core.audit_canonical(): v2 includes
+  -- user_id and created_at, in UTC with microsecond precision. Do not inline a
+  -- second copy here — see the Rust twin adjutant_sdk::canonical_payload.
+  NEW.entry_hash := encode(public.digest(core.audit_canonical(
+    NEW.prev_hash, NEW.id, NEW.action, NEW.resource_type, NEW.resource_id,
+    NEW.details, NEW.source, NEW.user_id, NEW.created_at), 'sha256'), 'hex');
+  RETURN NEW;
+END
+$fn$;
+
+DROP TRIGGER IF EXISTS audit_chain_fill ON core.audit_log;
+CREATE TRIGGER audit_chain_fill BEFORE INSERT ON core.audit_log
+  FOR EACH ROW EXECUTE FUNCTION core.audit_chain_fill();
+
+-- The append-only and TRUNCATE guards are deliberately untouched: the keyed
+-- column is written on INSERT only (the SDK computes it first), and any UPDATE
+-- remains refused.
+CREATE OR REPLACE FUNCTION core.audit_verify()
+RETURNS TABLE(first_bad BIGINT, rows_checked BIGINT)
+LANGUAGE sql STABLE AS $fn$
+SELECT min(id) FILTER (WHERE bad)::BIGINT, count(*)::BIGINT FROM (
+  SELECT a.id,
+    (a.prev_hash IS DISTINCT FROM COALESCE(lag(a.entry_hash, 1) OVER w, repeat('0', 64)))
+    OR (a.entry_hash IS DISTINCT FROM encode(public.digest(core.audit_canonical(
+        COALESCE(lag(a.entry_hash, 1) OVER w, repeat('0', 64)),
+        a.id, a.action, a.resource_type, a.resource_id, a.details, a.source,
+        a.user_id, a.created_at), 'sha256'), 'hex')) AS bad
+  FROM core.audit_log a WINDOW w AS (ORDER BY a.id)
+) t
+$fn$;
 "
     ),
 ];
