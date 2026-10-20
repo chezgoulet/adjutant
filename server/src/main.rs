@@ -1,7 +1,7 @@
 //! `adjutant` — the core server binary.
 
-use adjutant_server::config::{self, CliArgs, LogFormat};
 use adjutant_server::build_app;
+use adjutant_server::config::{self, CliArgs, LogFormat};
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -196,11 +196,34 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
             }
         }
+        Some("grant-role") => {
+            let username = args
+                .get(1)
+                .filter(|a| !a.starts_with('-'))
+                .ok_or("usage: adjutant grant-role <username> <role> [--database-url <URL>]")?;
+            let role = args
+                .get(2)
+                .filter(|a| !a.starts_with('-'))
+                .ok_or("usage: adjutant grant-role <username> <role> [--database-url <URL>]")?;
+            let cli = config::CliArgs::parse(args[3..].iter().cloned()).unwrap_or_default();
+            let cfg = config::load(&cli)?;
+            match adjutant_server::cli::grant_role(&cfg, username, role).await {
+                Ok(message) => {
+                    println!("{message}");
+                    return Ok(());
+                }
+                Err(e) => {
+                    eprintln!("error: {e}");
+                    std::process::exit(2);
+                }
+            }
+        }
         Some("serve") => {}
         Some("-h") | Some("--help") | Some("help") => {
             print!("{}", config::USAGE);
             return Ok(());
-        }        Some(other) if !other.starts_with('-') => {
+        }
+        Some(other) if !other.starts_with('-') => {
             eprintln!("error: unknown command {other:?}\n\n{}", config::USAGE);
             std::process::exit(2);
         }
@@ -222,7 +245,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .unwrap_or_else(|_| cfg.log_filter.clone().into());
     match cfg.log_format {
         LogFormat::Pretty => tracing_subscriber::fmt().with_env_filter(filter).init(),
-        LogFormat::Json => tracing_subscriber::fmt().with_env_filter(filter).json().init(),
+        LogFormat::Json => tracing_subscriber::fmt()
+            .with_env_filter(filter)
+            .json()
+            .init(),
     }
 
     tracing::info!(bind = %cfg.bind, plugin_dir = %cfg.plugin_dir.display(), "starting adjutant");
@@ -259,7 +285,9 @@ fn find_repo_root() -> Result<std::path::PathBuf, Box<dyn std::error::Error>> {
             }
         }
         if !dir.pop() {
-            return Err("not inside an adjutant workspace (no [workspace] Cargo.toml found)".into());
+            return Err(
+                "not inside an adjutant workspace (no [workspace] Cargo.toml found)".into(),
+            );
         }
     }
 }
@@ -279,7 +307,9 @@ fn plugin_list(raw: &str) -> Vec<String> {
 
 async fn shutdown_signal() {
     let ctrl_c = async {
-        tokio::signal::ctrl_c().await.expect("install ctrl-c handler");
+        tokio::signal::ctrl_c()
+            .await
+            .expect("install ctrl-c handler");
     };
 
     #[cfg(unix)]

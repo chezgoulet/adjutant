@@ -40,8 +40,33 @@ runs core migrations, loads the bundled plugins (`hello`, `auth`, `membership`),
 and runs each plugin's migrations — **on a pool authenticated as that plugin's
 own `adjutant_plugin_<id>` role**.
 
-Postgres is **not** exposed to the host; only the server is. The first user to
-`POST /api/auth/register` while `core.users` is empty becomes `chief`.
+Postgres is **not** exposed to the host; only the server is.
+
+**The first chief comes from one of two paths, never both.**
+
+- **Environment (recommended).** Set `ADJUTANT_BOOTSTRAP_USERNAME` and
+  `ADJUTANT_BOOTSTRAP_PASSWORD` (and optionally `ADJUTANT_BOOTSTRAP_EMAIL`) in
+  the server's environment. On the first boot against a database with no users,
+  the server creates that account with the `chief` role before it opens the
+  listener. Set both variables or neither: half a pair refuses to boot rather
+  than leaving a server nobody can log in to. Once the database has users the
+  variables are ignored on every later boot — changing the password there does
+  **not** change the account, because an environment that can rewrite a password
+  on restart is a backdoor. Remove the password from the environment after the
+  first boot.
+- **First registration.** `POST /api/auth/register` is open only while no user
+  exists; the first caller becomes `chief`. The one bootstrap slot is a row
+  (`core.bootstrap_claim`), so two concurrent first registrations cannot both
+  win: exactly one gets `201`, the other `403`.
+
+`adjutant grant-role <username> <role>` is the operator's recovery hatch. It
+writes `core.user_roles` directly, so it works when the last admin has been
+removed and the API is unreachable.
+
+**Upgrading an existing deployment:** re-run `bootstrap-isolation` against the
+new binary before starting the server. The auth plugin holds a new, narrow grant
+on `core.bootstrap_claim`; without it, registration returns `500` rather than
+`403` on an installation that has not been re-provisioned.
 
 ## The application role
 

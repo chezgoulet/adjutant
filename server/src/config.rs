@@ -21,7 +21,9 @@ impl LogFormat {
         match s.to_ascii_lowercase().as_str() {
             "pretty" | "text" => Ok(LogFormat::Pretty),
             "json" => Ok(LogFormat::Json),
-            other => Err(format!("invalid log format {other:?}: expected pretty|json")),
+            other => Err(format!(
+                "invalid log format {other:?}: expected pretty|json"
+            )),
         }
     }
 }
@@ -35,7 +37,10 @@ pub struct RateConfig {
 
 impl Default for RateConfig {
     fn default() -> Self {
-        Self { window_secs: 60, max_requests: 120 }
+        Self {
+            window_secs: 60,
+            max_requests: 120,
+        }
     }
 }
 
@@ -63,6 +68,19 @@ pub struct Config {
     /// (design plugin-isolation §3.6), so the default is to refuse to boot; this
     /// exists only for a throwaway/dev database.
     pub allow_superuser: bool,
+    /// The first chief, created at boot from `ADJUTANT_BOOTSTRAP_USERNAME` and
+    /// `ADJUTANT_BOOTSTRAP_PASSWORD` when the database has no users (#173).
+    /// `None` leaves the first-user-becomes-chief path to HTTP registration.
+    pub bootstrap_chief: Option<BootstrapChief>,
+}
+
+/// An operator-supplied first account. The password is held only in memory; it is
+/// never written to `core.*` in clear, and the created user's hash is argon2.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BootstrapChief {
+    pub username: String,
+    pub password: String,
+    pub email: Option<String>,
 }
 
 impl Default for Config {
@@ -79,6 +97,7 @@ impl Default for Config {
             allow_dev_headers: false,
             trusted_proxies: Vec::new(),
             allow_superuser: false,
+            bootstrap_chief: None,
         }
     }
 }
@@ -146,10 +165,10 @@ USAGE:
                                    create/refresh per-plugin DB roles, schema
                                    ownership, grants and stored credentials
                                    (run once by the operator, against an admin URL)
-                                   --enable names which plugins this deployment
-                                   runs, comma or space separated; every other
-                                   plugin on disk is disabled. Omit it and the
-                                   existing flags are left alone.
+    adjutant grant-role <username> <role> [OPTIONS]
+                                   grant a role directly in the database — the
+                                   recovery path when the last admin is gone or
+                                   the API is unreachable
     adjutant --help                print this help
 
 SERVE OPTIONS:
@@ -173,6 +192,8 @@ BOOTSTRAP-ISOLATION OPTIONS:
                            no CREATEROLE) that owns the core schema and holds the
                            plugin roles; serve as it to avoid a superuser
     --app-password <PW>    set the application role's password (default: leave it)
+    --enable <IDS>         which plugins this deployment runs, comma or space
+                           separated; every other plugin on disk is disabled
 
 ENVIRONMENT (override file, overridden by flags):
     ADJUTANT_CONFIG, ADJUTANT_BIND, ADJUTANT_DATABASE_URL, ADJUTANT_PLUGIN_DIR,
@@ -180,7 +201,10 @@ ENVIRONMENT (override file, overridden by flags):
     ADJUTANT_CORS (comma-separated origins), ADJUTANT_MAX_BODY,
     ADJUTANT_DEV_HEADERS (true enables the dev stub; off by default),
     ADJUTANT_TRUSTED_PROXIES, ADJUTANT_ALLOW_SUPERUSER (true permits a superuser
-    connection; off by default)
+    connection; off by default),
+    ADJUTANT_BOOTSTRAP_USERNAME / ADJUTANT_BOOTSTRAP_PASSWORD (create the first
+    chief at boot when the database has no users; set both, or neither) and
+    ADJUTANT_BOOTSTRAP_EMAIL (optional)
 ";
 
 impl CliArgs {
@@ -261,7 +285,9 @@ pub fn load(cli: &CliArgs) -> Result<Config, String> {
         cfg.rate.max_requests = v.parse().map_err(|e| format!("ADJUTANT_RATE_MAX: {e}"))?;
     }
     if let Ok(v) = std::env::var("ADJUTANT_RATE_WINDOW") {
-        cfg.rate.window_secs = v.parse().map_err(|e| format!("ADJUTANT_RATE_WINDOW: {e}"))?;
+        cfg.rate.window_secs = v
+            .parse()
+            .map_err(|e| format!("ADJUTANT_RATE_WINDOW: {e}"))?;
     }
     if let Ok(v) = std::env::var("ADJUTANT_CORS") {
         cfg.cors_origins = split_origins(&v);
@@ -277,6 +303,38 @@ pub fn load(cli: &CliArgs) -> Result<Config, String> {
     }
     if let Ok(v) = std::env::var("ADJUTANT_ALLOW_SUPERUSER") {
         cfg.allow_superuser = matches!(v.as_str(), "1" | "true" | "yes");
+    }
+    // The environment-supplied first chief (#173). Set together or not at all:
+    // half a credential pair is a misconfiguration that would otherwise boot a
+    // server nobody can log in to, or silently ignore the operator's intent.
+    let boot_user = std::env::var("ADJUTANT_BOOTSTRAP_USERNAME")
+        .ok()
+        .map(|v| v.trim().to_string())
+        .filter(|v| !v.is_empty());
+    let boot_pass = std::env::var("ADJUTANT_BOOTSTRAP_PASSWORD")
+        .ok()
+        .filter(|v| !v.is_empty());
+    match (boot_user, boot_pass) {
+        (None, None) => {}
+        (Some(username), Some(password)) => {
+            if password.len() < 8 {
+                return Err("ADJUTANT_BOOTSTRAP_PASSWORD: must be at least 8 characters".into());
+            }
+            cfg.bootstrap_chief = Some(BootstrapChief {
+                username,
+                password,
+                email: std::env::var("ADJUTANT_BOOTSTRAP_EMAIL")
+                    .ok()
+                    .map(|v| v.trim().to_string())
+                    .filter(|v| !v.is_empty()),
+            });
+        }
+        _ => {
+            return Err(
+                "ADJUTANT_BOOTSTRAP_USERNAME and ADJUTANT_BOOTSTRAP_PASSWORD must be set together"
+                    .into(),
+            )
+        }
     }
 
     // 3. CLI (highest precedence)
@@ -306,7 +364,11 @@ pub fn load(cli: &CliArgs) -> Result<Config, String> {
 }
 
 fn split_origins(s: &str) -> Vec<String> {
-    s.split(',').map(str::trim).filter(|o| !o.is_empty()).map(String::from).collect()
+    s.split(',')
+        .map(str::trim)
+        .filter(|o| !o.is_empty())
+        .map(String::from)
+        .collect()
 }
 
 fn merge_file(cfg: &mut Config, path: &Path) -> Result<(), String> {
@@ -364,6 +426,77 @@ fn merge_file(cfg: &mut Config, path: &Path) -> Result<(), String> {
 mod tests {
     use super::*;
 
+    /// The environment bootstrap is all-or-nothing (#173). Runs every case in
+    /// one test so env-var mutation cannot race between parallel tests.
+    #[test]
+    fn bootstrap_chief_from_environment() {
+        let keys = [
+            "ADJUTANT_BOOTSTRAP_USERNAME",
+            "ADJUTANT_BOOTSTRAP_PASSWORD",
+            "ADJUTANT_BOOTSTRAP_EMAIL",
+        ];
+        let saved: Vec<(String, Option<String>)> = keys
+            .iter()
+            .map(|k| (k.to_string(), std::env::var(k).ok()))
+            .collect();
+        for k in keys {
+            std::env::remove_var(k);
+        }
+
+        // Neither variable: registration remains the bootstrap path.
+        assert!(load(&CliArgs::default()).unwrap().bootstrap_chief.is_none());
+
+        // Half a pair is a misconfiguration, not a partial bootstrap.
+        std::env::set_var("ADJUTANT_BOOTSTRAP_USERNAME", "chief");
+        assert!(load(&CliArgs::default())
+            .unwrap_err()
+            .contains("must be set together"));
+        std::env::remove_var("ADJUTANT_BOOTSTRAP_USERNAME");
+        std::env::set_var("ADJUTANT_BOOTSTRAP_PASSWORD", "password123");
+        assert!(load(&CliArgs::default())
+            .unwrap_err()
+            .contains("must be set together"));
+        std::env::remove_var("ADJUTANT_BOOTSTRAP_PASSWORD");
+
+        // The route's 8-character rule applies at boot too: a password the login
+        // route would refuse must not become the chief's password.
+        std::env::set_var("ADJUTANT_BOOTSTRAP_USERNAME", "chief");
+        std::env::set_var("ADJUTANT_BOOTSTRAP_PASSWORD", "short");
+        assert!(load(&CliArgs::default())
+            .unwrap_err()
+            .contains("at least 8 characters"));
+
+        // Both halves: carried, with the optional email.
+        std::env::set_var("ADJUTANT_BOOTSTRAP_PASSWORD", "password123");
+        std::env::set_var("ADJUTANT_BOOTSTRAP_EMAIL", "chief@example.org");
+        assert_eq!(
+            load(&CliArgs::default()).unwrap().bootstrap_chief,
+            Some(BootstrapChief {
+                username: "chief".into(),
+                password: "password123".into(),
+                email: Some("chief@example.org".into()),
+            })
+        );
+
+        // A whitespace-only email is absent, not an empty string.
+        std::env::set_var("ADJUTANT_BOOTSTRAP_EMAIL", "   ");
+        assert_eq!(
+            load(&CliArgs::default())
+                .unwrap()
+                .bootstrap_chief
+                .unwrap()
+                .email,
+            None
+        );
+
+        for (k, v) in saved {
+            match v {
+                Some(v) => std::env::set_var(k, v),
+                None => std::env::remove_var(k),
+            }
+        }
+    }
+
     /// Precedence must hold: default < file < env < CLI. Runs all cases in one
     /// test so env-var mutation can't race between parallel tests.
     #[test]
@@ -383,7 +516,10 @@ mod tests {
             "bind = \"0.0.0.0:9000\"\nlog_format = \"json\"\n[rates]\nmax_requests = 5\n[cors]\norigins = [\"https://x.test\"]\n",
         )
         .unwrap();
-        let cli = CliArgs { config: Some(file.clone()), ..Default::default() };
+        let cli = CliArgs {
+            config: Some(file.clone()),
+            ..Default::default()
+        };
         let c = load(&cli).unwrap();
         assert_eq!(c.bind.to_string(), "0.0.0.0:9000");
         assert_eq!(c.log_format, LogFormat::Json);
@@ -398,7 +534,10 @@ mod tests {
 
         // CLI beats env
         std::env::set_var("ADJUTANT_BIND", "1.2.3.4:1111");
-        let cli2 = CliArgs { bind: Some("5.6.7.8:2222".into()), ..cli.clone() };
+        let cli2 = CliArgs {
+            bind: Some("5.6.7.8:2222".into()),
+            ..cli.clone()
+        };
         let c = load(&cli2).unwrap();
         assert_eq!(c.bind.to_string(), "5.6.7.8:2222", "cli must beat env");
         std::env::remove_var("ADJUTANT_BIND");
@@ -417,7 +556,11 @@ mod tests {
         std::fs::write(&file, "[auth]\nallow_dev_headers = true\n").unwrap();
 
         // File opt-in.
-        let c = load(&CliArgs { config: Some(file.clone()), ..Default::default() }).unwrap();
+        let c = load(&CliArgs {
+            config: Some(file.clone()),
+            ..Default::default()
+        })
+        .unwrap();
         assert!(c.allow_dev_headers, "file must be able to opt in");
 
         // CLI flag is the highest layer: it beats an env that disables.
@@ -432,7 +575,11 @@ mod tests {
         std::env::remove_var("ADJUTANT_DEV_HEADERS");
 
         // And the flag parses.
-        assert!(CliArgs::parse(vec!["--allow-dev-headers".to_string()]).unwrap().allow_dev_headers);
+        assert!(
+            CliArgs::parse(vec!["--allow-dev-headers".to_string()])
+                .unwrap()
+                .allow_dev_headers
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -441,8 +588,12 @@ mod tests {
     fn serve_subcommand_is_optional_and_not_a_flag() {
         // `adjutant serve --bind 1.2.3.4:1` and `adjutant --bind 1.2.3.4:1` must
         // behave identically; the bare `serve` form used to exit 2.
-        let with = CliArgs::parse(vec!["serve".to_string(), "--bind".to_string(), "1.2.3.4:1".to_string()])
-            .expect("serve form parses");
+        let with = CliArgs::parse(vec![
+            "serve".to_string(),
+            "--bind".to_string(),
+            "1.2.3.4:1".to_string(),
+        ])
+        .expect("serve form parses");
         let without = CliArgs::parse(vec!["--bind".to_string(), "1.2.3.4:1".to_string()])
             .expect("flag form parses");
         assert_eq!(with.bind, without.bind);

@@ -11,6 +11,32 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Added
+
+- **The first chief can be created from the environment.** Setting
+  `ADJUTANT_BOOTSTRAP_USERNAME` and `ADJUTANT_BOOTSTRAP_PASSWORD` (with optional
+  `ADJUTANT_BOOTSTRAP_EMAIL`) creates that account with the `chief` role on the
+  first boot against an empty database, before the listener opens. Half a
+  credential pair refuses to boot. Once any user exists the variables are
+  ignored — they never rewrite an existing account (#173).
+- **`adjutant grant-role <username> <role>`** — writes `core.user_roles`
+  directly, so it recovers a troop whose last admin has been removed and whose
+  API is therefore unreachable (#147).
+
+### Changed
+
+- **Registration has exactly one winner.** `POST /api/auth/register` claims a
+  single row in the new `core.bootstrap_claim` table before it creates the user;
+  the primary key is the mutex. Two concurrent first registrations can no longer
+  both become `chief`, and a failed registration gives the slot back (#173).
+  The auth plugin holds a narrow `SELECT, INSERT, DELETE` grant on that table, so
+  an existing deployment must re-run `bootstrap-isolation` on upgrade.
+- **The last admin cannot be removed by any writer.** An `AFTER DELETE` trigger
+  on `core.user_roles` refuses a delete that would leave
+  nobody holding `core:admin` or `auth:manage_users` at troop scope; the roles
+  route reports it as `409`. `POST /api/auth/roles` now grants before it revokes,
+  so a valid replacement is not caught between two statements (#147).
+
 ---
 
 ## [0.3.0] — 2026-09-27 — Milestones 5 and 6: the client, and the operational plugins
