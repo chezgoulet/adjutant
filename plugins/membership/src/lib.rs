@@ -634,9 +634,9 @@ impl AdjutantPlugin for MembershipPlugin {
                     }
 
                     // A lodge-scoped `read_lodge` grant that covers the member's
-                    // lodge. NOTE: `core.user_roles.scope_id` is UUID, while
-                    // membership lodge ids are bigint, so no such grant can be
-                    // stored yet — see the PR. The check is the design's shape.
+                    // lodge. `core.user_roles.scope_id` became TEXT in core
+                    // migration 5, so a lodge grant stores the bigint lodge id as
+                    // text and this check can match.
                     if let Some(lodge_id) = member["lodge_id"].as_i64() {
                         if c.permissions
                             .has_in_scope(
@@ -881,16 +881,19 @@ impl AdjutantPlugin for MembershipPlugin {
         );
 
         // --- lodges ------------------------------------------------------------
-        // Reference data: the caller needs `membership:read_lodge` at *some*
-        // scope (a lodge commander's lodge grant qualifies). These are not
-        // filtered per lodge — they are the troop's reference lists.
+        // Reference data gated at *some* scope, then narrowed in the handler to
+        // the lodges the caller's `membership:read_lodge` grant actually names:
+        // a lodge commander sees their lodge, a troop-scoped grant sees all.
+        // The core gate alone cannot make that distinction (it only knows the
+        // permission, not the row), so the predicate is bound below.
         let c = ctx.clone();
         let list_lodges = RouteDefinition::get_protected_any_scope(
             "/api/membership/lodges",
             "membership:read_lodge",
-            route_handler(move |_req| {
+            route_handler(move |req| {
                 let c = c.clone();
                 async move {
+                    let audience = lodge_audience(&c, &req).await?;
                     let rows = c
                         .db
                         .query(
@@ -899,8 +902,10 @@ impl AdjutantPlugin for MembershipPlugin {
                                         'id', p.id, 'name', p.name\
                                      ) ORDER BY p.name) FROM patrols p \
                                        WHERE p.lodge_id = l.id), '[]') AS patrols \
-                             FROM lodges l ORDER BY l.name",
-                            vec![],
+                             FROM lodges l \
+                             WHERE ($1::bool OR l.id = ANY($2::int8[])) \
+                             ORDER BY l.name",
+                            audience.params(),
                         )
                         .await?;
                     PluginResponse::json(200, &serde_json::json!({ "lodges": rows }))
@@ -998,18 +1003,25 @@ impl AdjutantPlugin for MembershipPlugin {
         );
 
         // --- proficiencies ----------------------------------------------------------
+        // The proficiency catalogue carries no lodge: it is troop curriculum, not
+        // a per-lodge list. So a troop-scoped `read_lodge` grant sees it and a
+        // lodge-only grant addresses none of it — the `$1` flag is the whole
+        // filter, and it fails closed rather than exposing troop-wide rows to a
+        // lodge-scoped caller.
         let c = ctx.clone();
         let list_proficiencies = RouteDefinition::get_protected_any_scope(
             "/api/membership/proficiencies",
             "membership:read_lodge",
-            route_handler(move |_req| {
+            route_handler(move |req| {
                 let c = c.clone();
                 async move {
+                    let audience = lodge_audience(&c, &req).await?;
                     let rows = c
                         .db
                         .query(
-                            "SELECT id, code, title, domain FROM proficiencies ORDER BY domain, code",
-                            vec![],
+                            "SELECT id, code, title, domain FROM proficiencies \
+                             WHERE $1::bool ORDER BY domain, code",
+                            vec![SqlValue::Bool(audience.is_troop())],
                         )
                         .await?;
                     PluginResponse::json(200, &serde_json::json!({ "proficiencies": rows }))
@@ -1163,9 +1175,10 @@ impl AdjutantPlugin for MembershipPlugin {
         let stewards = RouteDefinition::get_protected_any_scope(
             "/api/membership/stewards",
             "membership:read_lodge",
-            route_handler(move |_req| {
+            route_handler(move |req| {
                 let c = c.clone();
                 async move {
+                    let audience = lodge_audience(&c, &req).await?;
                     let rows = c
                         .db
                         .query(
@@ -1174,8 +1187,9 @@ impl AdjutantPlugin for MembershipPlugin {
                              FROM stewards s \
                              JOIN members m ON m.id = s.member_id \
                              LEFT JOIN lodges l ON l.id = s.lodge_id \
+                             WHERE ($1::bool OR s.lodge_id = ANY($2::int8[])) \
                              ORDER BY s.vacant, s.position",
-                            vec![],
+                            audience.params(),
                         )
                         .await?;
                     PluginResponse::json(200, &serde_json::json!({ "stewards": rows }))
@@ -1284,6 +1298,89 @@ async fn upsert_from_import(
     }
 
 export_plugin!(MembershipPlugin);
+
+// ---------------------------------------------------------------------------
+// Collection visibility (#146)
+// ---------------------------------------------------------------------------
+
+/// Which lodges a `membership:read_lodge` holder may see on the collection
+/// routes.
+///
+/// Those routes are gated `any_scope`, so the core gate proves only that the
+/// caller holds the permission *somewhere*. `docs/design/scoped-permissions.md`
+/// §2 makes the handler responsible for the row filter: a troop-covering grant
+/// reaches every lodge, a lodge-scoped one reaches exactly its lodges. This is
+/// the same split announcements draws with [`PermissionService::scopes_for`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum LodgeAudience {
+    /// A troop-scoped grant: every lodge row.
+    Troop,
+    /// Lodge-scoped grants: exactly these membership lodge ids.
+    Lodges(Vec<i64>),
+}
+
+impl LodgeAudience {
+    /// Holds the permission at troop scope, so no row filter applies.
+    fn is_troop(&self) -> bool {
+        matches!(self, Self::Troop)
+    }
+
+    /// The `$1` (all lodges) / `$2` (`int8[]` of lodge ids) bind pair every
+    /// filtered collection query takes. A troop audience still binds an empty
+    /// array: the boolean is the whole predicate, so the filter cannot leak
+    /// through an unbound parameter.
+    fn params(&self) -> Vec<SqlValue> {
+        match self {
+            Self::Troop => vec![SqlValue::Bool(true), SqlValue::IntArray(Vec::new())],
+            Self::Lodges(ids) => vec![SqlValue::Bool(false), SqlValue::IntArray(ids.clone())],
+        }
+    }
+}
+
+/// Resolve the caller's `membership:read_lodge` audience in **one** query, or
+/// refuse when the grant covers no lodge at all.
+///
+/// `core.user_roles.scope_id` and `core.scope_hierarchy.scope_id` are `TEXT`
+/// (core migration 5), while membership's `lodges.id` is `BIGINT`, so the two
+/// are mapped here explicitly. A scope id that does not parse as a lodge id
+/// names no row in this plugin and is dropped — fail closed, never widened.
+///
+/// A caller holding nothing usable is refused with `403`. The core gate already
+/// refuses that caller on these routes; refusing again here keeps the handler
+/// honest when it is exercised directly (tests) and if the gate ever changes.
+async fn lodge_audience(
+    c: &PluginContext,
+    req: &PluginRequest,
+) -> Result<LodgeAudience, SdkError> {
+    let held = c
+        .permissions
+        .scopes_for(req.identity.as_ref(), &["membership:read_lodge"])
+        .await?;
+    let mut lodges = Vec::new();
+    for entry in held {
+        match entry.scope.scope_type {
+            ScopeType::Troop => return Ok(LodgeAudience::Troop),
+            ScopeType::Lodge => {
+                if let Some(id) = entry.scope.scope_id.as_deref() {
+                    if let Ok(id) = id.parse::<i64>() {
+                        lodges.push(id);
+                    }
+                }
+            }
+            // A patrol grant covers patrols inside its lodge, never the lodge
+            // itself (coverage is downward only), so it opens no collection row.
+            ScopeType::Patrol => {}
+        }
+    }
+    if lodges.is_empty() {
+        return Err(SdkError::Forbidden(
+            "membership:read_lodge is held at no lodge scope".into(),
+        ));
+    }
+    lodges.sort_unstable();
+    lodges.dedup();
+    Ok(LodgeAudience::Lodges(lodges))
+}
 
 /// Replace membership's declared lodge → patrol edges in
 /// `core.scope_hierarchy` from its own roster (`patrols.lodge_id`).
