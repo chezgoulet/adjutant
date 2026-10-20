@@ -18,9 +18,12 @@ in particular the interim `v0.3.0` recommendation and the v1.0 gate.
     which is how a troop opens Adjutant from anywhere;
   - `adjutant-client-vX.Y.Z-android.apk`, the same client as an APK — the
     Obtainium path, and the file a phone installs. It is built in **release**
-    mode, signed with Flutter's throwaway debug key (the one platform that
-    refuses an unsigned install outright), and the workflow fails rather than
-    attach an APK that is missing or a stub.
+    mode and signed with the troop's **release key**, configured from the
+    `ANDROID_KEYSTORE_BASE64`, `ANDROID_KEYSTORE_PASSWORD`, `ANDROID_KEY_ALIAS`
+    and `ANDROID_KEY_PASSWORD` repository secrets. A missing secret fails the
+    job instead of falling back to the public debug key, and the built file is
+    checked with `apksigner verify --print-certs` (#168). The workflow fails
+    rather than attach an APK that is missing, a stub, or debug-signed.
 - **Every artifact carries a `.sha256` beside it**, and a manual
   `workflow_dispatch` run builds all three without creating a release — so a
   packaging fault can surface before a tag rather than at one.

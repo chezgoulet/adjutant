@@ -40,6 +40,7 @@ dependencies:
   # where the admin has no way to reach it — a download in name only.
   path_provider: ^2.1.0
   share_plus: ^10.0.0
+  flutter_secure_storage: ^10.3.4
 
 dev_dependencies:
   flutter_test:

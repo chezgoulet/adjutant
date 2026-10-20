@@ -16,6 +16,14 @@
 /// invalidates the cache is the end of the session: [signOut] drops every
 /// `cache.*` key, because a roster that outlives the session is one member's
 /// troop shown to the next. The queue is dropped with it, for the same reason.
+///
+/// **And every key names its owner.** The end of a session is not only the
+/// person tapping Sign out: a 401 at boot ends it too, and it used to leave the
+/// previous identity's cache and queue behind (#166). Dropping both there is the
+/// first half of the repair. The second half is that a cache read is written
+/// under `cache.<member id>.<name>` and a queued write records its owner, so an
+/// artefact that did survive — or that was written by an older build — can never
+/// be served or replayed as a different member.
 library;
 
 import 'dart:async';
@@ -26,6 +34,7 @@ import 'package:shared_preferences/shared_preferences.dart';
 
 import '../api/api_client.dart';
 import 'outbox.dart';
+import 'token_store.dart';
 
 class Cached<T> {
   const Cached(this.value, {required this.isStale, this.cachedAt});
@@ -54,17 +63,36 @@ class OfflineWriteRefused implements Exception {
 }
 
 class SessionState extends ChangeNotifier {
-  SessionState({ApiClient? client, Outbox? outbox})
-      : api = client ?? ApiClient(baseUrl: defaultBaseUrl),
-        outbox = outbox ?? Outbox() {
+  SessionState({
+    ApiClient? client,
+    Outbox? outbox,
+    TokenStore? tokenStore,
+  })  : api = client ?? ApiClient(baseUrl: defaultBaseUrl),
+        outbox = outbox ?? Outbox(),
+        _tokens = tokenStore ?? const SecureTokenStore() {
     // The counts the shell shows are the ones on disk, read once at
     // construction: a process that starts while a write is still owed must not
     // look like it has nothing to do.
     unawaited(refreshOutbox());
   }
 
-  static const _tokenKey = 'adjutant.token';
+  /// The old plaintext preference key. Read only to migrate it into the secure
+  /// store on first run (issue #169); never written again.
+  static const _legacyTokenKey = 'adjutant.token';
   static const _baseUrlKey = 'adjutant.baseUrl';
+
+  /// Where the bearer token lives. Injected so the test suite never touches a
+  /// platform channel; production gets [SecureTokenStore].
+  final TokenStore _tokens;
+
+  /// The authenticated member id, or null before sign-in / after sign-out.
+  ///
+  /// This is the owner of every cache key and every queued write. It is the
+  /// server's `id` from `/api/auth/me`, not a client-invented name.
+  String? _owner;
+
+  /// For tests and diagnostics: whose cache and queue this session is serving.
+  String? get ownerId => _owner;
 
   /// The address the app holds before the user has supplied one.
   ///
@@ -82,7 +110,19 @@ class SessionState extends ChangeNotifier {
   /// The durable queued-write list.
   final Outbox outbox;
 
-  Map<String, dynamic>? user;
+  Map<String, dynamic>? _user;
+
+  /// The signed-in user, as `/api/auth/me` answered.
+  ///
+  /// Assigning it also sets the owner of the cache and the queue, so there is
+  /// no way to have a user without an identity — including in tests, which set
+  /// this field directly.
+  Map<String, dynamic>? get user => _user;
+  set user(Map<String, dynamic>? value) {
+    _user = value;
+    _owner = _memberIdOf(value);
+  }
+
   bool booting = true;
   bool offline = false;
 
@@ -153,33 +193,84 @@ class SessionState extends ChangeNotifier {
       // the UI said why.
       api.setBaseUrl(savedBase);
     }
-    final token = prefs.getString(_tokenKey);
+    final token = await _readToken(prefs);
     if (token != null && token.isNotEmpty) {
       api.setToken(token);
       try {
         user = await api.me();
+        _owner = _memberIdOf(user);
         offline = false;
         // The server answered, so this is the moment to hand it anything the
         // last session left owing. Before `booting = false`, so the shell's
-        // first frame already shows the queue it actually has.
+        // first frame already shows the queue it actually has. The owner is set
+        // first: `syncOutbox` refuses entries that are not this member's.
         await syncOutbox();
+        await refreshOutbox();
       } on OfflineException {
         // Keep the token; we cannot confirm the session but we are not wrong to
         // hold it. The UI shows the offline banner.
         offline = true;
         user = _cachedUser(prefs);
+        _owner = _memberIdOf(user);
+        await refreshOutbox();
       } on ApiException catch (e) {
         if (e.isUnauthorized) {
+          // The server has ended this session, so this is the same end
+          // `signOut` performs — not merely "forget the token". Everything the
+          // previous identity cached, and every write it queued, goes with it:
+          // leaving either behind is how identity B is served A's roster
+          // offline and A's dues self-report replays under B's token (#166).
           await _clearToken(prefs);
+          await _clearCache(prefs);
+          await outbox.clear();
+          await refreshOutbox();
           user = null;
+          _owner = null;
         } else {
           offline = true;
           user = _cachedUser(prefs);
+          _owner = _memberIdOf(user);
+          await refreshOutbox();
         }
       }
+    } else {
+      await refreshOutbox();
     }
     booting = false;
     notifyListeners();
+  }
+
+  /// The `id` the server uses for this member, as a stable string.
+  ///
+  /// Absent is a real state (an offline first run, a server answer without an
+  /// id); it means no cache is served and no write is queued, because neither
+  /// can be attributed to anybody.
+  static String? _memberIdOf(Map<String, dynamic>? user) {
+    final id = user?['id'];
+    if (id == null) return null;
+    final text = id.toString().trim();
+    return text.isEmpty ? null : text;
+  }
+
+  /// Read the token from secure storage, migrating the old plaintext
+  /// `shared_preferences` value on first run and deleting the old key.
+  Future<String?> _readToken(SharedPreferences prefs) async {
+    final stored = await _tokens.read();
+    if (stored != null && stored.isNotEmpty) {
+      // The migration was interrupted between writing the secure copy and
+      // deleting the old key: finish it, so the plaintext copy does not linger.
+      if (prefs.containsKey(_legacyTokenKey)) {
+        await prefs.remove(_legacyTokenKey);
+      }
+      return stored;
+    }
+    final legacy = prefs.getString(_legacyTokenKey);
+    if (legacy != null && legacy.isNotEmpty) {
+      await _tokens.write(legacy);
+      await prefs.remove(_legacyTokenKey);
+      return legacy;
+    }
+    return null;
   }
 
   Map<String, dynamic>? _cachedUser(SharedPreferences prefs) {
@@ -208,8 +299,12 @@ class SessionState extends ChangeNotifier {
     await prefs.setString(_baseUrlKey, baseUrl);
     final token = await api.login(username: username, password: password);
     user = await api.me();
-    await prefs.setString(_tokenKey, token);
+    _owner = _memberIdOf(user);
+    await _tokens.write(token);
     await prefs.setString('adjutant.user', jsonEncode(user));
+    // The queue is the current member's before it is replayed: another
+    // identity's entries are left alone by `flush`'s owner filter.
+    await refreshOutbox();
     offline = false;
     // Signing in is the other moment the server is known reachable.
     await syncOutbox();
@@ -232,6 +327,7 @@ class SessionState extends ChangeNotifier {
     await outbox.clear();
     await refreshOutbox();
     user = null;
+    _owner = null;
     notifyListeners();
   }
 
@@ -244,7 +340,8 @@ class SessionState extends ChangeNotifier {
   }
 
   Future<void> _clearToken(SharedPreferences prefs) async {
-    await prefs.remove(_tokenKey);
+    await _tokens.delete();
+    await prefs.remove(_legacyTokenKey);
     await prefs.remove('adjutant.user');
   }
 
@@ -253,15 +350,22 @@ class SessionState extends ChangeNotifier {
   /// Read a collection through the cache: fresh on success, cached on a network
   /// failure. An authorisation failure is *not* swallowed into a stale read —
   /// it propagates so the shell can sign the user out.
+  ///
+  /// Names are scoped to the authenticated member (`cache.<id>.<key>`), so even
+  /// if a `cache.*` key survives — a build that predates this rule, a storage
+  /// fault — it is not a name a different member's session will look up.
   Future<Cached<List<Map<String, dynamic>>>> cachedList(
     String key,
     Future<List<Map<String, dynamic>>> Function() fetch,
   ) async {
     final prefs = await SharedPreferences.getInstance();
+    final cacheKey = _cacheKey(key);
     try {
       final fresh = await fetch();
-      await prefs.setString('cache.$key', jsonEncode(fresh));
-      await prefs.setString('cache.$key.at', DateTime.now().toIso8601String());
+      if (cacheKey != null) {
+        await prefs.setString(cacheKey, jsonEncode(fresh));
+        await prefs.setString('$cacheKey.at', DateTime.now().toIso8601String());
+      }
       offline = false;
       // A read that landed proves the server is reachable, which is the whole
       // trigger for "syncs when online": the queue is drained here rather than
@@ -270,7 +374,11 @@ class SessionState extends ChangeNotifier {
       return Cached(fresh, isStale: false, cachedAt: DateTime.now());
     } on OfflineException {
       offline = true;
-      return Cached(_readCache(prefs, key), isStale: true, cachedAt: _readCacheAt(prefs, key));
+      if (cacheKey == null) {
+        return const Cached([], isStale: true);
+      }
+      return Cached(_readCache(prefs, cacheKey),
+          isStale: true, cachedAt: _readCacheAt(prefs, cacheKey));
     }
   }
 
@@ -282,22 +390,33 @@ class SessionState extends ChangeNotifier {
     Future<Map<String, dynamic>> Function() fetch,
   ) async {
     final prefs = await SharedPreferences.getInstance();
+    final cacheKey = _cacheKey(key);
     try {
       final fresh = await fetch();
-      await prefs.setString('cache.$key', jsonEncode(fresh));
-      await prefs.setString('cache.$key.at', DateTime.now().toIso8601String());
+      if (cacheKey != null) {
+        await prefs.setString(cacheKey, jsonEncode(fresh));
+        await prefs.setString('$cacheKey.at', DateTime.now().toIso8601String());
+      }
       offline = false;
       await _syncIfPending();
       return Cached(fresh, isStale: false, cachedAt: DateTime.now());
     } on OfflineException {
       offline = true;
-      return Cached(_readCachedMap(prefs, key),
-          isStale: true, cachedAt: _readCacheAt(prefs, key));
+      if (cacheKey == null) return const Cached({}, isStale: true);
+      return Cached(_readCachedMap(prefs, cacheKey),
+          isStale: true, cachedAt: _readCacheAt(prefs, cacheKey));
     }
   }
 
+  /// The cache key for this session, or null when no identity is known.
+  ///
+  /// Null is not "use the global key": the whole point of #166 is that there is
+  /// no global key an unrelated identity may read.
+  String? _cacheKey(String name) =>
+      _owner == null ? null : 'cache.$_owner.$name';
+
   Map<String, dynamic> _readCachedMap(SharedPreferences prefs, String key) {
-    final raw = prefs.getString('cache.$key');
+    final raw = prefs.getString(key);
     if (raw == null) return const {};
     try {
       final decoded = jsonDecode(raw);
@@ -314,8 +433,16 @@ class SessionState extends ChangeNotifier {
   /// renders what is actually recorded rather than what this process remembers.
   Future<void> refreshOutbox() async {
     try {
-      pendingWrites = await outbox.pending();
-      refusedWrites = await outbox.refused();
+      if (_owner == null) {
+        // No identity yet: another member's queue is not ours to display, and
+        // this process has not earned the right to show zero either until the
+        // boot has read it.
+        pendingWrites = const [];
+        refusedWrites = const [];
+      } else {
+        pendingWrites = await outbox.pending(owner: _owner);
+        refusedWrites = await outbox.refused(owner: _owner);
+      }
     } on Object catch (e) {
       // No durable storage on this device. The queue is then empty and nothing
       // can be recorded in it — a state the write path reports honestly
@@ -337,9 +464,17 @@ class SessionState extends ChangeNotifier {
   /// and no background worker: nothing here runs that the person did not cause.
   Future<FlushReport> syncOutbox() async {
     if (_syncing) return const FlushReport();
+    final owner = _owner;
+    if (owner == null) {
+      // No current user: there is no queue this session may hand the server.
+      // This is the refusal half of #166 — the entries stay on disk, untouched,
+      // for whoever actually owns them.
+      return const FlushReport();
+    }
     _syncing = true;
     try {
       final report = await outbox.flush(
+        owner: owner,
         send: (entry) => api.send(entry.method, entry.path, body: entry.body),
       );
       if (report.sent > 0) {
@@ -362,13 +497,17 @@ class SessionState extends ChangeNotifier {
   /// Cheap gate for the read path: nothing owed, nothing to do.
   Future<void> _syncIfPending() async {
     if (_syncing) return;
-    if ((await outbox.pending()).isEmpty) return;
+    final owner = _owner;
+    if (owner == null) return;
+    if ((await outbox.pending(owner: owner)).isEmpty) return;
     await syncOutbox();
   }
 
   /// Forget the writes the server refused, once their reasons have been read.
+  ///
+  /// Only this member's refusals: another identity's are not ours to dismiss.
   Future<void> clearRefusedWrites() async {
-    await outbox.clearRefused();
+    await outbox.clearRefused(owner: _owner);
     await refreshOutbox();
   }
 
@@ -401,11 +540,20 @@ class SessionState extends ChangeNotifier {
       if (!replaySafe) {
         throw OfflineWriteRefused(refusal);
       }
+      final owner = _owner;
+      if (owner == null) {
+        // An unattributable write is never queued: it would replay as whoever
+        // signs in next, which is the defect #166 exists to stop. The offline
+        // failure surfaces instead, so the caller knows nothing left.
+        debugPrint('refusing to queue $method $path without a current user');
+        rethrow;
+      }
       offline = true;
       OutboxEntry entry;
       try {
         entry = await outbox.enqueue(OutboxEntry(
-          key: Outbox.keyFor(method, path, body),
+          key: Outbox.keyFor(method, path, body, owner: owner),
+          owner: owner,
           method: method,
           path: path,
           body: body,
@@ -570,7 +718,7 @@ class SessionState extends ChangeNotifier {
   }
 
   List<Map<String, dynamic>> _readCache(SharedPreferences prefs, String key) {
-    final raw = prefs.getString('cache.$key');
+    final raw = prefs.getString(key);
     if (raw == null) return const [];
     try {
       final decoded = jsonDecode(raw);
@@ -584,7 +732,7 @@ class SessionState extends ChangeNotifier {
   }
 
   DateTime? _readCacheAt(SharedPreferences prefs, String key) {
-    final raw = prefs.getString('cache.$key.at');
+    final raw = prefs.getString('$key.at');
     return raw == null ? null : DateTime.tryParse(raw);
   }
 }

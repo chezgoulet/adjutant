@@ -2,6 +2,7 @@ import 'dart:convert';
 
 import 'package:adjutant_client/api/api_client.dart';
 import 'package:adjutant_client/state/session.dart';
+import 'package:adjutant_client/state/token_store.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:http/http.dart' as http;
 import 'package:http/testing.dart';
@@ -38,15 +39,19 @@ void main() {
         seen.add(request.url);
         return request.url.path == '/api/auth/login'
             ? _json({'token': 'tok'})
-            : _json({'username': 'bea', 'display_name': 'Bea', 'roles': []});
+            : _json({'id': 'bea', 'username': 'bea', 'display_name': 'Bea', 'roles': []});
       }),
     );
 
-    await SessionState(client: api).signIn(
+    final tokens = InMemoryTokenStore();
+    await SessionState(client: api, tokenStore: tokens).signIn(
       baseUrl: 'https://lodge.example.org',
       username: 'bea',
       password: 'hunter2',
     );
+
+    expect(tokens.token, 'tok',
+        reason: 'the token goes to the injected store, not preferences');
 
     expect(api.baseUrl, 'https://lodge.example.org');
     expect(seen, isNotEmpty);
@@ -67,11 +72,12 @@ void main() {
       baseUrl: 'http://localhost:8080',
       httpClient: MockClient((request) async {
         seen.add(request.url);
-        return _json({'username': 'bea', 'display_name': 'Bea', 'roles': []});
+        return _json({'id': 'bea', 'username': 'bea', 'display_name': 'Bea', 'roles': []});
       }),
     );
 
-    final session = SessionState(client: api);
+    final tokens = InMemoryTokenStore();
+    final session = SessionState(client: api, tokenStore: tokens);
     await session.boot();
 
     expect(api.baseUrl, 'https://lodge.example.org',
@@ -81,6 +87,12 @@ void main() {
     expect(session.user, isNotNull,
         reason: 'and it must not be reported as offline when it answered');
     expect(session.offline, isFalse);
+
+    // The old plaintext key was read, moved to the secure store, and deleted
+    // (#169) — the token exists in exactly one place from the first run on.
+    expect(tokens.token, 'tok');
+    final prefs = await SharedPreferences.getInstance();
+    expect(prefs.getString('adjutant.token'), isNull);
   });
 
   test('boot leaves the address alone when nothing was ever saved', () async {
@@ -90,7 +102,7 @@ void main() {
       httpClient: MockClient((_) async => _json({})),
     );
 
-    await SessionState(client: api).boot();
+    await SessionState(client: api, tokenStore: InMemoryTokenStore()).boot();
 
     expect(api.baseUrl, 'http://localhost:8080',
         reason: 'a first run has no saved address, so the default holds');

@@ -55,6 +55,43 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   with `UPDATE` added for `revoked_at` (#149). Re-run `bootstrap-isolation` on
   upgrade so the role picks up both changes.
 
+### Fixed
+
+- **Collection routes decode the wrapper the server actually sends (#167).**
+  `_asList` accepted a hard-coded list of wrapper names, so
+  `GET /api/calendar/upcoming` (`{"occurrences": …}`) and
+  `GET /api/membership/stewards` (`{"stewards": …}`) silently decoded to an empty
+  list — and the dashboard and calendar cached that emptiness as the truth. It
+  now unwraps a bare array, a named wrapper the server uses (`occurrences`,
+  `stewards`, `checkouts`, `plugins`, `receipts`, `categories`, `runs`, `presets`,
+  `sessions`, and the keys already known), or an object with exactly one
+  array-valued field. Every list route has a decode test built from the plugin's
+  own `json!` payload.
+- **A 401 at boot ends the session, not just the token (#166).** The
+  unauthorized branch of `SessionState.boot()` now clears the read cache and the
+  queued-write list exactly as sign-out does. Cache keys are scoped to the
+  authenticated member id, and the outbox records its owner in the entry and its
+  idempotency key; a replay pass refuses an entry that is not the current
+  member's. Identity B is no longer served A's roster offline, and A's queued
+  dues self-report no longer replays under B's token.
+
+### Security
+
+- **The session token is in platform secure storage, not preferences (#169).**
+  `flutter_secure_storage` (Keystore/Keychain/libsecret), with a one-time
+  migration from `adjutant.token` that deletes the plaintext key. Android backup
+  is disabled and the preferences file is excluded from `dataExtractionRules` and
+  `fullBackupContent`. On the web, `localStorage` remains the only store and is
+  documented as such.
+- **The release APK is signed with the release key (#168).** The release workflow
+  reads `ANDROID_KEYSTORE_BASE64`, `ANDROID_KEYSTORE_PASSWORD`,
+  `ANDROID_KEY_ALIAS` and `ANDROID_KEY_PASSWORD`, writes a never-committed
+  `key.properties`, and fails if any is absent — it never falls back to the
+  public Android debug key. After the build, `apksigner verify --print-certs`
+  prints the signer DN and fails the job if it contains `CN=Android Debug`.
+  Anyone upgrading from a debug-signed build must uninstall it once; the
+  signatures are unrelated.
+
 ---
 
 ## [0.3.0] — 2026-09-27 — Milestones 5 and 6: the client, and the operational plugins
