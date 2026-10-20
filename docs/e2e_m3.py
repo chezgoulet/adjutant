@@ -462,6 +462,79 @@ def appointed_on_is_real():
     return ok, f"db={db!r} api={raw[:120]}"
 probe_raw("51 appointed_on decodes as a date, not null", appointed_on_is_real)
 
+# ------------------------------------------- 10. session revocation / password
+# #149 AUTH-3. A leaked token must stop working when its session is revoked, and
+# a password change must invalidate every sibling session but not the caller's.
+probe("52 chief creates a revocable user", "POST", "/api/auth/users", token=chief_token,
+      body={"username": "revocable", "password": "revocable-pass-1", "roles": ["scout"]},
+      expect_status=201)
+a = probe("53 first login", "POST", "/api/auth/login",
+          body={"username": "revocable", "password": "revocable-pass-1"},
+          expect_status=200, expect_in="token")
+token_a = a and a.get("token")
+assert token_a, "first login failed"
+b = probe("54 second concurrent login", "POST", "/api/auth/login",
+          body={"username": "revocable", "password": "revocable-pass-1"},
+          expect_status=200, expect_in="token")
+token_b = b and b.get("token")
+assert token_b, "second login failed"
+
+listed = probe("55 sessions list shows both, one current", "GET", "/api/auth/sessions",
+               token=token_a, expect_status=200, expect_in='"current":true')
+siblings = [s for s in (listed or {}).get("sessions", []) if not s.get("current")]
+assert len(siblings) == 1, f"expected exactly one sibling session, got {listed!r}"
+sibling_id = siblings[0]["id"]
+probe(f"56 revoke the sibling session", "DELETE", f"/api/auth/sessions/{sibling_id}",
+      token=token_a, expect_status=200, expect_in='"ok":true')
+probe("57 revoked token is 401", "GET", "/api/auth/me", token=token_b, expect_status=401)
+probe("58 the other session still works", "GET", "/api/auth/me", token=token_a,
+      expect_status=200, expect_in='"username":"revocable"')
+
+c = probe("59 third login before password change", "POST", "/api/auth/login",
+          body={"username": "revocable", "password": "revocable-pass-1"},
+          expect_status=200, expect_in="token")
+token_c = c and c.get("token")
+assert token_c, "third login failed"
+probe("60 password change succeeds", "POST", "/api/auth/password", token=token_a,
+      body={"current_password": "revocable-pass-1", "new_password": "revocable-pass-2"},
+      expect_status=200, expect_in="revoked_other_sessions")
+probe("61 caller survives their own password change", "GET", "/api/auth/me",
+      token=token_a, expect_status=200)
+probe("62 sibling session 401s after password change", "GET", "/api/auth/me",
+      token=token_c, expect_status=401)
+probe("63 old password no longer works", "POST", "/api/auth/login",
+      body={"username": "revocable", "password": "revocable-pass-1"},
+      expect_status=400, expect_in="invalid credentials")
+probe("64 new password works", "POST", "/api/auth/login",
+      body={"username": "revocable", "password": "revocable-pass-2"},
+      expect_status=200, expect_in="token")
+
+
+# ------------------------------------------------ 11. AUTH-4: Secure cookie
+def secure_cookie():
+    body = json.dumps({"username": "revocable", "password": "revocable-pass-2"}).encode()
+    req = urllib.request.Request(BASE + "/api/auth/login", method="POST")
+    req.add_header("content-type", "application/json")
+    status, _raw, hdrs = _open(req, data=body)
+    cookie = next((v for k, v in hdrs.items() if k.lower() == "set-cookie"), "")
+    ok = status == 200 and "Secure" in cookie and "HttpOnly" in cookie \
+        and "SameSite=Lax" in cookie
+    return ok, f"status={status} set-cookie={cookie[:160]}"
+probe_raw("65 login cookie carries Secure", secure_cookie)
+
+
+# ------------------------------------------------ 12. AUTH-5: auth audited
+def auth_audit_rows():
+    out = subprocess.run(["psql", *PSQL, "-tAc",
+                          "SELECT action FROM core.audit_log ORDER BY id;"],
+                         capture_output=True, text=True)
+    acts = out.stdout.split()
+    need = {"auth.register", "auth.login", "auth.login.failed", "auth.logout",
+            "auth.session.revoke", "auth.password.change"}
+    missing = need - set(acts)
+    return not missing, f"actions={acts} missing={sorted(missing)}"
+probe_raw("66 every auth event is audited", auth_audit_rows)
+
 srv.shutdown()
 print()
 npass = sum(1 for r in results if r[1] == "PASS")

@@ -153,6 +153,14 @@ Two settings matter:
 **Keep `ADJUTANT_DEV_HEADERS` off** (the default). When on, anyone who can reach
 the port can claim any role by setting `x-dev-user`/`x-dev-role`.
 
+The session cookie is always `HttpOnly; SameSite=Lax; Path=/` and, by default,
+`Secure`. A browser will not send a `Secure` cookie back over plain HTTP, so
+local development on `http://127.0.0.1` needs
+`ADJUTANT_INSECURE_COOKIES=true` to log in. That flag is **development-only**:
+leave it unset behind TLS. It is never inferred from `ADJUTANT_BIND` or from a
+forwarded header — a deployment that terminates TLS at the proxy must not set
+it.
+
 Three things about the trust setting that are easy to get wrong, and are the
 reason `deploy/verify.sh` exists:
 
