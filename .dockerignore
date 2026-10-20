@@ -8,3 +8,11 @@ plugins-built
 *.dylib
 *.dll
 docs/evidence
+# Credentials live in the build context's parent directory (deploy/.env) and the
+# repo root (.env). Nothing in the image needs them, and `COPY . .` would carry
+# them into the builder layer. See issue #178.
+.env
+.env.*
+*.env
+deploy/.env
+deploy/.env.*
