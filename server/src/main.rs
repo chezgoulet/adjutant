@@ -218,6 +218,26 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
             }
         }
+        Some("audit-verify") => {
+            let cli = config::CliArgs::parse(args[1..].iter().cloned()).unwrap_or_else(|e| {
+                eprintln!("error: {e}\n\n{}", config::USAGE);
+                std::process::exit(2);
+            });
+            let cfg = config::load(&cli)?;
+            match adjutant_server::cli::audit_verify(&cfg).await {
+                Ok((good, report)) => {
+                    println!("{report}");
+                    if !good {
+                        std::process::exit(1);
+                    }
+                    return Ok(());
+                }
+                Err(e) => {
+                    eprintln!("error: {e}");
+                    std::process::exit(2);
+                }
+            }
+        }
         Some("serve") => {}
         Some("-h") | Some("--help") | Some("help") => {
             print!("{}", config::USAGE);
