@@ -151,7 +151,11 @@ Two settings matter:
   means same-origin only.
 
 **Keep `ADJUTANT_DEV_HEADERS` off** (the default). When on, anyone who can reach
-the port can claim any role by setting `x-dev-user`/`x-dev-role`.
+the port can claim any role by setting `x-dev-user`/`x-dev-role`. A deployment
+that inherits `allow_dev_headers = true` from a config file can force it off on
+the command line with `--no-dev-headers`; the boot log warns while it is on, and
+`GET /api/plugins` reports `dev_headers.enabled` (with the risk text) so an
+auditor reading the admin surface sees it too.
 
 The session cookie is always `HttpOnly; SameSite=Lax; Path=/` and, by default,
 `Secure`. A browser will not send a `Secure` cookie back over plain HTTP, so

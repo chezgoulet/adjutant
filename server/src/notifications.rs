@@ -343,12 +343,7 @@ pub async fn mark_notification_read(
         // Raced with another mark-read between the lookup and here: the record
         // is read either way, and the read that landed is what we report.
         Ok(None) => {
-            let reread = sqlx::query(&format!(
-                "SELECT {NOTIFICATION_FIELDS} FROM core.notifications WHERE id = $1"
-            ))
-            .bind(id)
-            .fetch_optional(state.pool.as_ref())
-            .await;
+            let reread = reread_after_race(state.pool.as_ref(), id, &caller).await;
             match reread {
                 Ok(Some(row)) => row,
                 Ok(None) => {
@@ -374,6 +369,29 @@ pub async fn mark_notification_read(
 // ---------------------------------------------------------------------------
 // Internals
 // ---------------------------------------------------------------------------
+
+/// Re-read the record after the guarded `UPDATE` matched no row.
+///
+/// The `UPDATE` can miss for one benign reason only: another mark-read won the
+/// race, so `read_at IS NULL` no longer holds. It must not miss because the row
+/// belongs to somebody else — the lookup that got us here is recipient-scoped,
+/// and this re-read keeps the **same ownership predicate**. A bare `WHERE id =
+/// $1` would turn the fallback into a way to read a record the caller does not
+/// own, contradicting the route's "not the caller's is 404" contract.
+async fn reread_after_race(
+    pool: &PgPool,
+    id: i64,
+    recipient: &str,
+) -> Result<Option<sqlx::postgres::PgRow>, sqlx::Error> {
+    sqlx::query(&format!(
+        "SELECT {NOTIFICATION_FIELDS} FROM core.notifications \
+          WHERE id = $1 AND recipient = $2::uuid"
+    ))
+    .bind(id)
+    .bind(recipient)
+    .fetch_optional(pool)
+    .await
+}
 
 /// The caller's id, or `None` (an unauthenticated request, or an identity that
 /// is not a member row).
@@ -459,6 +477,7 @@ fn decode(value: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
 
     #[test]
     fn the_vocabulary_is_the_one_the_schema_accepts() {
@@ -513,5 +532,75 @@ mod tests {
         assert_eq!(params.get("limit").map(String::as_str), Some("5"));
         assert_eq!(params.get("note").map(String::as_str), Some("a b/c"));
         assert!(query_params(None).is_empty());
+    }
+
+    /// AUTH-8: the race fallback must keep the ownership predicate.
+    ///
+    /// The guarded `UPDATE` can legitimately miss because another mark-read won;
+    /// it can never legitimately match a record belonging to another member. The
+    /// old fallback selected by `id` alone, so this probe would have handed Cal
+    /// Bea's record. It is DB-gated for the same reason the route probes are:
+    /// the predicate lives in SQL, and a mock cannot prove it.
+    #[tokio::test]
+    #[ignore = "DB-gated: needs ADJUTANT_TEST_DATABASE_URL; run with `-- --ignored`"]
+    async fn the_race_fallback_reread_keeps_the_ownership_predicate() {
+        const BEA: &str = "33333333-3333-4333-8333-333333333333";
+        const CAL: &str = "44444444-4444-4444-8444-444444444444";
+
+        let url = std::env::var("ADJUTANT_TEST_DATABASE_URL").expect(
+            "ADJUTANT_TEST_DATABASE_URL must be set for the DB-gated notification probes",
+        );
+        let cfg = crate::config::Config {
+            database_url: url,
+            ..Default::default()
+        };
+        let pool = crate::db::connect_and_migrate(&cfg)
+            .await
+            .expect("the test database migrates");
+        for (id, name) in [(BEA, "Bea"), (CAL, "Cal")] {
+            sqlx::query(
+                "INSERT INTO core.users (id, display_name) VALUES ($1::uuid, $2) \
+                 ON CONFLICT DO NOTHING",
+            )
+            .bind(id)
+            .bind(name)
+            .execute(pool.as_ref())
+            .await
+            .expect("a member row");
+        }
+        sqlx::query("DELETE FROM core.notifications WHERE recipient IN ($1::uuid, $2::uuid)")
+            .bind(BEA)
+            .bind(CAL)
+            .execute(pool.as_ref())
+            .await
+            .expect("clear the probe's records");
+        let id = create(
+            pool.as_ref(),
+            SOURCE_CORE,
+            BEA,
+            "core.dues_overdue",
+            json!({}),
+            "en",
+        )
+        .await
+        .expect("a record for Bea");
+
+        // The owner's re-read still finds the row ...
+        assert!(
+            reread_after_race(&pool, id, BEA)
+                .await
+                .expect("owner re-read")
+                .is_some(),
+            "the owner's race fallback returns their record"
+        );
+        // ... and another member's does not, even though the id is real. This is
+        // the assertion the id-only fallback failed.
+        assert!(
+            reread_after_race(&pool, id, CAL)
+                .await
+                .expect("stranger re-read")
+                .is_none(),
+            "a race fallback must not return a record that is not the caller's"
+        );
     }
 }

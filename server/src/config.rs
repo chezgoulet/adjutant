@@ -147,6 +147,10 @@ pub struct CliArgs {
     pub log_format: Option<String>,
     /// Explicit opt-in to the spoofable dev identity headers (dev only).
     pub allow_dev_headers: bool,
+    /// Explicit opt-out of the dev identity headers, so a config file that says
+    /// `allow_dev_headers = true` can be overridden off from the command line.
+    /// CLI is the highest layer; this wins over `--allow-dev-headers` too.
+    pub no_dev_headers: bool,
     /// Explicit opt-out of the superuser boot refusal (dev/throwaway only).
     pub allow_superuser: bool,
     pub help: bool,
@@ -180,6 +184,9 @@ SERVE OPTIONS:
     --log-format <FMT>     pretty | json
     --allow-dev-headers    enable the spoofable x-dev-user/x-dev-role stub
                            (DEVELOPMENT ONLY; off by default)
+    --no-dev-headers       force the stub off, overriding a config file or
+                           environment that enabled it (wins over
+                           --allow-dev-headers)
     --allow-superuser      allow booting on a PostgreSQL superuser connection
                            (DEVELOPMENT/throwaway ONLY; off by default)
     -h, --help             print this help
@@ -238,6 +245,7 @@ impl CliArgs {
                 "--log" => out.log_filter = Some(take("--log")?),
                 "--log-format" => out.log_format = Some(take("--log-format")?),
                 "--allow-dev-headers" => out.allow_dev_headers = true,
+                "--no-dev-headers" => out.no_dev_headers = true,
                 "--allow-superuser" => out.allow_superuser = true,
                 other => return Err(format!("unknown argument {other:?} (try --help)")),
             }
@@ -355,6 +363,12 @@ pub fn load(cli: &CliArgs) -> Result<Config, String> {
     }
     if cli.allow_dev_headers {
         cfg.allow_dev_headers = true;
+    }
+    // CLI is the highest layer, and the opt-out is applied after the opt-in so
+    // `--no-dev-headers` can force off a config file, the environment, or even
+    // a contradictory `--allow-dev-headers`.
+    if cli.no_dev_headers {
+        cfg.allow_dev_headers = false;
     }
     if cli.allow_superuser {
         cfg.allow_superuser = true;
@@ -579,6 +593,39 @@ mod tests {
             CliArgs::parse(vec!["--allow-dev-headers".to_string()])
                 .unwrap()
                 .allow_dev_headers
+        );
+
+        // The missing opt-out: a file that says `true` can be forced off from
+        // the command line, which is the whole point of --no-dev-headers.
+        let c = load(&CliArgs {
+            config: Some(file.clone()),
+            no_dev_headers: true,
+            ..Default::default()
+        })
+        .unwrap();
+        assert!(!c.allow_dev_headers, "--no-dev-headers must beat the file");
+
+        // CLI wins over the environment too, and the opt-out is the safe reading
+        // of a contradictory pair.
+        std::env::set_var("ADJUTANT_DEV_HEADERS", "true");
+        let c = load(&CliArgs {
+            no_dev_headers: true,
+            ..Default::default()
+        })
+        .unwrap();
+        assert!(!c.allow_dev_headers, "--no-dev-headers must beat the env");
+        std::env::remove_var("ADJUTANT_DEV_HEADERS");
+        let c = load(&CliArgs {
+            allow_dev_headers: true,
+            no_dev_headers: true,
+            ..Default::default()
+        })
+        .unwrap();
+        assert!(!c.allow_dev_headers, "the opt-out wins a contradictory CLI pair");
+        assert!(
+            CliArgs::parse(vec!["--no-dev-headers".to_string()])
+                .unwrap()
+                .no_dev_headers
         );
 
         let _ = std::fs::remove_dir_all(&dir);

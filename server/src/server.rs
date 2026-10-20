@@ -37,6 +37,15 @@ use crate::plugin_runtime::{
     close_pool, load_all, load_plugin, LoadEnv, PluginRegistry, PluginSlot, RouteLookup,
 };
 
+/// The warning an operator must see when the spoofable identity stub is on.
+///
+/// One string, used both by the boot `WARN` and by `GET /api/plugins`, so the
+/// risk cannot be described one way at boot and another way in the admin
+/// surface an auditor actually reads.
+pub const DEV_HEADERS_RISK: &str = "the dev-header identity stub is ON: x-dev-user/x-dev-role are \
+     honoured and anyone who can reach this port can claim any identity and role. Disable it \
+     (ADJUTANT_DEV_HEADERS=false or --no-dev-headers) outside throwaway development";
+
 /// Shared app state. The registry lives behind a lock: admin lifecycle ops
 /// (enable/disable/uninstall/reload) mutate it while requests dispatch through
 /// it. `LoadedPlugin` keeps every `Library` mapped — retired plugins too (see
@@ -384,6 +393,13 @@ pub fn superuser_refusal(is_superuser: bool, allow_superuser: bool) -> Result<()
 
 /// Build the full application: connect DB, load plugins, assemble router.
 pub async fn build_app(cfg: &Config) -> Result<(Router, Arc<AppState>), BuildError> {
+    // AUTH-9: the stub is not a quiet convenience. Anyone who can reach the
+    // port becomes whoever they name, so the boot log says so at WARN — and
+    // `GET /api/plugins` reports the same risk (§ list_plugins).
+    if cfg.allow_dev_headers {
+        tracing::warn!("{}", DEV_HEADERS_RISK);
+    }
+
     let pool = db::connect(cfg).await.map_err(BuildError::Db)?;
 
     // Refuse a superuser before running any DDL.
@@ -967,6 +983,13 @@ async fn list_plugins(State(state): State<Arc<AppState>>, req: Request) -> Respo
         // its source and the actor, so a reader can tell a switched-off plugin
         // from one that is merely not loaded.
         "choice": choice,
+        // AUTH-9: the admin inventory is where a reviewer checks the running
+        // deployment, so it reports the spoofable stub explicitly. `risk` is
+        // the same sentence as the boot WARN; `null` means the stub is off.
+        "dev_headers": {
+            "enabled": state.config.allow_dev_headers,
+            "risk": state.config.allow_dev_headers.then_some(DEV_HEADERS_RISK),
+        },
     }))
     .into_response()
 }
