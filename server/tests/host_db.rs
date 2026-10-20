@@ -344,6 +344,217 @@ async fn probe_membership_role_cannot_write_user_roles() {
     );
 }
 
+/// #148: `membership` maps a session to a roster entry; the table-level SELECT
+/// it used to hold also exposed every argon2 password hash. Column-level grants
+/// make the hash unreachable while the roster columns keep working.
+#[tokio::test]
+#[ignore = "DB-gated: needs ADJUTANT_TEST_DATABASE_URL + CREATEROLE; run with `-- --ignored`"]
+async fn probe_membership_reads_roster_columns_but_not_password_hash() {
+    let (admin, pools) = setup(&["membership"]).await;
+    let role = schema::role_for("membership");
+    let membership = host::CoreDb::new(pools[0].clone());
+
+    // The grant is on columns, not the whole table.
+    let table_select: bool =
+        sqlx::query_scalar("SELECT has_table_privilege($1::name, 'core.users', 'SELECT')")
+            .bind(&role)
+            .fetch_one(admin.as_ref())
+            .await
+            .expect("has_table_privilege");
+    assert!(
+        !table_select,
+        "membership must not hold table-level SELECT on core.users (#148)"
+    );
+    let hash_readable: bool = sqlx::query_scalar(
+        "SELECT has_column_privilege($1::name, 'core.users', 'password_hash', 'SELECT')",
+    )
+    .bind(&role)
+    .fetch_one(admin.as_ref())
+    .await
+    .expect("has_column_privilege");
+    assert!(
+        !hash_readable,
+        "membership must not be able to read core.users.password_hash (#148)"
+    );
+
+    // The roster mapping still works: this is the query shape membership needs.
+    membership
+        .query(
+            "SELECT username, display_name FROM core.users".to_string(),
+            vec![],
+        )
+        .await
+        .expect("membership reads the roster identity columns");
+
+    // The negative probe. Assert *why* it fails: a privilege denial on the
+    // users table, after the catalog probes above showed the relation exists
+    // and only the column privilege is missing.
+    let err = membership
+        .query("SELECT password_hash FROM core.users".to_string(), vec![])
+        .await
+        .expect_err("membership must not read password hashes")
+        .to_string();
+    assert!(
+        err.contains("permission denied") && err.contains("users"),
+        "expected a column-privilege error on core.users, got: {err}"
+    );
+}
+
+/// #148 upgrade path: an install provisioned by the old code holds table-level
+/// `SELECT` on `core.users`, and `GRANT SELECT (cols)` does not remove it. This
+/// reproduces the old grant, shows the hash is exposed under it, re-runs the
+/// fixed bootstrap on the same database, and shows the exposure is closed.
+#[tokio::test]
+#[ignore = "DB-gated: needs ADJUTANT_TEST_DATABASE_URL + CREATEROLE; run with `-- --ignored`"]
+async fn probe_rebootstrap_revokes_the_legacy_table_grant() {
+    let (admin, pools) = setup(&["membership"]).await;
+    let role = schema::role_for("membership");
+    let legacy = host::CoreDb::new(pools[0].clone());
+
+    // Reproduce what the pre-#148 bootstrap left behind.
+    sqlx::query(&format!(
+        "GRANT SELECT, INSERT, UPDATE ON core.users TO \"{role}\""
+    ))
+    .execute(admin.as_ref())
+    .await
+    .expect("install the legacy table-level grant");
+    let exposed: bool =
+        sqlx::query_scalar("SELECT has_table_privilege($1::name, 'core.users', 'SELECT')")
+            .bind(&role)
+            .fetch_one(admin.as_ref())
+            .await
+            .expect("has_table_privilege");
+    assert!(
+        exposed,
+        "the legacy grant must be reproduced for this test to prove anything"
+    );
+    println!("[#148] legacy grant: has_table_privilege(SELECT)={exposed}");
+    legacy
+        .query("SELECT password_hash FROM core.users".to_string(), vec![])
+        .await
+        .expect("the legacy table grant exposes password_hash — this is the defect");
+
+    // Re-run the fixed bootstrap against the same database (fresh pool: the
+    // run rotates the generated password).
+    let secret = schema::bootstrap_role(admin.as_ref(), "membership", None, false)
+        .await
+        .expect("re-bootstrap against the legacy database");
+    let membership = host::CoreDb::new(
+        host::plugin_pool(&base_url(), "membership", &secret, 2)
+            .await
+            .expect("plugin pool after re-bootstrap"),
+    );
+
+    let table_select: bool =
+        sqlx::query_scalar("SELECT has_table_privilege($1::name, 'core.users', 'SELECT')")
+            .bind(&role)
+            .fetch_one(admin.as_ref())
+            .await
+            .expect("has_table_privilege");
+    assert!(
+        !table_select,
+        "bootstrap must revoke the legacy table-level grant, not merely add columns"
+    );
+    let hash_readable: bool = sqlx::query_scalar(
+        "SELECT has_column_privilege($1::name, 'core.users', 'password_hash', 'SELECT')",
+    )
+    .bind(&role)
+    .fetch_one(admin.as_ref())
+    .await
+    .expect("has_column_privilege");
+    assert!(
+        !hash_readable,
+        "the hash column must be unreadable after the upgrade re-run"
+    );
+    let username_readable: bool = sqlx::query_scalar(
+        "SELECT has_column_privilege($1::name, 'core.users', 'username', 'SELECT')",
+    )
+    .bind(&role)
+    .fetch_one(admin.as_ref())
+    .await
+    .expect("has_column_privilege");
+    assert!(
+        username_readable,
+        "the allowlisted columns must be re-granted after the revoke"
+    );
+    println!(
+        "[#148] after re-bootstrap: has_table_privilege(SELECT)={table_select}, \
+         has_column_privilege(password_hash, SELECT)={hash_readable}, \
+         has_column_privilege(username, SELECT)={username_readable}"
+    );
+
+    let err = membership
+        .query("SELECT password_hash FROM core.users".to_string(), vec![])
+        .await
+        .expect_err("the fixed bootstrap must close the hash exposure")
+        .to_string();
+    assert!(
+        err.contains("permission denied") && err.contains("users"),
+        "expected a column-privilege error on core.users, got: {err}"
+    );
+    membership
+        .query(
+            "SELECT username, display_name FROM core.users".to_string(),
+            vec![],
+        )
+        .await
+        .expect("roster columns still readable after the upgrade");
+}
+
+/// #148: auth needs the hash to verify a login and INSERT to create users, but
+/// no handler UPDATEs `core.users` (there is no password-change route). The
+/// unused authority is gone; the used column grant remains.
+#[tokio::test]
+#[ignore = "DB-gated: needs ADJUTANT_TEST_DATABASE_URL + CREATEROLE; run with `-- --ignored`"]
+async fn probe_auth_keeps_hash_select_but_loses_unused_update() {
+    let (admin, pools) = setup(&["auth"]).await;
+    let role = schema::role_for("auth");
+    let auth = host::CoreDb::new(pools[0].clone());
+
+    let table_update: bool =
+        sqlx::query_scalar("SELECT has_table_privilege($1::name, 'core.users', 'UPDATE')")
+            .bind(&role)
+            .fetch_one(admin.as_ref())
+            .await
+            .expect("has_table_privilege");
+    assert!(
+        !table_update,
+        "auth must not hold the unused UPDATE on core.users (#148)"
+    );
+    let hash_select: bool = sqlx::query_scalar(
+        "SELECT has_column_privilege($1::name, 'core.users', 'password_hash', 'SELECT')",
+    )
+    .bind(&role)
+    .fetch_one(admin.as_ref())
+    .await
+    .expect("has_column_privilege");
+    assert!(
+        hash_select,
+        "login verifies the hash, so auth keeps column SELECT"
+    );
+    let username_insert: bool = sqlx::query_scalar(
+        "SELECT has_column_privilege($1::name, 'core.users', 'username', 'INSERT')",
+    )
+    .bind(&role)
+    .fetch_one(admin.as_ref())
+    .await
+    .expect("has_column_privilege");
+    assert!(
+        username_insert,
+        "user creation inserts the columns named in the allowlist"
+    );
+
+    // Login's query shape works under the new grants (empty result is fine).
+    auth.query(
+        "SELECT id::text AS id, username, password_hash, is_active \
+         FROM core.users WHERE lower(username) = lower($1)"
+            .to_string(),
+        vec![SqlValue::Text("nobody".into())],
+    )
+    .await
+    .expect("login's column list is granted");
+}
+
 /// #33: `scope_id` is opaque TEXT owned by the plugin, `NULL` means troop-wide,
 /// and the invalid combinations are unstorable. A lodge-scoped grant with a
 /// bigint-looking id round-trips through storage and is honoured by
