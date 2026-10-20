@@ -106,7 +106,10 @@ impl InFlight {
             .expect("in-flight map poisoned")
             .entry(plugin.to_string())
             .or_insert(0) += 1;
-        InFlightGuard { inner: self.clone(), plugin: plugin.to_string() }
+        InFlightGuard {
+            inner: self.clone(),
+            plugin: plugin.to_string(),
+        }
     }
 
     pub fn count(&self, plugin: &str) -> usize {
@@ -127,7 +130,11 @@ impl InFlight {
     /// admin's request open forever — the caller decides what to do when it
     /// expires (the server keeps the pool open until the request really ends;
     /// see `disable_plugin`).
-    pub async fn wait_idle(&self, plugin: &str, timeout: std::time::Duration) -> Option<std::time::Duration> {
+    pub async fn wait_idle(
+        &self,
+        plugin: &str,
+        timeout: std::time::Duration,
+    ) -> Option<std::time::Duration> {
         let start = std::time::Instant::now();
         loop {
             if self.count(plugin) == 0 {
@@ -265,7 +272,10 @@ impl AppState {
     /// must use this — reading dev headers directly meant admin routes 401'd
     /// for real sessions once `allow_dev_headers=false`, and audit rows lost
     /// their actor entirely.
-    pub(crate) async fn resolve_identity(&self, headers: &axum::http::HeaderMap) -> Option<adjutant_sdk::Identity> {
+    pub(crate) async fn resolve_identity(
+        &self,
+        headers: &axum::http::HeaderMap,
+    ) -> Option<adjutant_sdk::Identity> {
         let map: HashMap<String, String> = headers
             .iter()
             .filter_map(|(k, v)| Some((k.as_str().to_string(), v.to_str().ok()?.to_string())))
@@ -300,7 +310,11 @@ impl AppState {
         // A disabled plugin has no instance to shut down: it was already dropped
         // when it was disabled (issue #89). Retired generations keep theirs, so
         // their documented `shutdown()` hook still runs.
-        for lp in plugins.iter_mut().filter_map(crate::plugin_runtime::PluginSlot::live_mut).chain(retired.iter_mut()) {
+        for lp in plugins
+            .iter_mut()
+            .filter_map(crate::plugin_runtime::PluginSlot::live_mut)
+            .chain(retired.iter_mut())
+        {
             if let Err(e) = lp.plugin.shutdown().await {
                 tracing::warn!(plugin = %lp.info.id, error = %e, "plugin shutdown failed");
             }
@@ -380,7 +394,17 @@ pub async fn build_app(cfg: &Config) -> Result<(Router, Arc<AppState>), BuildErr
             .map_err(BuildError::Db)?;
     superuser_refusal(is_superuser, cfg.allow_superuser).map_err(BuildError::Superuser)?;
 
-    db::migrate_core(pool.as_ref()).await.map_err(BuildError::Db)?;
+    db::migrate_core(pool.as_ref())
+        .await
+        .map_err(BuildError::Db)?;
+
+    // The first chief from the environment, before the listener opens (#173).
+    // Registering a claim row and a user in one transaction is what makes the
+    // HTTP bootstrap path's race irrelevant: by the time a caller can reach the
+    // route, either a user exists or the slot is still free.
+    crate::bootstrap::ensure_first_chief(pool.as_ref(), cfg.bootstrap_chief.as_ref())
+        .await
+        .map_err(|e| BuildError::Bootstrap(e.to_string()))?;
 
     let bus = EventBus::new();
     let identity = crate::identity::IdentityHub::new();
@@ -480,16 +504,20 @@ pub async fn build_app(cfg: &Config) -> Result<(Router, Arc<AppState>), BuildErr
     // under `outbox::SUBSCRIBER_OWNER` so a reload's sweep (which clears every
     // *plugin* generation) leaves it alone. Started after the state exists:
     // `start` takes a `Weak` to it.
-    state
-        .bus
-        .subscribe(crate::outbox::SUBSCRIBER_OWNER, crate::outbox::outcome_subscription());
+    state.bus.subscribe(
+        crate::outbox::SUBSCRIBER_OWNER,
+        crate::outbox::outcome_subscription(),
+    );
     relay.start(&state);
     backups.start(&state);
 
     let cors = cfg.cors_origins.first().map(|_| {
         let layer = CorsLayer::new();
         if cfg.cors_origins.iter().any(|o| o == "*") {
-            layer.allow_origin(Any).allow_methods(Any).allow_headers(Any)
+            layer
+                .allow_origin(Any)
+                .allow_methods(Any)
+                .allow_headers(Any)
         } else {
             let origins: Vec<_> = cfg
                 .cors_origins
@@ -576,7 +604,10 @@ pub async fn build_app(cfg: &Config) -> Result<(Router, Arc<AppState>), BuildErr
         None => app,
     };
 
-    tracing::info!(routes = route_count, "router assembled (dynamic plugin dispatch)");
+    tracing::info!(
+        routes = route_count,
+        "router assembled (dynamic plugin dispatch)"
+    );
     Ok((app, state))
 }
 
@@ -707,7 +738,16 @@ async fn dynamic_dispatch(State(state): State<Arc<AppState>>, req: Request) -> R
         }
     };
 
-    dispatch(state, plugin_id, required, required_scope, handler, params, req).await
+    dispatch(
+        state,
+        plugin_id,
+        required,
+        required_scope,
+        handler,
+        params,
+        req,
+    )
+    .await
 }
 
 /// Permission gate → build SDK request → call handler.
@@ -737,8 +777,13 @@ async fn dispatch(
 
     // 2. Permission gate — enforced by core, never by the plugin (SPEC §9).
     if let Some(perm) = &required {
-        if let Err(status) =
-            authorize(identity.as_ref(), &state.permissions, perm, required_scope.as_ref()).await
+        if let Err(status) = authorize(
+            identity.as_ref(),
+            &state.permissions,
+            perm,
+            required_scope.as_ref(),
+        )
+        .await
         {
             let msg = if status == 401 {
                 "authentication required"
@@ -800,8 +845,8 @@ async fn dispatch(
         Err(e) => {
             // The SDK owns the error → status mapping (SdkError::status), so the
             // core and plugins agree on 400/401/403/404/409/500.
-            let status = StatusCode::from_u16(e.status())
-                .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
+            let status =
+                StatusCode::from_u16(e.status()).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
             if status.is_server_error() {
                 // Never echo Db/Internal detail (it can carry SQL) to the client.
                 internal_error("plugin handler", &e)
@@ -929,10 +974,7 @@ async fn list_plugins(State(state): State<Arc<AppState>>, req: Request) -> Respo
 /// Last N events with cursor replay: `?since=<id>&limit=<1..500>`
 /// (SPEC §15 M2: event bus persistence + replay). Admin-gated: event payloads
 /// carry plugin data (member ids, messages) and the route is not public API.
-async fn recent_events(
-    State(state): State<Arc<AppState>>,
-    req: Request,
-) -> Response {
+async fn recent_events(State(state): State<Arc<AppState>>, req: Request) -> Response {
     if let Some(resp) = state.require_admin(req.headers()).await {
         return resp;
     }
@@ -1028,7 +1070,13 @@ async fn audit_refusal(
 ) {
     if let Err(e) = state
         .audit
-        .log(identity, action, "plugin", name, json!({ "refused": reason }))
+        .log(
+            identity,
+            action,
+            "plugin",
+            name,
+            json!({ "refused": reason }),
+        )
         .await
     {
         tracing::error!(action, plugin = name, error = %e, "refusal audit write failed");
@@ -1083,7 +1131,14 @@ async fn enable_plugin(
         }
         if let Some(reason) = enable_refusal(&name, &reg) {
             drop(reg);
-            audit_refusal(&state, identity.as_ref(), "plugin.enable.refused", &name, &reason).await;
+            audit_refusal(
+                &state,
+                identity.as_ref(),
+                "plugin.enable.refused",
+                &name,
+                &reason,
+            )
+            .await;
             return refusal(&name, &reason);
         }
     }
@@ -1096,8 +1151,18 @@ async fn enable_plugin(
         None => return error_response(StatusCode::NOT_FOUND, "unknown plugin"),
     };
     if !path.exists() {
-        let reason = format!("{name} cannot be enabled: its library {} is missing", path.display());
-        audit_refusal(&state, identity.as_ref(), "plugin.enable.refused", &name, &reason).await;
+        let reason = format!(
+            "{name} cannot be enabled: its library {} is missing",
+            path.display()
+        );
+        audit_refusal(
+            &state,
+            identity.as_ref(),
+            "plugin.enable.refused",
+            &name,
+            &reason,
+        )
+        .await;
         return refusal(&name, &reason);
     }
 
@@ -1135,7 +1200,14 @@ async fn enable_plugin(
             tracing::error!(plugin = %name, error = %e, "enable failed; plugin stays disabled");
             // The reason lands on the record, where the admin surface shows it.
             state.registry.write().await.record_error(&name, &reason);
-            audit_refusal(&state, identity.as_ref(), "plugin.enable.refused", &name, &reason).await;
+            audit_refusal(
+                &state,
+                identity.as_ref(),
+                "plugin.enable.refused",
+                &name,
+                &reason,
+            )
+            .await;
             return error_response(StatusCode::CONFLICT, reason);
         }
     };
@@ -1149,7 +1221,14 @@ async fn enable_plugin(
         );
         tracing::error!(plugin = %name, declared = %loaded.info.id, "enable refused: id mismatch");
         state.registry.write().await.record_error(&name, &reason);
-        audit_refusal(&state, identity.as_ref(), "plugin.enable.refused", &name, &reason).await;
+        audit_refusal(
+            &state,
+            identity.as_ref(),
+            "plugin.enable.refused",
+            &name,
+            &reason,
+        )
+        .await;
         return refusal(&name, &reason);
     }
 
@@ -1178,10 +1257,11 @@ async fn enable_plugin(
         }
     }
 
-    if let Err(e) = sqlx::query("UPDATE core.plugins SET enabled = true, updated_at = now() WHERE id = $1")
-        .bind(&name)
-        .execute(state.pool.as_ref())
-        .await
+    if let Err(e) =
+        sqlx::query("UPDATE core.plugins SET enabled = true, updated_at = now() WHERE id = $1")
+            .bind(&name)
+            .execute(state.pool.as_ref())
+            .await
     {
         // The flag is the durable truth (a restart reads it). If it cannot be
         // written, undo the load so no state contradicts the database.
@@ -1229,7 +1309,14 @@ async fn disable_plugin(
         }
         if let Some(reason) = disable_refusal(&name, &reg) {
             drop(reg);
-            audit_refusal(&state, identity.as_ref(), "plugin.disable.refused", &name, &reason).await;
+            audit_refusal(
+                &state,
+                identity.as_ref(),
+                "plugin.disable.refused",
+                &name,
+                &reason,
+            )
+            .await;
             return refusal(&name, &reason);
         }
     }
@@ -1245,7 +1332,14 @@ async fn disable_plugin(
         let reason =
             "refusing to remove the only identity provider while dev headers are off;              register/enable another identity provider, or set ADJUTANT_DEV_HEADERS=true              for a dev instance"
                 .to_string();
-        audit_refusal(&state, identity.as_ref(), "plugin.disable.refused", &name, &reason).await;
+        audit_refusal(
+            &state,
+            identity.as_ref(),
+            "plugin.disable.refused",
+            &name,
+            &reason,
+        )
+        .await;
         return refusal(&name, &reason);
     }
 
@@ -1264,10 +1358,11 @@ async fn disable_plugin(
     }
 
     // Flag first: past this point the teardown cannot fail.
-    if let Err(e) = sqlx::query("UPDATE core.plugins SET enabled = false, updated_at = now() WHERE id = $1")
-        .bind(&name)
-        .execute(state.pool.as_ref())
-        .await
+    if let Err(e) =
+        sqlx::query("UPDATE core.plugins SET enabled = false, updated_at = now() WHERE id = $1")
+            .bind(&name)
+            .execute(state.pool.as_ref())
+            .await
     {
         return internal_error("plugin lifecycle", &e);
     }
@@ -1429,17 +1524,18 @@ pub(crate) async fn load_fresh_generation(
 
     // `load_all` ran each plugin's `init`, which re-declares its scope edges;
     // refresh the resolution map before the new generation serves.
-    let fresh_hierarchy =
-        match crate::scope_hierarchy::ScopeHierarchy::load(state.pool.as_ref()).await {
-            Ok(h) => h,
-            Err(e) => {
-                tracing::error!(error = %e, "reload failed to load scope hierarchy; old registry kept");
-                return Err(error_response(
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    "reload failed; old registry kept",
-                ));
-            }
-        };
+    let fresh_hierarchy = match crate::scope_hierarchy::ScopeHierarchy::load(state.pool.as_ref())
+        .await
+    {
+        Ok(h) => h,
+        Err(e) => {
+            tracing::error!(error = %e, "reload failed to load scope hierarchy; old registry kept");
+            return Err(error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "reload failed; old registry kept",
+            ));
+        }
+    };
 
     Ok((fresh, fresh_hierarchy))
 }
@@ -1566,16 +1662,26 @@ mod tests {
     #[test]
     fn superuser_boot_is_refused_unless_explicitly_allowed() {
         assert!(superuser_refusal(false, false).is_ok());
-        assert!(superuser_refusal(true, true).is_ok(), "the opt-out permits it");
+        assert!(
+            superuser_refusal(true, true).is_ok(),
+            "the opt-out permits it"
+        );
         let err = superuser_refusal(true, false).expect_err("a superuser must be refused");
         assert!(err.contains("superuser"), "names the reason: {err}");
-        assert!(err.contains("ADJUTANT_ALLOW_SUPERUSER"), "names the opt-out: {err}");
+        assert!(
+            err.contains("ADJUTANT_ALLOW_SUPERUSER"),
+            "names the opt-out: {err}"
+        );
     }
 
     #[test]
     fn captures_are_percent_decoded_once() {
         assert_eq!(decode_path("%31"), "1");
-        assert_eq!(decode_path("a%2Fb"), "a/b", "an encoded slash decodes to a slash");
+        assert_eq!(
+            decode_path("a%2Fb"),
+            "a/b",
+            "an encoded slash decodes to a slash"
+        );
         assert_eq!(decode_path("a%20b"), "a b");
         // `+` is a literal plus in a path (unlike a query string).
         assert_eq!(decode_path("a+b"), "a+b");
@@ -1780,7 +1886,10 @@ mod tests {
 
         let reg = state.registry.read().await;
         let info = reg.info("hello").expect("fixture plugin");
-        assert!(!info.enabled, "the flag must not be flipped on audit failure");
+        assert!(
+            !info.enabled,
+            "the flag must not be flipped on audit failure"
+        );
         assert!(!info.loaded, "nothing may be loaded on audit failure");
         drop(reg);
         assert!(
@@ -1818,12 +1927,10 @@ mod tests {
         assert_eq!(flights.count("store"), 0);
         // Another plugin's requests are not this plugin's business.
         let _other = flights.enter("hello");
-        assert!(
-            flights
-                .wait_idle("store", std::time::Duration::from_millis(50))
-                .await
-                .is_some()
-        );
+        assert!(flights
+            .wait_idle("store", std::time::Duration::from_millis(50))
+            .await
+            .is_some());
     }
 
     /// Issue #89 requirement #6: the non-disableable minimum is a *declarative*
@@ -1832,10 +1939,13 @@ mod tests {
     fn the_required_plugins_refuse_with_their_reason() {
         let reg = PluginRegistry::new(vec![slot("auth", true), slot("membership", true)]);
         for (id, why) in REQUIRED_PLUGINS {
-            let reason = disable_refusal(id, &reg)
-                .unwrap_or_else(|| panic!("{id} must not be disableable"));
+            let reason =
+                disable_refusal(id, &reg).unwrap_or_else(|| panic!("{id} must not be disableable"));
             assert!(reason.contains(why), "the reason is carried: {reason}");
-            assert!(reason.contains("required"), "and says it is required: {reason}");
+            assert!(
+                reason.contains("required"),
+                "and says it is required: {reason}"
+            );
         }
         // A plugin outside the set is not refused.
         assert!(disable_refusal("hello", &reg).is_none());
@@ -1887,5 +1997,6 @@ pub enum BuildError {
     Plugin(#[from] crate::plugin_runtime::PluginRuntimeError),
     #[error("{0}")]
     Superuser(String),
+    #[error("bootstrap: {0}")]
+    Bootstrap(String),
 }
-

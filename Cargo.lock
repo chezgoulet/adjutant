@@ -167,10 +167,12 @@ name = "adjutant-server"
 version = "0.3.0"
 dependencies = [
  "adjutant-sdk",
+ "argon2",
  "async-trait",
  "axum",
  "chrono",
  "libloading",
+ "rand 0.8.8",
  "reqwest",
  "serde",
  "serde_json",

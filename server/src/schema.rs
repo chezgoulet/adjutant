@@ -39,6 +39,10 @@ pub fn core_grants(plugin_id: &str) -> Option<&'static [(&'static str, &'static 
         ("users", "SELECT, INSERT, UPDATE"),
         ("sessions", "SELECT, INSERT, DELETE"),
         ("user_roles", "SELECT, INSERT, DELETE"),
+        // The one bootstrap slot: `POST /api/auth/register` claims it before it
+        // creates the first user, so exactly one anonymous caller can win the
+        // race (#173). DELETE is the give-back on a failed registration.
+        ("bootstrap_claim", "SELECT, INSERT, DELETE"),
     ];
     // Membership reads users (to map a session to a roster entry) but must not
     // write `core.user_roles`: role assignment belongs to auth (#19). It had
@@ -50,8 +54,10 @@ pub fn core_grants(plugin_id: &str) -> Option<&'static [(&'static str, &'static 
     // table-level, so it can write any row: the residual is called out in the PR
     // and the loader rejects cycles/self-edges/unknown types, but per-row
     // ownership is not expressible with a table grant alone.
-    const MEMBERSHIP: &[(&str, &str)] =
-        &[("users", "SELECT"), ("scope_hierarchy", "SELECT, INSERT, DELETE")];
+    const MEMBERSHIP: &[(&str, &str)] = &[
+        ("users", "SELECT"),
+        ("scope_hierarchy", "SELECT, INSERT, DELETE"),
+    ];
     match plugin_id {
         "auth" => Some(AUTH),
         "membership" => Some(MEMBERSHIP),
@@ -196,8 +202,7 @@ pub async fn bootstrap_app_role(
         Err(e) if e.as_database_error().and_then(|d| d.code()).as_deref() == Some("42710") => {}
         Err(e) => return Err(e),
     }
-    let mut alter =
-        format!("ALTER ROLE \"{role}\" LOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE");
+    let mut alter = format!("ALTER ROLE \"{role}\" LOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE");
     if let Some(pw) = password {
         alter.push_str(&format!(" PASSWORD '{}'", pw.replace('\'', "''")));
     }
@@ -213,10 +218,14 @@ pub async fn bootstrap_app_role(
 /// This is the one deviation from §3.6's "owns nothing": it owns the core
 /// schema, not any plugin schema. Requires a connection that owns the objects.
 pub async fn transfer_core_ownership(pool: &PgPool, role: &str) -> Result<(), sqlx::Error> {
-    let db: String = sqlx::query_scalar("SELECT current_database()").fetch_one(pool).await?;
-    sqlx::query(&format!("GRANT CONNECT, CREATE ON DATABASE \"{db}\" TO \"{role}\""))
-        .execute(pool)
+    let db: String = sqlx::query_scalar("SELECT current_database()")
+        .fetch_one(pool)
         .await?;
+    sqlx::query(&format!(
+        "GRANT CONNECT, CREATE ON DATABASE \"{db}\" TO \"{role}\""
+    ))
+    .execute(pool)
+    .await?;
     let sql = format!(
         "DO $own$
          DECLARE r RECORD;
@@ -286,16 +295,23 @@ mod tests {
 
     #[test]
     fn core_grants_are_plugin_specific() {
-        assert!(core_grants("hello").is_none(), "unknown plugins get no core access");
+        assert!(
+            core_grants("hello").is_none(),
+            "unknown plugins get no core access"
+        );
         let auth = core_grants("auth").expect("auth has a core allowlist");
-        assert!(auth.iter().any(|(t, p)| *t == "users" && p.contains("INSERT")));
+        assert!(auth
+            .iter()
+            .any(|(t, p)| *t == "users" && p.contains("INSERT")));
         let membership = core_grants("membership").expect("membership has a core allowlist");
         assert!(
             !membership.iter().any(|(t, _)| *t == "user_roles"),
             "membership must not write/read core.user_roles (role assignment is auth's, #19)"
         );
         assert!(
-            membership.iter().any(|(t, p)| *t == "scope_hierarchy" && p.contains("INSERT")),
+            membership
+                .iter()
+                .any(|(t, p)| *t == "scope_hierarchy" && p.contains("INSERT")),
             "membership declares the lodge->patrol hierarchy"
         );
         assert!(

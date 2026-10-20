@@ -853,6 +853,69 @@ CREATE TRIGGER notifications_identity_immutable BEFORE UPDATE ON core.notificati
   FOR EACH ROW EXECUTE FUNCTION core.notification_identity_is_fixed();
 "
     ),
+    (14, "bootstrap_claim", "
+-- #173: the bootstrap slot is a row, so 'the first user becomes chief' has
+-- exactly one winner. The route inserts here **before** creating the user; the
+-- primary key is the mutex, so two concurrent first registrations cannot both
+-- pass the empty-table check. A row is spent forever once claimed — the same
+-- 'refuse rather than trust' shape the last-admin and last-identity-provider
+-- guards use.
+CREATE TABLE IF NOT EXISTS core.bootstrap_claim (
+    id          SMALLINT PRIMARY KEY DEFAULT 1 CHECK (id = 1),
+    claim_token TEXT NOT NULL,
+    claimed_at  TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+-- An installation that already has users has already spent its bootstrap. This
+-- backfill is what closes registration on every upgrade; without it an existing
+-- deployment would look unclaimed and the next caller would become chief.
+INSERT INTO core.bootstrap_claim (id, claim_token)
+SELECT 1, encode(public.gen_random_bytes(32), 'hex')
+WHERE EXISTS (SELECT 1 FROM core.users)
+ON CONFLICT DO NOTHING;
+"
+    ),
+    (15, "keep_an_admin", "
+-- #147: a write that leaves no user holding an administrative grant at troop
+-- scope is refused by the schema, not by one handler. Recovery from that state
+-- is otherwise psql-only: `chief` is the only role carrying `core:admin`, and
+-- nothing in the CLI could grant it back.
+--
+-- A trigger rather than a check in `POST /api/auth/roles`, because the concern
+-- is every writer of `core.user_roles` — today's handler, a future route, an
+-- operator's SQL. It is also where the cascade from a deleted last admin lands.
+--
+-- **Writers must grant before they revoke.** A transfer implemented as
+-- delete-then-insert trips this between the two statements even though its end
+-- state is valid; the auth handler inserts the new set first for that reason.
+--
+-- The role whose row is being deleted is not consulted: the question is only
+-- whether *somebody* still holds the authority afterwards. `auth:manage_users`
+-- is included because a troop that renamed its admin role should not lose the
+-- guard.
+CREATE OR REPLACE FUNCTION core.refuse_last_admin_removal() RETURNS trigger
+LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog, core AS $fn$
+BEGIN
+    IF NOT EXISTS (
+        SELECT 1
+        FROM core.user_roles ur
+        JOIN core.role_permissions rp ON rp.role_id = ur.role_id
+        WHERE rp.permission_id IN ('core:admin', 'auth:manage_users')
+          AND ur.scope_type = 'troop'
+    ) THEN
+        RAISE EXCEPTION 'last_admin: this write would leave no user holding core:admin or auth:manage_users at troop scope; grant another user chief first'
+            USING ERRCODE = 'check_violation';
+    END IF;
+    RETURN NULL;
+END
+$fn$;
+
+DROP TRIGGER IF EXISTS user_roles_keep_an_admin ON core.user_roles;
+CREATE TRIGGER user_roles_keep_an_admin
+  AFTER DELETE ON core.user_roles
+  FOR EACH ROW EXECUTE FUNCTION core.refuse_last_admin_removal();
+"
+    ),
 ];
 
 /// Bootstrap roles + permissions grants. `chief` gets everything (SPEC §9 —
@@ -893,7 +956,9 @@ pub async fn connect(cfg: &Config) -> Result<Arc<PgPool>, sqlx::Error> {
 pub async fn migrate_core(pool: &PgPool) -> Result<(), sqlx::Error> {
     // The schema must exist before run_migration can create its bookkeeping
     // table (core.schema_migrations) — fresh databases don't have it yet.
-    sqlx::query("CREATE SCHEMA IF NOT EXISTS core").execute(pool).await?;
+    sqlx::query("CREATE SCHEMA IF NOT EXISTS core")
+        .execute(pool)
+        .await?;
 
     for (version, name, sql) in CORE_MIGRATIONS {
         run_migration(pool, "core", *version, name, sql).await?;
@@ -1045,8 +1110,13 @@ fn validate_migration_name(name: &str) -> Result<(), sqlx::Error> {
 fn validate_schema_name(schema: &str) -> Result<(), sqlx::Error> {
     let ok = !schema.is_empty()
         && schema.len() <= 31
-        && schema.chars().next().is_some_and(|c| c.is_ascii_lowercase())
-        && schema.chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_');
+        && schema
+            .chars()
+            .next()
+            .is_some_and(|c| c.is_ascii_lowercase())
+        && schema
+            .chars()
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_');
     if ok {
         Ok(())
     } else {

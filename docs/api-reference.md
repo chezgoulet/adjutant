@@ -152,9 +152,9 @@ Config lives in the `auth` row's `core.plugins.config` (`{"oidc": {…},
 | POST | `/api/auth/login` | — | `{username, password}` → session token + `adjutant_session` cookie |
 | POST | `/api/auth/logout` | — | Ends the session |
 | GET | `/api/auth/me` | session | Current user and scoped role grants |
-| POST | `/api/auth/register` | — | `{username, email?, password}`; **open only while no users exist**; first user becomes `chief` (min 8-char password) |
+| POST | `/api/auth/register` | — | `{username, email?, password}`; **open only while no users exist**; first user becomes `chief` (min 8-char password). The bootstrap slot is a single row, so concurrent first registrations have exactly one winner; the loser gets `403` |
 | POST | `/api/auth/users` | `auth:manage_users` | `{username, email?, password, roles?}` |
-| POST | `/api/auth/roles` | `auth:manage_users` | `{username, roles: string[]}` (replaces grants) |
+| POST | `/api/auth/roles` | `auth:manage_users` | `{username, roles: string[]}` (replaces grants). Refuses with `409` when the write would leave no user holding `core:admin` or `auth:manage_users` at troop scope — grant another chief first |
 | GET | `/api/auth/users` | `auth:manage_users` | List users |
 | GET | `/api/auth/oidc/login` | — | Redirects to the IdP authorize endpoint (state stored server-side) |
 | GET | `/api/auth/oidc/callback` | — | Code exchange, id_token verification, session creation |

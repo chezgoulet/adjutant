@@ -23,14 +23,18 @@ pub fn validate_plugin_name(name: &str) -> Result<(), String> {
     let ok = !name.is_empty()
         && name.len() <= 31
         && name.chars().next().is_some_and(|c| c.is_ascii_lowercase())
-        && name.chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_');
+        && name
+            .chars()
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_');
     if !ok {
         return Err(format!(
             "invalid plugin name {name:?}: expected [a-z][a-z0-9_]{{0,30}} (lowercase, underscore)"
         ));
     }
     if crate::plugin_runtime::RESERVED_IDS.contains(&name) {
-        return Err(format!("{name:?} is reserved by the core or an existing plugin"));
+        return Err(format!(
+            "{name:?} is reserved by the core or an existing plugin"
+        ));
     }
     Ok(())
 }
@@ -191,11 +195,11 @@ impl AdjutantPlugin for __STRUCT__ {
 export_plugin!(__STRUCT__);
 "#;
 
-/// The scaffolded plugin's first migration, kept beside the template that names it:
-/// a template pointing at a `.sql` file the scaffolder did not write would produce a
-/// crate that cannot compile (`include_str!` would fail to resolve), which is a worse
-/// first impression than the inline form it replaced.
-const INITIAL_SCHEMA_SQL: &str = r#"CREATE TABLE IF NOT EXISTS items (
+    /// The scaffolded plugin's first migration, kept beside the template that names it:
+    /// a template pointing at a `.sql` file the scaffolder did not write would produce a
+    /// crate that cannot compile (`include_str!` would fail to resolve), which is a worse
+    /// first impression than the inline form it replaced.
+    const INITIAL_SCHEMA_SQL: &str = r#"CREATE TABLE IF NOT EXISTS items (
     id BIGSERIAL PRIMARY KEY,
     name TEXT NOT NULL,
     created_at TIMESTAMPTZ NOT NULL DEFAULT now()
@@ -323,7 +327,10 @@ pub async fn reset_database(test_url: &str) -> Result<(), String> {
     let kill = format!(
         "SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE datname = '{dbname}' AND pid <> pg_backend_pid()"
     );
-    sqlx::query(&kill).execute(&pool).await.map_err(|e| e.to_string())?;
+    sqlx::query(&kill)
+        .execute(&pool)
+        .await
+        .map_err(|e| e.to_string())?;
     sqlx::query(&format!("DROP DATABASE IF EXISTS \"{dbname}\""))
         .execute(&pool)
         .await
@@ -378,16 +385,21 @@ pub async fn bootstrap_isolation(
 
     let mut ids = Vec::new();
     for d in discovered {
-        let existing: Option<Option<String>> =
-            sqlx::query_scalar::<_, Option<String>>("SELECT db_secret FROM core.plugins WHERE id = $1")
-                .bind(&d.id)
-                .fetch_optional(pool.as_ref())
-                .await
-                .map_err(|e| format!("read {} credential: {e}", d.id))?;
-        let secret =
-            crate::schema::bootstrap_role(pool.as_ref(), &d.id, existing.flatten().as_deref(), rotate)
-                .await
-                .map_err(|e| format!("bootstrap {}: {e}", d.id))?;
+        let existing: Option<Option<String>> = sqlx::query_scalar::<_, Option<String>>(
+            "SELECT db_secret FROM core.plugins WHERE id = $1",
+        )
+        .bind(&d.id)
+        .fetch_optional(pool.as_ref())
+        .await
+        .map_err(|e| format!("read {} credential: {e}", d.id))?;
+        let secret = crate::schema::bootstrap_role(
+            pool.as_ref(),
+            &d.id,
+            existing.flatten().as_deref(),
+            rotate,
+        )
+        .await
+        .map_err(|e| format!("bootstrap {}: {e}", d.id))?;
         sqlx::query(
             "INSERT INTO core.plugins (id, version, db_secret) VALUES ($1, $2, $3) \
              ON CONFLICT (id) DO UPDATE SET version = EXCLUDED.version, \
@@ -471,8 +483,8 @@ pub async fn run_test_plugin(cfg: &Config) -> Result<Vec<Probe>, String> {
     cfg.bind = "127.0.0.1:0".parse().expect("ephemeral");
     cfg.rate.max_requests = 0; // probes would trip the limiter otherwise
     cfg.allow_dev_headers = true; // mock permissions
-    // The harness runs against a throwaway `_test` database, usually as a
-    // superuser; the refusal is about a real deployment connection.
+                                  // The harness runs against a throwaway `_test` database, usually as a
+                                  // superuser; the refusal is about a real deployment connection.
     cfg.allow_superuser = true;
     cfg.log_filter = "warn".into();
 
@@ -507,7 +519,11 @@ pub async fn run_test_plugin(cfg: &Config) -> Result<Vec<Probe>, String> {
 
     let mut probes = Vec::new();
 
-    let health = client.get(format!("{base}/")).send().await.map_err(|e| e.to_string())?;
+    let health = client
+        .get(format!("{base}/"))
+        .send()
+        .await
+        .map_err(|e| e.to_string())?;
     probes.push(Probe {
         name: "core health".into(),
         status: health.status().as_u16(),
@@ -700,11 +716,19 @@ pub struct ValidationCheck {
 }
 
 fn ok_check(name: &str, detail: &str) -> ValidationCheck {
-    ValidationCheck { name: name.into(), ok: true, detail: detail.into() }
+    ValidationCheck {
+        name: name.into(),
+        ok: true,
+        detail: detail.into(),
+    }
 }
 
 fn fail_check(name: &str, detail: &str) -> ValidationCheck {
-    ValidationCheck { name: name.into(), ok: false, detail: detail.into() }
+    ValidationCheck {
+        name: name.into(),
+        ok: false,
+        detail: detail.into(),
+    }
 }
 
 /// Validate a compiled plugin `.so` without a database or a server: verify the
@@ -735,15 +759,13 @@ pub async fn validate_plugin(so_path: &Path) -> Result<Vec<ValidationCheck>, Str
 
     // 2. Construct the plugin (same symbol the core resolves).
     let mut plugin: Box<dyn adjutant_sdk::AdjutantPlugin> = {
-        let factory = unsafe {
-            lib.get::<adjutant_sdk::PluginFactory>(adjutant_sdk::ENTRY_SYMBOL)
-        }
-        .map_err(|e| {
-            format!(
-                "missing `{}` symbol: {e}",
-                String::from_utf8_lossy(adjutant_sdk::ENTRY_SYMBOL)
-            )
-        })?;
+        let factory = unsafe { lib.get::<adjutant_sdk::PluginFactory>(adjutant_sdk::ENTRY_SYMBOL) }
+            .map_err(|e| {
+                format!(
+                    "missing `{}` symbol: {e}",
+                    String::from_utf8_lossy(adjutant_sdk::ENTRY_SYMBOL)
+                )
+            })?;
         unsafe { Box::from_raw(factory()) }
     };
     let id = plugin.id().to_string();
@@ -763,11 +785,17 @@ pub async fn validate_plugin(so_path: &Path) -> Result<Vec<ValidationCheck>, Str
     }
 
     let granted = plugin.permissions_granted();
-    checks.push(ok_check("permissions", &format!("{} declared", granted.len())));
+    checks.push(ok_check(
+        "permissions",
+        &format!("{} declared", granted.len()),
+    ));
 
     let migrations = plugin.migrations();
     match crate::plugin_runtime::validate_migrations(&id, &migrations) {
-        Ok(()) => checks.push(ok_check("migrations", &format!("{} declared", migrations.len()))),
+        Ok(()) => checks.push(ok_check(
+            "migrations",
+            &format!("{} declared", migrations.len()),
+        )),
         Err(e) => checks.push(fail_check("migrations", &e.to_string())),
     }
 
@@ -780,6 +808,63 @@ pub async fn validate_plugin(so_path: &Path) -> Result<Vec<ValidationCheck>, Str
     }
 
     Ok(checks)
+}
+
+// ---------------------------------------------------------------------------
+// grant-role
+// ---------------------------------------------------------------------------
+
+/// `adjutant grant-role <username> <role>` — the operator's recovery hatch (#147).
+///
+/// It exists because the last-admin refusal and an unreachable API have the same
+/// consequence: nobody can grant a role through HTTP. This path talks to the
+/// database directly, so it works while the server is down, while the only admin
+/// is locked out, and while `POST /api/auth/register` is closed.
+///
+/// It refuses an unknown user or role by name rather than letting a foreign-key
+/// violation say it, and it says whether the grant was new — an operator who
+/// runs it twice should not have to guess.
+pub async fn grant_role(cfg: &Config, username: &str, role: &str) -> Result<String, String> {
+    let pool = crate::db::connect_and_migrate(cfg)
+        .await
+        .map_err(|e| format!("connect: {e}"))?;
+
+    let user_id: Option<uuid::Uuid> =
+        sqlx::query_scalar("SELECT id FROM core.users WHERE lower(username) = lower($1)")
+            .bind(username)
+            .fetch_optional(pool.as_ref())
+            .await
+            .map_err(|e| e.to_string())?;
+    let Some(user_id) = user_id else {
+        return Err(format!("no user named {username:?}"));
+    };
+
+    let known: Vec<String> = sqlx::query_scalar("SELECT id FROM core.roles ORDER BY id")
+        .fetch_all(pool.as_ref())
+        .await
+        .map_err(|e| e.to_string())?;
+    if !known.iter().any(|k| k == role) {
+        return Err(format!(
+            "no role named {role:?}; known roles: {}",
+            known.join(", ")
+        ));
+    }
+
+    let inserted = sqlx::query(
+        "INSERT INTO core.user_roles (user_id, role_id) VALUES ($1, $2) \
+         ON CONFLICT DO NOTHING",
+    )
+    .bind(user_id)
+    .bind(role)
+    .execute(pool.as_ref())
+    .await
+    .map_err(|e| e.to_string())?;
+
+    Ok(if inserted.rows_affected() > 0 {
+        format!("granted {role} to {username}")
+    } else {
+        format!("{username} already holds {role}")
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -798,7 +883,10 @@ mod tests {
         assert!(validate_plugin_name("Camel").is_err());
         assert!(validate_plugin_name("9lives").is_err());
         assert!(validate_plugin_name("drop table").is_err());
-        assert!(validate_plugin_name("auth").is_err(), "reserved names rejected");
+        assert!(
+            validate_plugin_name("auth").is_err(),
+            "reserved names rejected"
+        );
         assert!(validate_plugin_name("plugins").is_err());
         assert!(validate_plugin_name(&"x".repeat(40)).is_err());
     }
@@ -812,7 +900,8 @@ mod tests {
     }
 
     #[test]
-    fn struct_names_camel_case() {        assert_eq!(struct_name_for("gear_locker"), "GearLocker");
+    fn struct_names_camel_case() {
+        assert_eq!(struct_name_for("gear_locker"), "GearLocker");
         assert_eq!(struct_name_for("scouting"), "Scouting");
         assert_eq!(struct_name_for("a_b_c"), "ABC");
     }
@@ -852,7 +941,11 @@ mod tests {
 
         let ws = std::fs::read_to_string(tmp.join("Cargo.toml")).unwrap();
         assert!(ws.contains("\"plugins/gear_locker\","));
-        assert_eq!(ws.matches("\"plugins/gear_locker\",").count(), 1, "idempotent");
+        assert_eq!(
+            ws.matches("\"plugins/gear_locker\",").count(),
+            1,
+            "idempotent"
+        );
 
         // duplicate refused; reserved refused
         assert!(scaffold_plugin(&tmp, "gear_locker").is_err());

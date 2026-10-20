@@ -65,7 +65,11 @@ fn verify_password(password: &str, stored: &str) -> bool {
     use argon2::password_hash::{PasswordHash, PasswordVerifier};
     use argon2::Argon2;
     PasswordHash::new(stored)
-        .map(|parsed| Argon2::default().verify_password(password.as_bytes(), &parsed).is_ok())
+        .map(|parsed| {
+            Argon2::default()
+                .verify_password(password.as_bytes(), &parsed)
+                .is_ok()
+        })
         .unwrap_or(false)
 }
 
@@ -107,7 +111,10 @@ fn extract_token(headers: &HashMap<String, String>) -> Option<String> {
             .map(|(_, v)| v.as_str())
     };
     if let Some(auth) = get("authorization") {
-        if let Some(tok) = auth.strip_prefix("Bearer ").or_else(|| auth.strip_prefix("bearer ")) {
+        if let Some(tok) = auth
+            .strip_prefix("Bearer ")
+            .or_else(|| auth.strip_prefix("bearer "))
+        {
             if !tok.is_empty() {
                 return Some(tok.trim().to_string());
             }
@@ -156,11 +163,19 @@ async fn session_identity(db: &DbHandle, token: &str) -> Result<Option<SessionUs
     let username = row["username"].as_str().unwrap_or_default().to_string();
     let roles: Vec<String> = row["roles"]
         .as_array()
-        .map(|a| a.iter().filter_map(|v| v.as_str().map(String::from)).collect())
+        .map(|a| {
+            a.iter()
+                .filter_map(|v| v.as_str().map(String::from))
+                .collect()
+        })
         .unwrap_or_default();
     let grants: Vec<RoleGrant> = row["grant_list"]
         .as_array()
-        .map(|a| a.iter().filter_map(|g| grant_from_row(&username, g)).collect())
+        .map(|a| {
+            a.iter()
+                .filter_map(|g| grant_from_row(&username, g))
+                .collect()
+        })
         .unwrap_or_default();
     Ok(Some(SessionUser {
         id: row["id"].as_str().unwrap_or_default().to_string(),
@@ -211,13 +226,33 @@ fn grant_from_row(user: &str, g: &serde_json::Value) -> Option<RoleGrant> {
         );
         return None;
     }
-    Some(RoleGrant { role_id, scope: Scope { scope_type, scope_id } })
+    Some(RoleGrant {
+        role_id,
+        scope: Scope {
+            scope_type,
+            scope_id,
+        },
+    })
 }
 
 /// PostgreSQL unique-violation detection. sqlx surfaces the driver message
 /// (SQLSTATE 23505) as text across the host boundary, so match both forms.
 fn is_duplicate_key(err: &str) -> bool {
     err.contains("duplicate key") || err.contains("23505")
+}
+
+/// Give the bootstrap slot back when registration failed before a user existed,
+/// so a mistyped or already-taken username does not spend the installation's only
+/// self-service way in (#173). Best-effort by design: this runs inside an error
+/// path, and the operator's `ADJUTANT_BOOTSTRAP_*` path is the deterministic
+/// recovery.
+async fn release_bootstrap_claim(db: &DbHandle, claim: &str) {
+    let _ = db
+        .execute(
+            "DELETE FROM core.bootstrap_claim WHERE claim_token = $1",
+            vec![SqlValue::Text(claim.to_string())],
+        )
+        .await;
 }
 
 /// Local username for an IdP-created user: lowercase, `[a-z0-9._-]`, capped at
@@ -284,7 +319,10 @@ struct SessionIdentityProvider {
 
 #[async_trait]
 impl IdentityProvider for SessionIdentityProvider {
-    async fn identify(&self, headers: &HashMap<String, String>) -> Result<Option<Identity>, SdkError> {
+    async fn identify(
+        &self,
+        headers: &HashMap<String, String>,
+    ) -> Result<Option<Identity>, SdkError> {
         let Some(token) = extract_token(headers) else {
             return Ok(None); // no credentials → core may fall back to dev headers
         };
@@ -306,21 +344,27 @@ pub struct AuthPlugin {
 
 impl AuthPlugin {
     pub fn new() -> Self {
-        Self { ctx: OnceLock::new(), cfg: AuthConfig::default() }
+        Self {
+            ctx: OnceLock::new(),
+            cfg: AuthConfig::default(),
+        }
     }
 
     fn ctx(&self) -> &PluginContext {
-        self.ctx.get().expect("core must call init() before routes()")
+        self.ctx
+            .get()
+            .expect("core must call init() before routes()")
     }
 
     async fn require_session(&self, req: &PluginRequest) -> Result<SessionUser, PluginResponse> {
-        let token = extract_token(&req.headers).ok_or_else(|| {
-            PluginResponse::error(401, "authentication required").unwrap()
-        })?;
+        let token = extract_token(&req.headers)
+            .ok_or_else(|| PluginResponse::error(401, "authentication required").unwrap())?;
         session_identity(&self.ctx().db, &token)
             .await
             .map_err(|e| PluginResponse::error(500, e.to_string()).unwrap())
-            .and_then(|u| u.ok_or_else(|| PluginResponse::error(401, "session expired or invalid").unwrap()))
+            .and_then(|u| {
+                u.ok_or_else(|| PluginResponse::error(401, "session expired or invalid").unwrap())
+            })
     }
 
     fn ttl(&self) -> i64 {
@@ -398,17 +442,17 @@ impl AdjutantPlugin for AuthPlugin {
                         password: String,
                     }
                     let body: Body = req.json()?;
-                    let rows = c
-                        .db
-                        .query(
+                    let rows =
+                        c.db.query(
                             "SELECT id::text AS id, username, password_hash, is_active \
                              FROM core.users WHERE lower(username) = lower($1)",
                             vec![SqlValue::Text(body.username.clone())],
                         )
                         .await?;
-                    let row = rows.into_iter().next().ok_or_else(|| {
-                        SdkError::BadRequest("invalid credentials".into())
-                    })?;
+                    let row = rows
+                        .into_iter()
+                        .next()
+                        .ok_or_else(|| SdkError::BadRequest("invalid credentials".into()))?;
                     let stored = row["password_hash"].as_str().unwrap_or("");
                     if stored.is_empty()
                         || !verify_password(&body.password, stored)
@@ -442,27 +486,34 @@ impl AdjutantPlugin for AuthPlugin {
                 async move {
                     let token = extract_token(&req.headers).unwrap_or_default();
                     if !token.is_empty() {
-                        c.db
-                            .execute(
-                                "DELETE FROM core.sessions WHERE token_hash = $1",
-                                vec![SqlValue::Text(token_hash(&token))],
-                            )
-                            .await?;
+                        c.db.execute(
+                            "DELETE FROM core.sessions WHERE token_hash = $1",
+                            vec![SqlValue::Text(token_hash(&token))],
+                        )
+                        .await?;
                     }
                     let mut resp = PluginResponse::json(200, &serde_json::json!({"ok": true}))?;
-                    resp.headers
-                        .push(("set-cookie".into(), format!("{SESSION_COOKIE}=; Path=/; Max-Age=0")));
+                    resp.headers.push((
+                        "set-cookie".into(),
+                        format!("{SESSION_COOKIE}=; Path=/; Max-Age=0"),
+                    ));
                     Ok(resp)
                 }
             }),
         );
 
         // --- me -------------------------------------------------------------
-        let me_self = AuthPlugin { ctx: self.ctx.clone(), cfg: self.cfg.clone() };
+        let me_self = AuthPlugin {
+            ctx: self.ctx.clone(),
+            cfg: self.cfg.clone(),
+        };
         let me = RouteDefinition::get(
             "/api/auth/me",
             route_handler(move |req| {
-                let me = AuthPlugin { ctx: me_self.ctx.clone(), cfg: me_self.cfg.clone() };
+                let me = AuthPlugin {
+                    ctx: me_self.ctx.clone(),
+                    cfg: me_self.cfg.clone(),
+                };
                 async move {
                     match me.require_session(&req).await {
                         Err(resp) => Ok(resp),
@@ -496,13 +547,12 @@ impl AdjutantPlugin for AuthPlugin {
                         email: Option<String>,
                         password: String,
                     }
-                    let n: i64 = c
-                        .db
-                        .query("SELECT COUNT(*) AS n FROM core.users", vec![])
-                        .await?
-                        .first()
-                        .and_then(|r| r["n"].as_i64())
-                        .unwrap_or(0);
+                    let n: i64 =
+                        c.db.query("SELECT COUNT(*) AS n FROM core.users", vec![])
+                            .await?
+                            .first()
+                            .and_then(|r| r["n"].as_i64())
+                            .unwrap_or(0);
                     if n > 0 {
                         return PluginResponse::error(
                             403,
@@ -511,9 +561,32 @@ impl AdjutantPlugin for AuthPlugin {
                     }
                     let body: Body = req.json()?;
                     if body.password.len() < 8 {
-                        return PluginResponse::error(400, "password must be at least 8 characters");
+                        return PluginResponse::error(
+                            400,
+                            "password must be at least 8 characters",
+                        );
                     }
                     let pw = hash_password(&body.password)?;
+                    // Claim the one bootstrap slot **before** creating the user (#173).
+                    // The primary key is the mutex: with two concurrent first
+                    // registrations exactly one INSERT returns a row, so the
+                    // empty-table check above can only be raced by a caller that has
+                    // already lost. The slot is spent for the life of the database.
+                    let claim = new_token();
+                    let claimed =
+                        c.db.query(
+                            "INSERT INTO core.bootstrap_claim (id, claim_token) VALUES (1, $1) \
+                             ON CONFLICT (id) DO NOTHING \
+                             RETURNING claim_token::text AS token",
+                            vec![SqlValue::Text(claim.clone())],
+                        )
+                        .await?;
+                    if claimed.is_empty() {
+                        return PluginResponse::error(
+                            403,
+                            "registration is closed — ask an admin to create the user",
+                        );
+                    }
                     let rows = match c
                         .db
                         .query(
@@ -533,12 +606,20 @@ impl AdjutantPlugin for AuthPlugin {
                         // A unique violation is the caller's problem, not a server
                         // error: report it as such (the earlier 500 was a defect).
                         Err(SdkError::Db(e)) if is_duplicate_key(&e) => {
+                            release_bootstrap_claim(&c.db, &claim).await;
                             return PluginResponse::error(
                                 409,
                                 "already registered — log in instead",
                             )
                         }
-                        Err(e) => return Err(e),
+                        Err(e) => {
+                            // The slot was claimed before the insert. Any failure
+                            // before a user exists must give it back, or a typo in
+                            // the username would spend the installation's only
+                            // bootstrap path (#173).
+                            release_bootstrap_claim(&c.db, &claim).await;
+                            return Err(e);
+                        }
                     };
                     let uid = rows
                         .first()
@@ -546,13 +627,12 @@ impl AdjutantPlugin for AuthPlugin {
                         .unwrap_or_default()
                         .to_string();
                     // First user of a fresh troop = chief (SPEC §9 bootstrap).
-                    c.db
-                        .execute(
-                            "INSERT INTO core.user_roles (user_id, role_id) \
+                    c.db.execute(
+                        "INSERT INTO core.user_roles (user_id, role_id) \
                              VALUES ($1::uuid, 'chief') ON CONFLICT DO NOTHING",
-                            vec![SqlValue::Text(uid.clone())],
-                        )
-                        .await?;
+                        vec![SqlValue::Text(uid.clone())],
+                    )
+                    .await?;
                     let (token, expires) = create_session(&c.db, &uid, ttl).await?;
                     let mut resp = PluginResponse::json(
                         201,
@@ -587,7 +667,10 @@ impl AdjutantPlugin for AuthPlugin {
                     }
                     let body: Body = req.json()?;
                     if body.password.len() < 8 {
-                        return PluginResponse::error(400, "password must be at least 8 characters");
+                        return PluginResponse::error(
+                            400,
+                            "password must be at least 8 characters",
+                        );
                     }
                     let pw = hash_password(&body.password)?;
                     let rows = match c
@@ -620,13 +703,12 @@ impl AdjutantPlugin for AuthPlugin {
                         .unwrap_or_default()
                         .to_string();
                     for role in &body.roles {
-                        c.db
-                            .execute(
-                                "INSERT INTO core.user_roles (user_id, role_id) \
+                        c.db.execute(
+                            "INSERT INTO core.user_roles (user_id, role_id) \
                                  VALUES ($1::uuid, $2) ON CONFLICT DO NOTHING",
-                                vec![SqlValue::Text(uid.clone()), SqlValue::Text(role.clone())],
-                            )
-                            .await?;
+                            vec![SqlValue::Text(uid.clone()), SqlValue::Text(role.clone())],
+                        )
+                        .await?;
                     }
                     c.audit
                         .log(
@@ -671,21 +753,51 @@ impl AdjutantPlugin for AuthPlugin {
                         .and_then(|r| r["id"].as_str())
                         .ok_or_else(|| SdkError::BadRequest("unknown user".into()))?
                         .to_string();
-                    // Replace the full role set (explicit PUT-like semantics).
-                    c.db
-                        .execute(
-                            "DELETE FROM core.user_roles WHERE user_id = $1::uuid",
+                    // Replace the full role set (explicit PUT-like semantics), but
+                    // grant before revoking: `core.user_roles` refuses a delete that
+                    // would leave the troop with no admin (#147), and a replace that
+                    // deleted first would trip that guard even when the same request
+                    // re-grants the role a moment later.
+                    let current =
+                        c.db.query(
+                            "SELECT role_id FROM core.user_roles WHERE user_id = $1::uuid",
                             vec![SqlValue::Text(uid.clone())],
                         )
                         .await?;
+                    let current: Vec<String> = current
+                        .iter()
+                        .filter_map(|r| r["role_id"].as_str().map(str::to_string))
+                        .collect();
+
                     for role in &body.roles {
-                        c.db
-                            .execute(
-                                "INSERT INTO core.user_roles (user_id, role_id) \
+                        c.db.execute(
+                            "INSERT INTO core.user_roles (user_id, role_id) \
                                  VALUES ($1::uuid, $2) ON CONFLICT DO NOTHING",
+                            vec![SqlValue::Text(uid.clone()), SqlValue::Text(role.clone())],
+                        )
+                        .await?;
+                    }
+                    for role in current.iter().filter(|r| !body.roles.contains(r)) {
+                        let deleted =
+                            c.db.execute(
+                                "DELETE FROM core.user_roles \
+                                 WHERE user_id = $1::uuid AND role_id = $2",
                                 vec![SqlValue::Text(uid.clone()), SqlValue::Text(role.clone())],
                             )
-                            .await?;
+                            .await;
+                        if let Err(e) = deleted {
+                            // The schema's keep-an-admin trigger (#147). Report it
+                            // as a refusal the caller can act on, not a 500: the
+                            // request is valid, the world is not ready for it.
+                            if e.to_string().contains("last_admin") {
+                                return PluginResponse::error(
+                                    409,
+                                    "refusing to remove the last admin — grant another user \
+                                     `chief` first (or run `adjutant grant-role`)",
+                                );
+                            }
+                            return Err(e);
+                        }
                     }
                     c.audit
                         .log(
@@ -712,9 +824,8 @@ impl AdjutantPlugin for AuthPlugin {
             route_handler(move |_req| {
                 let c = c.clone();
                 async move {
-                    let rows = c
-                        .db
-                        .query(
+                    let rows =
+                        c.db.query(
                             "SELECT u.id::text AS id, u.username, u.email, u.display_name, \
                                     u.is_active, \
                                     COALESCE(ARRAY(\
@@ -729,10 +840,18 @@ impl AdjutantPlugin for AuthPlugin {
             }),
         );
 
-        vec![login, logout, me, register, create_user, assign_roles, list_users]
-            .into_iter()
-            .chain(self.oidc_routes(ctx.clone()))
-            .collect()
+        vec![
+            login,
+            logout,
+            me,
+            register,
+            create_user,
+            assign_roles,
+            list_users,
+        ]
+        .into_iter()
+        .chain(self.oidc_routes(ctx.clone()))
+        .collect()
     }
 }
 
@@ -764,30 +883,24 @@ impl AuthPlugin {
                     };
                     // One-time state, stored server-side (SPEC: no client trust).
                     let state = new_token();
-                    c.db
-                        .execute(
-                            "INSERT INTO oidc_states (state) VALUES ($1) \
+                    c.db.execute(
+                        "INSERT INTO oidc_states (state) VALUES ($1) \
                              ON CONFLICT (state) DO NOTHING",
-                            vec![SqlValue::Text(state.clone())],
-                        )
-                        .await?;
+                        vec![SqlValue::Text(state.clone())],
+                    )
+                    .await?;
                     // Separate execute: sqlx prepared statements accept one
                     // command only ("cannot insert multiple commands").
-                    c.db
-                        .execute(
-                            "DELETE FROM oidc_states \
+                    c.db.execute(
+                        "DELETE FROM oidc_states \
                              WHERE created_at < now() - interval '15 minutes'",
-                            vec![],
-                        )
-                        .await?;
-                    let redirect = req
-                        .query_param("redirect")
-                        .unwrap_or("1")
-                        .to_string();
+                        vec![],
+                    )
+                    .await?;
+                    let redirect = req.query_param("redirect").unwrap_or("1").to_string();
                     // Per OIDC, the authorize endpoint comes from discovery —
                     // never guess it (the sep() helper builds DISCOVERY urls).
-                    let auth_ep =
-                        discover(&c.http, &oidc.issuer, "authorization_endpoint").await?;
+                    let auth_ep = discover(&c.http, &oidc.issuer, "authorization_endpoint").await?;
                     let sep_char = if auth_ep.contains('?') { "&" } else { "?" };
                     let url = format!(
                         "{auth_ep}{sep_char}response_type=code&client_id={}&redirect_uri={}&state={}&scope=openid+email+profile",
@@ -802,9 +915,12 @@ impl AuthPlugin {
                             .push(("cache-control".into(), "no-store".into()));
                         return Ok(resp);
                     }
-                    PluginResponse::json(200, &serde_json::json!({
-                        "authorize_url": url, "state": state,
-                    }))
+                    PluginResponse::json(
+                        200,
+                        &serde_json::json!({
+                            "authorize_url": url, "state": state,
+                        }),
+                    )
                 }
             }),
         );
@@ -829,9 +945,8 @@ impl AuthPlugin {
                         return PluginResponse::error(400, "missing code or state");
                     }
                     // Consume state (single-use, 15 min TTL enforced on insert).
-                    let consumed = c
-                        .db
-                        .query(
+                    let consumed =
+                        c.db.query(
                             "DELETE FROM oidc_states WHERE state = $1 RETURNING state",
                             vec![SqlValue::Text(state)],
                         )
@@ -854,8 +969,14 @@ impl AuthPlugin {
                         .request(
                             "POST".into(),
                             token_url,
-                            vec![("content-type".into(), "application/x-www-form-urlencoded".into())],
-                            Some(("application/x-www-form-urlencoded".into(), form.into_bytes())),
+                            vec![(
+                                "content-type".into(),
+                                "application/x-www-form-urlencoded".into(),
+                            )],
+                            Some((
+                                "application/x-www-form-urlencoded".into(),
+                                form.into_bytes(),
+                            )),
                         )
                         .await?;
                     if resp.status >= 400 {
@@ -876,9 +997,8 @@ impl AuthPlugin {
                     let email = claims.email.clone();
 
                     // Find-or-create the user keyed on the IdP subject.
-                    let rows = c
-                        .db
-                        .query(
+                    let rows =
+                        c.db.query(
                             "SELECT id::text AS id FROM core.users WHERE external_id = $1",
                             vec![SqlValue::Text(subject.clone())],
                         )
@@ -1000,9 +1120,14 @@ async fn discover(
     field: &str,
 ) -> Result<String, SdkError> {
     let url = discovery_url(issuer);
-    let resp = http.request("GET".into(), url.clone(), vec![], None).await?;
+    let resp = http
+        .request("GET".into(), url.clone(), vec![], None)
+        .await?;
     if resp.status >= 400 {
-        return Err(SdkError::Internal(format!("discovery failed: HTTP {}", resp.status)));
+        return Err(SdkError::Internal(format!(
+            "discovery failed: HTTP {}",
+            resp.status
+        )));
     }
     let doc: serde_json::Value = resp.json()?;
     doc[field]
@@ -1044,8 +1169,8 @@ async fn verify_id_token(
     use jsonwebtoken::jwk::JwkSet;
     use jsonwebtoken::{decode, decode_header, Algorithm, DecodingKey, Validation};
 
-    let header = decode_header(token)
-        .map_err(|e| SdkError::BadRequest(format!("id_token header: {e}")))?;
+    let header =
+        decode_header(token).map_err(|e| SdkError::BadRequest(format!("id_token header: {e}")))?;
 
     let key = match header.alg {
         Algorithm::HS256 | Algorithm::HS384 | Algorithm::HS512 => {
@@ -1089,7 +1214,10 @@ mod oidc_tests {
     #[test]
     fn urlencode_escapes_query_unsafe_bytes() {
         assert_eq!(urlencode("ab_c-1.2~"), "ab_c-1.2~");
-        assert_eq!(urlencode("https://a b/c?d=e&f"), "https%3A%2F%2Fa%20b%2Fc%3Fd%3De%26f");
+        assert_eq!(
+            urlencode("https://a b/c?d=e&f"),
+            "https%3A%2F%2Fa%20b%2Fc%3Fd%3De%26f"
+        );
     }
 
     #[test]
@@ -1136,12 +1264,8 @@ mod oidc_tests {
         let mut v = Validation::new(Algorithm::HS256);
         v.set_issuer(&["https://idp.example"]);
         v.set_audience(&["adjutant"]);
-        let out = decode::<C>(
-            &tok,
-            &DecodingKey::from_secret(b"shared-secret"),
-            &v,
-        )
-        .expect("valid token verifies");
+        let out = decode::<C>(&tok, &DecodingKey::from_secret(b"shared-secret"), &v)
+            .expect("valid token verifies");
         assert_eq!(out.claims.sub, "idp-user-1");
         assert_eq!(out.claims.email, "u@example.org");
 
@@ -1172,7 +1296,10 @@ mod tests {
         let h = hash_password("correct horse battery staple").unwrap();
         assert!(verify_password("correct horse battery staple", &h));
         assert!(!verify_password("wrong password", &h));
-        assert!(!verify_password("correct horse battery staple", "not-a-hash"));
+        assert!(!verify_password(
+            "correct horse battery staple",
+            "not-a-hash"
+        ));
     }
 
     #[test]
@@ -1188,7 +1315,10 @@ mod tests {
     #[test]
     fn extract_token_from_cookie_and_bearer() {
         let mut h = HashMap::new();
-        h.insert("cookie".into(), format!("{SESSION_COOKIE}=abc123; theme=dark"));
+        h.insert(
+            "cookie".into(),
+            format!("{SESSION_COOKIE}=abc123; theme=dark"),
+        );
         assert_eq!(extract_token(&h).as_deref(), Some("abc123"));
 
         let mut h = HashMap::new();
@@ -1354,7 +1484,11 @@ mod id_token_tests {
             } else {
                 return Err(SdkError::Internal(format!("unexpected url {url}")));
             };
-            Ok(HttpResponse { status: 200, headers: HashMap::new(), body })
+            Ok(HttpResponse {
+                status: 200,
+                headers: HashMap::new(),
+                body,
+            })
         }
     }
 
@@ -1398,7 +1532,9 @@ mod id_token_tests {
     async fn hs256_valid_token_is_accepted() {
         let http: Arc<dyn HostHttp> = Arc::new(StubHttp { jwks: None });
         let tok = hs256(&claims(ISSUER, CLIENT, 3600), SECRET.as_bytes());
-        let got = verify_id_token(&http, &oidc(), &tok).await.expect("valid token");
+        let got = verify_id_token(&http, &oidc(), &tok)
+            .await
+            .expect("valid token");
         assert_eq!(got.sub, "idp-user-1");
         assert_eq!(got.email.as_deref(), Some("u@example.org"));
     }
@@ -1409,14 +1545,20 @@ mod id_token_tests {
         // An hour past expiry: comfortably outside jsonwebtoken's default 60s
         // clock-skew leeway (which is why -60 would still be accepted).
         let tok = hs256(&claims(ISSUER, CLIENT, -3600), SECRET.as_bytes());
-        assert!(verify_id_token(&http, &oidc(), &tok).await.is_err(), "expired token must fail");
+        assert!(
+            verify_id_token(&http, &oidc(), &tok).await.is_err(),
+            "expired token must fail"
+        );
     }
 
     #[tokio::test]
     async fn wrong_issuer_audience_and_secret_are_rejected() {
         let http: Arc<dyn HostHttp> = Arc::new(StubHttp { jwks: None });
         for tok in [
-            hs256(&claims("https://evil.example", CLIENT, 3600), SECRET.as_bytes()),
+            hs256(
+                &claims("https://evil.example", CLIENT, 3600),
+                SECRET.as_bytes(),
+            ),
             hs256(&claims(ISSUER, "someone-else", 3600), SECRET.as_bytes()),
             hs256(&claims(ISSUER, CLIENT, 3600), b"wrong-secret"),
         ] {
@@ -1429,7 +1571,9 @@ mod id_token_tests {
 
     #[tokio::test]
     async fn rs256_token_is_verified_against_jwks() {
-        let http: Arc<dyn HostHttp> = Arc::new(StubHttp { jwks: Some(JWKS.into()) });
+        let http: Arc<dyn HostHttp> = Arc::new(StubHttp {
+            jwks: Some(JWKS.into()),
+        });
         let header = jsonwebtoken::Header {
             alg: jsonwebtoken::Algorithm::RS256,
             kid: Some("test-key-1".into()),
@@ -1441,13 +1585,17 @@ mod id_token_tests {
             &jsonwebtoken::EncodingKey::from_rsa_pem(RSA_PEM.as_bytes()).unwrap(),
         )
         .unwrap();
-        let got = verify_id_token(&http, &oidc(), &tok).await.expect("RS256 token via JWKS");
+        let got = verify_id_token(&http, &oidc(), &tok)
+            .await
+            .expect("RS256 token via JWKS");
         assert_eq!(got.sub, "idp-user-1");
     }
 
     #[tokio::test]
     async fn rs256_token_with_unknown_kid_is_rejected() {
-        let http: Arc<dyn HostHttp> = Arc::new(StubHttp { jwks: Some(JWKS.into()) });
+        let http: Arc<dyn HostHttp> = Arc::new(StubHttp {
+            jwks: Some(JWKS.into()),
+        });
         let header = jsonwebtoken::Header {
             alg: jsonwebtoken::Algorithm::RS256,
             kid: Some("no-such-key".into()),

@@ -230,6 +230,12 @@ probe("8 anonymous denied on same route", "GET", "/api/hello/greetings", expect_
 probe("9 chief creates scout", "POST", "/api/auth/users", token=chief_token,
       body={"username": "beatrice", "password": "shannons-scout-pass", "roles": ["scout"]},
       expect_status=201)
+# #147: the only admin cannot strip their own last grant. The scout exists but
+# holds no administrative role, so this write would leave nobody able to
+# administer the troop. The trigger behind it is what has to refuse, not just
+# this handler.
+probe("9a last admin cannot be stripped", "POST", "/api/auth/roles", token=chief_token,
+      body={"username": "christopher", "roles": []}, expect_status=409)
 sr = probe("10 scout logs in", "POST", "/api/auth/login",
            body={"username": "beatrice", "password": "shannons-scout-pass"},
            expect_status=200, expect_in="token")
