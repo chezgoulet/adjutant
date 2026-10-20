@@ -154,9 +154,12 @@ name = "adjutant-sdk"
 version = "0.3.0"
 dependencies = [
  "async-trait",
+ "base64",
  "chrono",
+ "hmac",
  "serde",
  "serde_json",
+ "sha2",
  "thiserror 2.0.20",
  "tokio",
  "uuid",
