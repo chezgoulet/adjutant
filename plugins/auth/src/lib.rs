@@ -85,6 +85,19 @@ fn token_hash(token: &str) -> String {
     hex::encode(Sha256::digest(token.as_bytes()))
 }
 
+/// Shape check before binding a path capture as `::uuid`. A malformed id is a
+/// missing id to the caller (404), not a database error they can distinguish.
+fn is_uuid(value: &str) -> bool {
+    value.len() == 36
+        && value.chars().enumerate().all(|(i, ch)| {
+            if matches!(i, 8 | 13 | 18 | 23) {
+                ch == '-'
+            } else {
+                ch.is_ascii_hexdigit()
+            }
+        })
+}
+
 // ---------------------------------------------------------------------------
 // Session handling (shared by routes + identity provider)
 // ---------------------------------------------------------------------------
@@ -92,6 +105,9 @@ fn token_hash(token: &str) -> String {
 #[derive(Debug, Serialize)]
 struct SessionUser {
     id: String,
+    /// The `core.sessions.id` the presented token belongs to. Used to tell the
+    /// caller which listed session is the current one.
+    session_id: String,
     username: String,
     email: Option<String>,
     display_name: String,
@@ -136,7 +152,8 @@ fn extract_token(headers: &HashMap<String, String>) -> Option<String> {
 async fn session_identity(db: &DbHandle, token: &str) -> Result<Option<SessionUser>, SdkError> {
     let rows = db
         .query(
-            "SELECT u.id::text AS id, u.username, u.email, u.display_name, u.is_active, \
+            "SELECT u.id::text AS id, s.id::text AS session_id, \
+                    u.username, u.email, u.display_name, u.is_active, \
                     COALESCE(ARRAY(\
                         SELECT role_id FROM core.user_roles WHERE user_id = u.id\
                     ), '{}') AS roles, \
@@ -149,7 +166,8 @@ async fn session_identity(db: &DbHandle, token: &str) -> Result<Option<SessionUs
                     ), '[]'::jsonb) AS grant_list \
              FROM core.sessions s \
              JOIN core.users u ON u.id = s.user_id \
-             WHERE s.token_hash = $1 AND s.expires_at > now()",
+             WHERE s.token_hash = $1 AND s.expires_at > now() \
+               AND s.revoked_at IS NULL",
             vec![SqlValue::Text(token_hash(token))],
         )
         .await?;
@@ -179,12 +197,31 @@ async fn session_identity(db: &DbHandle, token: &str) -> Result<Option<SessionUs
         .unwrap_or_default();
     Ok(Some(SessionUser {
         id: row["id"].as_str().unwrap_or_default().to_string(),
+        session_id: row["session_id"].as_str().unwrap_or_default().to_string(),
         username,
         email: row["email"].as_str().map(String::from),
         display_name: row["display_name"].as_str().unwrap_or_default().to_string(),
         roles,
         grants,
     }))
+}
+
+/// The authenticated caller, or the 401 response to return.
+///
+/// Shared by every route that acts on the caller's own account, so the
+/// revocation check (`session_identity`) cannot be bypassed by a new handler.
+async fn session_or_401(
+    ctx: &PluginContext,
+    req: &PluginRequest,
+) -> Result<SessionUser, PluginResponse> {
+    let token = extract_token(&req.headers)
+        .ok_or_else(|| PluginResponse::error(401, "authentication required").unwrap())?;
+    session_identity(&ctx.db, &token)
+        .await
+        .map_err(|e| PluginResponse::error(500, e.to_string()).unwrap())
+        .and_then(|u| {
+            u.ok_or_else(|| PluginResponse::error(401, "session expired or invalid").unwrap())
+        })
 }
 
 /// One `core.user_roles` row (as JSON) → [`RoleGrant`], **fail closed**.
@@ -239,6 +276,25 @@ fn grant_from_row(user: &str, g: &serde_json::Value) -> Option<RoleGrant> {
 /// (SQLSTATE 23505) as text across the host boundary, so match both forms.
 fn is_duplicate_key(err: &str) -> bool {
     err.contains("duplicate key") || err.contains("23505")
+}
+
+/// Record a refused login: the attempted username and a reason category, never
+/// the submitted secret. The actor is unknown (there is no session), so the
+/// entry falls back to `details.user_id`-style attribution in `details`.
+async fn audit_login_failure(
+    audit: &AuditService,
+    username: &str,
+    reason: &str,
+) -> Result<(), SdkError> {
+    audit
+        .log(
+            None,
+            "auth.login.failed",
+            "user",
+            username,
+            serde_json::json!({"username": username, "reason": reason}),
+        )
+        .await
 }
 
 /// Give the bootstrap slot back when registration failed before a user existed,
@@ -299,14 +355,43 @@ async fn create_session(
     Ok((token, chrono::Utc::now().to_rfc3339()))
 }
 
-fn session_cookie(token: &str, ttl_hours: i64) -> (String, String) {
+/// Whether the deployment explicitly opted out of the `Secure` cookie attribute.
+///
+/// Development-only escape hatch: the server binds plain HTTP locally, where a
+/// browser would refuse to send a `Secure` cookie. It is **never** inferred from
+/// the bind address or from a forwarded header — a deployment that terminates
+/// TLS at a proxy must leave this unset.
+fn insecure_cookies_enabled() -> bool {
+    std::env::var("ADJUTANT_INSECURE_COOKIES")
+        .map(|v| v == "true")
+        .unwrap_or(false)
+}
+
+fn session_cookie_with(token: &str, ttl_hours: i64, secure: bool) -> (String, String) {
+    let secure = if secure { "; Secure" } else { "" };
     (
         "set-cookie".into(),
         format!(
-            "{SESSION_COOKIE}={token}; HttpOnly; SameSite=Lax; Path=/; Max-Age={}",
+            "{SESSION_COOKIE}={token}; HttpOnly; SameSite=Lax; Path=/; Max-Age={}{secure}",
             ttl_hours * 3600
         ),
     )
+}
+
+fn session_cookie(token: &str, ttl_hours: i64) -> (String, String) {
+    session_cookie_with(token, ttl_hours, !insecure_cookies_enabled())
+}
+
+fn cleared_session_cookie_with(secure: bool) -> (String, String) {
+    let secure = if secure { "; Secure" } else { "" };
+    (
+        "set-cookie".into(),
+        format!("{SESSION_COOKIE}=; HttpOnly; SameSite=Lax; Path=/; Max-Age=0{secure}"),
+    )
+}
+
+fn cleared_session_cookie() -> (String, String) {
+    cleared_session_cookie_with(!insecure_cookies_enabled())
 }
 
 // ---------------------------------------------------------------------------
@@ -357,14 +442,7 @@ impl AuthPlugin {
     }
 
     async fn require_session(&self, req: &PluginRequest) -> Result<SessionUser, PluginResponse> {
-        let token = extract_token(&req.headers)
-            .ok_or_else(|| PluginResponse::error(401, "authentication required").unwrap())?;
-        session_identity(&self.ctx().db, &token)
-            .await
-            .map_err(|e| PluginResponse::error(500, e.to_string()).unwrap())
-            .and_then(|u| {
-                u.ok_or_else(|| PluginResponse::error(401, "session expired or invalid").unwrap())
-            })
+        session_or_401(self.ctx(), req).await
     }
 
     fn ttl(&self) -> i64 {
@@ -449,20 +527,34 @@ impl AdjutantPlugin for AuthPlugin {
                             vec![SqlValue::Text(body.username.clone())],
                         )
                         .await?;
-                    let row = rows
-                        .into_iter()
-                        .next()
-                        .ok_or_else(|| SdkError::BadRequest("invalid credentials".into()))?;
+                    let Some(row) = rows.into_iter().next() else {
+                        audit_login_failure(&c.audit, &body.username, "unknown_user").await?;
+                        return Err(SdkError::BadRequest("invalid credentials".into()));
+                    };
                     let stored = row["password_hash"].as_str().unwrap_or("");
-                    if stored.is_empty()
-                        || !verify_password(&body.password, stored)
-                        || row["is_active"] != serde_json::json!(true)
-                    {
-                        // Same message for unknown user and bad password — no user enumeration.
+                    if stored.is_empty() || !verify_password(&body.password, stored) {
+                        // The reason is recorded for auditors; the response is the
+                        // same for an unknown user and a bad password (no enumeration).
+                        audit_login_failure(&c.audit, &body.username, "bad_password").await?;
+                        return Err(SdkError::BadRequest("invalid credentials".into()));
+                    }
+                    if row["is_active"] != serde_json::json!(true) {
+                        audit_login_failure(&c.audit, &body.username, "inactive").await?;
                         return Err(SdkError::BadRequest("invalid credentials".into()));
                     }
                     let uid = row["id"].as_str().unwrap_or_default().to_string();
                     let (token, expires) = create_session(&c.db, &uid, ttl).await?;
+                    // Success is attributed to the user; the token itself is never
+                    // part of the audit record.
+                    c.audit
+                        .log(
+                            Some(&Identity::from_grants(uid.clone(), vec![])),
+                            "auth.login",
+                            "user",
+                            &uid,
+                            serde_json::json!({"username": body.username}),
+                        )
+                        .await?;
                     let mut resp = PluginResponse::json(
                         200,
                         &serde_json::json!({
@@ -486,18 +578,201 @@ impl AdjutantPlugin for AuthPlugin {
                 async move {
                     let token = extract_token(&req.headers).unwrap_or_default();
                     if !token.is_empty() {
-                        c.db.execute(
-                            "DELETE FROM core.sessions WHERE token_hash = $1",
-                            vec![SqlValue::Text(token_hash(&token))],
-                        )
-                        .await?;
+                        let removed =
+                            c.db.query(
+                                "DELETE FROM core.sessions WHERE token_hash = $1 \
+                                 RETURNING id::text AS id, user_id::text AS user_id",
+                                vec![SqlValue::Text(token_hash(&token))],
+                            )
+                            .await?;
+                        if let Some(row) = removed.first() {
+                            let uid = row["user_id"].as_str().unwrap_or_default().to_string();
+                            let sid = row["id"].as_str().unwrap_or_default().to_string();
+                            c.audit
+                                .log(
+                                    Some(&Identity::from_grants(uid, vec![])),
+                                    "auth.logout",
+                                    "session",
+                                    &sid,
+                                    serde_json::json!({}),
+                                )
+                                .await?;
+                        }
                     }
                     let mut resp = PluginResponse::json(200, &serde_json::json!({"ok": true}))?;
-                    resp.headers.push((
-                        "set-cookie".into(),
-                        format!("{SESSION_COOKIE}=; Path=/; Max-Age=0"),
-                    ));
+                    resp.headers.push(cleared_session_cookie());
                     Ok(resp)
+                }
+            }),
+        );
+
+        // --- own sessions: list ---------------------------------------------
+        let c = ctx.clone();
+        let list_sessions = RouteDefinition::get(
+            "/api/auth/sessions",
+            route_handler(move |req| {
+                let c = c.clone();
+                async move {
+                    let user = match session_or_401(&c, &req).await {
+                        Err(resp) => return Ok(resp),
+                        Ok(user) => user,
+                    };
+                    // `revoked_at` is filtered here as well as in the identity
+                    // lookup: a revoked session is no longer a thing the caller
+                    // is holding.
+                    let rows =
+                        c.db.query(
+                            "SELECT id::text AS id, created_at, expires_at, device_info \
+                             FROM core.sessions \
+                             WHERE user_id = $1::uuid AND revoked_at IS NULL \
+                               AND expires_at > now() \
+                             ORDER BY created_at DESC",
+                            vec![SqlValue::Text(user.id.clone())],
+                        )
+                        .await?;
+                    let sessions: Vec<serde_json::Value> = rows
+                        .iter()
+                        .map(|r| {
+                            let id = r["id"].as_str().unwrap_or_default();
+                            serde_json::json!({
+                                "id": id,
+                                "created_at": r["created_at"],
+                                "expires_at": r["expires_at"],
+                                "device_info": r["device_info"],
+                                "current": id == user.session_id.as_str(),
+                            })
+                        })
+                        .collect();
+                    PluginResponse::json(200, &serde_json::json!({"sessions": sessions}))
+                }
+            }),
+        );
+
+        // --- own sessions: revoke one ---------------------------------------
+        let c = ctx.clone();
+        let revoke_session = RouteDefinition::delete(
+            "/api/auth/sessions/{id}",
+            route_handler(move |req| {
+                let c = c.clone();
+                async move {
+                    let user = match session_or_401(&c, &req).await {
+                        Err(resp) => return Ok(resp),
+                        Ok(user) => user,
+                    };
+                    let id = req.params.get("id").cloned().unwrap_or_default();
+                    // Another user's session and a missing one take the same path:
+                    // both update no row and both answer 404 (never 403), so the
+                    // response cannot be used to test whether an id exists.
+                    if !is_uuid(&id) {
+                        return PluginResponse::error(404, "session not found");
+                    }
+                    let rows =
+                        c.db.query(
+                            "UPDATE core.sessions SET revoked_at = now() \
+                             WHERE id = $1::uuid AND user_id = $2::uuid \
+                               AND revoked_at IS NULL \
+                             RETURNING id::text AS id",
+                            vec![SqlValue::Text(id.clone()), SqlValue::Text(user.id.clone())],
+                        )
+                        .await?;
+                    if rows.is_empty() {
+                        return PluginResponse::error(404, "session not found");
+                    }
+                    c.audit
+                        .log(
+                            Some(&Identity::from_grants(user.id.clone(), vec![])),
+                            "auth.session.revoke",
+                            "session",
+                            &id,
+                            serde_json::json!({}),
+                        )
+                        .await?;
+                    PluginResponse::json(200, &serde_json::json!({"ok": true, "id": id}))
+                }
+            }),
+        );
+
+        // --- change password (revokes every other session) -------------------
+        let c = ctx.clone();
+        let change_password = RouteDefinition::post(
+            "/api/auth/password",
+            route_handler(move |req| {
+                let c = c.clone();
+                async move {
+                    #[derive(Deserialize)]
+                    struct Body {
+                        current_password: String,
+                        new_password: String,
+                    }
+                    let user = match session_or_401(&c, &req).await {
+                        Err(resp) => return Ok(resp),
+                        Ok(user) => user,
+                    };
+                    let body: Body = req.json()?;
+                    if body.new_password.len() < 8 {
+                        return PluginResponse::error(
+                            400,
+                            "new password must be at least 8 characters",
+                        );
+                    }
+                    let rows =
+                        c.db.query(
+                            "SELECT password_hash FROM core.users WHERE id = $1::uuid",
+                            vec![SqlValue::Text(user.id.clone())],
+                        )
+                        .await?;
+                    let stored = rows
+                        .first()
+                        .and_then(|r| r["password_hash"].as_str())
+                        .unwrap_or("");
+                    if stored.is_empty() || !verify_password(&body.current_password, stored) {
+                        c.audit
+                            .log(
+                                Some(&Identity::from_grants(user.id.clone(), vec![])),
+                                "auth.password.change.failed",
+                                "user",
+                                &user.id,
+                                serde_json::json!({"reason": "bad_current_password"}),
+                            )
+                            .await?;
+                        return PluginResponse::error(400, "current password is incorrect");
+                    }
+                    let hash = hash_password(&body.new_password)?;
+                    let updated =
+                        c.db.execute(
+                            "UPDATE core.users SET password_hash = $1 WHERE id = $2::uuid",
+                            vec![SqlValue::Text(hash), SqlValue::Text(user.id.clone())],
+                        )
+                        .await?;
+                    if updated == 0 {
+                        return PluginResponse::error(401, "session expired or invalid");
+                    }
+                    // Every sibling goes; the presented session is excluded by id,
+                    // so the caller is not logged out by their own password change.
+                    let revoked =
+                        c.db.execute(
+                            "UPDATE core.sessions SET revoked_at = now() \
+                             WHERE user_id = $1::uuid AND id <> $2::uuid \
+                               AND revoked_at IS NULL",
+                            vec![
+                                SqlValue::Text(user.id.clone()),
+                                SqlValue::Text(user.session_id.clone()),
+                            ],
+                        )
+                        .await?;
+                    c.audit
+                        .log(
+                            Some(&Identity::from_grants(user.id.clone(), vec![])),
+                            "auth.password.change",
+                            "user",
+                            &user.id,
+                            serde_json::json!({"revoked_other_sessions": revoked}),
+                        )
+                        .await?;
+                    PluginResponse::json(
+                        200,
+                        &serde_json::json!({"ok": true, "revoked_other_sessions": revoked}),
+                    )
                 }
             }),
         );
@@ -637,6 +912,15 @@ impl AdjutantPlugin for AuthPlugin {
                     )
                     .await?;
                     let (token, expires) = create_session(&c.db, &uid, ttl).await?;
+                    c.audit
+                        .log(
+                            Some(&Identity::from_grants(uid.clone(), vec![])),
+                            "auth.register",
+                            "user",
+                            &uid,
+                            serde_json::json!({"username": body.username}),
+                        )
+                        .await?;
                     let mut resp = PluginResponse::json(
                         201,
                         &serde_json::json!({
@@ -848,6 +1132,9 @@ impl AdjutantPlugin for AuthPlugin {
             logout,
             me,
             register,
+            list_sessions,
+            revoke_session,
+            change_password,
             create_user,
             assign_roles,
             list_users,
@@ -1335,11 +1622,37 @@ mod tests {
     }
 
     #[test]
-    fn cookie_format_is_http_only() {
-        let (_, v) = session_cookie("tok", 24);
-        assert!(v.contains("HttpOnly"));
-        assert!(v.contains("SameSite=Lax"));
-        assert!(v.contains("Max-Age=86400"));
+    fn cookie_is_secure_by_default_and_pins_every_attribute() {
+        // The old test asserted only that the attributes it expected were
+        // present, so a missing `Secure` was invisible. Pin the whole set.
+        let (_, secure) = session_cookie_with("tok", 24, true);
+        for attr in [
+            "HttpOnly",
+            "SameSite=Lax",
+            "Path=/",
+            "Max-Age=86400",
+            "Secure",
+        ] {
+            assert!(secure.contains(attr), "missing {attr}: {secure}");
+        }
+
+        // The development-only opt-out removes exactly `Secure`, nothing else.
+        let (_, insecure) = session_cookie_with("tok", 24, false);
+        assert!(!insecure.contains("Secure"), "{insecure}");
+        assert!(insecure.contains("HttpOnly") && insecure.contains("SameSite=Lax"));
+
+        // Clearing the cookie carries the same attributes, including `Secure`.
+        let (_, cleared) = cleared_session_cookie_with(true);
+        assert!(cleared.contains("Max-Age=0"));
+        assert!(cleared.contains("HttpOnly") && cleared.contains("SameSite=Lax"));
+        assert!(cleared.contains("Secure"), "{cleared}");
+
+        // The default (no ADJUTANT_INSECURE_COOKIES opt-in) must be Secure.
+        let (_, default) = session_cookie("tok", 24);
+        assert!(
+            default.contains("Secure"),
+            "default cookie is not Secure: {default}"
+        );
     }
 
     #[test]
@@ -1364,6 +1677,7 @@ mod tests {
         let host = TestHost::new();
         host.db.push_rows(vec![serde_json::json!({
             "id": "11111111-1111-1111-1111-111111111111",
+            "session_id": "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa",
             "username": "bea",
             "email": "bea@example.org",
             "display_name": "Bea",
@@ -1393,6 +1707,10 @@ mod tests {
         // The query went through the host and bound the token hash.
         let calls = host.db.queried.lock().unwrap();
         assert!(calls[0].sql_contains(&["core.sessions", "token_hash"]));
+        assert!(
+            calls[0].sql_contains(&["revoked_at IS NULL"]),
+            "identity lookup must reject a revoked session, not only the login path"
+        );
     }
 
     /// Scopes fail closed: an unrecognised/missing/empty `scope_type`, or a
@@ -1444,6 +1762,341 @@ mod tests {
                 "a malformed grant must be dropped, not widened: {bad}"
             );
         }
+    }
+
+    // --- new session/password handlers -------------------------------------
+
+    use adjutant_sdk::testing::{response_json, TestHost, TestRequest};
+
+    const CALLER: &str = "11111111-1111-1111-1111-111111111111";
+    const CALLER_SESSION: &str = "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa";
+    const OTHER_SESSION: &str = "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb";
+
+    fn session_row(user_id: &str, session_id: &str) -> serde_json::Value {
+        serde_json::json!({
+            "id": user_id,
+            "session_id": session_id,
+            "username": "bea",
+            "email": "bea@example.org",
+            "display_name": "Bea",
+            "is_active": true,
+            "roles": ["chief"],
+            "grant_list": [
+                {"role_id": "chief", "scope_type": "troop",
+                 "scope_id": "00000000-0000-0000-0000-000000000000"}
+            ]
+        })
+    }
+
+    fn with_cookie(req: TestRequest) -> TestRequest {
+        req.header("cookie", "adjutant_session=raw-token")
+    }
+
+    async fn call(
+        host: &TestHost,
+        method: &str,
+        path: &str,
+        req: PluginRequest,
+    ) -> (u16, serde_json::Value) {
+        let mut plugin = AuthPlugin::new();
+        plugin.init(host.context("auth")).await.unwrap();
+        let routes = plugin.routes();
+        let route = routes
+            .iter()
+            .find(|r| r.method.as_str() == method && r.path == path)
+            .unwrap_or_else(|| panic!("route {method} {path}"));
+        match (route.handler)(req).await {
+            Ok(resp) => (resp.status, response_json(&resp)),
+            Err(e) => (e.status(), serde_json::json!({"error": e.to_string()})),
+        }
+    }
+
+    fn audit_params(host: &TestHost) -> Vec<String> {
+        host.db
+            .last_execute_params("core.audit_log")
+            .expect("an audit INSERT")
+            .iter()
+            .map(|v| format!("{v:?}"))
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn list_sessions_requires_a_session() {
+        let host = TestHost::new();
+        let (status, _) = call(
+            &host,
+            "GET",
+            "/api/auth/sessions",
+            TestRequest::get("/api/auth/sessions").build(),
+        )
+        .await;
+        assert_eq!(status, 401);
+        assert_eq!(host.db.query_count(), 0, "no token, no lookup");
+    }
+
+    #[tokio::test]
+    async fn list_sessions_marks_the_presented_session() {
+        let host = TestHost::new();
+        host.db.push_rows(vec![session_row(CALLER, CALLER_SESSION)]);
+        host.db.push_rows(vec![
+            serde_json::json!({
+                "id": CALLER_SESSION, "created_at": "2026-10-01T00:00:00Z",
+                "expires_at": "2026-11-01T00:00:00Z", "device_info": {"os": "phone"}
+            }),
+            serde_json::json!({
+                "id": OTHER_SESSION, "created_at": "2026-10-02T00:00:00Z",
+                "expires_at": "2026-11-02T00:00:00Z", "device_info": {}
+            }),
+        ]);
+        let req = with_cookie(TestRequest::get("/api/auth/sessions")).build();
+        let (status, body) = call(&host, "GET", "/api/auth/sessions", req).await;
+        assert_eq!(status, 200, "{body}");
+        let sessions = body["sessions"].as_array().expect("sessions");
+        assert_eq!(sessions.len(), 2);
+        assert_eq!(sessions[0]["current"], serde_json::json!(true));
+        assert_eq!(sessions[1]["current"], serde_json::json!(false));
+        assert_eq!(sessions[0]["device_info"]["os"], serde_json::json!("phone"));
+
+        let queried = host.db.queried_sql();
+        assert!(queried[1].contains("user_id = $1::uuid"));
+        assert!(queried[1].contains("revoked_at IS NULL"));
+        let params = host
+            .db
+            .last_query_params("FROM core.sessions")
+            .expect("list params");
+        assert!(matches!(&params[0], SqlValue::Text(v) if v == CALLER));
+    }
+
+    #[tokio::test]
+    async fn revoke_requires_a_session_and_a_well_formed_id() {
+        let host = TestHost::new();
+        let (status, _) = call(
+            &host,
+            "DELETE",
+            "/api/auth/sessions/{id}",
+            TestRequest::delete("/api/auth/sessions/not-a-uuid")
+                .param("id", "not-a-uuid")
+                .build(),
+        )
+        .await;
+        assert_eq!(status, 401);
+        assert_eq!(host.db.query_count(), 0);
+
+        host.db.push_rows(vec![session_row(CALLER, CALLER_SESSION)]);
+        let req = with_cookie(TestRequest::delete("/api/auth/sessions/not-a-uuid"))
+            .param("id", "not-a-uuid")
+            .build();
+        let (status, body) = call(&host, "DELETE", "/api/auth/sessions/{id}", req).await;
+        assert_eq!(status, 404, "{body}");
+        assert_eq!(host.db.query_count(), 1, "only the session lookup ran");
+    }
+
+    #[tokio::test]
+    async fn revoking_another_users_session_is_404() {
+        let host = TestHost::new();
+        host.db.push_rows(vec![session_row(CALLER, CALLER_SESSION)]);
+        // The guarded UPDATE matches no row: not the caller's, or already gone.
+        host.db.push_rows(vec![]);
+        let req = with_cookie(TestRequest::delete(&format!(
+            "/api/auth/sessions/{OTHER_SESSION}"
+        )))
+        .param("id", OTHER_SESSION)
+        .build();
+        let (status, body) = call(&host, "DELETE", "/api/auth/sessions/{id}", req).await;
+        assert_eq!(status, 404, "{body}");
+        assert_eq!(body["error"], serde_json::json!("session not found"));
+        let sql = host.db.queried_sql();
+        assert!(
+            sql[1].contains("user_id = $2::uuid"),
+            "ownership is in the SQL"
+        );
+        let params = host.db.last_query_params("UPDATE core.sessions").unwrap();
+        assert!(matches!(&params[1], SqlValue::Text(v) if v == CALLER));
+    }
+
+    #[tokio::test]
+    async fn revoking_own_session_succeeds_and_is_audited() {
+        let host = TestHost::new();
+        host.db.push_rows(vec![session_row(CALLER, CALLER_SESSION)]);
+        host.db
+            .push_rows(vec![serde_json::json!({"id": OTHER_SESSION})]);
+        host.db.push_rows(vec![serde_json::json!({"id": CALLER})]); // audit actor exists
+        let req = with_cookie(TestRequest::delete(&format!(
+            "/api/auth/sessions/{OTHER_SESSION}"
+        )))
+        .param("id", OTHER_SESSION)
+        .build();
+        let (status, body) = call(&host, "DELETE", "/api/auth/sessions/{id}", req).await;
+        assert_eq!(status, 200, "{body}");
+        let params = host.db.last_query_params("UPDATE core.sessions").unwrap();
+        assert!(matches!(&params[0], SqlValue::Text(v) if v == OTHER_SESSION));
+        let audit = audit_params(&host).join(" ");
+        assert!(audit.contains("auth.session.revoke"), "{audit}");
+        assert!(!audit.contains("raw-token"));
+    }
+
+    #[tokio::test]
+    async fn password_change_refuses_a_bad_current_password() {
+        let host = TestHost::new();
+        let hash = hash_password("the-real-password").unwrap();
+        host.db.push_rows(vec![session_row(CALLER, CALLER_SESSION)]);
+        host.db
+            .push_rows(vec![serde_json::json!({"password_hash": hash})]);
+        host.db.push_rows(vec![serde_json::json!({"id": CALLER})]); // audit actor exists
+        let req = with_cookie(TestRequest::post("/api/auth/password"))
+            .json(&serde_json::json!({
+                "current_password": "the-wrong-password",
+                "new_password": "a-new-long-password",
+            }))
+            .build();
+        let (status, body) = call(&host, "POST", "/api/auth/password", req).await;
+        assert_eq!(status, 400, "{body}");
+        let executed = host.db.executed_sql().join(" ");
+        assert!(
+            !executed.contains("SET password_hash"),
+            "hash must not change"
+        );
+        assert!(!executed.contains("core.sessions SET revoked_at"));
+        let audit = audit_params(&host).join(" ");
+        assert!(audit.contains("auth.password.change.failed"), "{audit}");
+        assert!(!audit.contains("the-wrong-password"));
+        assert!(!audit.contains("a-new-long-password"));
+    }
+
+    #[tokio::test]
+    async fn password_change_rejects_a_short_new_password_before_reading_the_hash() {
+        let host = TestHost::new();
+        host.db.push_rows(vec![session_row(CALLER, CALLER_SESSION)]);
+        let req = with_cookie(TestRequest::post("/api/auth/password"))
+            .json(&serde_json::json!({
+                "current_password": "the-real-password",
+                "new_password": "short",
+            }))
+            .build();
+        let (status, _) = call(&host, "POST", "/api/auth/password", req).await;
+        assert_eq!(status, 400);
+        assert_eq!(host.db.query_count(), 1, "only the session lookup ran");
+        assert!(!host
+            .db
+            .executed_sql()
+            .iter()
+            .any(|s| s.contains("password_hash")));
+    }
+
+    #[tokio::test]
+    async fn password_change_revokes_siblings_but_not_the_caller() {
+        let host = TestHost::new();
+        let hash = hash_password("the-real-password").unwrap();
+        host.db.push_rows(vec![session_row(CALLER, CALLER_SESSION)]);
+        host.db
+            .push_rows(vec![serde_json::json!({"password_hash": hash})]);
+        host.db.push_execute(Ok(1)); // password_hash UPDATE
+        host.db.push_execute(Ok(2)); // sibling revocation
+        host.db.push_rows(vec![serde_json::json!({"id": CALLER})]); // audit actor exists
+        let req = with_cookie(TestRequest::post("/api/auth/password"))
+            .json(&serde_json::json!({
+                "current_password": "the-real-password",
+                "new_password": "a-new-long-password",
+            }))
+            .build();
+        let (status, body) = call(&host, "POST", "/api/auth/password", req).await;
+        assert_eq!(status, 200, "{body}");
+        assert_eq!(body["revoked_other_sessions"], serde_json::json!(2));
+
+        let executed = host.db.executed_sql();
+        assert!(executed[0].contains("UPDATE core.users SET password_hash"));
+        assert!(
+            executed[1].contains("UPDATE core.sessions SET revoked_at"),
+            "{executed:?}"
+        );
+        assert!(
+            executed[1].contains("id <> $2::uuid"),
+            "the caller is excluded"
+        );
+        let params = host.db.last_execute_params("UPDATE core.sessions").unwrap();
+        assert!(matches!(&params[0], SqlValue::Text(v) if v == CALLER));
+        assert!(matches!(&params[1], SqlValue::Text(v) if v == CALLER_SESSION));
+        let audit = audit_params(&host).join(" ");
+        assert!(audit.contains("auth.password.change"), "{audit}");
+        assert!(!audit.contains("a-new-long-password"));
+    }
+
+    #[tokio::test]
+    async fn failed_login_is_audited_without_the_submitted_secret() {
+        let host = TestHost::new();
+        host.db.push_rows(vec![]); // no such user
+        let req = TestRequest::post("/api/auth/login")
+            .json(&serde_json::json!({
+                "username": "mallory",
+                "password": "attempted-secret",
+            }))
+            .build();
+        let (status, body) = call(&host, "POST", "/api/auth/login", req).await;
+        assert_eq!(status, 400, "{body}");
+        let audit = audit_params(&host).join(" ");
+        assert!(audit.contains("auth.login.failed"), "{audit}");
+        assert!(audit.contains("mallory"), "{audit}");
+        assert!(audit.contains("unknown_user"), "{audit}");
+        assert!(!audit.contains("attempted-secret"), "{audit}");
+    }
+
+    #[tokio::test]
+    async fn login_success_and_logout_are_audited() {
+        let host = TestHost::new();
+        let hash = hash_password("the-real-password").unwrap();
+        host.db.push_rows(vec![serde_json::json!({
+            "id": CALLER, "username": "bea", "password_hash": hash, "is_active": true
+        })]);
+        host.db.push_rows(vec![serde_json::json!({"id": CALLER})]); // audit actor exists
+        let req = TestRequest::post("/api/auth/login")
+            .json(&serde_json::json!({
+                "username": "bea",
+                "password": "the-real-password",
+            }))
+            .build();
+        let (status, body) = call(&host, "POST", "/api/auth/login", req).await;
+        assert_eq!(status, 200, "{body}");
+        let token = body["token"].as_str().expect("token");
+        let audit = audit_params(&host).join(" ");
+        assert!(audit.contains("auth.login"), "{audit}");
+        assert!(
+            !audit.contains(token),
+            "the session token must never be audited"
+        );
+
+        // Logout deletes the presented row and records the actor from RETURNING.
+        host.db.push_rows(vec![
+            serde_json::json!({"id": OTHER_SESSION, "user_id": CALLER}),
+        ]);
+        host.db.push_rows(vec![serde_json::json!({"id": CALLER})]);
+        let req = with_cookie(TestRequest::post("/api/auth/logout")).build();
+        let (status, _) = call(&host, "POST", "/api/auth/logout", req).await;
+        assert_eq!(status, 200);
+        let audit = audit_params(&host).join(" ");
+        assert!(audit.contains("auth.logout"), "{audit}");
+        assert!(!audit.contains("raw-token"));
+    }
+
+    #[tokio::test]
+    async fn registration_is_audited() {
+        let host = TestHost::new();
+        host.db.push_rows(vec![serde_json::json!({"n": 0})]); // no users yet
+        host.db
+            .push_rows(vec![serde_json::json!({"token": "claim"})]); // bootstrap claim
+        host.db.push_rows(vec![serde_json::json!({"id": CALLER})]); // user INSERT
+        host.db.push_rows(vec![serde_json::json!({"id": CALLER})]); // audit actor exists
+        let req = TestRequest::post("/api/auth/register")
+            .json(&serde_json::json!({
+                "username": "christopher",
+                "password": "correct-horse-battery",
+            }))
+            .build();
+        let (status, body) = call(&host, "POST", "/api/auth/register", req).await;
+        assert_eq!(status, 201, "{body}");
+        let audit = audit_params(&host).join(" ");
+        assert!(audit.contains("auth.register"), "{audit}");
+        assert!(audit.contains("christopher"), "{audit}");
+        assert!(!audit.contains("correct-horse-battery"));
     }
 }
 
