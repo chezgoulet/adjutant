@@ -41,6 +41,54 @@ Adjutant's HTTP API is JSON over HTTP. Plugin routes live under
 | GET | `/api/notifications?unread=&limit=` | authenticated (**ownership**, not a grant) | The caller's own notification records, newest first, with the unread badge. No permission is declared: SPEC §9.2 — a caller reading their own record is an ownership check, not a grant (§ Notifications) |
 | POST | `/api/notifications/{id}/read` | authenticated (**ownership**, not a grant) | Marks the caller's own record read. `404` for a record that is not theirs (not `403`). Does **not** deliver anything |
 
+### The audit chain (`GET /api/audit/verify`)
+
+Two layers, reported separately. **`ok` describes the unkeyed SQL chain only**
+— it is the field's pre-#160 meaning — while `keyed` says whether the HMAC
+layer was checked at all.
+
+```json
+{
+  "ok": true,
+  "first_bad": null,
+  "rows_checked": 41,
+  "keyed": true,
+  "keyed_first_bad": null,
+  "keyed_rows_checked": 41,
+  "keyed_rows_unkeyed": 0
+}
+```
+
+- **Unkeyed (SQL).** `core.audit_verify()` walks rows in `id` order and
+  recomputes SHA-256 over the canonical payload
+  `prev_hash | id | action | resource_type | resource_id | details::text |
+  source | coalesce(user_id::text,'') |
+  to_char(created_at AT TIME ZONE 'UTC','YYYY-MM-DD"T"HH24:MI:SS.US')+00:00`.
+  The migration-17 formula covers **`user_id` and `created_at`** as well as
+  every field written by the app. `first_bad` is the lowest id that does not
+  verify. Changing any of those fields — including only the actor or the
+  timestamp — invalidates the row and every row after it.
+- **Keyed (app).** When `ADJUTANT_AUDIT_KEY` is set, every insert also lands
+  with `keyed_hash = HMAC-SHA256(key, the same canonical payload)`, computed by
+  the server before the INSERT. The app verifier walks the rows and compares
+  each hash, reporting `keyed_first_bad` and `keyed_rows_checked`.
+  `keyed_rows_unkeyed` counts rows whose `keyed_hash` is NULL (written before
+  the key was enabled, or by a writer that had no key); they are **not**
+  counted as protected.
+- **No key.** The column stays NULL, `/api/audit/verify` reports
+  `"keyed": false`, `keyed_rows_checked: 0`, and the boot log emits a WARN. The
+  unkeyed chain still verifies; it is simply not an off-database anchor.
+- **What the keyed layer does and does not prove.** It detects a writer who can
+  change `core.audit_log` (including the table's owning role, which can disable
+  the triggers and recompute the unkeyed chain) but does not hold the server's
+  environment. It does **not** protect against a compromised server process,
+  which holds the key by definition. Losing the key makes past keyed hashes
+  unverifiable; the unkeyed chain remains verifiable. See
+  [`deployment.md`](deployment.md#the-audit-log-and-adjutant_audit_key).
+
+`GET /api/audit/verify` **fails closed**: if either verification query errors,
+it answers `500`, never `{"ok":true,"rows_checked":0}`.
+
 ### The outbox (`core.outbox`)
 
 The money path for a fact that has **no caller to forward a credential from** — a

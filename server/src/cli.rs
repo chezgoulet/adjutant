@@ -868,6 +868,32 @@ pub async fn grant_role(cfg: &Config, username: &str, role: &str) -> Result<Stri
 }
 
 // ---------------------------------------------------------------------------
+// audit-verify
+// ---------------------------------------------------------------------------
+
+/// Verify both audit layers without the HTTP surface. Returns `(good, report)`
+/// where `report` is the same JSON object `GET /api/audit/verify` returns.
+///
+/// `good` is the unkeyed chain **and** the keyed layer: when a key is
+/// configured, a bad `keyed_hash` fails the command even though the unkeyed
+/// chain (which the database can recompute) still verifies. Without a key the
+/// command succeeds on the unkeyed chain and prints `keyed: false`.
+pub async fn audit_verify(cfg: &Config) -> Result<(bool, String), String> {
+    // Connect only: verification is read-only and must not require (or perform)
+    // migrations. A database that has not applied migration 17 has no
+    // core.audit_canonical()/keyed column, and the error says so.
+    let pool = crate::db::connect(cfg)
+        .await
+        .map_err(|e| format!("connect: {e}"))?;
+    let report = crate::audit::verify(pool.as_ref(), cfg.audit_key.as_ref())
+        .await
+        .map_err(|e| format!("verify: {e}"))?;
+    let good = report.ok && report.keyed_first_bad.is_none();
+    let json = serde_json::to_string_pretty(&report).map_err(|e| e.to_string())?;
+    Ok((good, json))
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 

@@ -1,6 +1,7 @@
 //! Adjutant core server library. Used by the `adjutant` binary and by
 //! integration tests.
 
+pub mod audit;
 pub mod backup;
 pub mod backup_routes;
 pub mod bootstrap;
