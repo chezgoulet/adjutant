@@ -242,7 +242,10 @@ Notes:
   role and hand it the `core` schema, then serve as it. Re-run it after any
   upgrade that adds a core grant (e.g. the `core.scope_hierarchy` grant
   membership needs to declare its lodge→patrol hierarchy): `bootstrap-isolation`
-  re-asserts the allowlist on every run.
+  re-asserts the allowlist on every run. It revokes the role's existing table-
+  and column-level privileges on `core.*` first, so a re-run also removes
+  authority an older release granted and this one does not — including the
+  table-level `SELECT` on `core.users` that predates column-level grants.
 - **The runtime now refuses to boot on a superuser connection** (a plugin escape
   would be total compromise). Serve as the non-superuser app role, or set
   `ADJUTANT_ALLOW_SUPERUSER=true` for a throwaway database.
