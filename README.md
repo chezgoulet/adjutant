@@ -113,7 +113,7 @@ Precedence is defaults < TOML file (./adjutant.toml or `--config`) < environment
 | `ADJUTANT_TRUSTED_PROXIES` | comma-separated peer IPs allowed to set `x-forwarded-for`. **Empty by default — the header is otherwise ignored**, because any client can send it |
 | `ADJUTANT_CORS` | comma-separated origins, `*` for any |
 | `ADJUTANT_MAX_BODY` | request body cap in bytes |
-| `ADJUTANT_DEV_HEADERS` | **`false` by default.** Set `true` (or pass `--allow-dev-headers`) to enable the spoofable `x-dev-user`/`x-dev-role` identity stub for development. Only consulted when no plugin identity provider answered |
+| `ADJUTANT_DEV_HEADERS` | **`false` by default.** Set `true` (or pass `--allow-dev-headers`) to enable the spoofable `x-dev-user`/`x-dev-role` identity stub for development. Only consulted when no plugin identity provider answered. `--no-dev-headers` forces it off, overriding a config file or environment that enabled it |
 | `ADJUTANT_ALLOW_SUPERUSER` | **`false` by default.** The server refuses to boot on a PostgreSQL superuser connection (a plugin escape would be total compromise). Set `true` (or pass `--allow-superuser`) only for a throwaway database |
 | `ADJUTANT_TEST_DATABASE_URL` | overrides the derived `_test` database for `adjutant test-plugin` and the DB-backed tests |
 
@@ -122,8 +122,10 @@ Precedence is defaults < TOML file (./adjutant.toml or `--config`) < environment
 - **Dev headers are off by default — and spoofable when on.** With
   `ADJUTANT_DEV_HEADERS=true` (or `--allow-dev-headers`), anyone who can reach
   the port can claim any role by setting two headers. Keep it off (the default)
-  and rely on the auth plugin's sessions. The milestone harnesses assert this
-  for you.
+  and rely on the auth plugin's sessions. `--no-dev-headers` overrides a config
+  file that enabled it. When it is on, the boot log warns and
+  `GET /api/plugins` reports `dev_headers.enabled` with the risk. The milestone
+  harnesses assert this for you.
 - **Disabling the last identity provider is refused.** With dev headers off the
   auth plugin is the only source of identity, so disabling or uninstalling it
   would make every authenticated route — including the admin route that would
