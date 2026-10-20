@@ -146,7 +146,10 @@ Roles, schema ownership and credentials are created once with
 `adjutant bootstrap-isolation` (needs `CREATEROLE`); the runtime reads the
 stored credential and needs no `CREATEROLE`. A plugin with no credential
 refuses to load. The allowlist lives in `server/src/schema.rs` (`core_grants`);
-a plugin needing another core table must add it there deliberately.
+it grants whole tables where nothing sensitive is involved and individual
+columns where it is (`core.users` is column-granted, so `membership` cannot read
+`password_hash`). A plugin needing another core table or column must add it
+there deliberately.
 
 ## Smoke test
 

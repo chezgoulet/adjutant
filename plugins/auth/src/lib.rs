@@ -547,8 +547,11 @@ impl AdjutantPlugin for AuthPlugin {
                         email: Option<String>,
                         password: String,
                     }
+                    // Column-level grants: `COUNT(*)` needs table-level SELECT,
+                    // which auth no longer holds on `core.users`. `COUNT(id)`
+                    // names a granted column and answers the same question.
                     let n: i64 =
-                        c.db.query("SELECT COUNT(*) AS n FROM core.users", vec![])
+                        c.db.query("SELECT COUNT(id) AS n FROM core.users", vec![])
                             .await?
                             .first()
                             .and_then(|r| r["n"].as_i64())

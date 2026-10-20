@@ -103,7 +103,8 @@ pub fn close_pool(p: &LoadedPlugin) {
 ///
 /// The list exists because [`crate::schema::core_grants`] keys its `core.*`
 /// allowlist on the plugin id string: a guest that declared `id: "auth"` would
-/// inherit `SELECT/INSERT/UPDATE` on `core.users` and the session/role grants.
+/// inherit the auth plugin's column-level `core.users` grants (hash SELECT,
+/// user INSERT) and its session/role grants.
 /// One shared list, enforced where the plugin is untrusted, is the fix for
 /// issue #21. The deeper fix — keying grants on something a plugin cannot
 /// declare — is part of the isolation work (#17/#18), not this PR.
