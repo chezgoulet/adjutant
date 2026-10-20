@@ -48,7 +48,14 @@ jobs:
       # toolchain the tests ran on.
       - name: Read the pinned toolchain
         id: toolchain
-        run: echo "channel=$(grep -oP '^channel\s*=\s*"\K[^"]+' rust-toolchain.toml)" >> "$GITHUB_OUTPUT"
+        run: |
+          set -euo pipefail
+          channel=$(grep -oP '^channel\s*=\s*"\K[^"]+' rust-toolchain.toml || true)
+          if [ -z "$channel" ]; then
+            echo "::error file=rust-toolchain.toml::no channel key; refusing to fall back to a floating toolchain (issue #179)"
+            exit 1
+          fi
+          echo "channel=$channel" >> "$GITHUB_OUTPUT"
 
       - uses: dtolnay/rust-toolchain@master
         with:
