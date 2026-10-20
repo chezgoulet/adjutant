@@ -207,3 +207,39 @@ else>`.
 | 3 | Mutations | **`delete` requires a troop-covering grant even when the route is declared scope-any.** The rest (`post`/`put`/`patch`) may be scope-any and check in the handler. Destructive operations are not available from a lodge-scoped grant. |
 | 4 | Order of work | **After plugin isolation** (see [`plugin-isolation.md`](plugin-isolation.md) §9). |
 | 5 | Coverage across a hierarchy | **Decided (owner, 2026-09-24): a lodge grant covers its patrols.** The hierarchy is a fact about the troop, so the core resolves it — but from **declared, core-owned edges**, not by calling a plugin and not by hardcoding lodge/patrol: the owning plugin writes `core.scope_hierarchy` (`parent_type, parent_id, child_type, child_id`), the core loads the edges into an in-memory map and expands each grant with its descendants (downward only, depth-bounded, cycles rejected). `membership` declares `lodge/<id>` → `patrol/<id>` from `patrols.lodge_id`. **Per-scope-type ownership is enforced:** `core.scope_owners` (`scope_type → plugin_id`) is written by the core only and read by a `SECURITY DEFINER` trigger that refuses any edge whose parent or child type the declaring `session_user` does not own (issue #37) — so a second plugin granted the table cannot widen another plugin's scopes. |
+
+---
+
+## 9. Conflicts: deliberately object-standing, not scope-standing
+
+`conflicts` declares its eleven routes `any_scope` and never calls `has_in_scope` /
+`scopes_for`; each handler decides by the caller's standing on the case (`party_ids` /
+`facilitator_ids`). That is a deliberate exception to §2, not an omission.
+
+A conflict case is a **private relation between people**, not a place in the troop. Giving it
+a lodge or patrol scope would say "whoever holds this permission at that scope may read it" —
+the opposite of the plugin's rule that a case is visible only to its parties and assigned
+facilitators. The object check is therefore *stricter* than a scope check: it names the people,
+not the geography, and a case between members of different patrols has no single place to be
+scoped to. `conflicts:manage` remains a staffing power, not a read grant (see
+`plugins/conflicts/src/lib.rs` module docs).
+
+What a patrol grant means on these routes:
+
+- It satisfies the core gate — the caller holds the permission *somewhere* — and that is all.
+  The handler then applies the same object check it applies to a troop grant. A
+  `conflicts:read_own` grant scoped to patrol P does **not** read the cases of patrol P, or any
+  case: it reads only cases where the caller is a listed party or facilitator.
+- The non-object routes are correspondingly narrow: `conflicts:file` lets a caller file a case
+  (they become a party by construction), and `conflicts:manage` lets a holder appoint
+  facilitators and see stalled metadata — neither confers case content.
+- The practical effect is that a single-patrol grant is not troop-wide on these routes, but it
+  is not confined to the patrol either. Standing, not scope, is the boundary; a reviewer
+  should read a conflicts grant as "may enter the pathway", never "may read its cases".
+
+To make these routes scope-aware would mean changing the privacy model, not just the gate:
+each case would need a declared scope (and a rule for cases that cross scopes), the schema and
+migration would carry it, `conflicts` would check `reach(..., &Scope::…)` against that value,
+and a troop-scoped `manage` holder would gain a read path the plugin currently forbids. That
+is a design decision for the owner, not a mechanical conformance fix (AUTH-10, tracked with
+#149).
