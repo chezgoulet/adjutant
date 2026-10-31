@@ -196,6 +196,54 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
             }
         }
+        Some("verify-isolation") => {
+            let mut app_role: Option<String> = None;
+            let mut passthrough: Vec<String> = Vec::new();
+            let mut it = args[1..].iter();
+            while let Some(a) = it.next() {
+                match a.as_str() {
+                    "--app-role" => app_role = it.next().cloned(),
+                    _ if a.starts_with("--app-role=") => {
+                        app_role = Some(a["--app-role=".len()..].to_string())
+                    }
+                    _ => passthrough.push(a.clone()),
+                }
+            }
+            let cli = config::CliArgs::parse(passthrough).unwrap_or_else(|e| {
+                eprintln!("error: {e}\n\n{}", config::USAGE);
+                std::process::exit(2);
+            });
+            let cfg = config::load(&cli)?;
+            tracing_subscriber::fmt()
+                .with_env_filter(
+                    tracing_subscriber::EnvFilter::try_from_default_env()
+                        .unwrap_or_else(|_| cfg.log_filter.clone().into()),
+                )
+                .with_writer(std::io::stderr)
+                .init();
+            match adjutant_server::cli::verify_isolation(&cfg, app_role.as_deref()).await {
+                Ok(checks) => {
+                    for check in checks {
+                        println!("PASS {check}");
+                    }
+                    println!(
+                        "isolation verified{}",
+                        app_role
+                            .as_deref()
+                            .map(|a| format!(" (application role {a})"))
+                            .unwrap_or_default()
+                    );
+                    return Ok(());
+                }
+                Err(e) => {
+                    eprintln!("FAIL: the restore is incomplete:");
+                    for line in e.lines() {
+                        eprintln!("  - {line}");
+                    }
+                    std::process::exit(1);
+                }
+            }
+        }
         Some("grant-role") => {
             let username = args
                 .get(1)
@@ -210,6 +258,26 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             match adjutant_server::cli::grant_role(&cfg, username, role).await {
                 Ok(message) => {
                     println!("{message}");
+                    return Ok(());
+                }
+                Err(e) => {
+                    eprintln!("error: {e}");
+                    std::process::exit(2);
+                }
+            }
+        }
+        Some("audit-verify") => {
+            let cli = config::CliArgs::parse(args[1..].iter().cloned()).unwrap_or_else(|e| {
+                eprintln!("error: {e}\n\n{}", config::USAGE);
+                std::process::exit(2);
+            });
+            let cfg = config::load(&cli)?;
+            match adjutant_server::cli::audit_verify(&cfg).await {
+                Ok((good, report)) => {
+                    println!("{report}");
+                    if !good {
+                        std::process::exit(1);
+                    }
                     return Ok(());
                 }
                 Err(e) => {

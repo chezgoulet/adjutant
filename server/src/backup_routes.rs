@@ -166,7 +166,7 @@ pub async fn download(
     let dir = crate::backup::backup_dir();
     // The filename comes from a URL, so it is resolved against the directory and
     // never joined blindly: `bundle_path` refuses separators, `..`, and anything
-    // that is not a `.dump`.
+    // that is not a `.dump` or a `.dump.age`.
     let Some(path) = crate::backup::bundle_path(&dir, &filename) else {
         return error_response(StatusCode::NOT_FOUND, "no such bundle");
     };
