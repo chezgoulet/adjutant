@@ -445,10 +445,30 @@ fn merge_file(cfg: &mut Config, path: &Path) -> Result<(), String> {
 mod tests {
     use super::*;
 
+    /// Serialises the tests in this module.
+    ///
+    /// `load()` reads process-global environment variables, and several tests
+    /// here set and clear them. Consolidating each test's cases into one
+    /// function stopped the racing *within* a test but not *between* tests: a
+    /// test that sets `ADJUTANT_BOOTSTRAP_USERNAME` while another test is inside
+    /// `load()` makes that other test observe a half-configured environment and
+    /// fail. It surfaced as
+    /// `dev_headers_default_off_and_require_explicit_opt_in` panicking with
+    /// "must be set together" only when the suite ran in parallel — it passed
+    /// alone and passed with `--test-threads=1`.
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// Take the module lock. A panic while holding it poisons the mutex; the
+    /// tests recover the guard rather than cascading one failure into the rest.
+    fn lock_env() -> std::sync::MutexGuard<'static, ()> {
+        ENV_LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
     /// The environment bootstrap is all-or-nothing (#173). Runs every case in
     /// one test so env-var mutation cannot race between parallel tests.
     #[test]
     fn bootstrap_chief_from_environment() {
+        let _env = lock_env();
         let keys = [
             "ADJUTANT_BOOTSTRAP_USERNAME",
             "ADJUTANT_BOOTSTRAP_PASSWORD",
@@ -520,6 +540,7 @@ mod tests {
     /// test so env-var mutation can't race between parallel tests.
     #[test]
     fn precedence_default_file_env_cli() {
+        let _env = lock_env();
         // default
         let d = Config::default();
         assert_eq!(d.bind.to_string(), "127.0.0.1:8787");
@@ -566,6 +587,7 @@ mod tests {
 
     #[test]
     fn dev_headers_default_off_and_require_explicit_opt_in() {
+        let _env = lock_env();
         // The spoofable stub must not be silently available.
         assert!(!Config::default().allow_dev_headers);
 
@@ -638,6 +660,7 @@ mod tests {
 
     #[test]
     fn serve_subcommand_is_optional_and_not_a_flag() {
+        let _env = lock_env();
         // `adjutant serve --bind 1.2.3.4:1` and `adjutant --bind 1.2.3.4:1` must
         // behave identically; the bare `serve` form used to exit 2.
         let with = CliArgs::parse(vec![
@@ -656,6 +679,7 @@ mod tests {
 
     #[test]
     fn cli_parses_flags_and_equals_form() {
+        let _env = lock_env();
         let args = vec![
             "--bind".to_string(),
             "0.0.0.0:1".to_string(),
@@ -670,6 +694,7 @@ mod tests {
 
     #[test]
     fn log_format_rejects_garbage() {
+        let _env = lock_env();
         assert!(LogFormat::parse("json").is_ok());
         assert!(LogFormat::parse("yaml").is_err());
     }
