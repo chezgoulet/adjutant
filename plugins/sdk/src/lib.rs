@@ -79,7 +79,7 @@
 use std::collections::HashMap;
 use std::future::Future;
 use std::pin::Pin;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
@@ -99,7 +99,7 @@ pub type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 /// the plugin factory and refuses a library whose value differs, so a stale
 /// build becomes a clear load error instead of undefined behaviour (the native
 /// loading caveat: core and plugin must be built against the same SDK).
-pub const SDK_ABI_VERSION: u32 = 4;
+pub const SDK_ABI_VERSION: u32 = 5;
 
 /// The SDK crate's SemVer version, for diagnostics and error messages.
 pub const SDK_VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -317,6 +317,20 @@ pub trait HostDb: Send + Sync + 'static {
     async fn execute(&self, sql: String, params: Vec<SqlValue>) -> Result<u64, SdkError>;
     /// Run a query; returns rows as JSON objects.
     async fn query(&self, sql: String, params: Vec<SqlValue>) -> Result<Vec<Value>, SdkError>;
+
+    /// Append one audit row. This is deliberately a trait method rather than a
+    /// second `HostDb` call: appending a **keyed** row needs the chain lock,
+    /// the previous hash, the row id and its timestamp in one transaction, and
+    /// the SDK's `execute` cannot hold those across calls.
+    ///
+    /// The default implementation is the plain INSERT, which is exactly right
+    /// for every host that does not hold a key (a plugin test's pool, a mock).
+    /// The core overrides it to add the HMAC when `ADJUTANT_AUDIT_KEY` is set.
+    /// Additive: existing `HostDb` implementations keep compiling unchanged.
+    async fn append_audit(&self, row: AuditRow) -> Result<(), SdkError> {
+        let (sql, params) = row.unkeyed_insert();
+        self.execute(sql, params).await.map(|_| ())
+    }
 }
 
 /// Event publishing, mediated by the core: persists to `core.events`, then
@@ -1317,6 +1331,231 @@ impl DbHandle {
 // Audit
 // ---------------------------------------------------------------------------
 
+/// The advisory lock both the SQL trigger and the Rust writer take before
+/// reading the previous entry hash. It is a **hard-coded constant** on purpose:
+/// two different locks would let one writer read a stale `prev_hash`, and the
+/// chain would verify as broken later with no trace of why.
+pub const AUDIT_CHAIN_ADVISORY_LOCK: i64 = 918_273_645;
+
+/// The `prev_hash` of the first row: 64 zeroes, exactly as the SQL trigger uses.
+pub const AUDIT_ZERO_HASH: &str = "0000000000000000000000000000000000000000000000000000000000000000";
+
+/// One row to append. The SDK builds it from the caller's arguments; the host
+/// decides how to write it (keyed when it holds a key, plain otherwise).
+#[derive(Debug, Clone)]
+pub struct AuditRow {
+    pub user_id: SqlValue,
+    pub action: String,
+    pub resource_type: String,
+    pub resource_id: String,
+    /// JSON text; the INSERT casts it to `jsonb`.
+    pub details: String,
+    pub source: String,
+}
+
+impl AuditRow {
+    /// The plain INSERT (no keyed hash). The parameter order is part of the
+    /// SDK's observable shape — plugin tests inspect it — so it is kept as it
+    /// was before the keyed layer existed.
+    pub fn unkeyed_insert(&self) -> (String, Vec<SqlValue>) {
+        let sql = "INSERT INTO core.audit_log (user_id, action, resource_type, resource_id, details, source) \
+                   VALUES ($1, $2, $3, $4, $5::jsonb, $6)"
+            .to_string();
+        (
+            sql,
+            vec![
+                self.user_id.clone(),
+                self.action.clone().into(),
+                self.resource_type.clone().into(),
+                self.resource_id.clone().into(),
+                SqlValue::Json(self.details.clone()),
+                self.source.clone().into(),
+            ],
+        )
+    }
+}
+
+/// The canonical string hashed by `core.audit_canonical()` (SQL) **and** by
+/// this crate. If you change it, change migration 17, the trigger, the
+/// verifier and this function together — the format is pinned here, beside the
+/// only Rust implementation, and in the migration beside the only SQL one.
+///
+/// ```text
+/// prev_hash | id | action | resource_type | resource_id | details::text |
+/// source | coalesce(user_id::text,'') |
+/// to_char(created_at AT TIME ZONE 'UTC','YYYY-MM-DD"T"HH24:MI:SS.US')||'+00:00'
+/// ```
+///
+/// `details_text` must be PostgreSQL's `jsonb::text` rendering (keys sorted,
+/// spaces inserted), not the JSON string the caller sent: `jsonb` normalises,
+/// and the trigger hashes what is stored. `created_at_utc` is the canonical
+/// text, not an RFC 3339 string in another shape — use [`canonical_created_at`].
+// The argument list mirrors `core.audit_canonical` one-for-one; collapsing it
+// into a struct would only move the same nine fields elsewhere.
+#[allow(clippy::too_many_arguments)]
+pub fn canonical_payload(
+    prev_hash: &str,
+    id: i64,
+    action: &str,
+    resource_type: &str,
+    resource_id: &str,
+    details_text: &str,
+    source: &str,
+    user_id: Option<&str>,
+    created_at_utc: &str,
+) -> String {
+    format!(
+        "{prev_hash}|{id}|{action}|{resource_type}|{resource_id}|{details_text}|{source}|{}|{created_at_utc}",
+        user_id.unwrap_or("")
+    )
+}
+
+/// `YYYY-MM-DDTHH:MM:SS.ffffff+00:00`, truncating to the microsecond precision
+/// PostgreSQL stores. This is the Rust half of the format pinned above.
+pub fn canonical_created_at(at: DateTime<Utc>) -> String {
+    let micros = at.timestamp_micros();
+    let at = DateTime::from_timestamp_micros(micros).unwrap_or(at);
+    at.format("%Y-%m-%dT%H:%M:%S%.6f+00:00").to_string()
+}
+
+fn hex_lower(bytes: &[u8]) -> String {
+    use std::fmt::Write as _;
+    let mut out = String::with_capacity(bytes.len() * 2);
+    for b in bytes {
+        let _ = write!(out, "{b:02x}");
+    }
+    out
+}
+
+/// Decode a hex string, either case. `None` for an odd length or a non-hex
+/// character: a malformed stored hash is a mismatch, never a parse error that
+/// aborts the verification walk.
+fn hex_decode(s: &str) -> Option<Vec<u8>> {
+    if !s.len().is_multiple_of(2) {
+        return None;
+    }
+    s.as_bytes()
+        .chunks_exact(2)
+        .map(|pair| {
+            let hi = (pair[0] as char).to_digit(16)?;
+            let lo = (pair[1] as char).to_digit(16)?;
+            Some(((hi << 4) | lo) as u8)
+        })
+        .collect()
+}
+
+/// The unkeyed `entry_hash`: SHA-256 of the canonical payload, lowercase hex.
+pub fn unkeyed_digest(payload: &str) -> String {
+    use sha2::{Digest, Sha256};
+    let mut h = Sha256::new();
+    h.update(payload.as_bytes());
+    hex_lower(&h.finalize())
+}
+
+/// A 32-byte audit key. The bytes are private and `Debug` is redacted: the key
+/// must never reach a log line, an error string or a test assertion message.
+#[derive(Clone)]
+pub struct ChainKey {
+    bytes: [u8; 32],
+}
+
+impl std::fmt::Debug for ChainKey {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("ChainKey(<redacted 32 bytes>)")
+    }
+}
+
+impl ChainKey {
+    pub fn from_bytes(bytes: [u8; 32]) -> Self {
+        Self { bytes }
+    }
+
+    /// Parse `ADJUTANT_AUDIT_KEY`: exactly 64 hex characters, or base64 that
+    /// decodes to exactly 32 bytes. Everything else is refused; a short key is
+    /// not silently stretched.
+    pub fn parse(value: &str) -> Result<Self, String> {
+        let value = value.trim();
+        if value.len() == 64 && value.bytes().all(|b| b.is_ascii_hexdigit()) {
+            let mut bytes = [0u8; 32];
+            for (i, pair) in value.as_bytes().chunks_exact(2).enumerate() {
+                let s = std::str::from_utf8(pair).map_err(|_| "not hex".to_string())?;
+                bytes[i] = u8::from_str_radix(s, 16).map_err(|_| "not hex".to_string())?;
+            }
+            return Ok(Self { bytes });
+        }
+
+        use base64::Engine as _;
+        let decoded = base64::engine::general_purpose::STANDARD
+            .decode(value)
+            .or_else(|_| base64::engine::general_purpose::STANDARD_NO_PAD.decode(value))
+            .map_err(|_| {
+                "expected 64 hex characters or base64-encoded 32 bytes".to_string()
+            })?;
+        let bytes: [u8; 32] = decoded.try_into().map_err(|_| {
+            "base64 value must decode to exactly 32 bytes".to_string()
+        })?;
+        Ok(Self { bytes })
+    }
+
+    /// HMAC-SHA256 over the canonical payload, lowercase hex. This is what
+    /// lands in `core.audit_log.keyed_hash`.
+    pub fn keyed_digest(&self, payload: &str) -> String {
+        use hmac::{Hmac, Mac};
+        use sha2::Sha256;
+        let mut mac = Hmac::<Sha256>::new_from_slice(&self.bytes)
+            .expect("HMAC accepts a key of any length");
+        mac.update(payload.as_bytes());
+        hex_lower(&mac.finalize().into_bytes())
+    }
+
+    /// Compare a stored `keyed_hash` with the HMAC of `payload` in constant
+    /// time (`hmac`'s `verify_slice`). A malformed or wrong-length stored value
+    /// is a mismatch, not an error: one bad row must not abort the walk.
+    pub fn keyed_digest_matches(&self, payload: &str, stored_hex: &str) -> bool {
+        use hmac::{Hmac, Mac};
+        use sha2::Sha256;
+        let Some(expected) = hex_decode(stored_hex) else {
+            return false;
+        };
+        let mut mac =
+            Hmac::<Sha256>::new_from_slice(&self.bytes).expect("HMAC accepts a key of any length");
+        mac.update(payload.as_bytes());
+        mac.verify_slice(&expected).is_ok()
+    }
+}
+
+/// Process-global key, set once at boot by the core. A global is the additive
+/// route: `AuditService::new` keeps its signature, every plugin and every test
+/// keeps compiling, and the key lives in exactly one place in the process.
+static CHAIN_KEY: OnceLock<ChainKey> = OnceLock::new();
+
+/// Install the process-wide key. The first call wins; returns `true` when this
+/// call set it, `false` when a key was already installed.
+///
+/// **Rotation is restart-shaped.** A `OnceLock` cannot be replaced, so a second
+/// call — including one carrying a different key — silently returns `false` and
+/// the first key stays in force. Changing `ADJUTANT_AUDIT_KEY` therefore has no
+/// effect until the process restarts; see `docs/deployment.md`. A caller that
+/// gets `false` should say so rather than assume its key is in use.
+pub fn set_chain_key(key: ChainKey) -> bool {
+    CHAIN_KEY.set(key).is_ok()
+}
+
+/// The process-wide key, if one was installed at boot.
+pub fn chain_key() -> Option<&'static ChainKey> {
+    CHAIN_KEY.get()
+}
+
+/// Narrow alias module so callers can write `adjutant_sdk::audit::set_chain_key`
+/// and `adjutant_sdk::audit::ChainKey` without moving the long-standing
+/// crate-root `AuditService` (the ABI and every existing import stay put).
+pub mod audit {
+    pub use crate::{
+        canonical_created_at, canonical_payload, chain_key, set_chain_key, unkeyed_digest,
+        AuditRow, ChainKey, AUDIT_CHAIN_ADVISORY_LOCK, AUDIT_ZERO_HASH,
+    };
+}
+
 /// Append-only audit log writer (`core.audit_log`).
 #[derive(Clone)]
 pub struct AuditService {
@@ -1387,19 +1626,14 @@ impl AuditService {
         };
         let details = serde_json::to_string(&details).unwrap_or_else(|_| "{}".into());
         self.db
-            .execute(
-                "INSERT INTO core.audit_log (user_id, action, resource_type, resource_id, details, source) \
-                 VALUES ($1, $2, $3, $4, $5::jsonb, $6)"
-                    .to_string(),
-                vec![
-                    user_value,
-                    action.to_string().into(),
-                    resource_type.to_string().into(),
-                    resource_id.to_string().into(),
-                    SqlValue::Json(details),
-                    self.source.clone().into(),
-                ],
-            )
+            .append_audit(AuditRow {
+                user_id: user_value,
+                action: action.to_string(),
+                resource_type: resource_type.to_string(),
+                resource_id: resource_id.to_string(),
+                details,
+                source: self.source.clone(),
+            })
             .await?;
         Ok(())
     }
@@ -3268,5 +3502,91 @@ mod tests {
     fn assert_published_names_what_was_published_instead() {
         let events = crate::testing::MockEvents::new();
         events.assert_published("mission.completed");
+    }
+
+    // --- audit chain v2 + keyed layer (#159, #160) --------------------------
+
+    /// The fixed vector that the DB-gated test sends to PostgreSQL unchanged.
+    /// Details are jsonb's rendering, not the caller's JSON string, because the
+    /// trigger hashes what `jsonb::text` produced.
+    const VECTOR_PAYLOAD: &str = concat!(
+        "0000000000000000000000000000000000000000000000000000000000000000",
+        "|42|member.update|member|11111111-1111-1111-1111-111111111111",
+        "|{\"a\": 1, \"b\": \"x\"}|core|22222222-2222-2222-2222-222222222222",
+        "|2026-01-02T03:04:05.123456+00:00"
+    );
+    const VECTOR_KEY_HEX: &str =
+        "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f";
+    const VECTOR_SHA256: &str =
+        "00eadce274e06ffb6281a5efb9b67ea0c85b3439820733cc3371aa83d9034f5a";
+    const VECTOR_HMAC: &str =
+        "2d8575623def2a1a4665481a00d8ff266a9db8419e95c3572f5e80861cc14c30";
+
+    #[test]
+    fn audit_vector_is_pinned_for_sql_and_rust() {
+        let payload = crate::canonical_payload(
+            crate::AUDIT_ZERO_HASH,
+            42,
+            "member.update",
+            "member",
+            "11111111-1111-1111-1111-111111111111",
+            "{\"a\": 1, \"b\": \"x\"}",
+            "core",
+            Some("22222222-2222-2222-2222-222222222222"),
+            "2026-01-02T03:04:05.123456+00:00",
+        );
+        assert_eq!(payload, VECTOR_PAYLOAD, "canonical form must not drift");
+        assert_eq!(crate::unkeyed_digest(&payload), VECTOR_SHA256);
+
+        let key = crate::ChainKey::parse(VECTOR_KEY_HEX).expect("hex key");
+        assert_eq!(key.keyed_digest(&payload), VECTOR_HMAC);
+
+        // The DB test in server/tests/host_db.rs asserts PostgreSQL produces
+        // these same two strings for this same row and key.
+    }
+
+    #[test]
+    fn chain_key_accepts_hex_and_base64_of_32_bytes() {
+        let hex = crate::ChainKey::parse(VECTOR_KEY_HEX).expect("64 hex chars");
+        let b64 = crate::ChainKey::parse("AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8=")
+            .expect("base64 of 32 bytes");
+        assert_eq!(
+            hex.keyed_digest(VECTOR_PAYLOAD),
+            b64.keyed_digest(VECTOR_PAYLOAD),
+            "both encodings carry the same key"
+        );
+    }
+
+    #[test]
+    fn chain_key_rejects_short_malformed_and_wrong_length_values() {
+        for bad in [
+            "",
+            "deadbeef",
+            &"0".repeat(63),
+            &"0".repeat(65),
+            "zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz",
+            "AAECAwQFBgcICQoLDA0ODw==", // 16 bytes
+        ] {
+            assert!(
+                crate::ChainKey::parse(bad).is_err(),
+                "{bad:?} must be refused, not stretched or truncated"
+            );
+        }
+        let err = crate::ChainKey::parse("not base64!").unwrap_err();
+        assert!(err.contains("64 hex"), "error names the accepted forms: {err}");
+    }
+
+    #[test]
+    fn canonical_timestamp_truncates_to_postgres_microseconds() {
+        use chrono::TimeZone as _;
+        let at = chrono::Utc
+            .with_ymd_and_hms(2026, 1, 2, 3, 4, 5)
+            .unwrap()
+            + chrono::Duration::nanoseconds(123_456_789);
+        assert_eq!(
+            crate::canonical_created_at(at),
+            "2026-01-02T03:04:05.123456+00:00",
+            "the Rust and SQL forms must agree to the microsecond"
+        );
     }
 }

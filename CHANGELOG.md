@@ -13,12 +13,26 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Added
 
+- **The audit chain has an off-database anchor** (#160). Setting
+  `ADJUTANT_AUDIT_KEY` (64 hex characters or base64 of 32 bytes) makes every
+  audit insert carry `keyed_hash = HMAC-SHA256(key, canonical payload)`,
+  computed by the server before the INSERT; the key is never sent to PostgreSQL.
+  `GET /api/audit/verify` reports both layers (`keyed`, `keyed_first_bad`,
+  `keyed_rows_checked`, `keyed_rows_unkeyed`) and the new `adjutant audit-verify`
+  subcommand verifies without HTTP. Unset, the column stays NULL, boot logs a
+  WARN, and verification says `keyed: false` rather than pretending to be
+  keyed. `docs/deployment.md` states the threat model and the cost of losing the
+  key.
 - **The first chief can be created from the environment.** Setting
   `ADJUTANT_BOOTSTRAP_USERNAME` and `ADJUTANT_BOOTSTRAP_PASSWORD` (with optional
   `ADJUTANT_BOOTSTRAP_EMAIL`) creates that account with the `chief` role on the
   first boot against an empty database, before the listener opens. Half a
   credential pair refuses to boot. Once any user exists the variables are
   ignored — they never rewrite an existing account (#173).
+- **`adjutant verify-isolation [--app-role <name>]`** — asserts the roles,
+  schema/table ownership, allowlist grants and per-role session identity a
+  working deployment must have. `deploy/restore.sh` runs it before it starts the
+  app or reports success (#161).
 - **`adjutant grant-role <username> <role>`** — writes `core.user_roles`
   directly, so it recovers a troop whose last admin has been removed and whose
   API is therefore unreachable (#147).
@@ -31,6 +45,26 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Changed
 
+- **The audit digest now covers `user_id` and `created_at`** (#159). Migration
+  17 replaces `core.audit_chain_fill()` and `core.audit_verify()` with a v2
+  canonical payload that includes the actor and the timestamp in UTC at
+  microsecond precision, and recomputes the chain over existing rows so an
+  upgrade does not leave every row bad. Changing only who or when a row records
+  now makes `first_bad` name it. The append-only and TRUNCATE guards are
+  unchanged. `core.audit_canonical()` is declared `STABLE`, not `IMMUTABLE`:
+  `to_char(timestamp with time zone, text)` is `STABLE`, and the verifier reads
+  every row so the planner optimisation an `IMMUTABLE` marker would promise is
+  not used.
+- **Migration 17 rewrites the whole audit log once.** It disables the append-only
+  trigger and recomputes every existing `core.audit_log` row in one transaction.
+  Upgrade time and lock duration are proportional to the table's size, so a large
+  deployment should expect an upgrade window. An error rolls the whole migration
+  back, leaving the old chain intact and the trigger armed.
+- **The SDK ABI is 5.** `HostDb` gains `append_audit` (with a default that
+  performs the plain INSERT), the additive seam that lets the server compute a
+  keyed hash before the row exists. Existing `HostDb` implementations compile
+  unchanged, but a plugin built against ABI 4 is refused rather than loaded with
+  a mismatched vtable — rebuild and re-stage plugins on upgrade.
 - **Registration has exactly one winner.** `POST /api/auth/register` claims a
   single row in the new `core.bootstrap_claim` table before it creates the user;
   the primary key is the mutex. Two concurrent first registrations can no longer
@@ -57,6 +91,13 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Fixed
 
+- **A partial restore fails instead of printing `ok` (#161).** `deploy/restore.sh`
+  now restores with `--no-owner --no-acl` (there are no roles to own or grant to
+  yet), checks `PIPESTATUS[0]`, treats `errors ignored` as data loss, and runs
+  the new `adjutant verify-isolation` after `bootstrap-isolation`. That command
+  checks every installed plugin's role, schema/table ownership, allowlist grants,
+  an unlisted `core.*` table being unreachable, and a live connection as the
+  plugin role — and names the specific missing role or table.
 - **Collection routes decode the wrapper the server actually sends (#167).**
   `_asList` accepted a hard-coded list of wrapper names, so
   `GET /api/calendar/upcoming` (`{"occurrences": …}`) and
@@ -77,6 +118,18 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Security
 
+- **Backup bundles are encrypted, and fail closed without a key (#163).** Every
+  bundle is written as `adjutant-<stamp>.dump.age`, encrypted to the age
+  recipient in `ADJUTANT_BACKUP_AGE_RECIPIENT`; the private key never lives on
+  the server. With no recipient a backup fails with an error naming that
+  variable unless `ADJUTANT_BACKUP_ALLOW_PLAINTEXT=true` explicitly accepts a
+  plaintext `.dump` and logs a WARN. `deploy/restore.sh` decrypts with
+  `ADJUTANT_BACKUP_AGE_IDENTITY` and refuses to drop the database when the
+  identity is missing or unusable. The decrypt is piped straight into
+  `pg_restore -l` and then into the restore itself, so no clear-text dump is
+  ever written to disk — not even a `chmod 600` file in `/tmp` that a crash
+  could leave behind. The runtime image installs `age` for the in-app backup
+  button.
 - **The session token is in platform secure storage, not preferences (#169).**
   `flutter_secure_storage` (Keystore/Keychain/libsecret), with a one-time
   migration from `adjutant.token` that deletes the plaintext key. Android backup

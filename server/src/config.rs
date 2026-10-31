@@ -9,6 +9,8 @@ use std::path::{Path, PathBuf};
 
 use serde::Deserialize;
 
+use adjutant_sdk::audit::ChainKey;
+
 /// Log output format.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LogFormat {
@@ -72,6 +74,11 @@ pub struct Config {
     /// `ADJUTANT_BOOTSTRAP_PASSWORD` when the database has no users (#173).
     /// `None` leaves the first-user-becomes-chief path to HTTP registration.
     pub bootstrap_chief: Option<BootstrapChief>,
+    /// The keyed audit layer's key (`ADJUTANT_AUDIT_KEY`, #160). `None` means
+    /// `core.audit_log.keyed_hash` stays NULL and `/api/audit/verify` reports
+    /// `keyed: false`: the unkeyed chain is the only protection, and the boot
+    /// log says so. Never logged; `ChainKey`'s `Debug` is redacted.
+    pub audit_key: Option<ChainKey>,
 }
 
 /// An operator-supplied first account. The password is held only in memory; it is
@@ -98,6 +105,7 @@ impl Default for Config {
             trusted_proxies: Vec::new(),
             allow_superuser: false,
             bootstrap_chief: None,
+            audit_key: None,
         }
     }
 }
@@ -169,10 +177,17 @@ USAGE:
                                    create/refresh per-plugin DB roles, schema
                                    ownership, grants and stored credentials
                                    (run once by the operator, against an admin URL)
+    adjutant verify-isolation [--app-role <NAME>] [OPTIONS]
+                                   assert the roles, ownership, allowlist grants
+                                   and session identities a restore must produce
+                                   (exits non-zero and names the missing role or
+                                   table; used by deploy/restore.sh)
     adjutant grant-role <username> <role> [OPTIONS]
                                    grant a role directly in the database — the
                                    recovery path when the last admin is gone or
                                    the API is unreachable
+    adjutant audit-verify [OPTIONS]  verify the audit chain (and the keyed layer
+                                   when ADJUTANT_AUDIT_KEY is set) without HTTP
     adjutant --help                print this help
 
 SERVE OPTIONS:
@@ -209,6 +224,8 @@ ENVIRONMENT (override file, overridden by flags):
     ADJUTANT_DEV_HEADERS (true enables the dev stub; off by default),
     ADJUTANT_TRUSTED_PROXIES, ADJUTANT_ALLOW_SUPERUSER (true permits a superuser
     connection; off by default),
+    ADJUTANT_AUDIT_KEY (64 hex characters or base64 of 32 bytes; unset leaves
+    the audit chain unkeyed and /api/audit/verify reports keyed:false),
     ADJUTANT_BOOTSTRAP_USERNAME / ADJUTANT_BOOTSTRAP_PASSWORD (create the first
     chief at boot when the database has no users; set both, or neither) and
     ADJUTANT_BOOTSTRAP_EMAIL (optional)
@@ -311,6 +328,15 @@ pub fn load(cli: &CliArgs) -> Result<Config, String> {
     }
     if let Ok(v) = std::env::var("ADJUTANT_ALLOW_SUPERUSER") {
         cfg.allow_superuser = matches!(v.as_str(), "1" | "true" | "yes");
+    }
+    // #160: the keyed audit layer. Optional by design — local runs and the test
+    // suite must boot — but anything present must be a real 32-byte key. A
+    // malformed key is refused here, at boot, rather than silently degrading to
+    // an unkeyed chain (which would look protected and not be).
+    if let Ok(v) = std::env::var("ADJUTANT_AUDIT_KEY") {
+        cfg.audit_key = Some(
+            ChainKey::parse(&v).map_err(|e| format!("ADJUTANT_AUDIT_KEY: {e}"))?,
+        );
     }
     // The environment-supplied first chief (#173). Set together or not at all:
     // half a credential pair is a misconfiguration that would otherwise boot a
@@ -440,10 +466,30 @@ fn merge_file(cfg: &mut Config, path: &Path) -> Result<(), String> {
 mod tests {
     use super::*;
 
+    /// Serialises the tests in this module.
+    ///
+    /// `load()` reads process-global environment variables, and several tests
+    /// here set and clear them. Consolidating each test's cases into one
+    /// function stopped the racing *within* a test but not *between* tests: a
+    /// test that sets `ADJUTANT_BOOTSTRAP_USERNAME` while another test is inside
+    /// `load()` makes that other test observe a half-configured environment and
+    /// fail. It surfaced as
+    /// `dev_headers_default_off_and_require_explicit_opt_in` panicking with
+    /// "must be set together" only when the suite ran in parallel — it passed
+    /// alone and passed with `--test-threads=1`.
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// Take the module lock. A panic while holding it poisons the mutex; the
+    /// tests recover the guard rather than cascading one failure into the rest.
+    fn lock_env() -> std::sync::MutexGuard<'static, ()> {
+        ENV_LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
     /// The environment bootstrap is all-or-nothing (#173). Runs every case in
     /// one test so env-var mutation cannot race between parallel tests.
     #[test]
     fn bootstrap_chief_from_environment() {
+        let _env = lock_env();
         let keys = [
             "ADJUTANT_BOOTSTRAP_USERNAME",
             "ADJUTANT_BOOTSTRAP_PASSWORD",
@@ -515,6 +561,7 @@ mod tests {
     /// test so env-var mutation can't race between parallel tests.
     #[test]
     fn precedence_default_file_env_cli() {
+        let _env = lock_env();
         // default
         let d = Config::default();
         assert_eq!(d.bind.to_string(), "127.0.0.1:8787");
@@ -561,6 +608,7 @@ mod tests {
 
     #[test]
     fn dev_headers_default_off_and_require_explicit_opt_in() {
+        let _env = lock_env();
         // The spoofable stub must not be silently available.
         assert!(!Config::default().allow_dev_headers);
 
@@ -633,6 +681,7 @@ mod tests {
 
     #[test]
     fn serve_subcommand_is_optional_and_not_a_flag() {
+        let _env = lock_env();
         // `adjutant serve --bind 1.2.3.4:1` and `adjutant --bind 1.2.3.4:1` must
         // behave identically; the bare `serve` form used to exit 2.
         let with = CliArgs::parse(vec![
@@ -651,6 +700,7 @@ mod tests {
 
     #[test]
     fn cli_parses_flags_and_equals_form() {
+        let _env = lock_env();
         let args = vec![
             "--bind".to_string(),
             "0.0.0.0:1".to_string(),
@@ -665,6 +715,7 @@ mod tests {
 
     #[test]
     fn log_format_rejects_garbage() {
+        let _env = lock_env();
         assert!(LogFormat::parse("json").is_ok());
         assert!(LogFormat::parse("yaml").is_err());
     }
