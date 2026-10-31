@@ -1427,6 +1427,23 @@ fn hex_lower(bytes: &[u8]) -> String {
     out
 }
 
+/// Decode a hex string, either case. `None` for an odd length or a non-hex
+/// character: a malformed stored hash is a mismatch, never a parse error that
+/// aborts the verification walk.
+fn hex_decode(s: &str) -> Option<Vec<u8>> {
+    if !s.len().is_multiple_of(2) {
+        return None;
+    }
+    s.as_bytes()
+        .chunks_exact(2)
+        .map(|pair| {
+            let hi = (pair[0] as char).to_digit(16)?;
+            let lo = (pair[1] as char).to_digit(16)?;
+            Some(((hi << 4) | lo) as u8)
+        })
+        .collect()
+}
+
 /// The unkeyed `entry_hash`: SHA-256 of the canonical payload, lowercase hex.
 pub fn unkeyed_digest(payload: &str) -> String {
     use sha2::{Digest, Sha256};
@@ -1490,6 +1507,21 @@ impl ChainKey {
         mac.update(payload.as_bytes());
         hex_lower(&mac.finalize().into_bytes())
     }
+
+    /// Compare a stored `keyed_hash` with the HMAC of `payload` in constant
+    /// time (`hmac`'s `verify_slice`). A malformed or wrong-length stored value
+    /// is a mismatch, not an error: one bad row must not abort the walk.
+    pub fn keyed_digest_matches(&self, payload: &str, stored_hex: &str) -> bool {
+        use hmac::{Hmac, Mac};
+        use sha2::Sha256;
+        let Some(expected) = hex_decode(stored_hex) else {
+            return false;
+        };
+        let mut mac =
+            Hmac::<Sha256>::new_from_slice(&self.bytes).expect("HMAC accepts a key of any length");
+        mac.update(payload.as_bytes());
+        mac.verify_slice(&expected).is_ok()
+    }
 }
 
 /// Process-global key, set once at boot by the core. A global is the additive
@@ -1499,6 +1531,12 @@ static CHAIN_KEY: OnceLock<ChainKey> = OnceLock::new();
 
 /// Install the process-wide key. The first call wins; returns `true` when this
 /// call set it, `false` when a key was already installed.
+///
+/// **Rotation is restart-shaped.** A `OnceLock` cannot be replaced, so a second
+/// call — including one carrying a different key — silently returns `false` and
+/// the first key stays in force. Changing `ADJUTANT_AUDIT_KEY` therefore has no
+/// effect until the process restarts; see `docs/deployment.md`. A caller that
+/// gets `false` should say so rather than assume its key is in use.
 pub fn set_chain_key(key: ChainKey) -> bool {
     CHAIN_KEY.set(key).is_ok()
 }

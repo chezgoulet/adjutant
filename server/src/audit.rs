@@ -94,7 +94,7 @@ pub async fn verify(
             row.user_id_text.as_deref(),
             &row.created_at_text,
         );
-        if key.keyed_digest(&payload) != stored && report.keyed_first_bad.is_none() {
+        if !key.keyed_digest_matches(&payload, &stored) && report.keyed_first_bad.is_none() {
             report.keyed_first_bad = Some(row.id);
         }
     }
@@ -116,4 +116,27 @@ struct KeyedRow {
     user_id_text: Option<String>,
     created_at_text: String,
     keyed_hash: Option<String>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Finding 3: one changed character in the stored hash is a mismatch, and
+    /// a malformed value is a mismatch too — never an error that aborts the walk.
+    #[test]
+    fn keyed_comparison_detects_a_one_character_change() {
+        let key = ChainKey::from_bytes([7u8; 32]);
+        let payload = "row|1|action";
+        let stored = key.keyed_digest(payload);
+        assert!(key.keyed_digest_matches(payload, &stored));
+
+        let mut tampered = stored.into_bytes();
+        tampered[0] = if tampered[0] == b'0' { b'1' } else { b'0' };
+        let tampered = String::from_utf8(tampered).expect("hex is ASCII");
+        assert!(!key.keyed_digest_matches(payload, &tampered));
+
+        assert!(!key.keyed_digest_matches(payload, "not-hex"));
+        assert!(!key.keyed_digest_matches(payload, "deadbeef"));
+    }
 }

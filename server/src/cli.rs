@@ -872,12 +872,17 @@ pub async fn grant_role(cfg: &Config, username: &str, role: &str) -> Result<Stri
 // ---------------------------------------------------------------------------
 
 /// Verify both audit layers without the HTTP surface. Returns `(good, report)`
-/// where `report` is the same JSON object `GET /api/audit/verify` returns.
+/// where `report` is the same JSON object `GET /api/audit/verify` returns,
+/// followed by one plain-text line when keyed rows without a `keyed_hash` exist.
 ///
 /// `good` is the unkeyed chain **and** the keyed layer: when a key is
 /// configured, a bad `keyed_hash` fails the command even though the unkeyed
 /// chain (which the database can recompute) still verifies. Without a key the
 /// command succeeds on the unkeyed chain and prints `keyed: false`.
+///
+/// Unkeyed rows on a keyed deployment do not change `good`: they are legitimate
+/// pre-key history, but they can also come from a writer outside the keyed
+/// path, so the plain-text line makes them visible without failing the command.
 pub async fn audit_verify(cfg: &Config) -> Result<(bool, String), String> {
     // Connect only: verification is read-only and must not require (or perform)
     // migrations. A database that has not applied migration 17 has no
@@ -889,8 +894,25 @@ pub async fn audit_verify(cfg: &Config) -> Result<(bool, String), String> {
         .await
         .map_err(|e| format!("verify: {e}"))?;
     let good = report.ok && report.keyed_first_bad.is_none();
-    let json = serde_json::to_string_pretty(&report).map_err(|e| e.to_string())?;
+    let mut json = serde_json::to_string_pretty(&report).map_err(|e| e.to_string())?;
+    if let Some(note) = unkeyed_rows_note(&report) {
+        json.push('\n');
+        json.push_str(&note);
+    }
     Ok((good, json))
+}
+
+/// Finding 4: on a keyed deployment, NULL `keyed_hash` rows are either history
+/// written before the key existed or a writer that bypassed the keyed path.
+/// Say so on one line, but never fail the command for it.
+fn unkeyed_rows_note(report: &crate::audit::AuditReport) -> Option<String> {
+    if !report.keyed || report.keyed_rows_unkeyed == 0 {
+        return None;
+    }
+    Some(format!(
+        "warning: {} audit row(s) have no keyed_hash: either pre-key history or writes from a writer outside the keyed chain.",
+        report.keyed_rows_unkeyed
+    ))
 }
 
 // ---------------------------------------------------------------------------
@@ -900,6 +922,31 @@ pub async fn audit_verify(cfg: &Config) -> Result<(bool, String), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn audit_report(keyed: bool, keyed_rows_unkeyed: i64) -> crate::audit::AuditReport {
+        crate::audit::AuditReport {
+            ok: true,
+            first_bad: None,
+            rows_checked: 2,
+            keyed,
+            keyed_first_bad: None,
+            keyed_rows_checked: 0,
+            keyed_rows_unkeyed,
+        }
+    }
+
+    /// Finding 4: unkeyed rows on a keyed deployment produce one visible line,
+    /// and no line when there is no key or nothing is unkeyed.
+    #[test]
+    fn unkeyed_rows_on_a_keyed_deployment_get_one_warning_line() {
+        let note = unkeyed_rows_note(&audit_report(true, 3)).expect("a note");
+        assert!(note.contains('3'), "the count is stated: {note}");
+        assert!(note.contains("pre-key"), "names pre-key history: {note}");
+        assert!(!note.contains('\n'), "one line only: {note}");
+
+        assert!(unkeyed_rows_note(&audit_report(true, 0)).is_none());
+        assert!(unkeyed_rows_note(&audit_report(false, 3)).is_none());
+    }
 
     #[test]
     fn plugin_name_validation() {

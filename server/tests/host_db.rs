@@ -1355,6 +1355,69 @@ async fn keyed_layer_detects_an_owner_rewrite_the_unkeyed_chain_accepts() {
     assert_eq!(action, "owner-rewrote");
 }
 
+/// Finding 4: a keyed deployment with pre-key (NULL `keyed_hash`) rows reports
+/// them in one plain-text line but still succeeds — the rows are not proof of a
+/// bypass, and they must not be counted as keyed protection either.
+#[tokio::test]
+#[ignore = "DB-gated: needs ADJUTANT_TEST_DATABASE_URL; run with `-- --ignored`"]
+async fn keyed_deployment_names_unkeyed_rows_without_failing() {
+    use adjutant_sdk::{audit::ChainKey, AuditService};
+
+    let _guard = AUDIT.lock().await;
+    let (pool, _) = setup(&[]).await;
+    reset_audit_log(pool.as_ref()).await;
+
+    let key = ChainKey::parse(TEST_KEY_HEX).expect("fixed test key");
+    assert!(
+        adjutant_sdk::audit::set_chain_key(key.clone())
+            || adjutant_sdk::audit::chain_key().is_some(),
+        "the process-global key is installed once"
+    );
+
+    let audit = AuditService::new(host::CoreDb::new(pool.clone()), "core".into());
+    audit
+        .log(None, "keyed", "thing", "1", serde_json::json!({}))
+        .await
+        .expect("keyed append");
+
+    // A writer outside the keyed path: the trigger fills the unkeyed chain, but
+    // keyed_hash stays NULL, exactly like history written before the key.
+    sqlx::query(
+        "INSERT INTO core.audit_log (action, resource_type, resource_id, details, source) \
+         VALUES ('pre-key', 'thing', '2', '{}', 'core')",
+    )
+    .execute(pool.as_ref())
+    .await
+    .expect("unkeyed append");
+
+    let report = adjutant_server::audit::verify(pool.as_ref(), Some(&key))
+        .await
+        .expect("keyed verify");
+    assert!(report.ok, "the unkeyed chain verifies");
+    assert!(report.keyed, "the keyed layer was checked");
+    assert_eq!(report.keyed_rows_checked, 1);
+    assert_eq!(report.keyed_rows_unkeyed, 1);
+    assert_eq!(report.keyed_first_bad, None);
+
+    let cfg = adjutant_server::config::Config {
+        database_url: base_url(),
+        audit_key: Some(key),
+        ..Default::default()
+    };
+    let (good, cli_report) = adjutant_server::cli::audit_verify(&cfg)
+        .await
+        .expect("audit-verify CLI with a key");
+    assert!(good, "unkeyed rows are a warning, not a failure");
+    assert!(
+        cli_report.contains("1 audit row(s) have no keyed_hash"),
+        "the count is stated, got: {cli_report}"
+    );
+    assert!(
+        cli_report.contains("outside the keyed chain"),
+        "the bypass possibility is stated, got: {cli_report}"
+    );
+}
+
 /// The fixed vector, computed by PostgreSQL itself. The Rust half lives in
 /// `plugins/sdk` (`audit_vector_is_pinned_for_sql_and_rust`); both must agree or
 /// the trigger and the app verifier disagree about every row.
@@ -1364,6 +1427,20 @@ async fn sql_and_rust_agree_on_the_pinned_audit_vector() {
     use adjutant_sdk::audit::ChainKey;
 
     let (pool, _) = setup(&[]).await;
+
+    // Finding 1: the wrapper calls to_char, whose timestamp forms are STABLE.
+    // An IMMUTABLE marker would be a false promise to the planner.
+    let volatility: String = sqlx::query_scalar(
+        "SELECT provolatile::text FROM pg_proc \
+         WHERE proname = 'audit_canonical' AND pronamespace = 'core'::regnamespace",
+    )
+    .fetch_one(pool.as_ref())
+    .await
+    .expect("core.audit_canonical exists");
+    assert_eq!(
+        volatility, "s",
+        "core.audit_canonical must be STABLE, not IMMUTABLE"
+    );
     let payload: String = sqlx::query_scalar(
         "SELECT core.audit_canonical( \
              $1::text, 42::bigint, $2::text, $3::text, $4::text, $5::jsonb, $6::text, \
