@@ -142,6 +142,12 @@ a row records breaks the chain, not only its action and details. That chain is
 recomputed inside PostgreSQL and is checked by `GET /api/audit/verify` (`ok`,
 `first_bad`, `rows_checked`) and by `adjutant audit-verify`.
 
+**Migration 17 costs time proportional to `core.audit_log`.** It disables the
+append-only trigger and rewrites every existing row in one transaction to
+recompute the v2 chain, so upgrade time and lock duration scale with the table's
+row count. A large deployment should expect an upgrade window. Any error rolls
+the whole migration back, leaving the old chain intact and the trigger armed.
+
 The unkeyed chain is tamper-**evidence** only against a writer who cannot
 recompute it. The role that serves Adjutant **owns** `core.audit_log`, so it can
 disable the triggers, rewrite a row, recompute the chain and verify `ok:true`.
@@ -184,6 +190,14 @@ unkeyed chain still verifies after a key loss; `/api/audit/verify` will simply
 report `keyed_first_bad` on every row that was keyed, and keying new rows under a
 different key would start a new keyed generation. **Do not rotate the key in
 place**: rows under the old key can never match the new one.
+
+**Rotation is restart-shaped.** `set_chain_key` installs the key in a
+`OnceLock`: the first call wins, and a second call — including one carrying a
+different value — silently returns `false` and leaves the first key in force. A
+changed `ADJUTANT_AUDIT_KEY` therefore has no effect until the process restarts.
+The restart is what rotates the key; rows written before it remain under the old
+key, so plan the same way as any other key change rather than expecting an
+in-process switch.
 
 Without a key, the column stays NULL, boot logs a WARN naming what is not
 protected, and both the HTTP route and `adjutant audit-verify` report

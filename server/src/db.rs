@@ -958,6 +958,18 @@ ALTER TABLE core.audit_log ADD COLUMN IF NOT EXISTS keyed_hash TEXT;
 --
 -- details::text is jsonb's rendering (sorted keys), not the caller's JSON
 -- text: jsonb normalises on the way in, and both sides hash what is stored.
+--
+-- STABLE, not IMMUTABLE. PostgreSQL catalogues to_char(timestamp with time
+-- zone, text) at provolatile = 's' (STABLE): it is not independent of session
+-- settings. The wrapper is accepted either way, which is the trap — IMMUTABLE
+-- is a promise to the planner that the expression can be folded at plan time
+-- and indexed, and that promise is false here.
+--
+-- STABLE is honest and costs nothing today: core.audit_verify() reads and
+-- recomputes every row, so there is no index or plan-time fold to lose. The
+-- alternative, earning IMMUTABLE with explicit field extraction, would change
+-- the canonical string and force the Rust twin and this migration's recompute
+-- to change in the same commit, for an optimisation nothing uses.
 CREATE OR REPLACE FUNCTION core.audit_canonical(
     p_prev_hash     TEXT,
     p_id            BIGINT,
@@ -969,7 +981,7 @@ CREATE OR REPLACE FUNCTION core.audit_canonical(
     p_user_id       UUID,
     p_created_at    TIMESTAMPTZ
 ) RETURNS TEXT
-LANGUAGE sql IMMUTABLE AS $fn$
+LANGUAGE sql STABLE AS $fn$
 SELECT p_prev_hash || '|' || p_id::text || '|' || p_action || '|' ||
        p_resource_type || '|' || p_resource_id || '|' || p_details::text || '|' ||
        p_source || '|' || COALESCE(p_user_id::text, '') || '|' ||
@@ -980,6 +992,11 @@ $fn$;
 -- would leave every row reporting as bad. The append-only trigger would refuse
 -- these UPDATEs, so it is disabled for the recompute and re-enabled in the same
 -- transaction: an error anywhere rolls the disable back too.
+--
+-- Cost: this rewrites every existing row in one transaction. Upgrade time and
+-- lock duration scale with core.audit_log's row count, so a large deployment
+-- should expect an upgrade window. An error rolls the whole migration back,
+-- leaving the old chain intact and the append-only trigger armed.
 ALTER TABLE core.audit_log DISABLE TRIGGER audit_append_only;
 
 DO $fn$

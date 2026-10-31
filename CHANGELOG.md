@@ -47,7 +47,15 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   microsecond precision, and recomputes the chain over existing rows so an
   upgrade does not leave every row bad. Changing only who or when a row records
   now makes `first_bad` name it. The append-only and TRUNCATE guards are
-  unchanged.
+  unchanged. `core.audit_canonical()` is declared `STABLE`, not `IMMUTABLE`:
+  `to_char(timestamp with time zone, text)` is `STABLE`, and the verifier reads
+  every row so the planner optimisation an `IMMUTABLE` marker would promise is
+  not used.
+- **Migration 17 rewrites the whole audit log once.** It disables the append-only
+  trigger and recomputes every existing `core.audit_log` row in one transaction.
+  Upgrade time and lock duration are proportional to the table's size, so a large
+  deployment should expect an upgrade window. An error rolls the whole migration
+  back, leaving the old chain intact and the trigger armed.
 - **The SDK ABI is 5.** `HostDb` gains `append_audit` (with a default that
   performs the plain INSERT), the additive seam that lets the server compute a
   keyed hash before the row exists. Existing `HostDb` implementations compile
