@@ -133,6 +133,82 @@ than ~45 plugins. A hot-reload builds fresh pools for the new generation while
 retired plugins keep theirs, so leave reload headroom. See
 [`design/plugin-isolation.md`](design/plugin-isolation.md) §3.3.
 
+## The audit log and `ADJUTANT_AUDIT_KEY`
+
+`core.audit_log` is append-only and hash-chained. Each row's `entry_hash` is
+SHA-256 over `prev_hash | id | action | resource_type | resource_id |
+details::text | source | user_id | created_at` — so changing **who** or **when**
+a row records breaks the chain, not only its action and details. That chain is
+recomputed inside PostgreSQL and is checked by `GET /api/audit/verify` (`ok`,
+`first_bad`, `rows_checked`) and by `adjutant audit-verify`.
+
+**Migration 17 costs time proportional to `core.audit_log`.** It disables the
+append-only trigger and rewrites every existing row in one transaction to
+recompute the v2 chain, so upgrade time and lock duration scale with the table's
+row count. A large deployment should expect an upgrade window. Any error rolls
+the whole migration back, leaving the old chain intact and the trigger armed.
+
+The unkeyed chain is tamper-**evidence** only against a writer who cannot
+recompute it. The role that serves Adjutant **owns** `core.audit_log`, so it can
+disable the triggers, rewrite a row, recompute the chain and verify `ok:true`.
+To detect that, set a key the database does not hold:
+
+```bash
+export ADJUTANT_AUDIT_KEY="$(openssl rand -hex 32)"   # 64 hex chars, or base64 of 32 bytes
+```
+
+On every insert the server computes `keyed_hash = HMAC-SHA256(key, the same
+canonical payload)` **before** the INSERT, in the same transaction that takes the
+chain lock. The key is never sent to PostgreSQL, never written to the database,
+and never logged (its `Debug` is redacted). A malformed value refuses boot with
+an `ADJUTANT_AUDIT_KEY:` error rather than silently running unkeyed.
+
+**The honest threat model.**
+
+- **Protects against:** someone who can read or write the database — including
+  the role that owns `core.audit_log`, or a stolen backup, or `pg_dump` — but
+  does not hold the server's environment. Rewriting a row and recomputing the
+  unkeyed chain leaves `keyed_hash` stale; the app verifier names the row
+  (`keyed_first_bad`). A restored dump cannot be re-signed without the key.
+- **Does not protect against:** a compromised server process. It holds the key
+  to write each row, so an attacker with code execution or the environment can
+  compute valid hashes. The key is an anchor against the database, not against
+  the application.
+- **It is not an external notarisation.** There is no periodic export to a store
+  the database cannot write; an attacker who compromises both the database and
+  the server's environment is outside this layer's reach. A database owner can
+  also strip `keyed_hash` from rows — `keyed_rows_unkeyed` makes that visible,
+  but a full strip leaves no keyed row to compare, so the honest longer-term
+  answer is an exported `(id, keyed_hash)` snapshot somewhere the database
+  cannot write. That is not built here.
+
+**Losing the key is permanent for the keyed layer.** Past `keyed_hash` values
+cannot be re-verified without the original key (an HMAC is not reversible, and
+there is no second copy). Keep the key with the other deployment secrets (for
+example in `deploy/.env`, which the backup dump deliberately excludes). The
+unkeyed chain still verifies after a key loss; `/api/audit/verify` will simply
+report `keyed_first_bad` on every row that was keyed, and keying new rows under a
+different key would start a new keyed generation. **Do not rotate the key in
+place**: rows under the old key can never match the new one.
+
+**Rotation is restart-shaped.** `set_chain_key` installs the key in a
+`OnceLock`: the first call wins, and a second call — including one carrying a
+different value — silently returns `false` and leaves the first key in force. A
+changed `ADJUTANT_AUDIT_KEY` therefore has no effect until the process restarts.
+The restart is what rotates the key; rows written before it remain under the old
+key, so plan the same way as any other key change rather than expecting an
+in-process switch.
+
+Without a key, the column stays NULL, boot logs a WARN naming what is not
+protected, and both the HTTP route and `adjutant audit-verify` report
+`keyed: false`. That is a statement about the anchor, not a green tick.
+
+To verify from a shell (exit code 1 if either layer fails):
+
+```bash
+adjutant audit-verify --database-url "$ADJUTANT_DATABASE_URL"
+```
+
 ## Putting it behind TLS
 
 Terminate TLS at a reverse proxy (Caddy, nginx, Traefik) and forward to the
@@ -425,7 +501,11 @@ the RPO is whatever the operator actually ran.
 
 The audit log is append-only and hash-chained, so it is the one thing a partial
 restore can quietly corrupt. Verify it after a restore with
-`GET /api/audit/verify` (admin only).
+`GET /api/audit/verify` (admin only) or `adjutant audit-verify`. Check both
+layers: `ok` is the unkeyed chain and `keyed` is whether the HMAC layer was
+checked. A restore cannot recompute `keyed_hash` values — that is the point of
+the key — so a dump restored and then tampered with will fail the keyed layer
+even if its unkeyed chain was rebuilt.
 
 ## Releases
 

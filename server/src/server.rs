@@ -400,6 +400,28 @@ pub async fn build_app(cfg: &Config) -> Result<(Router, Arc<AppState>), BuildErr
         tracing::warn!("{}", DEV_HEADERS_RISK);
     }
 
+    // #160: install the keyed layer before anything can append an audit row.
+    // The key is process-global (so `AuditService::new` and every plugin keep
+    // compiling), and it never reaches SQL, a log line, or the database role.
+    match &cfg.audit_key {
+        Some(key) => {
+            if !adjutant_sdk::audit::set_chain_key(key.clone()) {
+                tracing::warn!(
+                    "ADJUTANT_AUDIT_KEY: a chain key was already installed in this process; \
+                     the first one stays in force"
+                );
+            }
+            tracing::info!("audit: keyed chain enabled (HMAC-SHA256 over the v2 payload)");
+        }
+        None => tracing::warn!(
+            "ADJUTANT_AUDIT_KEY is not set: the audit chain covers action, resource, details, \
+             source, user_id and created_at, but it is NOT keyed. A role that owns core.audit_log \
+             can disable the triggers, rewrite a row, recompute the chain and verify ok:true. \
+             Set a 32-byte key (64 hex characters or base64) to make that detectable; \
+             GET /api/audit/verify reports keyed:false until then."
+        ),
+    }
+
     let pool = db::connect(cfg).await.map_err(BuildError::Db)?;
 
     // Refuse a superuser before running any DDL.
@@ -1047,25 +1069,17 @@ async fn recent_events(State(state): State<Arc<AppState>>, req: Request) -> Resp
     Json(json!({ "events": events, "cursor": last })).into_response()
 }
 
-/// Recompute the audit hash chain (SPEC §15 M2: tamper-evident audit log).
-/// FAILS CLOSED: if the verification query itself errors, the endpoint answers
-/// 500 — never `{"ok":true,"rows_checked":0}`, which is what the old
+/// Recompute the audit hash chain (SPEC §15 M2: tamper-evident audit log) and,
+/// when `ADJUTANT_AUDIT_KEY` is configured, the keyed HMAC layer (#159, #160).
+/// FAILS CLOSED: if a verification query errors, the endpoint answers 500 —
+/// never `{"ok":true,"rows_checked":0}`, which is what the old
 /// `unwrap_or((None, 0))` produced and would have masked a broken verifier.
 async fn audit_verify(State(state): State<Arc<AppState>>, req: Request) -> Response {
     if let Some(resp) = state.require_admin(req.headers()).await {
         return resp;
     }
-    let row: Result<(Option<i64>, i64), sqlx::Error> =
-        sqlx::query_as("SELECT first_bad, rows_checked FROM core.audit_verify()")
-            .fetch_one(state.pool.as_ref())
-            .await;
-    match row {
-        Ok((first_bad, rows)) => Json(json!({
-            "ok": first_bad.is_none(),
-            "first_bad": first_bad,
-            "rows_checked": rows,
-        }))
-        .into_response(),
+    match crate::audit::verify(state.pool.as_ref(), state.config.audit_key.as_ref()).await {
+        Ok(report) => Json(report).into_response(),
         Err(e) => internal_error("audit verification", &e),
     }
 }

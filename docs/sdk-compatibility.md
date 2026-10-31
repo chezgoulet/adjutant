@@ -88,6 +88,7 @@ byte-for-byte as they were.
 | 0.2.0 (M4 target) | 2 | First version with the handshake and scoped identity (`Identity.grants`) |
 | 0.3.0 (scope enforcement) | 3 | Scopes are enforced: `required_scope` on routes, `Identity.grants` is the source of truth (`roles` is derived), `ScopeType::Personal` removed, `PermissionService::has` → `has_any_scope`/`has_in_scope`/`reach` |
 | 0.3.0 (core scheduler) | 4 | `AdjutantPlugin::schedules()` + `Schedule`/`schedule_handler`: the core runs plugin-declared periodic work on the plugin's pool, with a timeout, one attempt per tick, and a `core.scheduled_runs` record |
+| 0.3.0 (audit chain v2 + keyed, #159/#160) | 5 | `HostDb::append_audit` (defaulted; existing implementations compile unchanged). It is a change to the `HostDb` trait surface, so the ABI moves even though no existing call site changes: a stale `.so` is refused rather than loaded with a mismatched vtable |
 | 0.3.0 (SDK v0.3 helpers) | 4 | `permissions!` / `migrations!` declaration macros, `PermissionDecl` / `PermissionSet` / `MigrationSource`, and the `testing::assert_routes_gate_declared` / `undeclared_route_gates` assertions. **Additive** — see [above](#additive-helpers-do-not-bump-the-abi-sdk-v03); nothing the core enforces changed and no plugin needs rebuilding to keep working |
 
 ## Migrating a plugin from ABI 3 to 4

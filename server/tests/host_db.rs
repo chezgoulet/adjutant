@@ -126,6 +126,10 @@ static SETUP: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 /// (they assert on its global contents, so they must not interleave).
 static HIERARCHY: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
+/// Serializes the audit probes: they truncate `core.audit_log`, and the keyed
+/// one installs the process-global chain key.
+static AUDIT: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
 /// Migrate `core` on the test database and bootstrap a plugin fixture role/schema
 /// for each id, returning `(admin_pool, plugin_pools)`. Mirrors a real
 /// deployment's first `bootstrap-isolation` run.
@@ -1129,5 +1133,494 @@ async fn probe_scheduler_runs_records_and_stops() {
     assert_eq!(
         after_stop, 0,
         "a stopped plugin's schedules must not start new runs after the stop"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Audit chain v2 + the keyed layer (#159, #160)
+//
+// These are the issue reproductions as tests. They are #[ignore]d with the rest
+// of this file, so a bare workspace run reports them as ignored, never passed.
+// ---------------------------------------------------------------------------
+
+/// Empty the chain without tripping the append-only/TRUNCATE guards. The guards
+/// are the mechanism under test in other probes; here we are the owner preparing
+/// a fixture, which is exactly the adversary #160 describes.
+async fn reset_audit_log(pool: &sqlx::PgPool) {
+    sqlx::raw_sql(
+        "ALTER TABLE core.audit_log DISABLE TRIGGER audit_append_only;\
+         ALTER TABLE core.audit_log DISABLE TRIGGER audit_no_truncate;\
+         TRUNCATE core.audit_log RESTART IDENTITY;\
+         ALTER TABLE core.audit_log ENABLE TRIGGER audit_append_only;\
+         ALTER TABLE core.audit_log ENABLE TRIGGER audit_no_truncate;",
+    )
+    .execute(pool)
+    .await
+    .expect("reset core.audit_log");
+}
+
+async fn unkeyed_verify(pool: &sqlx::PgPool) -> (Option<i64>, i64) {
+    sqlx::query_as("SELECT first_bad, rows_checked FROM core.audit_verify()")
+        .fetch_one(pool)
+        .await
+        .expect("core.audit_verify()")
+}
+
+/// #159's reproduction: change only the actor and the timestamp, and the v1
+/// chain kept saying ok. v2 must name the row.
+#[tokio::test]
+#[ignore = "DB-gated: needs ADJUTANT_TEST_DATABASE_URL; run with `-- --ignored`"]
+async fn changing_user_id_and_created_at_breaks_the_chain() {
+    let _guard = AUDIT.lock().await;
+    let (pool, _) = setup(&[]).await;
+    reset_audit_log(pool.as_ref()).await;
+
+    let alice = "aaaaaaaa-1111-1111-1111-111111111111";
+    let bob = "bbbbbbbb-2222-2222-2222-222222222222";
+    for (id, name) in [(alice, "Alice"), (bob, "Bob")] {
+        sqlx::query(
+            "INSERT INTO core.users (id, display_name) VALUES ($1::uuid, $2) \
+             ON CONFLICT (id) DO NOTHING",
+        )
+        .bind(id)
+        .bind(name)
+        .execute(pool.as_ref())
+        .await
+        .expect("fixture user");
+    }
+
+    for (action, user) in [("first", alice), ("second", bob)] {
+        sqlx::query(
+            "INSERT INTO core.audit_log (user_id, action, resource_type, resource_id, details, source) \
+             VALUES ($1::uuid, $2, 'thing', '1', '{}', 'core')",
+        )
+        .bind(user)
+        .bind(action)
+        .execute(pool.as_ref())
+        .await
+        .expect("append audit row");
+    }
+
+    let (first_bad, rows) = unkeyed_verify(pool.as_ref()).await;
+    assert_eq!(first_bad, None, "the untouched chain verifies");
+    assert_eq!(rows, 2);
+
+    // The CLI reports the same two layers and does not claim keyed protection
+    // when configured without a key.
+    let cfg = adjutant_server::config::Config {
+        database_url: base_url(),
+        audit_key: None,
+        ..Default::default()
+    };
+    let (good, report) = adjutant_server::cli::audit_verify(&cfg)
+        .await
+        .expect("audit-verify CLI");
+    assert!(good, "the unkeyed chain is good");
+    assert!(
+        report.contains("\"keyed\": false"),
+        "no key reports keyed:false, got: {report}"
+    );
+
+    // The owner disables the append-only guard, changes only who and when, and
+    // re-arms it. Nothing hashed by v1 changed.
+    sqlx::query("ALTER TABLE core.audit_log DISABLE TRIGGER audit_append_only")
+        .execute(pool.as_ref())
+        .await
+        .expect("disable guard");
+    sqlx::query(
+        "UPDATE core.audit_log \
+         SET user_id = $1::uuid, created_at = created_at - interval '30 days' \
+         WHERE id = 1",
+    )
+    .bind(bob)
+    .execute(pool.as_ref())
+    .await
+    .expect("rewrite actor and timestamp");
+    sqlx::query("ALTER TABLE core.audit_log ENABLE TRIGGER audit_append_only")
+        .execute(pool.as_ref())
+        .await
+        .expect("re-arm guard");
+
+    let (first_bad, rows) = unkeyed_verify(pool.as_ref()).await;
+    assert_eq!(
+        first_bad,
+        Some(1),
+        "v2 hashes user_id and created_at, so the re-attributed row is named"
+    );
+    assert_eq!(rows, 2);
+}
+
+const TEST_KEY_HEX: &str =
+    "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f";
+
+/// #160's reproduction: the owner rewrites an action and recomputes the unkeyed
+/// chain. SQL says ok — and the keyed verifier names the row. Without the key,
+/// there is nothing to name.
+#[tokio::test]
+#[ignore = "DB-gated: needs ADJUTANT_TEST_DATABASE_URL; run with `-- --ignored`"]
+async fn keyed_layer_detects_an_owner_rewrite_the_unkeyed_chain_accepts() {
+    use adjutant_sdk::{audit::ChainKey, AuditService};
+
+    let _guard = AUDIT.lock().await;
+    let (pool, _) = setup(&[]).await;
+    reset_audit_log(pool.as_ref()).await;
+
+    let key = ChainKey::parse(TEST_KEY_HEX).expect("fixed test key");
+    assert!(
+        adjutant_sdk::audit::set_chain_key(key.clone()) || adjutant_sdk::audit::chain_key().is_some(),
+        "the process-global key is installed once"
+    );
+
+    let audit = AuditService::new(host::CoreDb::new(pool.clone()), "core".into());
+    audit
+        .log(None, "first", "thing", "1", serde_json::json!({"n": 1}))
+        .await
+        .expect("keyed append 1");
+    audit
+        .log(None, "second", "thing", "2", serde_json::json!({"n": 2}))
+        .await
+        .expect("keyed append 2");
+
+    let keyed: Vec<Option<String>> =
+        sqlx::query_scalar("SELECT keyed_hash FROM core.audit_log ORDER BY id")
+            .fetch_all(pool.as_ref())
+            .await
+            .expect("read keyed hashes");
+    assert_eq!(keyed.len(), 2);
+    assert!(
+        keyed.iter().all(Option::is_some),
+        "the writer computes keyed_hash before the INSERT; the row lands with both hashes"
+    );
+
+    let report = adjutant_server::audit::verify(pool.as_ref(), Some(&key))
+        .await
+        .expect("keyed verify");
+    assert!(report.ok, "the chain verifies");
+    assert!(report.keyed);
+    assert_eq!(report.keyed_rows_checked, 2);
+    assert_eq!(report.keyed_rows_unkeyed, 0);
+    assert_eq!(report.keyed_first_bad, None);
+
+    // Without a key the verifier says so and checks nothing — it does not
+    // report a green keyed result.
+    let no_key = adjutant_server::audit::verify(pool.as_ref(), None)
+        .await
+        .expect("unkeyed verify");
+    assert!(!no_key.keyed);
+    assert_eq!(no_key.keyed_rows_checked, 0);
+    assert_eq!(no_key.keyed_first_bad, None);
+
+    // As the owning role: disable the guard, rewrite the action, recompute the
+    // unkeyed chain exactly as core.audit_chain_fill would, re-arm. The owner
+    // also *guesses* the keyed layer by writing the unkeyed digest into
+    // `keyed_hash` — the best a writer without the key can do. The real HMAC
+    // still disagrees, which is the whole point of the key.
+    sqlx::query("ALTER TABLE core.audit_log DISABLE TRIGGER audit_append_only")
+        .execute(pool.as_ref())
+        .await
+        .expect("disable guard");
+    sqlx::query("UPDATE core.audit_log SET action = 'owner-rewrote' WHERE id = 1")
+        .execute(pool.as_ref())
+        .await
+        .expect("rewrite action");
+    sqlx::raw_sql(
+        r#"
+        DO $fn$
+        DECLARE r RECORD; prev TEXT := repeat('0', 64); h TEXT;
+        BEGIN
+          FOR r IN SELECT id, user_id, action, resource_type, resource_id, details, source, created_at
+                   FROM core.audit_log ORDER BY id LOOP
+            h := encode(public.digest(core.audit_canonical(prev, r.id, r.action, r.resource_type,
+                 r.resource_id, r.details, r.source, r.user_id, r.created_at), 'sha256'), 'hex');
+            UPDATE core.audit_log
+               SET prev_hash = prev, entry_hash = h, keyed_hash = h
+             WHERE id = r.id;
+            prev := h;
+          END LOOP;
+        END $fn$;
+        "#,
+    )
+    .execute(pool.as_ref())
+    .await
+    .expect("recompute the unkeyed chain as the owner");
+    sqlx::query("ALTER TABLE core.audit_log ENABLE TRIGGER audit_append_only")
+        .execute(pool.as_ref())
+        .await
+        .expect("re-arm guard");
+
+    let (first_bad, rows) = unkeyed_verify(pool.as_ref()).await;
+    assert_eq!(
+        first_bad, None,
+        "the unkeyed chain is internally consistent again — this is the point of #160"
+    );
+    assert_eq!(rows, 2);
+
+    let report = adjutant_server::audit::verify(pool.as_ref(), Some(&key))
+        .await
+        .expect("keyed verify after rewrite");
+    assert!(report.ok, "the unkeyed layer still says ok");
+    assert_eq!(
+        report.keyed_first_bad,
+        Some(1),
+        "the keyed layer names the rewritten row"
+    );
+    assert_eq!(report.keyed_rows_checked, 2);
+
+    // The operator's CLI path reaches the same two layers: the unkeyed chain is
+    // good, the keyed layer is not, and the command must exit non-zero.
+    let cfg = adjutant_server::config::Config {
+        database_url: base_url(),
+        audit_key: Some(key.clone()),
+        ..Default::default()
+    };
+    let (good, cli_report) = adjutant_server::cli::audit_verify(&cfg)
+        .await
+        .expect("audit-verify CLI with a key");
+    assert!(!good, "the keyed rewrite must fail the CLI");
+    assert!(
+        cli_report.contains("\"keyed_first_bad\": 1"),
+        "the CLI names the row, got: {cli_report}"
+    );
+
+    // And the row the owner erased is genuinely gone from the unkeyed view.
+    let action: String = sqlx::query_scalar("SELECT action FROM core.audit_log WHERE id = 1")
+        .fetch_one(pool.as_ref())
+        .await
+        .expect("read row 1");
+    assert_eq!(action, "owner-rewrote");
+}
+
+/// Finding 4: a keyed deployment with pre-key (NULL `keyed_hash`) rows reports
+/// them in one plain-text line but still succeeds — the rows are not proof of a
+/// bypass, and they must not be counted as keyed protection either.
+#[tokio::test]
+#[ignore = "DB-gated: needs ADJUTANT_TEST_DATABASE_URL; run with `-- --ignored`"]
+async fn keyed_deployment_names_unkeyed_rows_without_failing() {
+    use adjutant_sdk::{audit::ChainKey, AuditService};
+
+    let _guard = AUDIT.lock().await;
+    let (pool, _) = setup(&[]).await;
+    reset_audit_log(pool.as_ref()).await;
+
+    let key = ChainKey::parse(TEST_KEY_HEX).expect("fixed test key");
+    assert!(
+        adjutant_sdk::audit::set_chain_key(key.clone())
+            || adjutant_sdk::audit::chain_key().is_some(),
+        "the process-global key is installed once"
+    );
+
+    let audit = AuditService::new(host::CoreDb::new(pool.clone()), "core".into());
+    audit
+        .log(None, "keyed", "thing", "1", serde_json::json!({}))
+        .await
+        .expect("keyed append");
+
+    // A writer outside the keyed path: the trigger fills the unkeyed chain, but
+    // keyed_hash stays NULL, exactly like history written before the key.
+    sqlx::query(
+        "INSERT INTO core.audit_log (action, resource_type, resource_id, details, source) \
+         VALUES ('pre-key', 'thing', '2', '{}', 'core')",
+    )
+    .execute(pool.as_ref())
+    .await
+    .expect("unkeyed append");
+
+    let report = adjutant_server::audit::verify(pool.as_ref(), Some(&key))
+        .await
+        .expect("keyed verify");
+    assert!(report.ok, "the unkeyed chain verifies");
+    assert!(report.keyed, "the keyed layer was checked");
+    assert_eq!(report.keyed_rows_checked, 1);
+    assert_eq!(report.keyed_rows_unkeyed, 1);
+    assert_eq!(report.keyed_first_bad, None);
+
+    let cfg = adjutant_server::config::Config {
+        database_url: base_url(),
+        audit_key: Some(key),
+        ..Default::default()
+    };
+    let (good, cli_report) = adjutant_server::cli::audit_verify(&cfg)
+        .await
+        .expect("audit-verify CLI with a key");
+    assert!(good, "unkeyed rows are a warning, not a failure");
+    assert!(
+        cli_report.contains("1 audit row(s) have no keyed_hash"),
+        "the count is stated, got: {cli_report}"
+    );
+    assert!(
+        cli_report.contains("outside the keyed chain"),
+        "the bypass possibility is stated, got: {cli_report}"
+    );
+}
+
+/// The fixed vector, computed by PostgreSQL itself. The Rust half lives in
+/// `plugins/sdk` (`audit_vector_is_pinned_for_sql_and_rust`); both must agree or
+/// the trigger and the app verifier disagree about every row.
+#[tokio::test]
+#[ignore = "DB-gated: needs ADJUTANT_TEST_DATABASE_URL; run with `-- --ignored`"]
+async fn sql_and_rust_agree_on_the_pinned_audit_vector() {
+    use adjutant_sdk::audit::ChainKey;
+
+    let (pool, _) = setup(&[]).await;
+
+    // Finding 1: the wrapper calls to_char, whose timestamp forms are STABLE.
+    // An IMMUTABLE marker would be a false promise to the planner.
+    let volatility: String = sqlx::query_scalar(
+        "SELECT provolatile::text FROM pg_proc \
+         WHERE proname = 'audit_canonical' AND pronamespace = 'core'::regnamespace",
+    )
+    .fetch_one(pool.as_ref())
+    .await
+    .expect("core.audit_canonical exists");
+    assert_eq!(
+        volatility, "s",
+        "core.audit_canonical must be STABLE, not IMMUTABLE"
+    );
+    let payload: String = sqlx::query_scalar(
+        "SELECT core.audit_canonical( \
+             $1::text, 42::bigint, $2::text, $3::text, $4::text, $5::jsonb, $6::text, \
+             $7::uuid, $8::timestamptz)",
+    )
+    .bind(adjutant_sdk::AUDIT_ZERO_HASH)
+    .bind("member.update")
+    .bind("member")
+    .bind("11111111-1111-1111-1111-111111111111")
+    .bind("{\"b\":\"x\",\"a\":1}")
+    .bind("core")
+    .bind("22222222-2222-2222-2222-222222222222")
+    .bind("2026-01-02T03:04:05.123456Z")
+    .fetch_one(pool.as_ref())
+    .await
+    .expect("SQL canonical payload");
+
+    let (sha, hmac): (String, String) = sqlx::query_as(
+        "SELECT encode(public.digest($1, 'sha256'), 'hex'), \
+                encode(public.hmac(convert_to($1, 'UTF8'), decode($2, 'hex'), 'sha256'), 'hex')",
+    )
+    .bind(&payload)
+    .bind(TEST_KEY_HEX)
+    .fetch_one(pool.as_ref())
+    .await
+    .expect("SQL digests");
+
+    let rust_payload = adjutant_sdk::canonical_payload(
+        adjutant_sdk::AUDIT_ZERO_HASH,
+        42,
+        "member.update",
+        "member",
+        "11111111-1111-1111-1111-111111111111",
+        "{\"a\": 1, \"b\": \"x\"}",
+        "core",
+        Some("22222222-2222-2222-2222-222222222222"),
+        "2026-01-02T03:04:05.123456+00:00",
+    );
+    assert_eq!(
+        payload, rust_payload,
+        "SQL and Rust must pin the same canonical form"
+    );
+    assert_eq!(
+        sha,
+        adjutant_sdk::unkeyed_digest(&rust_payload),
+        "the unkeyed entry_hash agrees"
+    );
+    let key = ChainKey::parse(TEST_KEY_HEX).expect("fixed key");
+    assert_eq!(
+        hmac,
+        key.keyed_digest(&rust_payload),
+        "the keyed HMAC agrees"
+    );
+}
+
+/// The one path a fresh install never takes: upgrading a database whose rows
+/// already carry v1 hashes. Re-running migration 17's SQL must repair them
+/// (the DO block) and leave the append-only guard armed.
+#[tokio::test]
+#[ignore = "DB-gated: needs ADJUTANT_TEST_DATABASE_URL; run with `-- --ignored`"]
+async fn migration_17_recomputes_a_v1_chain_on_upgrade() {
+    let _guard = AUDIT.lock().await;
+    let (pool, _) = setup(&[]).await;
+    reset_audit_log(pool.as_ref()).await;
+
+    for action in ["first", "second"] {
+        sqlx::query(
+            "INSERT INTO core.audit_log (action, resource_type, resource_id, details, source) \
+             VALUES ($1, 'thing', '1', '{}', 'core')",
+        )
+        .bind(action)
+        .execute(pool.as_ref())
+        .await
+        .expect("append phase-2 row");
+    }
+
+    // Rewrite the hashes with the v1 formula, as a database that applied
+    // migration 2 and not 17 would have them.
+    sqlx::query("ALTER TABLE core.audit_log DISABLE TRIGGER audit_append_only")
+        .execute(pool.as_ref())
+        .await
+        .expect("disable guard");
+    sqlx::raw_sql(
+        r#"
+        DO $fn$
+        DECLARE r RECORD; prev TEXT := repeat('0', 64); h TEXT;
+        BEGIN
+          FOR r IN SELECT id, action, resource_type, resource_id, details, source
+                   FROM core.audit_log ORDER BY id LOOP
+            h := encode(public.digest(prev || '|' || r.id::text || '|' || r.action || '|' ||
+                 r.resource_type || '|' || r.resource_id || '|' || r.details::text || '|' ||
+                 r.source, 'sha256'), 'hex');
+            UPDATE core.audit_log SET prev_hash = prev, entry_hash = h WHERE id = r.id;
+            prev := h;
+          END LOOP;
+        END $fn$;
+        "#,
+    )
+    .execute(pool.as_ref())
+    .await
+    .expect("write v1 hashes");
+    sqlx::query("ALTER TABLE core.audit_log ENABLE TRIGGER audit_append_only")
+        .execute(pool.as_ref())
+        .await
+        .expect("re-arm guard");
+
+    let (first_bad, _) = unkeyed_verify(pool.as_ref()).await;
+    assert_eq!(
+        first_bad,
+        Some(1),
+        "v1 hashes do not satisfy the v2 verifier"
+    );
+
+    let sql = db::CORE_MIGRATIONS
+        .iter()
+        .find(|(version, _, _)| *version == 17)
+        .map(|(_, _, sql)| *sql)
+        .expect("migration 17 is present");
+    sqlx::raw_sql(&format!("BEGIN; {sql}; COMMIT;"))
+        .execute(pool.as_ref())
+        .await
+        .expect("run migration 17 over existing rows");
+
+    let (first_bad, rows) = unkeyed_verify(pool.as_ref()).await;
+    assert_eq!(
+        first_bad, None,
+        "the upgrade recomputed the chain instead of leaving every row bad"
+    );
+    assert_eq!(rows, 2);
+
+    let armed: bool = sqlx::query_scalar(
+        "SELECT tgenabled <> 'D' FROM pg_trigger WHERE tgname = 'audit_append_only'",
+    )
+    .fetch_one(pool.as_ref())
+    .await
+    .expect("trigger state");
+    assert!(armed, "the append-only guard is re-armed after the recompute");
+
+    // Prove it: an UPDATE is refused again.
+    let err = sqlx::query("UPDATE core.audit_log SET action = 'nope' WHERE id = 1")
+        .execute(pool.as_ref())
+        .await
+        .expect_err("the append-only guard is back");
+    assert!(
+        err.to_string().contains("append-only"),
+        "expected the append-only error, got: {err}"
     );
 }
