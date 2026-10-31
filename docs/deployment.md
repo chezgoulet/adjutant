@@ -276,31 +276,90 @@ plugin's schema, the roles' grants, and the append-only audit chain. So the
 database dump is the backup, and `deploy/backup.sh` takes it:
 
 ```bash
+export ADJUTANT_BACKUP_AGE_RECIPIENT="age1..."   # public key, safe on the server
 ./deploy/backup.sh                 # or: ./deploy/backup.sh /other/dir
 ```
 
 | | |
 |---|---|
-| **What** | the `adjutant` database (`pg_dump -Fc`), plus its `.sha256` |
+| **What** | the `adjutant` database (`pg_dump -Fc`), encrypted with `age`, plus its `.sha256` |
+| **Artifact** | `adjutant-<stamp>.dump.age` (a deliberate plaintext fallback is `.dump`) |
 | **Where** | `$ADJUTANT_BACKUP_DIR`, default `/var/backups/adjutant` |
 | **Retention** | `$ADJUTANT_BACKUP_KEEP_DAYS`, default 14 days, pruned by the script |
 | **Cadence** | daily, and immediately before any upgrade — see below |
 | **NOT in the dump** | `deploy/.env` (it holds `POSTGRES_PASSWORD` and `ADJUTANT_APP_PASSWORD`) and the plugin `.so` files. Back the `.env` up somewhere else and keep it: without it a restore cannot reproduce the credentials the roles were created with. |
 
-The script refuses to call a zero-byte dump a success, and re-reads the archive
-with `pg_restore -l` before trusting it — a dump you cannot list is a dump you
-cannot restore.
+The script refuses to call a zero-byte dump a success. An encrypted bundle is
+checked for the age header, and when `ADJUTANT_BACKUP_AGE_IDENTITY` is available
+it is decrypted and re-read with `pg_restore -l` — a dump you cannot list is a
+dump you cannot restore.
+
+### A bundle is credential material
+
+`core.plugins.db_secret` holds every plugin role's password, and `pg_dump -Fc`
+is compressed, **not encrypted**. Every bundle — host-produced or from the
+in-app backup button — is encrypted to an age **recipient** public key before it
+is written:
+
+| Variable | Meaning |
+|---|---|
+| `ADJUTANT_BACKUP_AGE_RECIPIENT` | age public key (`age1...`) used to encrypt. Safe on the server; the matching **private** key must not be. |
+| `ADJUTANT_BACKUP_AGE_IDENTITY` | path to the age identity file, needed only to **restore** or to read a bundle back. |
+| `ADJUTANT_BACKUP_ALLOW_PLAINTEXT` | the explicit opt-out. Must be `true` (or `1`) to write a plaintext `.dump` and log a WARN. |
+
+**The default is fail closed.** With no recipient configured a backup fails with
+an error naming `ADJUTANT_BACKUP_AGE_RECIPIENT`; it does not quietly write a
+plaintext bundle. `ADJUTANT_BACKUP_ALLOW_PLAINTEXT=true` is the one deliberate
+exception, and the WARN it logs says the bundle is credential material.
+
+Generate a key pair somewhere that is **not** the deployment host:
+
+```bash
+age-keygen -o adjutant-backup.key       # keep this off the server
+grep '^# public key:' adjutant-backup.key
+```
+
+`deploy/backup.sh` and `deploy/restore.sh` use `age` from the host when it is
+installed there, and otherwise run it from the runtime image; the in-app backup
+button always uses the image's copy. The Dockerfile's runtime stage installs it
+for exactly this reason.
+
+**What encryption does and does not protect.** The bundle lives in a Docker
+named volume on the same host as the database, so encrypting it protects the
+copy, not the host. A host compromise still reaches the running database and
+everything the app can read; age turns a stolen bundle or an accidentally
+copied volume from "every plugin password and all troop data" into ciphertext.
+Treat the identity file as the recovery key: without it the bundle is
+unreadable, and losing it is losing every backup.
 
 ### Restoring
 
 ```bash
-./deploy/restore.sh /var/backups/adjutant/adjutant-2026-09-26-153006.dump --yes
+export ADJUTANT_BACKUP_AGE_IDENTITY=/root/adjutant-backup.key
+./deploy/restore.sh /var/backups/adjutant/adjutant-2026-10-20-120000.dump.age --yes
 ```
 
-`--yes` because it drops the current database. The script validates the archive
-**before** dropping anything, then: stop the app, recreate the database,
-`pg_restore`, **run `bootstrap-isolation`**, start the app, and refuse to exit
-successfully unless it answers through the proxy and the plugin grants exist.
+`--yes` because it drops the current database. A `.dump.age` with no identity
+configured, or with an identity file that does not exist, **fails before the
+database is dropped** — never drop a database you cannot restore. The script
+then validates the archive before dropping anything. The decrypt is piped
+straight into `pg_restore -l` for that check and into `pg_restore` for the
+restore itself, so **no plaintext dump is written to disk at any point**; the
+bundle is decrypted twice rather than leaving a clear-text copy behind. It then
+stops the app, recreates the database, runs `pg_restore --no-owner --no-acl` (**no** ACLs or
+owners yet, because the roles do not exist), runs `bootstrap-isolation`, and
+finally runs `adjutant verify-isolation`. Only then does it start the app and
+refuse to exit successfully unless it answers through the proxy and the plugin
+grants exist.
+
+`verify-isolation` is the step that makes `ok` mean something. For every
+installed plugin it checks that the `adjutant_plugin_<id>` role exists, that the
+plugin's schema and tables are owned by it, that its `core.*` allowlist grants
+are present and no unlisted `core.*` table is reachable, and that a connection
+made the way the runtime makes it reports `session_user` as that role. It also
+checks `adjutant_app` exists, owns `core`, and is a member of every plugin role.
+Failures name the specific missing role or table. A plaintext `.dump` from an
+older release is still accepted, with a WARN that it is credential material.
 
 ### The step everyone misses, and why it is the whole reason there is a script
 
@@ -317,8 +376,8 @@ Command was: GRANT SELECT,INSERT,DELETE ON TABLE core.sessions TO adjutant_plugi
 pg_restore: warning: errors ignored on restore: 6
 ```
 
-**`errors ignored` is the dangerous part.** The restore reports success, the data
-is all there, and the server then crash-loops on
+**`errors ignored` is the dangerous part.** The old script reported success, the
+data was all there, and the server then crash-looped on
 
 ```
 password authentication failed for user "adjutant_app"     (28P01, 7 restarts, exit 1)
@@ -328,7 +387,8 @@ which points at a password when the actual fault is a role that was never
 created. `bootstrap-isolation` closes it: it creates the roles, transfers
 ownership of the plugin schemas to them, hands the `core` schema to
 `adjutant_app`, stores each plugin's credential, and **re-asserts the grant
-allowlist** — which is what puts back the six `GRANT`s that `pg_restore` dropped.
+allowlist** — which is what puts back the six `GRANT`s the old restore dropped,
+without ever attempting them against roles that do not exist.
 
 ### Measured, not asserted
 

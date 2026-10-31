@@ -80,6 +80,11 @@ export DOMAIN=adjutant.example.org      # the certificate is for this name
 export ACME_EMAIL=you@example.org
 export POSTGRES_PASSWORD="$(openssl rand -hex 24)"
 export ADJUTANT_APP_PASSWORD="$(openssl rand -hex 24)"
+# The age public key backup bundles are encrypted to. There is no default: a
+# backup without it fails closed rather than writing every plugin password in
+# clear text. Keep the private identity off this host (see docs/deployment.md
+# § Backup and restore).
+export ADJUTANT_BACKUP_AGE_RECIPIENT="age1..."
 # The edge network's third octet (default 172.31.7). The subnet, the proxy's
 # static address and the value the app trusts are all derived from it, so this is
 # the one thing a second stack on the same host changes.

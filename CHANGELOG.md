@@ -19,6 +19,10 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   first boot against an empty database, before the listener opens. Half a
   credential pair refuses to boot. Once any user exists the variables are
   ignored — they never rewrite an existing account (#173).
+- **`adjutant verify-isolation [--app-role <name>]`** — asserts the roles,
+  schema/table ownership, allowlist grants and per-role session identity a
+  working deployment must have. `deploy/restore.sh` runs it before it starts the
+  app or reports success (#161).
 - **`adjutant grant-role <username> <role>`** — writes `core.user_roles`
   directly, so it recovers a troop whose last admin has been removed and whose
   API is therefore unreachable (#147).
@@ -57,6 +61,13 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Fixed
 
+- **A partial restore fails instead of printing `ok` (#161).** `deploy/restore.sh`
+  now restores with `--no-owner --no-acl` (there are no roles to own or grant to
+  yet), checks `PIPESTATUS[0]`, treats `errors ignored` as data loss, and runs
+  the new `adjutant verify-isolation` after `bootstrap-isolation`. That command
+  checks every installed plugin's role, schema/table ownership, allowlist grants,
+  an unlisted `core.*` table being unreachable, and a live connection as the
+  plugin role — and names the specific missing role or table.
 - **Collection routes decode the wrapper the server actually sends (#167).**
   `_asList` accepted a hard-coded list of wrapper names, so
   `GET /api/calendar/upcoming` (`{"occurrences": …}`) and
@@ -77,6 +88,18 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Security
 
+- **Backup bundles are encrypted, and fail closed without a key (#163).** Every
+  bundle is written as `adjutant-<stamp>.dump.age`, encrypted to the age
+  recipient in `ADJUTANT_BACKUP_AGE_RECIPIENT`; the private key never lives on
+  the server. With no recipient a backup fails with an error naming that
+  variable unless `ADJUTANT_BACKUP_ALLOW_PLAINTEXT=true` explicitly accepts a
+  plaintext `.dump` and logs a WARN. `deploy/restore.sh` decrypts with
+  `ADJUTANT_BACKUP_AGE_IDENTITY` and refuses to drop the database when the
+  identity is missing or unusable. The decrypt is piped straight into
+  `pg_restore -l` and then into the restore itself, so no clear-text dump is
+  ever written to disk — not even a `chmod 600` file in `/tmp` that a crash
+  could leave behind. The runtime image installs `age` for the in-app backup
+  button.
 - **The session token is in platform secure storage, not preferences (#169).**
   `flutter_secure_storage` (Keystore/Keychain/libsecret), with a one-time
   migration from `adjutant.token` that deletes the plaintext key. Android backup
