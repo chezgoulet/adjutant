@@ -116,6 +116,10 @@ Precedence is defaults < TOML file (./adjutant.toml or `--config`) < environment
 | `ADJUTANT_TRUSTED_PROXIES` | comma-separated peer IPs allowed to set `x-forwarded-for`. **Empty by default — the header is otherwise ignored**, because any client can send it |
 | `ADJUTANT_CORS` | comma-separated origins, `*` for any |
 | `ADJUTANT_MAX_BODY` | request body cap in bytes |
+| `ADJUTANT_HTTP_HEADER_TIMEOUT` | seconds to receive a request's headers (default `5`) |
+| `ADJUTANT_HTTP_BODY_TIMEOUT` | total seconds allowed for a request body, not reset per chunk (default `10`) |
+| `ADJUTANT_HTTP_REQUEST_TIMEOUT` | seconds for the whole request, handler included (default `300`; the backup bundle gets the same five minutes the client does) |
+| `ADJUTANT_HTTP_MAX_CONNECTIONS` | concurrent accepted connections (default `128`); further sockets wait in the kernel backlog |
 | `ADJUTANT_DEV_HEADERS` | **`false` by default.** Set `true` (or pass `--allow-dev-headers`) to enable the spoofable `x-dev-user`/`x-dev-role` identity stub for development. Only consulted when no plugin identity provider answered. `--no-dev-headers` forces it off, overriding a config file or environment that enabled it |
 | `ADJUTANT_ALLOW_SUPERUSER` | **`false` by default.** The server refuses to boot on a PostgreSQL superuser connection (a plugin escape would be total compromise). Set `true` (or pass `--allow-superuser`) only for a throwaway database |
 | `ADJUTANT_TEST_DATABASE_URL` | overrides the derived `_test` database for `adjutant test-plugin` and the DB-backed tests |

@@ -824,12 +824,19 @@ pub async fn run_test_plugin(cfg: &Config) -> Result<Vec<Probe>, String> {
     let base = format!("http://{addr}");
 
     let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
+    let header_timeout = std::time::Duration::from_secs(cfg.http.header_timeout_secs);
+    let max_connections = cfg.http.max_connections;
     let server = tokio::spawn(async move {
-        axum::serve(listener, app)
-            .with_graceful_shutdown(async {
+        crate::serve::serve(
+            listener,
+            app,
+            async {
                 let _ = shutdown_rx.await;
-            })
-            .await
+            },
+            header_timeout,
+            max_connections,
+        )
+        .await
     });
 
     // Give the listener a beat, then read the live route table.

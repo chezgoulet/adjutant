@@ -326,12 +326,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let listener = tokio::net::TcpListener::bind(cfg.bind).await?;
     tracing::info!(addr = %listener.local_addr()?, "listening");
 
-    // ConnectInfo feeds the rate limiter's per-IP key.
-    axum::serve(
+    // ConnectInfo feeds the rate limiter's per-IP key. The serve loop also
+    // carries the header-read deadline and the connection cap (issue #172).
+    adjutant_server::serve::serve(
         listener,
-        app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+        app,
+        shutdown_signal(),
+        std::time::Duration::from_secs(cfg.http.header_timeout_secs),
+        cfg.http.max_connections,
     )
-    .with_graceful_shutdown(shutdown_signal())
     .await?;
 
     // Give plugins their shutdown hook and stop event handlers before exiting.

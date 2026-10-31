@@ -21,6 +21,15 @@ Adjutant's HTTP API is JSON over HTTP. Plugin routes live under
   the access log.
 - **Rate limiting:** fixed window per client IP (config `ADJUTANT_RATE_MAX`,
   `ADJUTANT_RATE_WINDOW`; `0` disables). A `429` includes `retry-after`.
+- **Timeouts and size:** a connection must send its first byte within
+  `ADJUTANT_HTTP_HEADER_TIMEOUT` (default 5 s), and the header block then gets
+  that same deadline. A request body has one total
+  `ADJUTANT_HTTP_BODY_TIMEOUT` (default 10 s, never renewed by a slow drip), and
+  the whole request is bounded by `ADJUTANT_HTTP_REQUEST_TIMEOUT` (default
+  300 s). A stalled body answers `408`; a body over `ADJUTANT_MAX_BODY` answers
+  `413`. At most `ADJUTANT_HTTP_MAX_CONNECTIONS` (default 128) sockets are
+  served at once. On a plugin route the permission gate runs before the body is
+  read, so an unauthenticated caller gets `401` without the body.
 - **CORS:** controlled by `ADJUTANT_CORS` (empty = same-origin only).
 
 ## Core

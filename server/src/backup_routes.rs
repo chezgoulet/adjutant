@@ -8,7 +8,7 @@
 
 use std::sync::Arc;
 
-use axum::body::{to_bytes, Body};
+use axum::body::Body;
 use axum::extract::{Path, Request, State};
 use axum::http::{header, StatusCode};
 use axum::response::{IntoResponse, Response};
@@ -58,7 +58,10 @@ pub async fn set_schedule(State(state): State<Arc<AppState>>, req: Request) -> R
     let actor = identity.as_ref().map(|i| i.user_id.clone());
 
     let (_, body) = req.into_parts();
-    let bytes = to_bytes(body, state.config.max_body_bytes).await.unwrap_or_default();
+    let bytes = match crate::middleware::read_body(body, state.config.max_body_bytes).await {
+        Ok(bytes) => bytes,
+        Err(resp) => return resp,
+    };
     let value: serde_json::Value = match serde_json::from_slice(&bytes) {
         Ok(v) => v,
         Err(e) => return error_response(StatusCode::BAD_REQUEST, format!("invalid JSON: {e}")),
