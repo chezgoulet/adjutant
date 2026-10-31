@@ -95,8 +95,11 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   variable unless `ADJUTANT_BACKUP_ALLOW_PLAINTEXT=true` explicitly accepts a
   plaintext `.dump` and logs a WARN. `deploy/restore.sh` decrypts with
   `ADJUTANT_BACKUP_AGE_IDENTITY` and refuses to drop the database when the
-  identity is missing or unusable. The runtime image installs `age` for the
-  in-app backup button.
+  identity is missing or unusable. The decrypt is piped straight into
+  `pg_restore -l` and then into the restore itself, so no clear-text dump is
+  ever written to disk — not even a `chmod 600` file in `/tmp` that a crash
+  could leave behind. The runtime image installs `age` for the in-app backup
+  button.
 - **The session token is in platform secure storage, not preferences (#169).**
   `flutter_secure_storage` (Keystore/Keychain/libsecret), with a one-time
   migration from `adjutant.token` that deletes the plaintext key. Android backup

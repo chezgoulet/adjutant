@@ -342,8 +342,11 @@ export ADJUTANT_BACKUP_AGE_IDENTITY=/root/adjutant-backup.key
 `--yes` because it drops the current database. A `.dump.age` with no identity
 configured, or with an identity file that does not exist, **fails before the
 database is dropped** — never drop a database you cannot restore. The script
-then validates the archive before dropping anything, and: stops the app,
-recreates the database, runs `pg_restore --no-owner --no-acl` (**no** ACLs or
+then validates the archive before dropping anything. The decrypt is piped
+straight into `pg_restore -l` for that check and into `pg_restore` for the
+restore itself, so **no plaintext dump is written to disk at any point**; the
+bundle is decrypted twice rather than leaving a clear-text copy behind. It then
+stops the app, recreates the database, runs `pg_restore --no-owner --no-acl` (**no** ACLs or
 owners yet, because the roles do not exist), runs `bootstrap-isolation`, and
 finally runs `adjutant verify-isolation`. Only then does it start the app and
 refuse to exit successfully unless it answers through the proxy and the plugin

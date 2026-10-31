@@ -37,6 +37,13 @@
 # restore — never drop a database whose bundle you cannot read. A plaintext
 # `.dump` is accepted (older bundles exist) and is called out as credential
 # material.
+#
+# **No plaintext dump is ever written to disk.** The decrypt is piped straight
+# into `pg_restore -l` for validation and into `pg_restore` for the restore, so
+# the clear-text archive (which holds every plugin role's password) never gets a
+# path, not even a `chmod 600` one in `/tmp` that a `SIGKILL`, an OOM kill or a
+# host crash could leave behind. The bundle is read twice, so it is decrypted
+# twice; that is deliberate and cheaper than any on-disk intermediate.
 set -euo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -54,10 +61,6 @@ ASSUME_YES="${2:-}"
 fail() { echo "FAIL: $*" >&2; exit 1; }
 ok()   { echo "  ok — $*"; }
 warn() { echo "  WARN — $*" >&2; }
-
-DECRYPTED=""
-cleanup() { [ -n "$DECRYPTED" ] && rm -f "$DECRYPTED"; return 0; }
-trap cleanup EXIT
 
 : "${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD (see deploy/README.md)}"
 : "${ADJUTANT_APP_PASSWORD:?set ADJUTANT_APP_PASSWORD (see deploy/README.md)}"
@@ -86,23 +89,35 @@ age_decrypt() {
   fi
 }
 
+# The archive as a stream on stdout. Every read of a bundle goes through this, so
+# a decrypted copy never lands on disk: it exists only inside the pipe between
+# this function and the `pg_restore` consuming it.
+bundle_stream() {
+  case "$DUMP" in
+    *.age) age_decrypt "$DUMP" "$IDENTITY" ;;
+    *) cat -- "$DUMP" ;;
+  esac
+}
+
 echo "== 0. open the bundle before dropping anything =="
-INPUT="$DUMP"
+encrypted=0
+IDENTITY=""
 case "$DUMP" in
   *.age)
+    encrypted=1
     IDENTITY="${ADJUTANT_BACKUP_AGE_IDENTITY:-}"
     [ -n "$IDENTITY" ] || fail \
       "$DUMP is encrypted; set ADJUTANT_BACKUP_AGE_IDENTITY to the age identity file. \
 Refusing to drop the database for a bundle this host cannot read."
     [ -f "$IDENTITY" ] || fail \
       "ADJUTANT_BACKUP_AGE_IDENTITY=$IDENTITY does not exist. Refusing to drop the database."
-    DECRYPTED="$(mktemp "${TMPDIR:-/tmp}/adjutant-restore.XXXXXX")"
-    chmod 600 "$DECRYPTED"
-    if ! age_decrypt "$DUMP" "$IDENTITY" > "$DECRYPTED"; then
-      fail "cannot decrypt $DUMP with $IDENTITY — refusing to drop the database"
-    fi
-    INPUT="$DECRYPTED"
-    ok "decrypted $DUMP with $IDENTITY"
+    # Metadata check before the decrypt and before the DROP: a truncated or
+    # overwritten file should be named as "not an age bundle", not surface as a
+    # confusing decrypt error later.
+    first_line=""
+    IFS= read -r first_line < "$DUMP" || true
+    [ "$first_line" = 'age-encryption.org/v1' ] \
+      || fail "$DUMP does not start with the age header — refusing to drop the database for it"
     ;;
   *)
     warn "$DUMP is a PLAINTEXT bundle: it is credential material (every plugin role's password)."
@@ -115,8 +130,23 @@ esac
 # `< "$DUMP"` redirect, because the last redirect wins), and left an empty
 # database behind with a perfectly good dump on disk. A restore script must fail
 # before the destructive step, not after it.
-"${COMPOSE[@]}" exec -T postgres pg_restore -l < "$INPUT" >/dev/null 2>&1 \
-  || fail "$INPUT is not a readable pg_restore archive — refusing to drop the database for it"
+#
+# The decrypt is the first leg of the pipeline and `pg_restore -l` is the second;
+# both statuses are fatal and mean different things. `set +e` is needed only
+# because `pipefail` would otherwise abort before `PIPESTATUS` can be read.
+set +e
+bundle_stream | "${COMPOSE[@]}" exec -T postgres pg_restore -l >/dev/null 2>&1
+read_rc=("${PIPESTATUS[@]}")
+set -e
+if [ "${read_rc[0]}" -ne 0 ]; then
+  if [ "$encrypted" -eq 1 ]; then
+    fail "cannot decrypt $DUMP with ADJUTANT_BACKUP_AGE_IDENTITY — refusing to drop the database for it"
+  fi
+  fail "cannot read $DUMP — refusing to drop the database for it"
+fi
+[ "${read_rc[1]}" -eq 0 ] \
+  || fail "$DUMP is not a readable pg_restore archive — refusing to drop the database for it"
+[ "$encrypted" -eq 0 ] || ok "decrypted the bundle with ADJUTANT_BACKUP_AGE_IDENTITY"
 ok "the bundle is readable; safe to proceed"
 
 echo "== 1. stop the application so nothing writes mid-restore =="
@@ -137,14 +167,24 @@ echo "== 3. restore the dump (no owner, no ACL: neither exists yet) =="
 restore_log="$(mktemp "${TMPDIR:-/tmp}/adjutant-restore-log.XXXXXX")"
 start=$(date +%s)
 set +e
-"${COMPOSE[@]}" exec -T postgres pg_restore -U adjutant -d adjutant --no-owner --no-acl \
-  < "$INPUT" 2>&1 | tee "$restore_log" | tail -20
+bundle_stream \
+  | "${COMPOSE[@]}" exec -T postgres pg_restore -U adjutant -d adjutant --no-owner --no-acl 2>&1 \
+  | tee "$restore_log" | tail -20
 rc=("${PIPESTATUS[@]}")
 set -e
 elapsed_restore=$(( $(date +%s) - start ))
 
+# First leg: the decrypt (or `cat` for an older plaintext bundle). Second leg:
+# pg_restore itself. They are separate failures — a bad identity must not read as
+# a bad archive, and a SQL error must not read as a decryption problem.
 if [ "${rc[0]}" -ne 0 ]; then
-  fail "pg_restore exited ${rc[0]} — the restore is partial, not successful. Re-run after reading the output above."
+  if [ "$encrypted" -eq 1 ]; then
+    fail "cannot decrypt $DUMP with ADJUTANT_BACKUP_AGE_IDENTITY — the restore is partial, not successful."
+  fi
+  fail "cannot read $DUMP — the restore is partial, not successful."
+fi
+if [ "${rc[1]}" -ne 0 ]; then
+  fail "pg_restore exited ${rc[1]} — the restore is partial, not successful. Re-run after reading the output above."
 fi
 if grep -q 'errors ignored' "$restore_log"; then
   fail "pg_restore reported 'errors ignored' — after --no-acl those errors are data loss, not pre-role noise. Read the output above."
