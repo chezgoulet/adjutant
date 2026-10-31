@@ -375,7 +375,10 @@ dump you cannot restore.
 `core.plugins.db_secret` holds every plugin role's password, and `pg_dump -Fc`
 is compressed, **not encrypted**. Every bundle — host-produced or from the
 in-app backup button — is encrypted to an age **recipient** public key before it
-is written:
+is written. `pg_dump`'s stdout is piped straight into `age` in both producers,
+so the complete credential-bearing archive exists only inside that pipe: no
+plaintext dump is written to the backups volume (or anywhere else), not even a
+`0600` temporary one that a crash or an OOM kill could leave behind.
 
 | Variable | Meaning |
 |---|---|

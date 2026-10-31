@@ -97,7 +97,7 @@ jobs:
       # `deploy/backup.sh` sidesteps it a different way — it dumps from *inside*
       # the postgres container and so always uses the server's own client. The
       # in-app runner brings its own, which is the whole difference.
-      - name: PostgreSQL client 18 (for the backup probes)
+      - name: PostgreSQL client 18 + age (for the backup probes)
         run: |
           sudo install -d /usr/share/postgresql-common/pgdg
           sudo curl -fsSL https://www.postgresql.org/media/keys/ACCC4CF8.asc \
@@ -106,7 +106,11 @@ jobs:
           https://apt.postgresql.org/pub/repos/apt $(lsb_release -cs)-pgdg main" \
             | sudo tee /etc/apt/sources.list.d/pgdg.list
           sudo apt-get update -qq
-          sudo apt-get install -y -qq postgresql-client-18
+          # `age` is not optional: without it the encrypted-bundle probe fails
+          # rather than skipping. A probe that passes when the thing it exists
+          # to exercise is missing is not evidence.
+          sudo apt-get install -y -qq postgresql-client-18 age
+          age --version
           echo "wrapper:  $(pg_dump --version)"
           echo "real 18:  $(/usr/lib/postgresql/18/bin/pg_dump --version)"
           # `pg_dump` on Debian and Ubuntu is postgresql-common's **wrapper**, not

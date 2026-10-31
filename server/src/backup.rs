@@ -16,6 +16,12 @@
 //! configured, unless `ADJUTANT_BACKUP_ALLOW_PLAINTEXT=true` deliberately opts
 //! into a `.dump` with a WARN. The private key is not on the server.
 //!
+//! `pg_dump`'s stdout is piped straight into `age`. There is no intermediate
+//! plaintext file: the complete credential-bearing dump never has a path, not
+//! even a `0600` one in the backups volume that a crash or an OOM kill could
+//! leave behind for the next person who copies that volume. Only the deliberate
+//! plaintext opt-in writes the archive to disk unencrypted.
+//!
 //! What a bundle is *not*: a complete backup. A `pg_dump` carries the database
 //! and not the cluster's roles, so restoring one onto a clean host needs
 //! `bootstrap-isolation` afterwards. That is `deploy/restore.sh`'s job and
@@ -367,11 +373,36 @@ pub async fn prune(pool: &PgPool, dir: &Path) -> Result<usize, String> {
     Ok(removed)
 }
 
-/// Run `pg_dump -Fc` with its stdout pointed at `path`.
+/// The one message a missing `pg_dump` gets: it names the fix, not the symptom.
+fn pg_dump_missing() -> String {
+    "pg_dump is not on this server. The container image must carry a client \
+     new enough for the database it dumps — see the Dockerfile."
+        .to_string()
+}
+
+/// The same for `age`: the runtime image installs it for exactly this reason.
+fn age_missing() -> String {
+    "age is not on this server. The runtime image installs it for exactly \
+     this reason — see the Dockerfile."
+        .to_string()
+}
+
+/// The stderr of a failed command, or its exit status when it said nothing.
+fn command_failure(name: &str, output: &std::process::Output) -> String {
+    let err = String::from_utf8_lossy(&output.stderr).trim().to_string();
+    if err.is_empty() {
+        format!("{name} exited {}", output.status)
+    } else {
+        err
+    }
+}
+
+/// Run `pg_dump -Fc` with its stdout pointed at `path` — the plaintext opt-in.
 ///
 /// The file is created `0600`: a plaintext dump is the one artifact that carries
-/// every plugin credential, so it is not readable by anyone else on the host even
-/// for the seconds before `age` consumes it.
+/// every plugin credential, so it is not readable by anyone else on the host.
+/// This is only reached when `ADJUTANT_BACKUP_ALLOW_PLAINTEXT=true`; the normal
+/// path is [`dump_and_encrypt_to`], which never writes the dump to disk.
 async fn dump_to(path: &Path, database_url: &str) -> Result<(), String> {
     let file = create_private(path)
         .map_err(|e| format!("cannot create {}: {e}", path.display()))?;
@@ -388,72 +419,114 @@ async fn dump_to(path: &Path, database_url: &str) -> Result<(), String> {
 
     let output = match child {
         Ok(child) => child.wait_with_output().await,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            return Err(
-                "pg_dump is not on this server. The container image must carry a client \
-                 new enough for the database it dumps — see the Dockerfile."
-                    .to_string(),
-            )
-        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Err(pg_dump_missing()),
         Err(e) => return Err(format!("cannot run pg_dump: {e}")),
     };
 
     match output {
         Ok(o) if o.status.success() => Ok(()),
-        Ok(o) => {
-            let err = String::from_utf8_lossy(&o.stderr).trim().to_string();
-            Err(if err.is_empty() {
-                format!("pg_dump exited {}", o.status)
-            } else {
-                err
-            })
-        }
+        Ok(o) => Err(command_failure("pg_dump", &o)),
         Err(e) => Err(format!("cannot wait for pg_dump: {e}")),
     }
 }
 
-/// Encrypt `input` to `output` with the age recipient.
+/// Stream `pg_dump -Fc` into `age` and write only the ciphertext to `path`.
 ///
-/// The private key is not present here by design; this server can write bundles
-/// it cannot read. A missing `age` is a configuration error with a named fix, and
-/// a failed encryption removes the output rather than leaving a half-written
-/// bundle that looks complete.
-async fn encrypt_to(input: &Path, output: &Path, recipient: &str) -> Result<(), String> {
-    if output.exists() {
+/// The credential-bearing archive exists only inside the pipe between the two
+/// processes. A plaintext dump written to the backups volume first — even `0600`
+/// and even if `age` consumes it a moment later — is one crash, OOM kill or
+/// full disk away from becoming a stray copy of the artifact this issue is
+/// about. The private key is not present here by design: this server can write
+/// bundles it cannot read.
+async fn dump_and_encrypt_to(
+    path: &Path,
+    database_url: &str,
+    recipient: &str,
+) -> Result<(), String> {
+    if path.exists() {
         return Err(format!(
             "refusing to overwrite an existing bundle: {}",
-            output.display()
+            path.display()
         ));
     }
-    let result = tokio::process::Command::new("age")
+
+    let mut dump = match tokio::process::Command::new("pg_dump")
+        .arg("--dbname")
+        .arg(database_url)
+        .arg("--format=custom")
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .kill_on_drop(true)
+        .spawn()
+    {
+        Ok(child) => child,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Err(pg_dump_missing()),
+        Err(e) => return Err(format!("cannot run pg_dump: {e}")),
+    };
+    let Some(stdout) = dump.stdout.take() else {
+        let _ = dump.kill().await;
+        return Err("pg_dump started without a stdout pipe".to_string());
+    };
+    // `age` reads the dump from its stdin, which *is* pg_dump's stdout pipe.
+    let stdin: std::process::Stdio = match stdout.try_into() {
+        Ok(stdio) => stdio,
+        Err(e) => {
+            let _ = dump.kill().await;
+            return Err(format!("cannot pass pg_dump's output to age: {e}"));
+        }
+    };
+
+    let encrypt = match tokio::process::Command::new("age")
         .arg("--recipient")
         .arg(recipient)
         .arg("--output")
-        .arg(output)
-        .arg(input)
-        .output()
-        .await;
-
-    match result {
-        Ok(o) if o.status.success() => Ok(()),
-        Ok(o) => {
-            let _ = std::fs::remove_file(output);
-            let err = String::from_utf8_lossy(&o.stderr).trim().to_string();
-            Err(if err.is_empty() {
-                format!("age exited {}", o.status)
-            } else {
-                format!("age could not encrypt the bundle: {err}")
-            })
-        }
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Err(
-            "age is not on this server. The runtime image installs it for exactly \
-             this reason — see the Dockerfile."
-                .to_string(),
-        ),
+        .arg(path)
+        .stdin(stdin)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::piped())
+        .kill_on_drop(true)
+        .spawn()
+    {
+        Ok(child) => child,
         Err(e) => {
-            let _ = std::fs::remove_file(output);
-            Err(format!("cannot run age: {e}"))
+            let _ = dump.kill().await;
+            let _ = dump.wait().await;
+            return Err(if e.kind() == std::io::ErrorKind::NotFound {
+                age_missing()
+            } else {
+                format!("cannot run age: {e}")
+            });
         }
+    };
+
+    // `age` ends when `pg_dump` closes the pipe; waiting on both concurrently
+    // drains both stderr pipes, so neither can block the other on a full pipe.
+    let (encrypted, dumped) = tokio::join!(encrypt.wait_with_output(), dump.wait_with_output());
+
+    let dump_err = match &dumped {
+        Ok(o) if o.status.success() => None,
+        Ok(o) => Some(command_failure("pg_dump", o)),
+        Err(e) => Some(format!("cannot wait for pg_dump: {e}")),
+    };
+    let enc_err = match &encrypted {
+        Ok(o) if o.status.success() => None,
+        Ok(o) => Some(format!("age could not encrypt the bundle: {}", command_failure("age", o))),
+        Err(e) => Some(format!("cannot wait for age: {e}")),
+    };
+
+    if dump_err.is_none() && enc_err.is_none() {
+        return Ok(());
+    }
+    // A partial or unencrypted output is not a bundle; do not leave one behind
+    // for the reconciler to list as a run that looks complete.
+    let _ = std::fs::remove_file(path);
+    match (dump_err, enc_err) {
+        // Report both legs: a bad recipient makes `pg_dump` die of a broken pipe
+        // too, and the recipient error is the one that names the real fault.
+        (Some(d), Some(a)) => Err(format!("{d}; and {a}")),
+        (Some(d), None) => Err(d),
+        (None, Some(a)) => Err(a),
+        (None, None) => Ok(()),
     }
 }
 
@@ -487,11 +560,6 @@ pub async fn run(
     let stamp = chrono::Utc::now().format("%F-%H%M%S").to_string();
     let filename = artifact_name(&stamp, encrypted);
     let path = dir.join(&filename);
-    // The plaintext dump is a temporary file only when a recipient is known; it
-    // must never survive the run. `.plaintext` is deliberately not a bundle
-    // suffix, so the reconciler and prune never mistake it for one.
-    let plaintext_path = encrypted.then(|| dir.join(format!(".{filename}.{}.plaintext", std::process::id())));
-    let write_path = plaintext_path.as_deref().unwrap_or(&path);
 
     if !encrypted {
         tracing::warn!(
@@ -512,13 +580,10 @@ pub async fn run(
     .await
     .map_err(|e| e.to_string())?;
 
-    let mut outcome = dump_to(write_path, database_url).await;
-    if outcome.is_ok() {
-        if let (Some(recipient), Some(plaintext)) = (recipient.as_deref(), plaintext_path.as_deref()) {
-            outcome = encrypt_to(plaintext, &path, recipient).await;
-            let _ = std::fs::remove_file(plaintext);
-        }
-    }
+    let outcome = match recipient.as_deref() {
+        Some(recipient) => dump_and_encrypt_to(&path, database_url, recipient).await,
+        None => dump_to(&path, database_url).await,
+    };
 
     let outcome = match outcome {
         Ok(()) => {
@@ -553,9 +618,6 @@ pub async fn run(
 
     if let Err(why) = outcome {
         let _ = std::fs::remove_file(&path);
-        if let Some(plaintext) = plaintext_path.as_deref() {
-            let _ = std::fs::remove_file(plaintext);
-        }
         mark_failed(pool, id, &why).await;
         return Err(why);
     }
