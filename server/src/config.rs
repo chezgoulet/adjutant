@@ -46,6 +46,47 @@ impl Default for RateConfig {
     }
 }
 
+/// HTTP connection and request deadlines (issue #172).
+///
+/// The header timeout is enforced by the server loop (hyper's HTTP/1 builder),
+/// because middleware only runs after a complete header block has arrived. The
+/// body and request deadlines are router layers, so a handler cannot forget
+/// them; the connection cap is a semaphore in the accept loop.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct HttpConfig {
+    /// First-byte deadline; the same budget then bounds the rest of the header
+    /// block. A client that sends nothing cannot occupy a socket at all.
+    pub header_timeout_secs: u64,
+    /// Maximum time from request start to the last body frame.
+    pub body_timeout_secs: u64,
+    /// Maximum time for the whole request, handler included.
+    pub request_timeout_secs: u64,
+    /// Concurrent accepted connections. Further TCP handshakes wait in the
+    /// kernel accept backlog until a slot is free.
+    pub max_connections: usize,
+}
+
+impl Default for HttpConfig {
+    fn default() -> Self {
+        Self {
+            // Every client this repo ships sends headers immediately; five
+            // seconds is generous for a lossy mobile link and still cuts the
+            // measured 25 s partial-header hold.
+            header_timeout_secs: 5,
+            // A total body deadline, not an inactivity timeout: one byte per
+            // second must not renew it. The Flutter client gives a whole JSON
+            // request 20 s, and no route in this tree accepts an upload.
+            body_timeout_secs: 10,
+            // The longest legitimate request is a backup bundle read/download;
+            // the client gives that one five minutes, so the server does too.
+            request_timeout_secs: 300,
+            // A held connection costs a slot for at most the header timeout;
+            // 128 leaves room for a troop while bounding the accept path.
+            max_connections: 128,
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct Config {
     pub bind: SocketAddr,
@@ -55,6 +96,8 @@ pub struct Config {
     pub log_filter: String,
     pub log_format: LogFormat,
     pub rate: RateConfig,
+    /// Request, body, header and connection limits (issue #172).
+    pub http: HttpConfig,
     /// Empty = no CORS layer (same-origin only). `["*"]` allows everyone.
     pub cors_origins: Vec<String>,
     /// Dev identity headers (`x-dev-user`/`x-dev-role`). Trivially spoofable —
@@ -100,6 +143,7 @@ impl Default for Config {
             log_filter: "info,adjutant_server=debug".into(),
             log_format: LogFormat::Pretty,
             rate: RateConfig::default(),
+            http: HttpConfig::default(),
             cors_origins: Vec::new(),
             allow_dev_headers: false,
             trusted_proxies: Vec::new(),
@@ -121,6 +165,7 @@ struct FileConfig {
     log_filter: Option<String>,
     log_format: Option<String>,
     rates: Option<FileRates>,
+    http: Option<FileHttp>,
     cors: Option<FileCors>,
     auth: Option<FileAuth>,
     trusted_proxies: Option<Vec<String>>,
@@ -131,6 +176,14 @@ struct FileConfig {
 struct FileRates {
     window_secs: Option<u64>,
     max_requests: Option<u32>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct FileHttp {
+    header_timeout_secs: Option<u64>,
+    body_timeout_secs: Option<u64>,
+    request_timeout_secs: Option<u64>,
+    max_connections: Option<usize>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -221,6 +274,8 @@ ENVIRONMENT (override file, overridden by flags):
     ADJUTANT_CONFIG, ADJUTANT_BIND, ADJUTANT_DATABASE_URL, ADJUTANT_PLUGIN_DIR,
     ADJUTANT_LOG, ADJUTANT_LOG_FORMAT, ADJUTANT_RATE_MAX, ADJUTANT_RATE_WINDOW,
     ADJUTANT_CORS (comma-separated origins), ADJUTANT_MAX_BODY,
+    ADJUTANT_HTTP_HEADER_TIMEOUT / ADJUTANT_HTTP_BODY_TIMEOUT /
+    ADJUTANT_HTTP_REQUEST_TIMEOUT (seconds) and ADJUTANT_HTTP_MAX_CONNECTIONS,
     ADJUTANT_DEV_HEADERS (true enables the dev stub; off by default),
     ADJUTANT_TRUSTED_PROXIES, ADJUTANT_ALLOW_SUPERUSER (true permits a superuser
     connection; off by default),
@@ -320,6 +375,26 @@ pub fn load(cli: &CliArgs) -> Result<Config, String> {
     if let Ok(v) = std::env::var("ADJUTANT_MAX_BODY") {
         cfg.max_body_bytes = v.parse().map_err(|e| format!("ADJUTANT_MAX_BODY: {e}"))?;
     }
+    if let Ok(v) = std::env::var("ADJUTANT_HTTP_HEADER_TIMEOUT") {
+        cfg.http.header_timeout_secs = v
+            .parse()
+            .map_err(|e| format!("ADJUTANT_HTTP_HEADER_TIMEOUT: {e}"))?;
+    }
+    if let Ok(v) = std::env::var("ADJUTANT_HTTP_BODY_TIMEOUT") {
+        cfg.http.body_timeout_secs = v
+            .parse()
+            .map_err(|e| format!("ADJUTANT_HTTP_BODY_TIMEOUT: {e}"))?;
+    }
+    if let Ok(v) = std::env::var("ADJUTANT_HTTP_REQUEST_TIMEOUT") {
+        cfg.http.request_timeout_secs = v
+            .parse()
+            .map_err(|e| format!("ADJUTANT_HTTP_REQUEST_TIMEOUT: {e}"))?;
+    }
+    if let Ok(v) = std::env::var("ADJUTANT_HTTP_MAX_CONNECTIONS") {
+        cfg.http.max_connections = v
+            .parse()
+            .map_err(|e| format!("ADJUTANT_HTTP_MAX_CONNECTIONS: {e}"))?;
+    }
     if let Ok(v) = std::env::var("ADJUTANT_DEV_HEADERS") {
         cfg.allow_dev_headers = matches!(v.as_str(), "1" | "true" | "yes");
     }
@@ -400,6 +475,22 @@ pub fn load(cli: &CliArgs) -> Result<Config, String> {
         cfg.allow_superuser = true;
     }
 
+    // A zero deadline or zero connection slots does not disable a limit: it
+    // makes the server refuse every connection or wait forever. Fail at boot
+    // with the setting named, rather than at the first request.
+    if cfg.http.header_timeout_secs == 0 {
+        return Err("HTTP header timeout must be at least 1 second".into());
+    }
+    if cfg.http.body_timeout_secs == 0 {
+        return Err("HTTP body timeout must be at least 1 second".into());
+    }
+    if cfg.http.request_timeout_secs == 0 {
+        return Err("HTTP request timeout must be at least 1 second".into());
+    }
+    if cfg.http.max_connections == 0 {
+        return Err("HTTP max connections must be at least 1".into());
+    }
+
     Ok(cfg)
 }
 
@@ -441,6 +532,20 @@ fn merge_file(cfg: &mut Config, path: &Path) -> Result<(), String> {
         }
         if let Some(v) = r.max_requests {
             cfg.rate.max_requests = v;
+        }
+    }
+    if let Some(h) = f.http {
+        if let Some(v) = h.header_timeout_secs {
+            cfg.http.header_timeout_secs = v;
+        }
+        if let Some(v) = h.body_timeout_secs {
+            cfg.http.body_timeout_secs = v;
+        }
+        if let Some(v) = h.request_timeout_secs {
+            cfg.http.request_timeout_secs = v;
+        }
+        if let Some(v) = h.max_connections {
+            cfg.http.max_connections = v;
         }
     }
     if let Some(c) = f.cors {

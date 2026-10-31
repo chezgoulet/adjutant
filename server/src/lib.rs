@@ -21,6 +21,7 @@ pub mod plugin_runtime;
 pub mod scheduler;
 pub mod schema;
 pub mod scope_hierarchy;
+pub mod serve;
 pub mod server;
 pub mod wasm;
 

@@ -16,7 +16,6 @@
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
-use axum::body::to_bytes;
 use axum::extract::{Path, Request, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
@@ -25,6 +24,8 @@ use axum::{Json, Router};
 use serde_json::json;
 use tokio::sync::RwLock;
 use tower_http::cors::{Any, CorsLayer};
+use tower_http::limit::RequestBodyLimitLayer;
+use tower_http::timeout::TimeoutLayer;
 
 use adjutant_sdk::{AuditService, Identity, PermissionService, PluginRequest};
 
@@ -569,6 +570,36 @@ pub async fn build_app(cfg: &Config) -> Result<(Router, Arc<AppState>), BuildErr
         }
     });
 
+    let app = build_router(state.clone());
+
+    // CORS is outermost, so its headers are present on 429s and errors too.
+    let app = match cors {
+        Some(c) => app.layer(c),
+        None => app,
+    };
+
+    tracing::info!(
+        routes = route_count,
+        "router assembled (dynamic plugin dispatch)"
+    );
+    Ok((app, state))
+}
+
+/// Assemble the application router from `state`.
+///
+/// Kept separate from [`build_app`] so tests (and any future embedding) can
+/// mount the exact production middleware stack without a database boot. Issue
+/// #172's limits live here, not in handlers:
+///
+/// * `RequestBodyLimitLayer` caps body size before an extractor sees it;
+/// * `body_deadline` puts one total deadline on the body, so a slow drip cannot
+///   renew it frame by frame;
+/// * `TimeoutLayer` bounds the whole request, handler included.
+///
+/// The header-read deadline and connection cap are below this router, in
+/// [`crate::serve::serve`].
+pub fn build_router(state: Arc<AppState>) -> Router {
+    let cfg = &state.config;
     let app = Router::new()
         .route("/", get(health))
         .route("/api/plugins", get(list_plugins))
@@ -628,25 +659,23 @@ pub async fn build_app(cfg: &Config) -> Result<(Router, Arc<AppState>), BuildErr
         .fallback(dynamic_dispatch)
         .with_state(state.clone());
 
-    // Layer order: later call = outermost. CORS outermost (headers on 429s and
-    // errors), then access log (sees every response incl. rate-limited), then
-    // the limiter (cheap rejection before any handler work).
+    // Later call = outermost. The limiter stays cheap and outside the timeout
+    // so rate-limited requests do not consume a connection's handler slots.
+    let app = app.layer(RequestBodyLimitLayer::new(cfg.max_body_bytes));
+    let app = app.layer(axum::middleware::from_fn_with_state(
+        std::time::Duration::from_secs(cfg.http.body_timeout_secs),
+        crate::middleware::body_deadline,
+    ));
+    let app = app.layer(TimeoutLayer::with_status_code(
+        StatusCode::REQUEST_TIMEOUT,
+        std::time::Duration::from_secs(cfg.http.request_timeout_secs),
+    ));
     let limiter = RateLimiter::new(cfg.rate.clone(), cfg.trusted_proxies.clone());
     let app = app.layer(axum::middleware::from_fn_with_state(
         limiter,
         rate_limit_layer,
     ));
-    let app = app.layer(axum::middleware::from_fn(request_log));
-    let app = match cors {
-        Some(c) => app.layer(c),
-        None => app,
-    };
-
-    tracing::info!(
-        routes = route_count,
-        "router assembled (dynamic plugin dispatch)"
-    );
-    Ok((app, state))
+    app.layer(axum::middleware::from_fn(request_log))
 }
 
 /// Clear every **plugin's** event subscriptions before rebinding the new
@@ -799,9 +828,6 @@ async fn dispatch(
     req: Request,
 ) -> Response {
     let (parts, body) = req.into_parts();
-    let body_bytes = to_bytes(body, state.config.max_body_bytes)
-        .await
-        .unwrap_or_default();
 
     // 1. Identity: plugin providers first (the auth plugin owns real
     // sessions), dev headers only as a gated fallback (SPEC §7.1 — spoofable,
@@ -814,6 +840,8 @@ async fn dispatch(
     let identity = state.resolve_identity(&parts.headers).await;
 
     // 2. Permission gate — enforced by core, never by the plugin (SPEC §9).
+    // This runs BEFORE the body is read: an unauthenticated caller cannot make
+    // the server wait on a body (issue #172's `/api/auth/login` companion).
     if let Some(perm) = &required {
         if let Err(status) = authorize(
             identity.as_ref(),
@@ -832,7 +860,15 @@ async fn dispatch(
         }
     }
 
-    // 3. Convert Axum request → SDK request.
+    // 3. Only an authorized (or public) request gets to spend the body
+    // deadline. `read_body` turns a stalled body into a 408 instead of letting
+    // the handler see an empty body.
+    let body_bytes = match crate::middleware::read_body(body, state.config.max_body_bytes).await {
+        Ok(bytes) => bytes,
+        Err(resp) => return resp,
+    };
+
+    // 4. Convert Axum request → SDK request.
     let query = parts
         .uri
         .query()
@@ -860,11 +896,11 @@ async fn dispatch(
         params,
         query,
         headers,
-        body: body_bytes.to_vec(),
+        body: body_bytes,
         identity,
     };
 
-    // 4. Call the plugin.
+    // 5. Call the plugin.
     match handler(preq).await {
         Ok(resp) => {
             let status =

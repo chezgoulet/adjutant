@@ -38,6 +38,13 @@ repository = "https://github.com/chezgoulet/adjutant"
 [workspace.dependencies]
 adjutant-sdk = { path = "plugins/sdk", version = "0.3.0" }
 axum = "0.8"
+# The server loop needs hyper's HTTP/1 header-read deadline, which `axum::serve`
+# does not expose (issue #172). These are already axum's own dependencies.
+hyper = { version = "1", features = ["server", "http1"] }
+hyper-util = { version = "0.1", features = ["tokio", "service"] }
+http-body = "1"
+http-body-util = "0.1"
+tower = { version = "0.5", features = ["util"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "signal", "net", "process"] }
 # Hashing a backup bundle on disk. The audit chain hashes in SQL, so nothing
 # needed a Rust digest until the backup runner had to read a file back.
@@ -56,7 +63,7 @@ chrono = { version = "0.4", features = ["serde"] }
 thiserror = "2"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
-tower-http = { version = "0.6", features = ["cors"] }
+tower-http = { version = "0.6", features = ["cors", "timeout", "limit"] }
 toml = "0.9"
 wasmtime = "49"
 wasmtime-wasi = "49"
