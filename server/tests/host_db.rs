@@ -401,6 +401,19 @@ async fn probe_membership_reads_roster_columns_but_not_password_hash() {
         err.contains("permission denied") && err.contains("users"),
         "expected a column-privilege error on core.users, got: {err}"
     );
+
+    // `SELECT *` is the shape a table-level grant used to permit. Under column
+    // grants it must fail even though the roster columns are readable: the role
+    // is not allowed to project the columns it was never granted.
+    let err = membership
+        .query("SELECT * FROM core.users".to_string(), vec![])
+        .await
+        .expect_err("membership must not be able to SELECT * from core.users")
+        .to_string();
+    assert!(
+        err.contains("permission denied") && err.contains("users"),
+        "expected a column-privilege error for SELECT * on core.users, got: {err}"
+    );
 }
 
 /// #148 upgrade path: an install provisioned by the old code holds table-level
@@ -562,6 +575,28 @@ async fn probe_auth_hash_update_is_column_narrow() {
     assert!(
         hash_select,
         "login verifies the hash, so auth keeps column SELECT"
+    );
+    let users_table_select: bool =
+        sqlx::query_scalar("SELECT has_table_privilege($1::name, 'core.users', 'SELECT')")
+            .bind(&role)
+            .fetch_one(admin.as_ref())
+            .await
+            .expect("has_table_privilege");
+    assert!(
+        !users_table_select,
+        "auth reads named columns, never the whole of core.users (#148)"
+    );
+    // Auth reads the hash and the login columns but not `SELECT *`: it holds no
+    // grant on `avatar_url`, `created_at` or `updated_at`, so the wildcard must
+    // be refused rather than silently widening what the role may project.
+    let err = auth
+        .query("SELECT * FROM core.users".to_string(), vec![])
+        .await
+        .expect_err("auth must not be able to SELECT * from core.users")
+        .to_string();
+    assert!(
+        err.contains("permission denied") && err.contains("users"),
+        "expected a column-privilege error for SELECT * on core.users, got: {err}"
     );
     let username_insert: bool = sqlx::query_scalar(
         "SELECT has_column_privilege($1::name, 'core.users', 'username', 'INSERT')",
