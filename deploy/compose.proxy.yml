@@ -99,7 +99,15 @@ services:
       - no-new-privileges:true
     cap_drop:
       - ALL
-    networks: [internal, edge]
+    networks:
+      internal:
+      edge:
+        # Pinned BELOW the proxy's .2. Compose starts this service before Caddy
+        # (Caddy depends on it), and Docker's dynamic pool would otherwise hand
+        # it .2; Caddy's static .2 then fails with "Address already in use" and
+        # the whole proof never runs. The probe addresses start at .4, so .3 is
+        # the deterministic slot for the app.
+        ipv4_address: ${ADJUTANT_EDGE_PREFIX:-172.31.7}.3
     restart: unless-stopped
 
   caddy:
