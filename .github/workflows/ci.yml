@@ -32,7 +32,7 @@ jobs:
       # test, not by CI.
       ADJUTANT_ALLOW_SUPERUSER: "true"
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       # The toolchain version lives in exactly one place. `dtolnay/rust-toolchain@stable`
       # does NOT read rust-toolchain.toml, so it floated forward while local stable
@@ -80,10 +80,10 @@ jobs:
       # debug artifacts above. The release profile compiled here is also the
       # release-vs-debug check for the server: CI used to compile only `--debug`.
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
+        uses: docker/setup-buildx-action@v4
 
       - name: Build the deployment image
-        uses: docker/build-push-action@v6
+        uses: docker/build-push-action@v7
         with:
           context: .
           load: true
@@ -487,16 +487,16 @@ jobs:
       DOMAIN: adjutant.invalid
       ACME_EMAIL: ci@adjutant.invalid
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
+        uses: docker/setup-buildx-action@v4
 
       # Same context and same cache scope as `verify`, so a warm cache turns this
       # into cache retrieval. Built into the project-qualified tag Compose looks
       # for, so its `up` does not compile the workspace again.
       - name: Build the image under the compose project's name
-        uses: docker/build-push-action@v6
+        uses: docker/build-push-action@v7
         with:
           context: .
           load: true
@@ -560,7 +560,7 @@ jobs:
         # not "whatever directory the workspace root happens to be".
         working-directory: client
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       # Issue #76: the toolchain is pinned, not followed. `client/pubspec.yaml`'s
       # `environment.flutter` is the single source of truth — the same shape as
@@ -630,7 +630,7 @@ jobs:
       # build needs no setup — only its downloads cached. Gradle (dependencies,
       # wrapper distribution) is the slow part of a cold APK build.
       - name: Gradle caches (for the APK build)
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: |
             ~/.gradle/caches
@@ -685,7 +685,7 @@ jobs:
     needs: [client]
     runs-on: [self-hosted, linux, x64, android]
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       # One script does the whole gate — a throwaway database, the server with the
       # dev-header stub off, the APK installed and launched on the device, then
@@ -706,8 +706,8 @@ jobs:
     env:
       RUSTUP_TOOLCHAIN: "1.96.0"
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@1.96.0
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@1.120.0
       - uses: Swatinem/rust-cache@v2
       - name: cargo check on MSRV
         run: cargo check --workspace
