@@ -41,12 +41,25 @@ https://apt.postgresql.org/pub/repos/apt bookworm-pgdg main" \
          > /etc/apt/sources.list.d/pgdg.list \
     && apt-get update \
     && apt-get install -y --no-install-recommends postgresql-client-18 age \
-    && apt-get purge -y --auto-remove curl gnupg \
+    && apt-get purge -y --auto-remove gnupg \
     && rm -rf /var/lib/apt/lists/*
+# `curl` is deliberately kept: the HEALTHCHECK below is an HTTP probe of the
+# server, and the image has no other HTTP client. It is still an unprivileged
+# user with no capabilities (see USER/cap_drop), so this is the one binary the
+# healthcheck needs rather than a build-time convenience left behind by accident.
 WORKDIR /app
 
 COPY --from=builder /src/target/release/adjutant /usr/local/bin/adjutant
-RUN mkdir -p /app/plugins /app/backups
+# The runtime identity is fixed and documented rather than allocated at build
+# time: a volume created by this image inherits these ids, and an operator
+# upgrading an existing backup volume can name the same pair when chowning it.
+# 10001 is above Debian's system range (100-999), so the base image will not
+# assign it to a package account on a later rebuild.
+RUN groupadd --gid 10001 adjutant \
+    && useradd --uid 10001 --gid adjutant --no-create-home --home-dir /app \
+         --shell /usr/sbin/nologin adjutant \
+    && mkdir -p /app/plugins /app/backups \
+    && chown -R adjutant:adjutant /app
 
 # Every plugin library the workspace built, by the same rule
 # `scripts/stage-plugins.py` uses: a plugin is a workspace crate that produces a
@@ -69,6 +82,38 @@ ENV ADJUTANT_PLUGIN_DIR=/app/plugins \
     ADJUTANT_BACKUP_DIR=/app/backups \
     ADJUTANT_LOG_FORMAT=json
 EXPOSE 8787
+
+# Everything above that writes happens as this user. The process never needs a
+# capability: it binds 8787 (>1024) and spawns `pg_dump`/`age` as children. The
+# compose files assert that too (`cap_drop: [ALL]`, `no-new-privileges`), so a
+# future image change that wants root has to say so rather than inherit it.
+USER adjutant:adjutant
+
+# Probe `/`, the core health route: it needs no plugin, no session and no
+# database read, so it answers exactly while the process is able to serve. It is
+# also one of the two open probes named in deploy/traefik/adjutant.yml.
+#
+# The interval is comfortably wider than the rate limiter's window in every
+# shipped configuration (deploy/verify.sh deliberately narrows it to 1 request
+# per 5s): a probe that exhausts its own budget would report 429 and teach
+# operators to ignore a red light.
+#
+# `start-period` is long on purpose. The listener is bound only after core and
+# plugin migrations finish, and migration 17 rewrites the whole audit chain, so
+# a large installation can legitimately serve nothing for minutes. Failures
+# inside this window do not count toward `retries`.
+#
+# `NotBootstrapped` is deliberately RED. The process refuses to boot before
+# `bootstrap-isolation` and exits 1, so the port is never bound and the probe
+# cannot succeed; the container's health state is `unhealthy` instead of the old
+# image's bare "Up" with no health state at all. (A crash-loop that exits in
+# under a second makes compose print `Restarting` rather than `Up (unhealthy)`,
+# but it is never healthy.) That is the defect this healthcheck exists to
+# expose, not a false alarm: pre-bootstrap is a required setup step that has not
+# been run, not a serving state. A green light there is precisely what hid the
+# crash-loop.
+HEALTHCHECK --interval=15s --timeout=5s --start-period=5m --retries=3 \
+  CMD curl -fsS --max-time 4 http://127.0.0.1:8787/ || exit 1
 
 ENTRYPOINT ["adjutant"]
 CMD ["serve"]

@@ -33,6 +33,10 @@ services:
       interval: 5s
       timeout: 5s
       retries: 12
+    # initdb and the entrypoint's drop to the `postgres` user need the default
+    # capabilities, so this service keeps them. It never needs a new one.
+    security_opt:
+      - no-new-privileges:true
     networks: [internal]
     restart: unless-stopped
 
@@ -86,6 +90,15 @@ services:
     # host path is Docker's business.
     volumes:
       - backups:/app/backups
+    # Keep this block identical to docker-compose.yml: deploy/verify.sh compares
+    # the two rendered `adjutant` services and fails on drift. The image's USER
+    # is 10001:10001, the server needs no capability, and no setuid binary may
+    # raise one.
+    user: "10001:10001"
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
     networks: [internal, edge]
     restart: unless-stopped
 

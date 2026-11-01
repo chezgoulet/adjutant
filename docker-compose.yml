@@ -36,6 +36,11 @@ services:
       interval: 5s
       timeout: 5s
       retries: 12
+    # initdb and the entrypoint's drop to the `postgres` user need the default
+    # capabilities (CHOWN, SETUID, SETGID, DAC_OVERRIDE, FOWNER), so this service
+    # keeps them. It never needs to gain a *new* privilege, though.
+    security_opt:
+      - no-new-privileges:true
     restart: unless-stopped
 
   adjutant:
@@ -78,6 +83,18 @@ services:
     # host path is Docker's business.
     volumes:
       - backups:/app/backups
+    # Matches the image's USER. Stated here as well so `docker inspect` and a
+    # future Dockerfile edit cannot diverge silently. A volume created by this
+    # image inherits 10001:10001; an existing volume from before the change
+    # needs a one-time chown (docs/deployment.md, "Container user").
+    user: "10001:10001"
+    # The server binds 8787 and spawns pg_dump/age; none of that needs a Linux
+    # capability. No new privileges means a setuid binary cannot raise the bar
+    # if one ever appears in the image.
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
     restart: unless-stopped
 
 volumes:
