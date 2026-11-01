@@ -116,6 +116,12 @@ network and therefore needs neither a domain nor TLS. For a certificate without 
 domain, see `docs/deployment.md` § Putting it behind TLS — that question has three
 answers and this directory only assumes the first.
 
+CI runs the same script in the `deploy` job (`.github/workflows/ci.yml`): it
+builds the image, starts `compose.proxy.yml`, bootstraps the runtime role with the
+command above, waits for the image's own healthcheck to report `healthy`, runs the
+three proofs, and tears the stack down. The job is what keeps this file from being
+a proof only a person remembers to run.
+
 ## Status — read this before trusting it
 
 **The bring-up and all three proofs are proven on a real host** (2026-09-26).

@@ -13,6 +13,7 @@ has to remember:
 
     python3 scripts/stage-plugins.py            # target/debug  -> plugins-built/
     python3 scripts/stage-plugins.py --profile release
+    python3 scripts/stage-plugins.py --list     # derived names only, for the image gate
 
 "Publishable" is load-bearing, and it was learned the hard way. The rule used to
 read "has no hand-written list", which is not the same as "what is a plugin": the
@@ -75,15 +76,28 @@ def cdylib_crates() -> list[tuple[str, str]]:
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--profile", default="debug", help="cargo profile dir (debug, release)")
+    parser.add_argument(
+        "--list",
+        action="store_true",
+        help="print the derived library names and exit; stage nothing",
+    )
     args = parser.parse_args()
-
-    libdir = REPO / "target" / args.profile
-    OUT.mkdir(exist_ok=True)
 
     crates = cdylib_crates()
     if not crates:
         print("no cdylib crates found — the workspace is not what this expects", file=sys.stderr)
         return 1
+
+    if args.list:
+        # The image gate compares this list with what the built image carries.
+        # Keeping the rule here rather than in the workflow is the point: a
+        # second copy of "what is a plugin" is how #88 happened again.
+        for _package, lib in crates:
+            print(f"lib{lib}.so")
+        return 0
+
+    libdir = REPO / "target" / args.profile
+    OUT.mkdir(exist_ok=True)
 
     missing: list[str] = []
     staged: list[str] = []

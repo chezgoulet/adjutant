@@ -68,6 +68,49 @@ jobs:
       - name: Build
         run: cargo build --workspace
 
+      # #176: the image is the one artifact the workspace gates never built, and
+      # that is how the Dockerfile shipped three plugins of fourteen (#88) with a
+      # green board. Built here, in `verify`, because a deployment is not verified
+      # until the artifact it deploys is built by the gate that says "green".
+      #
+      # `mode=max` is deliberate: a multi-stage build's expensive layer is the
+      # builder stage, and `mode=min` would not cache it, so every warm run would
+      # recompile the release workspace. The context excludes `target/`
+      # (.dockerignore), so this is the image's own build, not a reuse of the
+      # debug artifacts above. The release profile compiled here is also the
+      # release-vs-debug check for the server: CI used to compile only `--debug`.
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build the deployment image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          load: true
+          tags: adjutant:ci
+          build-args: CARGO_BUILD_JOBS=4
+          cache-from: type=gha,scope=adjutant-image
+          cache-to: type=gha,mode=max,scope=adjutant-image
+
+      # `docker build` catches a COPY whose path is missing, but not #88: a
+      # shorter list of libraries that all exist. Compare the image against the
+      # same derivation `stage-plugins.py` uses for every other plugin list, so
+      # the image cannot quietly carry a subset again.
+      - name: The image carries every plugin the workspace builds
+        run: |
+          set -euo pipefail
+          expected="$(python3 scripts/stage-plugins.py --list | sort)"
+          actual="$(docker run --rm --entrypoint sh adjutant:ci -c 'cd /app/plugins && ls *.so' | sort)"
+          if [ "$actual" != "$expected" ]; then
+            echo "::error::the image's plugin set does not match the workspace derivation (#88)"
+            diff -u <(printf '%s\n' "$expected") <(printf '%s\n' "$actual") || true
+            exit 1
+          fi
+          count="$(printf '%s\n' "$expected" | wc -l)"
+          [ "$count" -gt 0 ] || { echo "::error::the derivation found no plugins"; exit 1; }
+          docker run --rm --entrypoint sh adjutant:ci -c 'test -s /app/plugins/adjutant_hello_wasm.wasm'
+          echo "image carries $count plugin libraries plus the WASM guest"
+
       # The gate the milestone docs quote: 0 warnings, in CI, on every push.
       - name: Clippy
         run: cargo clippy --workspace --all-targets -- -D warnings
@@ -419,6 +462,85 @@ jobs:
       - name: Live client harness (real server, real client)
         run: scripts/client-live-harness.sh
 
+  # #176: `deploy/verify.sh` is the proxy-fronted deployment proof, and until
+  # this job existed CI never ran it. It needs a running stack, which is exactly
+  # why it sat outside every gate: this job gives it one — Postgres, Adjutant and
+  # Caddy from `deploy/compose.proxy.yml`, bootstrapped with the documented
+  # one-off `bootstrap-isolation` command, then the three proofs.
+  #
+  # It runs after `verify` so the image it starts is the one that job just built,
+  # retrieved through the same GHA cache rather than compiled a second time. The
+  # proofs talk to Caddy's origin listener on the compose network, so they need no
+  # DNS, no certificate and no public hostname; `adjutant.invalid` is a
+  # placeholder, and a failed ACME attempt for it does not affect the listener the
+  # proofs use.
+  deploy:
+    needs: verify
+    runs-on: ubuntu-latest
+    env:
+      # Fixed so the image built below is the image Compose resolves for the
+      # `adjutant` service (`${project}-${service}`), with no rebuild.
+      COMPOSE_PROJECT_NAME: adjutant-ci-deploy
+      # Throwaway credentials for a throwaway stack. Nothing here is reused.
+      POSTGRES_PASSWORD: ci-postgres-password
+      ADJUTANT_APP_PASSWORD: ci-app-password
+      DOMAIN: adjutant.invalid
+      ACME_EMAIL: ci@adjutant.invalid
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      # Same context and same cache scope as `verify`, so a warm cache turns this
+      # into cache retrieval. Built into the project-qualified tag Compose looks
+      # for, so its `up` does not compile the workspace again.
+      - name: Build the image under the compose project's name
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          load: true
+          tags: adjutant-ci-deploy-adjutant:latest
+          build-args: CARGO_BUILD_JOBS=4
+          cache-from: type=gha,scope=adjutant-image
+          cache-to: type=gha,mode=max,scope=adjutant-image
+
+      - name: Start Postgres and bootstrap the runtime role
+        run: |
+          set -euo pipefail
+          compose=(docker compose -f deploy/compose.proxy.yml)
+          "${compose[@]}" up -d --wait postgres
+          # Connect as the bootstrap superuser, not as the role being created:
+          # the compose file points the app at `adjutant_app`, which does not
+          # exist yet (deploy/README.md records this exact failure).
+          "${compose[@]}" run --rm \
+            -e ADJUTANT_DATABASE_URL="postgres://adjutant:${POSTGRES_PASSWORD}@postgres:5432/adjutant" \
+            adjutant bootstrap-isolation --app-role adjutant_app --app-password "$ADJUTANT_APP_PASSWORD"
+
+      # #200 gave the image a HEALTHCHECK, but a deployment gate that never asks
+      # Docker for the answer would let a wrong probe target through: verify.sh
+      # needs the listener, not the container's health state, and an image can
+      # serve while its own healthcheck is red. Ask before the rate limiter is
+      # turned down by verify.sh, otherwise the probes and the healthcheck share
+      # a one-request bucket.
+      - name: The image reports healthy after bootstrap
+        run: |
+          set -euo pipefail
+          compose=(docker compose -f deploy/compose.proxy.yml)
+          "${compose[@]}" up -d --wait --wait-timeout 300 adjutant
+          cid="$("${compose[@]}" ps -q adjutant)"
+          status="$(docker inspect --format '{{.State.Health.Status}}' "$cid")"
+          [ "$status" = "healthy" ] \
+            || { echo "::error::the image reports health '$status', not healthy"; "${compose[@]}" logs --tail 50 adjutant; exit 1; }
+          echo "adjutant reports healthy: $(docker inspect --format '{{json .Config.Healthcheck.Test}}' "$cid")"
+
+      - name: deploy/verify.sh — the three proxy proofs
+        run: ./deploy/verify.sh
+
+      - name: Tear the stack down
+        if: always()
+        run: docker compose -f deploy/compose.proxy.yml down -v --remove-orphans
+
   # The Flutter client ships to users (Obtainium), yet until this job existed no
   # CI step ever compiled it: the Rust jobs never look inside client/, so a change
   # there was green by default — a probe nobody runs. This is the same gate the
@@ -522,15 +644,27 @@ jobs:
       - name: Build web (release)
         run: flutter build web --release
 
-      # The only step in this repository that compiles Android resources and the
-      # merged manifest. Debug, not release: the release signing config reads
-      # `android/key.properties`, which CI deliberately does not have (#168), and
-      # release-vs-debug changes only the Dart compilation mode, not whether the
-      # resources and manifest are valid — debug is the faster of the two. The
-      # debug keystore here signs a CI build nobody ships; the release workflow
-      # is the one that must never use it.
+      # The first of two Android compiles. Debug stays because it is the faster
+      # signal on the resource/manifest half, and because it is the configuration
+      # a developer runs locally. The release compile below covers the other
+      # half: debug does not exercise Dart AOT or R8/shrinking. Both CI builds
+      # are signed with the debug key and are never uploaded; the release
+      # workflow is the one that must never use it (#168).
       - name: Build Android APK (debug)
         run: flutter build apk --debug
+
+      # #176: the APK a scout installs is built `--release` (release.yml), but
+      # the only Android compile in CI was `--debug`, so release-only failures —
+      # Dart AOT, and R8/shrinking once the `release {}` block grows — were
+      # outside every gate. This compiles the same configuration on every PR.
+      #
+      # CI has no release keystore (#168), so Gradle uses the debug key here.
+      # That is acceptable for this step and only this step: it proves the
+      # release build compiles, and the artifact is never uploaded or shipped.
+      # The release workflow still refuses to build without the real key and
+      # verifies the signer before it attaches anything.
+      - name: Build Android APK (release)
+        run: flutter build apk --release
 
   # The client on a **real Android device**, against a **real server** — the one
   # half a build cannot reach. #119 made the `client` job compile the APK; it

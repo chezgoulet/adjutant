@@ -274,16 +274,23 @@ Order within the stage is by dependency, not by size:
 7. **#53 — CONTRIBUTING.md, code of conduct, PR process.** **In PR #112** (green;
    not yet merged). Small, but a precondition of Stage 5's community
    contribution, not a courtesy.
-8. **The image is never built in CI, so the deployment is ungraded. — STILL
-   OPEN.** The workflow builds the workspace and stages the plugin libraries, but
-   nothing builds the `Dockerfile` — which is how an image shipping **three
+8. **The image is never built in CI, so the deployment is ungraded. — Gated by
+   #176.** The workflow builds the workspace and stages the plugin libraries, but
+   nothing built the `Dockerfile` — which is how an image shipping **three
    plugins of fourteen** stayed green until a human read it (#88). **The same
    three-of-fourteen list was in `.github/workflows/release.yml`**, in the one
    file that builds what users download: fixed 2026-09-27 by deriving the set from
    `scripts/stage-plugins.py` and failing when the tarball carries fewer libraries
-   than the staging step derived. The gate for the *image* is still the cheap
-   thing to build here: build it and assert the plugin count inside matches the
-   same derivation.
+   than the staging step derived. The image now has the same treatment: `verify`
+   builds it (Buildx, GHA layer cache) and **fails if the libraries inside do not
+   match `scripts/stage-plugins.py --list`**, so a shorter-but-valid copy list is
+   caught rather than passing as a successful build. A separate `deploy` job
+   brings up `deploy/compose.proxy.yml`, bootstraps it, waits for the image's
+   healthcheck to report `healthy`, and runs `deploy/verify.sh` — the proof that
+   was previously only ever run by hand. The shipped APK's `--release`
+   configuration is now compiled by the `client` job on every PR as well (it
+   deliberately does not have the release key, so that build is never shipped;
+   the release workflow still verifies the real signer).
 9. **The compose stack starts on a clean host.** Not a documentation task: the
    first real run is what found the Postgres 18 mount fault above, and the box
    should not be called met again on the strength of files existing. The evidence
