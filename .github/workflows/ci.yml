@@ -127,11 +127,15 @@ jobs:
           # first on PATH for the steps below, which bypasses the wrapper.
           echo "/usr/lib/postgresql/18/bin" >> "$GITHUB_PATH"
 
+      # `rerunnable_suite` is the #189 regression: it runs `host_db` twice
+      # against the same database, so a probe that leaves an admin grant behind
+      # fails the second run instead of only a developer's warm database.
       - name: DB-backed host tests + pool lifecycle + plugin load semantics + backups
         run: |
           pg_dump --version
           cargo test -p adjutant-server --test host_db --test pool_lifecycle \
-            --test plugin_load_semantics --test backups -- --ignored --nocapture
+            --test plugin_load_semantics --test backups --test rerunnable_suite \
+            -- --ignored --nocapture
 
       # The notification record (#46, slice 1): a scheduled run records one
       # through `core.notify` (as a plugin role, its source derived from

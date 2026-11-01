@@ -130,6 +130,27 @@ static HIERARCHY: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 /// one installs the process-global chain key.
 static AUDIT: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
+/// Empty `core.user_roles` without tripping the last-admin guard (#189).
+///
+/// `probe_scope_id_is_opaque_text_and_round_trips` must start from an empty
+/// table, and ends by storing a troop-scoped `chief` grant. The next run's
+/// `DELETE FROM core.user_roles` then fails: the final row it removes is the
+/// only admin, so `user_roles_keep_an_admin` refuses it — correctly, since that
+/// is the write the guard exists to stop. Every DELETE ordering leaves *some*
+/// admin row for last, so the fixture cannot delete its way back to empty.
+///
+/// TRUNCATE does not fire the row-level trigger. This is an admin-only fixture
+/// reset on a throwaway `_test` database, not a production write path; the
+/// guard still refuses every DELETE the suite (or an operator) would use
+/// against real data. Reset before and after the probe so a run that fails
+/// midway cannot poison the next one.
+async fn reset_user_roles(pool: &sqlx::PgPool) {
+    sqlx::query("TRUNCATE core.user_roles")
+        .execute(pool)
+        .await
+        .expect("reset core.user_roles");
+}
+
 /// Migrate `core` on the test database and bootstrap a plugin fixture role/schema
 /// for each id, returning `(admin_pool, plugin_pools)`. Mirrors a real
 /// deployment's first `bootstrap-isolation` run.
@@ -685,10 +706,7 @@ async fn probe_scope_id_is_opaque_text_and_round_trips() {
     let (admin, _pools) = setup(&[]).await;
     let uid = "11111111-1111-1111-1111-111111111111";
 
-    sqlx::query("DELETE FROM core.user_roles")
-        .execute(admin.as_ref())
-        .await
-        .expect("clear");
+    reset_user_roles(admin.as_ref()).await;
     sqlx::query(
         "INSERT INTO core.users (id, display_name) VALUES ($1::uuid, 'Bea') ON CONFLICT DO NOTHING",
     )
@@ -790,6 +808,16 @@ async fn probe_scope_id_is_opaque_text_and_round_trips() {
     .execute(admin.as_ref())
     .await;
     assert!(troop_with_null.is_ok(), "troop-wide is scope_id NULL");
+
+    // Leave the shared test database as we found it (#189). Removing the
+    // fixture user after the role reset keeps a rerun's `ON CONFLICT` insert
+    // honest rather than silently reusing last run's row.
+    reset_user_roles(admin.as_ref()).await;
+    sqlx::query("DELETE FROM core.users WHERE id = $1::uuid")
+        .bind(uid)
+        .execute(admin.as_ref())
+        .await
+        .expect("remove the fixture user");
 }
 
 /// Hierarchical coverage: with a declared lodge→patrol edge, a lodge-scoped

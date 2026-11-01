@@ -91,6 +91,13 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Fixed
 
+- **The DB-gated host suite is re-runnable against the same database (#189).**
+  `probe_scope_id_is_opaque_text_and_round_trips` left a troop-scoped `chief`
+  grant behind, so the next run's `DELETE FROM core.user_roles` tripped the
+  last-admin guard. The probe now resets `core.user_roles` with an admin-only
+  `TRUNCATE` before and after (row triggers do not fire), and a new
+  `rerunnable_suite` target runs `host_db` twice in CI. The guard itself is
+  unchanged.
 - **A partial restore fails instead of printing `ok` (#161).** `deploy/restore.sh`
   now restores with `--no-owner --no-acl` (there are no roles to own or grant to
   yet), checks `PIPESTATUS[0]`, treats `errors ignored` as data loss, and runs
