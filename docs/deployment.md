@@ -31,8 +31,14 @@ docker compose run --rm \
 docker compose up -d
 
 # 3. Check it is up
+docker compose ps                # adjutant: Up (healthy) once the first probe passes
 curl -s localhost:8787/          # {"service":"adjutant","status":"ok"}
 ```
+
+Skipping step 2 leaves the container **`Restarting`** (a crash-loop is fast) with
+`Health=unhealthy`, never a bare `Up`: before `bootstrap-isolation` the server
+exits with `NotBootstrapped` and never binds the port, so the probe cannot
+answer. See [Container user and health](#container-user-and-health).
 
 The server connects as **`adjutant_app`**, a non-superuser role (no
 `SUPERUSER`, no `CREATEROLE`); it is never the Postgres superuser. On start it
@@ -85,6 +91,79 @@ own `core` — otherwise the only role that could boot would be a superuser. It
 owns **no plugin schema**; those belong to the plugin roles. The server refuses
 to boot on a superuser connection unless `ADJUTANT_ALLOW_SUPERUSER=true` is set
 for a throwaway database.
+
+## Container user and health
+
+The image runs the server as a fixed unprivileged identity, **uid/gid
+10001:10001** (`adjutant`). Both compose files repeat `user: "10001:10001"` so
+`docker inspect` cannot disagree with the Dockerfile. Everything the process
+writes is owned by that pair in the image: `/app` (with `/app/plugins` and
+`/app/backups`). A *new* named `backups` volume inherits the ownership of the
+image directory it mounts over, so a fresh deployment needs no chown.
+
+**Upgrading a stack created before this change.** The existing `backups` volume
+was initialised while the image still ran as root, so it is root-owned and the
+in-app backup button will fail with a permission error. Fix it once, before or
+after starting the new image:
+
+```bash
+docker compose run --rm --user root --cap-add CHOWN --entrypoint chown adjutant \
+  -R 10001:10001 /app/backups
+```
+
+`--cap-add CHOWN` is required, not optional: the service sets
+`cap_drop: [ALL]`, so even uid 0 cannot change an owner without it. (That is the
+hardening working, and it is why the command names the one capability it needs
+rather than running the service without `cap_drop`.)
+
+The container's `/` is not writable by design; do not work around a permission
+error by putting `user: root` back. Name the path that failed — the fix is the
+ownership of that path.
+
+**The healthcheck** is defined in the image (so `docker run` has it too) and
+probes `GET http://127.0.0.1:8787/` — the core, unauthenticated health route,
+which needs no plugin, session or database read:
+
+| | |
+|---|---|
+| interval | 15s |
+| timeout | 5s |
+| start-period | 5m |
+| retries | 3 |
+
+The start-period is generous because the listener is bound only **after** core
+and plugin migrations finish, and migration 17 rewrites the whole audit chain;
+a large installation can legitimately serve nothing for minutes. Failures
+during the start-period do not count toward the retries.
+
+**Pre-bootstrap is deliberately red.** `NotBootstrapped` is an *expected*
+state — but it is expected only because a required setup step has not been run.
+The process exits 1 and never binds the port, so the probe cannot succeed and
+the container carries `Health=unhealthy`. The old image had no healthcheck, so
+the same container could be sampled as plain `Up` between restarts, with no
+health state at all, and an operator watching status saw nothing wrong.
+
+Be precise about what a healthcheck can show for a *fast* crash-loop: Docker
+only runs the probe while the container is running, and this one exits in well
+under a second, so `docker compose ps` shows `Restarting` rather than
+`Up (unhealthy)`. The health state is `unhealthy` all the same (`docker inspect
+… .State.Health.Status`), and a process that stays alive without binding the
+port — a long migration, a hung dependency — does show `Up (unhealthy)` after
+the start-period and retries. Either way it is never `healthy`. The health
+light answers "is this container serving?", not "did it start?". Once
+`bootstrap-isolation` has run and the server answers, the state becomes
+`healthy` within one interval.
+
+The interval is wider than the rate limiter's window in the shipped
+configurations (including `deploy/verify.sh`, which narrows the limiter to one
+request per 5s) so the probe never reports its own 429 as a dead server.
+
+**Hardening.** The `adjutant` service drops all capabilities
+(`cap_drop: [ALL]`) and sets `no-new-privileges:true` in both compose files: it
+binds 8787, and its `pg_dump`/`age` children need no capability. `postgres`
+keeps its default capabilities because `initdb` and the entrypoint's drop to
+the `postgres` user need CHOWN/SETUID/SETGID/DAC_OVERRIDE/FOWNER, but it also
+sets `no-new-privileges:true` — it never needs to *gain* a privilege.
 
 ## Bare metal
 
