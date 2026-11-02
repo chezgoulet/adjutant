@@ -4,6 +4,11 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 description = "WASM hello plugin: the sandboxed-path counterpart of plugins/examples/hello."
+# This is a built example shipped inside Adjutant, not a crate for crates.io.
+# Declaring that also lets cargo-deny's `allow-wildcard-paths` apply to its
+# path dependency on `adjutant-wasm-guest`: the lint refuses path dependencies
+# for public crates because crates.io does not publish them (#181, OPS-10).
+publish = false
 
 [lib]
 crate-type = ["cdylib"]

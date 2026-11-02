@@ -17,7 +17,7 @@
 
 services:
   postgres:
-    image: postgres:18-alpine
+    image: postgres@sha256:3b0ef735388b2cb097fc29b8bb421d86d57d0ddbe7aa1fbd6493e06d65028503  # postgres:18-alpine (linux/amd64)
     environment:
       POSTGRES_USER: adjutant
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD}
@@ -111,7 +111,7 @@ services:
     restart: unless-stopped
 
   caddy:
-    image: caddy:2-alpine
+    image: caddy@sha256:04913b1da43339a40ad1ea87827d70a576ac5aa6cf674c6e24fdca675887533a  # caddy:2-alpine (linux/amd64)
     depends_on: [adjutant]
     environment:
       DOMAIN: ${DOMAIN:?set DOMAIN to the certificate name}
@@ -145,7 +145,7 @@ services:
   # the failure this file is trying to avoid. A second stack on the same host sets
   # only that: `ADJUTANT_EDGE_PREFIX=172.31.8`.
   probe:
-    image: curlimages/curl:8.22.0
+    image: curlimages/curl@sha256:43366cd60f226c7655181a0f7e85c468a41d182fdd2dc2c1c3b872a2b9d05d7a  # curlimages/curl:8.22.0 (linux/amd64)
     profiles: ["probe"]
     entrypoint: ["sh", "-c"]
     networks:
@@ -156,7 +156,7 @@ services:
   # The second client. Same image, different pinned address — this is what makes
   # "a second client gets its own bucket" a real assertion rather than a hope.
   probe2:
-    image: curlimages/curl:8.22.0
+    image: curlimages/curl@sha256:43366cd60f226c7655181a0f7e85c468a41d182fdd2dc2c1c3b872a2b9d05d7a  # curlimages/curl:8.22.0 (linux/amd64)
     profiles: ["probe"]
     entrypoint: ["sh", "-c"]
     networks:

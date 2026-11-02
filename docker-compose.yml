@@ -16,7 +16,7 @@
 #     superuser boot refusal passable.
 services:
   postgres:
-    image: postgres:18-alpine
+    image: postgres@sha256:3b0ef735388b2cb097fc29b8bb421d86d57d0ddbe7aa1fbd6493e06d65028503  # postgres:18-alpine (linux/amd64)
     environment:
       # Admin/bootstrap superuser. The server does not run as it.
       POSTGRES_USER: adjutant

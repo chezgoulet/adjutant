@@ -1,5 +1,9 @@
 # cargo-deny configuration. Run with `cargo deny check`.
-# CI runs this on every push (see .github/workflows/ci.yml).
+# CI runs this on every push (see .github/workflows/ci.yml) **twice**: once with
+# the root manifest and once with `--manifest-path wasm/Cargo.toml`. The root
+# manifest excludes `wasm` (those crates build for wasm32-wasip1), so one run
+# would leave the guest workspace outside every advisory/licence/ban/source
+# gate (#181, OPS-10).
 
 [graph]
 all-features = true
@@ -9,6 +13,14 @@ all-features = true
 # `ignore` here only with a comment and a linked advisory.
 version = 2
 yanked = "deny"
+# Stated policy, not an inherited default: an unmaintained crate fails the gate
+# whether it is a direct workspace dependency or transitive. The alternative
+# (`workspace`, which only fails for direct dependencies) would let an
+# unmaintained crate ride in through wasmtime or another large tree without
+# anyone deciding that. If a specific unmaintained crate must stay, ignore that
+# one advisory with a reason and a revisit date below; do not downgrade the
+# whole class.
+unmaintained = "all"
 ignore = [
     # RUSTSEC-2026-0391: zstd advisories in wasmtime-internal-cache's compilation-cache decompression path. The fix (zstd 0.14.3) is not adoptable: wasmtime 50.0.1, the newest release, still declares zstd ^0.13.0, and 0.14 is a different minor - semver forbids Cargo from crossing it for a 0.x crate. Both cheap overrides are refused by Cargo: `cargo update --precise 0.14.3` fails the requirement, and a version-only [patch.crates-io] errors with 'patches must point to different sources'. The only override is forking zstd or wasmtime-internal-cache, which we decline for code we never execute. Reachability: Adjutant never enables the wasmtime compilation cache (no cache_config or cache_dir in server/src), so the affected path is linked but never run. REVISIT by 2027-01-31, or when wasmtime-internal-cache widens to zstd ^0.14, whichever is sooner.
     { id = "RUSTSEC-2026-0391", reason = "zstd: fix 0.14.3 not adoptable (wasmtime 50.0.1 requires ^0.13.0); path unreachable, cache never enabled. Revisit 2027-01-31 or when wasmtime widens to ^0.14." },
@@ -38,11 +50,22 @@ allow = [
 ]
 
 [bans]
+# Allowed deliberately: duplicate versions are normal in a graph this size
+# (sixteen plugin crates plus wasmtime and its machinery), and two copies of a
+# crate are not a vulnerability by themselves. Denying them would force
+# `cargo update` churn and either invent pins the upstream graph does not
+# support or push the project to exempt crates ad hoc, which is a weaker rule.
+# The risk duplicates can carry is covered by the advisory and licence gates,
+# and `cargo tree -d` is the review tool when a duplicate is worth explaining.
 multiple-versions = "allow"
 # Wildcard version requirements are forbidden, but workspace path dependencies
 # (the internal crates) are not wildcards.
 wildcards = "deny"
 allow-wildcard-paths = true
+# There is no crate-specific deny list because the project has no named banned
+# crate. If one is added, put it here as a `[[bans.deny]]` table with a reason
+# (and scope it by version where possible) so the decision is reviewable rather
+# than living in a reviewer's memory.
 
 [sources]
 unknown-registry = "deny"

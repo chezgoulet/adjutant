@@ -2,7 +2,8 @@
 
 # --- build ------------------------------------------------------------------
 # Pinned to the MSRV so the container builds with a known-good toolchain.
-FROM rust:1.96-bookworm AS builder
+# rust:1.96-bookworm (linux/amd64)
+FROM rust@sha256:d99f7b31f49909348dc59b51f3c95d1efded1701ffb222f095aaab7de3c4abd8 AS builder
 WORKDIR /src
 COPY . .
 # Parallel rustc jobs during the image build. Defaulted low on purpose: a
@@ -16,7 +17,8 @@ RUN rustup target add wasm32-wasip1 \
     && cargo build --manifest-path wasm/Cargo.toml --release --target wasm32-wasip1
 
 # --- runtime ----------------------------------------------------------------
-FROM debian:bookworm-slim AS runtime
+# debian:bookworm-slim (linux/amd64)
+FROM debian@sha256:a3bba7dc7dbcc1f37c2856c51fc9a7fac96608f50cb87b1b4e4d8b8c85ae988e AS runtime
 # `pg_dump` for the in-app backup button, from PGDG rather than bookworm's own
 # repo. That is not a preference: bookworm ships postgresql-client 15, the deploy
 # stack runs postgres:18, and `pg_dump` refuses to dump a *newer* server. A
