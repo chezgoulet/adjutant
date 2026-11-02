@@ -7,11 +7,23 @@ on:
   pull_request:
 
 jobs:
+  # #181: a supply-chain rule written only in prose drifts back to tags. This job
+  # is the rule: `scripts/check-pins.py` fails when a workflow `uses:` has no
+  # 40-hex commit SHA (or no human-readable trailing version comment) and when a
+  # Dockerfile/Compose image has no `@sha256:` digest. It needs no database, so
+  # it gets its own cheap job rather than waiting behind the heavy `verify` job.
+  supply-chain:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - name: Every action and base image is pinned
+        run: python3 scripts/check-pins.py
+
   verify:
     runs-on: ubuntu-latest
     services:
       postgres:
-        image: postgres:18-alpine
+        image: postgres@sha256:3b0ef735388b2cb097fc29b8bb421d86d57d0ddbe7aa1fbd6493e06d65028503  # postgres:18-alpine (linux/amd64)
         env:
           POSTGRES_USER: adjutant
           POSTGRES_PASSWORD: adjutant
@@ -32,7 +44,7 @@ jobs:
       # test, not by CI.
       ADJUTANT_ALLOW_SUPERUSER: "true"
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
 
       # The toolchain version lives in exactly one place. `dtolnay/rust-toolchain@stable`
       # does NOT read rust-toolchain.toml, so it floated forward while local stable
@@ -48,13 +60,13 @@ jobs:
           fi
           echo "channel=$channel" >> "$GITHUB_OUTPUT"
 
-      - uses: dtolnay/rust-toolchain@master
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # v1 (master)
         with:
           toolchain: ${{ steps.toolchain.outputs.channel }}
           components: clippy
           targets: wasm32-wasip1
 
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
 
       # Make toolchain drift visible in the log instead of mysterious.
       - name: Toolchain version
@@ -80,10 +92,10 @@ jobs:
       # debug artifacts above. The release profile compiled here is also the
       # release-vs-debug check for the server: CI used to compile only `--debug`.
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
+        uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3.12.0
 
       - name: Build the deployment image
-        uses: docker/build-push-action@v6
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6.19.2
         with:
           context: .
           load: true
@@ -120,8 +132,20 @@ jobs:
         run: RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps
 
       # Advisories, licenses, bans, and sources (config: deny.toml).
-      - name: cargo-deny
-        uses: EmbarkStudios/cargo-deny-action@v2
+      #
+      # The root manifest excludes `wasm` (the guest crates build for
+      # wasm32-wasip1 and must not enter the host graph), so a single run with
+      # the default manifest would leave `wasm/`, `wasm/guest` and
+      # `wasm/examples/hello` outside every advisory/licence/ban gate. Run the
+      # separate wasm workspace explicitly rather than assuming the root run
+      # covers it (#181, OPS-10).
+      - name: cargo-deny (root workspace)
+        uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25 # v2.1.1
+
+      - name: cargo-deny (wasm workspace)
+        uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25 # v2.1.1
+        with:
+          manifest-path: ./wasm/Cargo.toml
 
       - name: Unit + integration tests
         run: cargo test --workspace
@@ -450,7 +474,7 @@ jobs:
       # The same pinned toolchain as the `client` job, read from the same file
       # (issue #76): two Flutter versions in one workflow is two chances for the
       # gates to disagree about what "green" means.
-      - uses: subosito/flutter-action@v2
+      - uses: subosito/flutter-action@1a449444c387b1966244ae4d4f8c696479add0b2 # v2.23.0
         with:
           channel: stable
           flutter-version-file: client/pubspec.yaml
@@ -487,16 +511,16 @@ jobs:
       DOMAIN: adjutant.invalid
       ACME_EMAIL: ci@adjutant.invalid
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
 
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
+        uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3.12.0
 
       # Same context and same cache scope as `verify`, so a warm cache turns this
       # into cache retrieval. Built into the project-qualified tag Compose looks
       # for, so its `up` does not compile the workspace again.
       - name: Build the image under the compose project's name
-        uses: docker/build-push-action@v6
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6.19.2
         with:
           context: .
           load: true
@@ -560,7 +584,7 @@ jobs:
         # not "whatever directory the workspace root happens to be".
         working-directory: client
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
 
       # Issue #76: the toolchain is pinned, not followed. `client/pubspec.yaml`'s
       # `environment.flutter` is the single source of truth — the same shape as
@@ -569,7 +593,7 @@ jobs:
       # channel instead meant a local 3.47.5 could pass while this gate had
       # silently moved on for reasons nobody chose, and a red could mean the
       # toolchain rather than the diff.
-      - uses: subosito/flutter-action@v2
+      - uses: subosito/flutter-action@1a449444c387b1966244ae4d4f8c696479add0b2 # v2.23.0
         with:
           channel: stable
           flutter-version-file: client/pubspec.yaml
@@ -630,7 +654,7 @@ jobs:
       # build needs no setup — only its downloads cached. Gradle (dependencies,
       # wrapper distribution) is the slow part of a cold APK build.
       - name: Gradle caches (for the APK build)
-        uses: actions/cache@v4
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
         with:
           path: |
             ~/.gradle/caches
@@ -685,7 +709,7 @@ jobs:
     needs: [client]
     runs-on: [self-hosted, linux, x64, android]
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
 
       # One script does the whole gate — a throwaway database, the server with the
       # dev-header stub off, the APK installed and launched on the device, then
@@ -706,8 +730,8 @@ jobs:
     env:
       RUSTUP_TOOLCHAIN: "1.96.0"
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@1.96.0
-      - uses: Swatinem/rust-cache@v2
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: dtolnay/rust-toolchain@d86e0fa8f147d6539442c26a61ebba8becc19489 # 1.96.0
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
       - name: cargo check on MSRV
         run: cargo check --workspace

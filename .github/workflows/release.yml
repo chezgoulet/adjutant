@@ -21,7 +21,7 @@ jobs:
   release:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
 
       # `github.ref_name` is the branch name on a dispatch run, and every branch
       # here is `type/name`. A slash is fatal twice over: it turns a `dist/…`
@@ -57,12 +57,12 @@ jobs:
           fi
           echo "channel=$channel" >> "$GITHUB_OUTPUT"
 
-      - uses: dtolnay/rust-toolchain@master
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # v1 (master)
         with:
           toolchain: ${{ steps.toolchain.outputs.channel }}
           targets: wasm32-wasip1
 
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
 
       - name: Build release
         run: cargo build --release --workspace
@@ -85,7 +85,7 @@ jobs:
       # The client half of the product, built from the same tag. Web is built
       # here because the 161st can open it from anywhere; the Android artifact
       # (the Obtainium path) is attached below, from the same tag.
-      - uses: subosito/flutter-action@v2
+      - uses: subosito/flutter-action@1a449444c387b1966244ae4d4f8c696479add0b2 # v2.23.0
         with:
           channel: stable
           # The same pinned toolchain the gates read (issue #76): two Flutter
@@ -191,7 +191,7 @@ jobs:
       # ran it can look at them, without a release having been created.
       - name: Upload the artifacts of a manual run
         if: github.event_name == 'workflow_dispatch'
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: adjutant-${{ steps.ref.outputs.slug }}-artifacts
           path: dist/*
@@ -200,7 +200,7 @@ jobs:
       # Only a tag creates a release. A dispatch run must never publish.
       - name: Create release
         if: github.event_name == 'push'
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2.6.2
         with:
           files: |
             dist/*.tar.gz
