@@ -23,6 +23,14 @@ jobs:
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
 
+      # The tag is the release's name, but `Cargo.toml` is its version. The tag,
+      # the workspace version, the SDK dependency, the client's pubspec, the
+      # newest CHANGELOG heading and the bridge's advertised version must all
+      # agree before this job builds or uploads anything (#177). A tag cut from
+      # drift therefore fails here and publishes nothing.
+      - name: Check version consistency before building
+        run: python3 scripts/check-versions.py
+
       # `github.ref_name` is the branch name on a dispatch run, and every branch
       # here is `type/name`. A slash is fatal twice over: it turns a `dist/…`
       # artifact *path* into a directory that may not exist, and `upload-artifact`
