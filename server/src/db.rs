@@ -245,9 +245,16 @@ ALTER TABLE core.user_roles ALTER COLUMN scope_id DROP DEFAULT;
 ALTER TABLE core.user_roles ALTER COLUMN scope_id DROP NOT NULL;
 ALTER TABLE core.user_roles ALTER COLUMN scope_id TYPE TEXT USING scope_id::text;
 
--- Normalise existing (all troop-wide) rows to NULL.
+-- Normalise troop-wide rows to NULL. Only troop rows: migration 1 gave EVERY
+-- row the zero-UUID default regardless of scope_type, so a deployed
+-- (scope_type='lodge', scope_id=zero-UUID) grant is a plausible legacy shape.
+-- Nulling it here used to violate the CHECK added below in the same migration,
+-- aborting the whole transaction and leaving the server unable to boot (#158).
+-- A non-troop zero UUID is a valid opaque id under #33, so it is kept as-is
+-- rather than deleted; the only rows whose meaning is troop-wide are the
+-- scope_type='troop' ones.
 UPDATE core.user_roles SET scope_id = NULL
-  WHERE scope_type = 'troop' OR scope_id = '00000000-0000-0000-0000-000000000000';
+  WHERE scope_type = 'troop';
 
 CREATE UNIQUE INDEX IF NOT EXISTS idx_user_roles_unique
   ON core.user_roles (user_id, role_id, COALESCE(scope_id, ''));

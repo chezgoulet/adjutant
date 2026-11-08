@@ -820,6 +820,74 @@ async fn probe_scope_id_is_opaque_text_and_round_trips() {
         .expect("remove the fixture user");
 }
 
+/// #158: migration 5 aborted on a live database carrying a plausible legacy
+/// grant. Migration 1 declared `scope_id UUID NOT NULL DEFAULT zero-UUID` for
+/// every scope type, so `(scope_type='lodge', scope_id=zero-UUID)` is a row a
+/// deployed database can hold. Migration 5 nulled it and then added a CHECK
+/// requiring a non-troop row to have a non-NULL scope_id, so the transaction
+/// aborted and every boot retried and failed.
+///
+/// The row is seeded on the current (already-text) shape, then migration 5's
+/// SQL is re-run exactly as the migration runner would: the upgrade path, not a
+/// fresh install.
+#[tokio::test]
+#[ignore = "DB-gated: needs ADJUTANT_TEST_DATABASE_URL; run with `-- --ignored`"]
+async fn migration_5_keeps_a_non_troop_zero_uuid_grant() {
+    let (admin, _pools) = setup(&[]).await;
+    let uid = "33333333-3333-3333-3333-333333333333";
+    const ZERO_UUID: &str = "00000000-0000-0000-0000-000000000000";
+
+    reset_user_roles(admin.as_ref()).await;
+    sqlx::query(
+        "INSERT INTO core.users (id, display_name) VALUES ($1::uuid, 'Legacy Grant') \
+         ON CONFLICT DO NOTHING",
+    )
+    .bind(uid)
+    .execute(admin.as_ref())
+    .await
+    .expect("fixture user");
+    sqlx::query(
+        "INSERT INTO core.user_roles (user_id, role_id, scope_type, scope_id) \
+         VALUES ($1::uuid, 'scout', 'lodge', $2)",
+    )
+    .bind(uid)
+    .bind(ZERO_UUID)
+    .execute(admin.as_ref())
+    .await
+    .expect("the legacy non-troop zero-UUID grant is storable");
+
+    let sql = db::CORE_MIGRATIONS
+        .iter()
+        .find(|(version, _, _)| *version == 5)
+        .map(|(_, _, sql)| *sql)
+        .expect("migration 5 is present");
+    sqlx::raw_sql(&format!("BEGIN; {sql}; COMMIT;"))
+        .execute(admin.as_ref())
+        .await
+        .expect("migration 5 applies over a non-troop zero-UUID row");
+
+    let (scope_type, scope_id): (String, Option<String>) = sqlx::query_as(
+        "SELECT scope_type, scope_id FROM core.user_roles WHERE user_id = $1::uuid",
+    )
+    .bind(uid)
+    .fetch_one(admin.as_ref())
+    .await
+    .expect("the grant survived the migration");
+    assert_eq!(scope_type, "lodge");
+    assert_eq!(
+        scope_id.as_deref(),
+        Some(ZERO_UUID),
+        "a non-troop zero UUID is a valid opaque id and must not be nulled"
+    );
+
+    reset_user_roles(admin.as_ref()).await;
+    sqlx::query("DELETE FROM core.users WHERE id = $1::uuid")
+        .bind(uid)
+        .execute(admin.as_ref())
+        .await
+        .expect("remove the fixture user");
+}
+
 /// Hierarchical coverage: with a declared lodge→patrol edge, a lodge-scoped
 /// grant covers the patrol inside it (and not another), and coverage stays
 /// downward (a patrol grant does not cover its lodge). Edges are core-owned
