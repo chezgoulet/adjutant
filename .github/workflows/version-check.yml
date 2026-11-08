@@ -1,0 +1,24 @@
+name: Version consistency
+
+# #177: the tag, Cargo.toml, client/pubspec.yaml and the newest CHANGELOG
+# heading were four statements of one version and nothing compared them. This
+# job is the comparison, and it is deliberately separate from the heavy suites:
+# it is cheap enough to run on every branch push and on a tag, and the release
+# workflow runs the same script before it builds anything.
+on:
+  push:
+    branches: ["**"]
+    tags: ["v*"]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  version-consistency:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - name: Tag, Cargo.toml, pubspec.yaml and CHANGELOG agree
+        run: python3 scripts/check-versions.py
