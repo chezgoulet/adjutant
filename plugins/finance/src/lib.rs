@@ -1559,6 +1559,16 @@ const DUES_FUNDING_MIGRATION: &str = include_str!("../migrations/002_dues_fundin
 /// index that allows a receipt one correction and no more.
 const RECEIPTS_MIGRATION: &str = include_str!("../migrations/003_receipts.sql");
 
+/// Migration 4's SQL, embedded at compile time from
+/// `migrations/004_ledger_append_only.sql`.
+///
+/// It makes the ledger a record: UPDATE and DELETE are refused by a trigger, and
+/// a statement-level guard refuses TRUNCATE on both `transactions` and
+/// `receipts`. Ownership of those tables (and their guard functions) is moved to
+/// the deployment role after this migration, so the plugin role that writes them
+/// cannot disable the triggers (#152).
+const LEDGER_APPEND_ONLY_MIGRATION: &str = include_str!("../migrations/004_ledger_append_only.sql");
+
 #[async_trait]
 impl AdjutantPlugin for FinancePlugin {
     fn id(&self) -> &str {
@@ -1609,6 +1619,7 @@ impl AdjutantPlugin for FinancePlugin {
             Migration::new(1, "finance_schema", MIGRATION_SCHEMA),
             Migration::new(2, "dues_funding", DUES_FUNDING_MIGRATION),
             Migration::new(3, "receipts", RECEIPTS_MIGRATION),
+            Migration::new(4, "ledger_append_only", LEDGER_APPEND_ONLY_MIGRATION),
         ]
     }
 

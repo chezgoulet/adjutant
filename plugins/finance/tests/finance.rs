@@ -385,8 +385,8 @@ async fn declared_manifest_satisfies_the_load_rules() {
     // swaps the constraint — and the swap keeps the invariant.
     assert_eq!(
         migrations.len(),
-        3,
-        "the funding rule and the receipts are each their own version"
+        4,
+        "the funding rule, the receipts and the ledger guard are each their own version"
     );
     assert_eq!(migrations[1].version, 2);
     assert_eq!(migrations[1].name, "dues_funding");
@@ -452,6 +452,22 @@ async fn declared_manifest_satisfies_the_load_rules() {
         assert!(receipts.contains(expected), "migration 3 is missing {expected}");
     }
     assert!(!receipts.contains("NUMERIC") && !receipts.contains("DECIMAL"));
+
+    // Migration 4 makes the ledger a record too (#152): UPDATE/DELETE are
+    // refused by the database, and TRUNCATE — which fires no row trigger — is
+    // refused by a statement-level guard on both record tables.
+    assert_eq!(migrations[3].version, 4);
+    assert_eq!(migrations[3].name, "ledger_append_only");
+    let ledger = &migrations[3].sql;
+    for expected in [
+        "CREATE OR REPLACE FUNCTION finance_transactions_are_records()",
+        "BEFORE UPDATE OR DELETE ON transactions",
+        "CREATE OR REPLACE FUNCTION finance_ledger_no_truncate()",
+        "BEFORE TRUNCATE ON transactions",
+        "BEFORE TRUNCATE ON receipts",
+    ] {
+        assert!(ledger.contains(expected), "migration 4 is missing {expected}");
+    }
 
     let mut seen: Vec<(String, String)> = Vec::new();
     for r in &routes {

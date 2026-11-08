@@ -245,9 +245,16 @@ ALTER TABLE core.user_roles ALTER COLUMN scope_id DROP DEFAULT;
 ALTER TABLE core.user_roles ALTER COLUMN scope_id DROP NOT NULL;
 ALTER TABLE core.user_roles ALTER COLUMN scope_id TYPE TEXT USING scope_id::text;
 
--- Normalise existing (all troop-wide) rows to NULL.
+-- Normalise troop-wide rows to NULL. Only troop rows: migration 1 gave EVERY
+-- row the zero-UUID default regardless of scope_type, so a deployed
+-- (scope_type='lodge', scope_id=zero-UUID) grant is a plausible legacy shape.
+-- Nulling it here used to violate the CHECK added below in the same migration,
+-- aborting the whole transaction and leaving the server unable to boot (#158).
+-- A non-troop zero UUID is a valid opaque id under #33, so it is kept as-is
+-- rather than deleted; the only rows whose meaning is troop-wide are the
+-- scope_type='troop' ones.
 UPDATE core.user_roles SET scope_id = NULL
-  WHERE scope_type = 'troop' OR scope_id = '00000000-0000-0000-0000-000000000000';
+  WHERE scope_type = 'troop';
 
 CREATE UNIQUE INDEX IF NOT EXISTS idx_user_roles_unique
   ON core.user_roles (user_id, role_id, COALESCE(scope_id, ''));
@@ -1054,6 +1061,50 @@ SELECT min(id) FILTER (WHERE bad)::BIGINT, count(*)::BIGINT FROM (
   FROM core.audit_log a WINDOW w AS (ORDER BY a.id)
 ) t
 $fn$;
+"
+    ),
+    (
+        18,
+        "events_replay_gap_free",
+        "-- #162: a cursor replay could silently skip an event that committed late.
+--
+-- BIGSERIAL allocates an id at INSERT but a row becomes visible at COMMIT, so
+-- one transaction can hold a lower id while a higher id is already visible. A
+-- reader that advances its cursor to the higher id never sees the lower one
+-- after it commits -- the event is durable in core.events and unreachable by
+-- replay, which defeats the durability the bus promises.
+--
+-- The fix makes id allocation and commit order the same. A BEFORE INSERT
+-- trigger takes a transaction-scoped advisory lock BEFORE assigning the id and
+-- holds it until this transaction commits or rolls back. A concurrent insert
+-- waits for that resolution, so it can only be allocated a higher id after the
+-- lower one is visible (committed) or gone forever (rolled back). `id > cursor
+-- ORDER BY id` is then gap-free for every writer, including raw SQL that never
+-- goes through the host publisher.
+--
+-- The column default is dropped so an ordinary insert arrives with NEW.id NULL
+-- and the trigger is the only allocator. An explicit id (a dump restore, a
+-- fixture) is kept as given and still serialised by the lock; restoring a dump
+-- is single-threaded, so it cannot interleave with live allocation.
+--
+-- The lock key is distinct from the audit chain's 918273645: the two chains are
+-- independent and must not block each other.
+ALTER TABLE core.events ALTER COLUMN id DROP DEFAULT;
+
+CREATE OR REPLACE FUNCTION core.events_serialize_id() RETURNS trigger
+LANGUAGE plpgsql AS $fn$
+BEGIN
+  PERFORM pg_advisory_xact_lock(918273646);
+  IF NEW.id IS NULL THEN
+    NEW.id := nextval('core.events_id_seq');
+  END IF;
+  RETURN NEW;
+END
+$fn$;
+
+DROP TRIGGER IF EXISTS events_serialize_id ON core.events;
+CREATE TRIGGER events_serialize_id BEFORE INSERT ON core.events
+  FOR EACH ROW EXECUTE FUNCTION core.events_serialize_id();
 "
     ),
 ];

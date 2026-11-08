@@ -462,6 +462,13 @@ pub async fn build_app(cfg: &Config) -> Result<(Router, Arc<AppState>), BuildErr
     .await
     .map_err(BuildError::Plugin)?;
 
+    // #152: the finance plugin's record tables are written by its own role, but
+    // must not be owned by it — an owner can disable the immutability triggers.
+    // Migrations have run by now, so this is the first point the guards exist.
+    crate::schema::protect_record_tables(pool.as_ref())
+        .await
+        .map_err(BuildError::Db)?;
+
     // Bind event subscriptions before any traffic flows — but only for plugins
     // that are actually **loaded**. A disabled plugin is not in the live set at
     // all now (issue #89), so this is no longer a flag check that could drift: a
@@ -1594,6 +1601,17 @@ pub(crate) async fn load_fresh_generation(
             ));
         }
     };
+
+    // #152: a reload may have just applied the finance plugin's guard migration
+    // (enable/reinstall). Ownership has to be moved after that, exactly as at
+    // boot, or the writing role could disarm the guards it just installed.
+    if let Err(e) = crate::schema::protect_record_tables(state.pool.as_ref()).await {
+        tracing::error!(error = %e, "reload could not protect record ownership; old registry kept");
+        return Err(error_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "reload failed; old registry kept",
+        ));
+    }
 
     // `load_all` ran each plugin's `init`, which re-declares its scope edges;
     // refresh the resolution map before the new generation serves.

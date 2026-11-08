@@ -201,8 +201,9 @@ async fn ensure_core_ready(admin: &PgPool) {
 /// `CREATE SCHEMA` is deliberately **not** done as the plugin role: a plugin
 /// role does not own the database and has no `CREATE` on it (`bootstrap-isolation`
 /// creates the schema as the operator, `AUTHORIZATION adjutant_plugin_<id>`), so
-/// the probe does what the operator does and then migrates as the plugin, which
-/// owns what is inside its own schema.
+/// the probe does what the operator does and then migrates as the plugin. After a
+/// boot, the protected record tables belong to the deployment role (#152), so
+/// applied versions are skipped exactly as the real runner skips them.
 async fn ensure_plugin_schema(admin: &PgPool, plugin: &PgPool) {
     sqlx::query(&format!(
         "CREATE SCHEMA IF NOT EXISTS finance AUTHORIZATION {PLUGIN_ROLE}"
@@ -210,12 +211,22 @@ async fn ensure_plugin_schema(admin: &PgPool, plugin: &PgPool) {
     .execute(admin)
     .await
     .expect("the finance schema, as `bootstrap-isolation` creates it");
-    sqlx::query(&format!("ALTER SCHEMA finance OWNER TO {PLUGIN_ROLE}"))
-        .execute(admin)
-        .await
-        .expect("the plugin role owns its own schema");
+    // #152: a hardened database has the record tables owned by the deployment
+    // role, so the plugin may no longer re-run DDL that touches them. Apply only
+    // the versions the real runner would apply: it skips a version it has
+    // already recorded, and this fixture now mirrors that instead of replaying
+    // every migration's SQL.
+    let applied: Vec<i64> = sqlx::query_scalar(
+        "SELECT version FROM core.schema_migrations WHERE schema = 'finance'",
+    )
+    .fetch_all(admin)
+    .await
+    .expect("read the applied finance migrations");
     let mut conn = plugin.acquire().await.expect("plugin connection");
     for migration in FinancePlugin::new().migrations() {
+        if applied.contains(&migration.version) {
+            continue;
+        }
         let script = format!(
             "BEGIN; SET LOCAL search_path TO \"finance\"; {}; COMMIT;",
             migration.sql
@@ -255,10 +266,20 @@ struct Leg {
 /// Clear anything a previous run left behind. Called **before** a probe writes
 /// and again after, never between a write and the assertion on it.
 async fn cleanup(admin: &PgPool, mark: &str) {
+    // The ledger is a record now (#152): DELETE is refused even to the operator.
+    // This is probe cleanup, not a write path, so it disables trigger firing for
+    // the one statement — scoped to a transaction so it cannot leak.
+    let Ok(mut tx) = admin.begin().await else {
+        return;
+    };
+    let _ = sqlx::query("SET LOCAL session_replication_role = replica")
+        .execute(&mut *tx)
+        .await;
     let _ = sqlx::query("DELETE FROM finance.transactions WHERE description LIKE $1")
         .bind(format!("{PROBE_MARK}{mark}%"))
-        .execute(admin)
+        .execute(&mut *tx)
         .await;
+    let _ = tx.commit().await;
 }
 
 /// Every row a probe wrote, in id order.
