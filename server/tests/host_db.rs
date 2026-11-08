@@ -130,6 +130,10 @@ static HIERARCHY: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 /// one installs the process-global chain key.
 static AUDIT: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
+/// Serializes the event-replay probes: they truncate `core.events` and assert on
+/// the ids a concurrent insert receives.
+static EVENTS: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
 /// Empty `core.user_roles` without tripping the last-admin guard (#189).
 ///
 /// `probe_scope_id_is_opaque_text_and_round_trips` must start from an empty
@@ -1719,4 +1723,95 @@ async fn migration_17_recomputes_a_v1_chain_on_upgrade() {
         err.to_string().contains("append-only"),
         "expected the append-only error, got: {err}"
     );
+}
+
+// ---------------------------------------------------------------------------
+// Cursor replay is gap-free (#162)
+// ---------------------------------------------------------------------------
+
+/// #162's reproduction, as two SQL sessions.
+///
+/// T1 allocates a low id and stays open. T2 commits a higher id, a reader sees
+/// it and advances its cursor past T1's id; when T1 finally commits, the event
+/// is durable but unreachable by `id > cursor`.
+///
+/// Migration 18 makes id allocation and commit order the same: the INSERT
+/// trigger holds a transaction-scoped advisory lock from before `nextval` until
+/// commit, so T2 cannot receive a higher id while T1 is unresolved. This test
+/// asserts the reader's own discipline — after its first poll and the commit of
+/// T1, replaying from the cursor it returned must not lose either event.
+#[tokio::test]
+#[ignore = "DB-gated: needs ADJUTANT_TEST_DATABASE_URL; run with `-- --ignored`"]
+async fn replay_from_the_returned_cursor_does_not_skip_a_late_commit() {
+    let _guard = EVENTS.lock().await;
+    let (pool, _) = setup(&[]).await;
+    sqlx::query("TRUNCATE core.events RESTART IDENTITY")
+        .execute(pool.as_ref())
+        .await
+        .expect("reset core.events");
+
+    // T1: allocate a low id, keep the transaction open.
+    let mut tx1 = pool.begin().await.expect("T1 transaction");
+    sqlx::query(
+        "INSERT INTO core.events (event_type, payload, source_plugin) \
+         VALUES ('a-lost', '{}', 'probe')",
+    )
+    .execute(&mut *tx1)
+    .await
+    .expect("T1 insert");
+
+    // T2: a concurrent insert. Before migration 18 it commits immediately with
+    // a higher id; after it, the trigger makes it wait for T1 to resolve.
+    let pool2 = pool.clone();
+    let t2 = tokio::spawn(async move {
+        sqlx::query_scalar::<_, i64>(
+            "INSERT INTO core.events (event_type, payload, source_plugin) \
+             VALUES ('b-late', '{}', 'probe') RETURNING id",
+        )
+        .fetch_one(pool2.as_ref())
+        .await
+    });
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+
+    // Poll #1: the reader sees what is visible and uses the last id as its
+    // cursor, exactly as `/api/events/recent` does.
+    let first: Vec<(i64, String)> = sqlx::query_as(
+        "SELECT id, event_type FROM core.events WHERE id > 0 ORDER BY id ASC LIMIT 100",
+    )
+    .fetch_all(pool.as_ref())
+    .await
+    .expect("poll #1");
+    let cursor = first.last().map(|row| row.0).unwrap_or(0);
+
+    tx1.commit().await.expect("T1 commit");
+    let second_id = t2
+        .await
+        .expect("T2 task")
+        .expect("T2 insert commits after T1");
+
+    // Poll #2 from the cursor poll #1 returned. The late event must be here.
+    let second: Vec<(i64, String)> = sqlx::query_as(
+        "SELECT id, event_type FROM core.events WHERE id > $1 ORDER BY id ASC LIMIT 100",
+    )
+    .bind(cursor)
+    .fetch_all(pool.as_ref())
+    .await
+    .expect("poll #2");
+
+    let mut seen: Vec<&str> = first
+        .iter()
+        .chain(second.iter())
+        .map(|(_, event_type)| event_type.as_str())
+        .collect();
+    seen.sort_unstable();
+    assert_eq!(
+        seen,
+        vec!["a-lost", "b-late"],
+        "cursor {cursor} (T2 id {second_id}) skipped an event: poll #1 = {first:?}, poll #2 = {second:?}"
+    );
+
+    sqlx::query("TRUNCATE core.events RESTART IDENTITY")
+        .execute(pool.as_ref())
+        .await
+        .expect("cleanup core.events");
 }
