@@ -14,6 +14,12 @@
 //! filesystem or the network. On top of that: a 64 MiB linear-memory cap and a
 //! fuel budget per entry-point call. See the tests at the bottom.
 //!
+//! **Outbound HTTP is a declared capability, not an implied one (#155).** The
+//! `http.request` host call is still available, but [`WasmPlugin`]'s manifest
+//! must list each reachable scheme+host in `http_allow` (default: empty, deny
+//! all), and the host refuses non-public addresses and the operator deny list
+//! as well. See [`crate::host::HttpPolicy`].
+//!
 //! The host wraps a guest in [`WasmPlugin`], which implements the ordinary
 //! [`AdjutantPlugin`] trait. The registry, validation, permission gate, and
 //! dispatch path are unchanged — WASM is just another plugin implementation.
@@ -431,6 +437,10 @@ struct Manifest {
     migrations: Vec<MigrationMeta>,
     #[serde(default)]
     routes: Vec<RouteMeta>,
+    /// Outbound HTTP capability (#155): scheme+host entries this guest may
+    /// reach, e.g. `["https://api.example.com"]`. Empty means no outbound HTTP.
+    #[serde(default)]
+    http_allow: Vec<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -515,12 +525,23 @@ impl WasmPlugin {
         .await
         .map_err(|e| format!("wasm task failed: {e}"))??;
 
+        // Fail at load, not at the first request: a malformed entry must not
+        // become a policy that silently matches nothing (or everything).
+        crate::host::HttpPolicy::validate_allowlist(&manifest.http_allow)
+            .map_err(|e| format!("invalid manifest http_allow: {e}"))?;
+
         let ctx_slot = guest.store.data().ctx.clone();
         Ok(Self {
             guest: Arc::new(Mutex::new(guest)),
             ctx_slot,
             manifest,
         })
+    }
+
+    /// The scheme+host entries this guest declared for outbound HTTP. Empty
+    /// means the guest may reach nothing (default deny, #155).
+    pub fn http_allowlist(&self) -> Vec<String> {
+        self.manifest.http_allow.clone()
     }
 }
 
@@ -673,6 +694,46 @@ mod tests {
         store.set_fuel(GUEST_FUEL).unwrap();
         let errno = prestat.call(&mut store, ()).unwrap();
         assert_ne!(errno, 0, "fd 3 must not be a preopened directory");
+    }
+
+    /// Issue #155: the guest's `http.request` host call must obey the policy on
+    /// its `PluginContext`, and a guest that declared no `http_allow` entries
+    /// must not reach the transport at all. This drives the exact dispatch arm
+    /// the guest calls, with the same `PluginHttp` wrapper `load_opened` installs.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn guest_http_request_is_refused_without_a_manifest_allowlist() {
+        use adjutant_sdk::testing::TestHost;
+
+        let host = TestHost::new();
+        let transport = host.http.clone();
+        let mut ctx = host.context("guest");
+        ctx.http = crate::host::PluginHttp::new(
+            transport.clone(),
+            crate::host::HttpPolicy::untrusted(&[], Vec::new()).expect("empty guest policy"),
+        );
+
+        let runtime = Handle::current();
+        let payload = json!({
+            "method": "GET",
+            "url": "http://127.0.0.1:8787/api/plugins",
+            "headers": [],
+        })
+        .to_string();
+        let out = tokio::task::spawn_blocking(move || {
+            dispatch(&runtime, Some(ctx), None, "http.request", &payload)
+        })
+        .await
+        .expect("blocking dispatch");
+
+        assert!(out.contains("\"ok\":false"), "guest call must fail: {out}");
+        assert!(
+            out.contains("forbidden") || out.contains("refuses"),
+            "the refusal names the policy: {out}"
+        );
+        assert!(
+            transport.request_urls().is_empty(),
+            "a denied guest URL must never reach the host transport"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread")]

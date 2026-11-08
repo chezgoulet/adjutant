@@ -168,6 +168,9 @@ def start_server(extra_env, log_path):
     env.update({
         "ADJUTANT_BIND": BIND,
         "ADJUTANT_PLUGIN_DIR": str(PLUGIN_DIR),
+        # This tree's first-party native ids; see #156. The probe stages every
+        # workspace plugin, so it names the two with core.* grants.
+        "ADJUTANT_FIRST_PARTY_PLUGINS": "auth,membership",
         "ADJUTANT_DATABASE_URL": DSN,
         "ADJUTANT_DEV_HEADERS": "true",
         "ADJUTANT_CORS": "*",

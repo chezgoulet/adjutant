@@ -87,6 +87,7 @@ echo "==> booting the server on $BASE (dev headers OFF)"
 # nothing. ADJUTANT_RATE_MAX=0 because this run issues a burst of requests.
 ADJUTANT_DATABASE_URL="$LIVE_URL" \
 ADJUTANT_PLUGIN_DIR="$PLUGIN_DIR" \
+ADJUTANT_FIRST_PARTY_PLUGINS="${ADJUTANT_FIRST_PARTY_PLUGINS:-auth,membership}" \
 ADJUTANT_DEV_HEADERS=false \
 ADJUTANT_RATE_MAX=0 \
 ADJUTANT_ALLOW_SUPERUSER=true \

@@ -307,6 +307,14 @@ impl AppState {
     /// Graceful shutdown: stop event handlers, then call every plugin's
     /// documented `shutdown()` hook (live and retired generations alike) before
     /// the process exits. Without this, that hook was dead code.
+    ///
+    /// **No registry lock is held across plugin code** (#157/F6). The executable
+    /// halves are moved out under the write lock, which is then released before
+    /// any `shutdown().await` runs. A hook that blocks, or that calls back into
+    /// `state.registry`, can therefore no longer deadlock every concurrent
+    /// dispatch and graceful termination. Each hook is also bounded by
+    /// `SHUTDOWN_TIMEOUT`, so one wedged plugin cannot hang the process
+    /// forever.
     pub async fn shutdown(&self) {
         self.bus.shutdown();
         self.scheduler.stop_all();
@@ -314,9 +322,15 @@ impl AppState {
         // the plugins it delivers to are torn down.
         self.relay.stop();
         self.backups.stop();
-        let mut reg = self.registry.write().await;
-        // Destructure the guard so the two vecs borrow independently.
-        let PluginRegistry { plugins, retired } = &mut *reg;
+
+        let (mut plugins, mut retired) = {
+            let mut reg = self.registry.write().await;
+            // Taking the executable halves empties the registry in one short
+            // critical section. The guard is dropped at the end of this block,
+            // before the loop below awaits plugin code.
+            (std::mem::take(&mut reg.plugins), std::mem::take(&mut reg.retired))
+        };
+
         // A disabled plugin has no instance to shut down: it was already dropped
         // when it was disabled (issue #89). Retired generations keep theirs, so
         // their documented `shutdown()` hook still runs.
@@ -325,8 +339,16 @@ impl AppState {
             .filter_map(crate::plugin_runtime::PluginSlot::live_mut)
             .chain(retired.iter_mut())
         {
-            if let Err(e) = lp.plugin.shutdown().await {
-                tracing::warn!(plugin = %lp.info.id, error = %e, "plugin shutdown failed");
+            match tokio::time::timeout(SHUTDOWN_TIMEOUT, lp.plugin.shutdown()).await {
+                Ok(Ok(())) => {}
+                Ok(Err(e)) => {
+                    tracing::warn!(plugin = %lp.info.id, error = %e, "plugin shutdown failed")
+                }
+                Err(_) => tracing::warn!(
+                    plugin = %lp.info.id,
+                    timeout_ms = SHUTDOWN_TIMEOUT.as_millis(),
+                    "plugin shutdown timed out; continuing"
+                ),
             }
         }
         tracing::info!("plugins shut down");
@@ -458,6 +480,8 @@ pub async fn build_app(cfg: &Config) -> Result<(Router, Arc<AppState>), BuildErr
         serde_json::Value::Object(Default::default()),
         identity.clone(),
         http.clone(),
+        &cfg.first_party_plugins,
+        &cfg.http_deny_hosts,
     )
     .await
     .map_err(BuildError::Plugin)?;
@@ -1131,6 +1155,11 @@ async fn audit_verify(State(state): State<Arc<AppState>>, req: Request) -> Respo
 /// request really ends, so a request can never meet a closed pool.
 const DRAIN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
+/// Bound on one plugin's `shutdown()` hook. Independent of the registry lock
+/// (which is not held), so this only stops a wedged hook from hanging process
+/// exit; it does not protect dispatch, because dispatch no longer waits here.
+const SHUTDOWN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
 /// Audit a **refusal** (issue #89 requirement #8). Best effort by design: the
 /// refusal stands even when its audit row cannot be written, because refusing is
 /// the safe direction — the write failure is logged loudly either way.
@@ -1264,6 +1293,8 @@ async fn enable_plugin(
         config: serde_json::Value::Object(Default::default()),
         identity: state.identity.clone(),
         http: state.http.clone(),
+        first_party_plugins: &state.config.first_party_plugins,
+        http_deny_hosts: &state.config.http_deny_hosts,
     };
     let mut seen_routes = state.registry.read().await.live_route_keys();
     let loaded = match load_plugin(&path, &env, &mut seen_routes).await {
@@ -1582,6 +1613,8 @@ pub(crate) async fn load_fresh_generation(
         serde_json::Value::Object(Default::default()),
         state.identity.clone(),
         state.http.clone(),
+        &state.config.first_party_plugins,
+        &state.config.http_deny_hosts,
     )
     .await
     {
@@ -1798,6 +1831,43 @@ mod tests {
         }
     }
 
+    /// A plugin whose `shutdown` deliberately waits for the test to release it.
+    /// It reports "entered" first so the test knows shutdown is inside the hook
+    /// (and, before the fix, that the registry write lock is being held).
+    struct WaitingShutdownPlugin {
+        entered: Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
+        release: Mutex<Option<tokio::sync::oneshot::Receiver<()>>>,
+    }
+
+    #[async_trait]
+    impl AdjutantPlugin for WaitingShutdownPlugin {
+        fn id(&self) -> &str {
+            "waiting_shutdown"
+        }
+        fn name(&self) -> &str {
+            "Waiting shutdown"
+        }
+        fn version(&self) -> &str {
+            "0.0.1"
+        }
+        async fn init(&mut self, _ctx: PluginContext) -> Result<(), SdkError> {
+            Ok(())
+        }
+        fn routes(&self) -> Vec<RouteDefinition> {
+            Vec::new()
+        }
+        async fn shutdown(&mut self) -> Result<(), SdkError> {
+            if let Some(tx) = self.entered.lock().unwrap().take() {
+                let _ = tx.send(());
+            }
+            let rx = self.release.lock().unwrap().take();
+            if let Some(rx) = rx {
+                let _ = rx.await;
+            }
+            Ok(())
+        }
+    }
+
     /// A minimal plugin for the registry fixture; `init` is never called.
     struct TinyPlugin;
 
@@ -2004,6 +2074,67 @@ mod tests {
             .wait_idle("store", std::time::Duration::from_millis(50))
             .await
             .is_some());
+    }
+
+    /// Issue #157/F6: `AppState::shutdown` used to hold the registry write lock
+    /// across `plugin.shutdown().await`. This test enters a plugin hook, then
+    /// requires that a concurrent `registry.read()` completes. Before the fix the
+    /// read blocks behind the held writer and the timeout fails the test; after
+    /// the fix the lock was released before the hook was called.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn shutdown_does_not_hold_the_registry_lock_across_plugin_code() {
+        let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        let state = failing_audit_state();
+        {
+            let mut reg = state.registry.write().await;
+            reg.plugins.push(PluginSlot::Live(LoadedPlugin {
+                plugin: Box::new(WaitingShutdownPlugin {
+                    entered: Mutex::new(Some(entered_tx)),
+                    release: Mutex::new(Some(release_rx)),
+                }),
+                library: None,
+                pool: None,
+                routes: Vec::new(),
+                path: std::path::PathBuf::new(),
+                info: PluginInfo {
+                    id: "waiting_shutdown".into(),
+                    name: "Waiting shutdown".into(),
+                    version: "0.0.1".into(),
+                    enabled: true,
+                    routes: 0,
+                    kind: "native".into(),
+                    isolated: true,
+                    loaded: true,
+                    last_error: None,
+                    permissions: Vec::new(),
+                    schedules: Vec::new(),
+                    route_list: Vec::new(),
+                },
+            }));
+        }
+
+        let shutting_down = {
+            let state = state.clone();
+            tokio::spawn(async move { state.shutdown().await })
+        };
+        // Wait until the hook is entered: at this instant the old code holds the
+        // registry write lock.
+        tokio::time::timeout(std::time::Duration::from_secs(2), entered_rx)
+            .await
+            .expect("shutdown must reach the plugin hook")
+            .expect("entered sender");
+
+        let guard = tokio::time::timeout(std::time::Duration::from_secs(2), state.registry.read())
+            .await
+            .expect("a plugin hook must not keep the registry lock");
+        drop(guard);
+
+        let _ = release_tx.send(());
+        tokio::time::timeout(std::time::Duration::from_secs(2), shutting_down)
+            .await
+            .expect("shutdown finishes once the hook returns")
+            .expect("shutdown task");
     }
 
     /// Issue #89 requirement #6: the non-disableable minimum is a *declarative*

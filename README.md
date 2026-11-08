@@ -88,9 +88,12 @@ python3 scripts/stage-plugins.py
 ADJUTANT_DATABASE_URL=postgres://adjutant@127.0.0.1:5433/adjutant_dev \
   cargo run -p adjutant-server -- bootstrap-isolation --plugin-dir plugins-built
 
-# 5. run (--allow-dev-headers is for local auth-less testing; dev only)
+# 5. run (--allow-dev-headers is for local auth-less testing; dev only).
+#    The first-party list is what lets the native auth/membership ids keep
+#    their core.* grants (#156); it is empty unless the operator names them.
 ADJUTANT_PLUGIN_DIR=plugins-built \
 ADJUTANT_DATABASE_URL=postgres://adjutant@127.0.0.1:5433/adjutant_dev \
+ADJUTANT_FIRST_PARTY_PLUGINS=auth,membership \
   cargo run -p adjutant-server -- --allow-dev-headers
 ```
 
@@ -120,6 +123,8 @@ Precedence is defaults < TOML file (./adjutant.toml or `--config`) < environment
 | `ADJUTANT_HTTP_BODY_TIMEOUT` | total seconds allowed for a request body, not reset per chunk (default `10`) |
 | `ADJUTANT_HTTP_REQUEST_TIMEOUT` | seconds for the whole request, handler included (default `300`; the backup bundle gets the same five minutes the client does) |
 | `ADJUTANT_HTTP_MAX_CONNECTIONS` | concurrent accepted connections (default `128`); further sockets wait in the kernel backlog |
+| `ADJUTANT_HTTP_DENY_HOSTS` | comma-separated hosts (and their subdomains) that no plugin's `ctx.http` may reach, on top of the always-denied loopback/link-local/private ranges. WASM guests additionally need each reachable scheme+host in their manifest `http_allow` |
+| `ADJUTANT_FIRST_PARTY_PLUGINS` | comma-separated native plugin ids the operator asserts are first-party. **Empty by default.** A native plugin whose id carries `core.*` grants (currently `auth`, `membership`) is refused unless named here; WASM guests can never be named (#156) |
 | `ADJUTANT_DEV_HEADERS` | **`false` by default.** Set `true` (or pass `--allow-dev-headers`) to enable the spoofable `x-dev-user`/`x-dev-role` identity stub for development. Only consulted when no plugin identity provider answered. `--no-dev-headers` forces it off, overriding a config file or environment that enabled it |
 | `ADJUTANT_ALLOW_SUPERUSER` | **`false` by default.** The server refuses to boot on a PostgreSQL superuser connection (a plugin escape would be total compromise). Set `true` (or pass `--allow-superuser`) only for a throwaway database |
 | `ADJUTANT_TEST_DATABASE_URL` | overrides the derived `_test` database for `adjutant test-plugin` and the DB-backed tests |
