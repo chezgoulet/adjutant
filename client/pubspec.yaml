@@ -2,7 +2,11 @@ name: adjutant_client
 description: "Adjutant — sovereignty-first administration for democratic scout troops."
 publish_to: 'none'
 
-version: 0.1.0+1
+# The product version. Kept equal to Cargo.toml [workspace.package].version by
+# scripts/check-versions.py (#177): Android's versionName is read from here via
+# build.gradle.kts, so a stale value ships an APK that reports the wrong release.
+# The `+N` build number is independent of the release version.
+version: 0.3.0+1
 
 # The exact Flutter SDK this app is built and gated with (issue #76). CI reads
 # THIS file — `flutter-version-file` in .github/workflows/ci.yml — rather than

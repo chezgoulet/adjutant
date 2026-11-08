@@ -43,11 +43,29 @@ in particular the interim `v0.3.0` recommendation and the v1.0 gate.
 
 ## Version bump
 
+`Cargo.toml` `[workspace.package].version` is the source of truth. The core and
+SDK inherit it, and the release tag is cut from it.
+
 1. Update `version` in [`Cargo.toml`](../Cargo.toml) `[workspace.package]`
-   (the core and SDK share a version; plugins version independently).
-2. If the SDK contract changed in a breaking way, bump `SDK_ABI_VERSION` in
+   (the core and SDK share a version; plugins version independently). Keep the
+   `[workspace.dependencies]` entry for `adjutant-sdk` at the same version.
+2. Update `version` in [`client/pubspec.yaml`](../client/pubspec.yaml) to the
+   same `X.Y.Z`. Keep or increment the `+N` build number; Android's
+   `versionName` comes from this field, not from `Cargo.toml` (#177).
+3. If the SDK contract changed in a breaking way, bump `SDK_ABI_VERSION` in
    `plugins/sdk/src/lib.rs` and note it in [`CHANGELOG.md`](../CHANGELOG.md).
-3. Move the `[Unreleased]` changelog section to the new version.
+4. Move the `[Unreleased]` changelog section to the new version.
+5. Run the gate before tagging:
+
+   ```bash
+   python3 scripts/check-versions.py --tag vX.Y.Z
+   ```
+
+   It compares the proposed tag, `Cargo.toml`, the `adjutant-sdk` dependency,
+   `client/pubspec.yaml`, the newest released `CHANGELOG.md` heading and the MCP
+   bridge's `SERVER_VERSION`. The same script runs on every push and tag in CI,
+   and is the first step of the release job, so mismatched files cannot publish
+   a release even if the local run is skipped.
 
 ## Verify before publishing
 
