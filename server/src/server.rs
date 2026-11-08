@@ -480,6 +480,7 @@ pub async fn build_app(cfg: &Config) -> Result<(Router, Arc<AppState>), BuildErr
         serde_json::Value::Object(Default::default()),
         identity.clone(),
         http.clone(),
+        &cfg.first_party_plugins,
         &cfg.http_deny_hosts,
     )
     .await
@@ -1292,6 +1293,7 @@ async fn enable_plugin(
         config: serde_json::Value::Object(Default::default()),
         identity: state.identity.clone(),
         http: state.http.clone(),
+        first_party_plugins: &state.config.first_party_plugins,
         http_deny_hosts: &state.config.http_deny_hosts,
     };
     let mut seen_routes = state.registry.read().await.live_route_keys();
@@ -1611,6 +1613,7 @@ pub(crate) async fn load_fresh_generation(
         serde_json::Value::Object(Default::default()),
         state.identity.clone(),
         state.http.clone(),
+        &state.config.first_party_plugins,
         &state.config.http_deny_hosts,
     )
     .await

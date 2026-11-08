@@ -182,6 +182,7 @@ ADJUTANT_DATABASE_URL=postgres://adjutant@127.0.0.1:5432/adjutant \
 # Serve as the non-superuser app role. The runtime connects as each plugin role
 # for plugin SQL; it never needs CREATEROLE.
 ADJUTANT_PLUGIN_DIR=plugins-built \
+ADJUTANT_FIRST_PARTY_PLUGINS=auth,membership \
 ADJUTANT_DATABASE_URL=postgres://adjutant_app:"$ADJUTANT_APP_PASSWORD"@127.0.0.1:5432/adjutant \
   ./target/release/adjutant serve
 ```

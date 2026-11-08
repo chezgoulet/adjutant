@@ -178,6 +178,7 @@ fn env_for<'a>(url: &'a str, admin: &Arc<sqlx::PgPool>) -> LoadEnv<'a> {
         config: serde_json::json!({}),
         identity: adjutant_server::identity::IdentityHub::new(),
         http: adjutant_server::host::CoreHttp::new(),
+        first_party_plugins: &[],
         http_deny_hosts: &[],
     }
 }
@@ -192,6 +193,7 @@ async fn boot(dir: &Path, url: &str, admin: &Arc<sqlx::PgPool>) -> PluginRegistr
         serde_json::json!({}),
         adjutant_server::identity::IdentityHub::new(),
         adjutant_server::host::CoreHttp::new(),
+        &[],
         &[],
     )
     .await

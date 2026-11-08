@@ -79,10 +79,14 @@ COPY --from=builder /src/target/release/libadjutant_*.so /app/plugins/
 COPY --from=builder /src/wasm/target/wasm32-wasip1/release/adjutant_hello_wasm.wasm /app/plugins/
 
 # Dev identity headers stay OFF unless explicitly opted in (SPEC §7.1).
+# The image ships these first-party plugins; the operator allowlist is what
+# lets their native ids keep the core.* grants schema.rs keys on the id (#156).
+# A custom image should name its own first-party set (or none).
 ENV ADJUTANT_PLUGIN_DIR=/app/plugins \
     ADJUTANT_BIND=0.0.0.0:8787 \
     ADJUTANT_BACKUP_DIR=/app/backups \
-    ADJUTANT_LOG_FORMAT=json
+    ADJUTANT_LOG_FORMAT=json \
+    ADJUTANT_FIRST_PARTY_PLUGINS=auth,membership
 EXPOSE 8787
 
 # Everything above that writes happens as this user. The process never needs a

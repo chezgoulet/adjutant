@@ -238,7 +238,10 @@ jobs:
 
       # Route/registry smoke ladder against a pristine test database.
       - name: test-plugin harness
-        run: ADJUTANT_PLUGIN_DIR=plugins-built ./target/debug/adjutant test-plugin
+        run: |
+          ADJUTANT_PLUGIN_DIR=plugins-built \
+          ADJUTANT_FIRST_PARTY_PLUGINS=auth,membership \
+            ./target/debug/adjutant test-plugin
 
       # The money path's own probes: the stripe plugin's ledger booking is one
       # statement, idempotent across a redelivery, and its worklist tells the
@@ -410,6 +413,7 @@ jobs:
           ./target/debug/adjutant bootstrap-isolation \
             --database-url "$ADJUTANT_DATABASE_URL" --plugin-dir plugins-built
           ADJUTANT_PLUGIN_DIR=plugins-built \
+          ADJUTANT_FIRST_PARTY_PLUGINS=auth,membership \
           ADJUTANT_DEV_HEADERS=false \
           ADJUTANT_RATE_MAX=0 \
           ADJUTANT_LOG=warn \
@@ -438,6 +442,7 @@ jobs:
           # copy of the credential.
           export ADJUTANT_DATABASE_URL="$ADJUTANT_TEST_DATABASE_URL"
           ADJUTANT_PLUGIN_DIR=plugins-built \
+          ADJUTANT_FIRST_PARTY_PLUGINS=auth,membership \
           ADJUTANT_DEV_HEADERS=true \
           ADJUTANT_ALLOW_SUPERUSER=true \
           ADJUTANT_RATE_MAX=0 \

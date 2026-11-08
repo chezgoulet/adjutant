@@ -28,9 +28,12 @@ cargo test -p adjutant-gear_locker
 # 5. Run the live route probes against a pristine test database
 ADJUTANT_PLUGIN_DIR=plugins-built ./target/debug/adjutant test-plugin
 
-# 6. Load it into a server
+# 6. Load it into a server (name the first-party ids so auth/membership keep
+#    their core.* grants; see #156)
 cp target/debug/libadjutant_gear_locker.so plugins-built/
-ADJUTANT_PLUGIN_DIR=plugins-built cargo run -p adjutant-server
+ADJUTANT_PLUGIN_DIR=plugins-built \
+ADJUTANT_FIRST_PARTY_PLUGINS=auth,membership \
+  cargo run -p adjutant-server
 ```
 
 The scaffold is a compiling plugin: a manifest (the trait impl), two

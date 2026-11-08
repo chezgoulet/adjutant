@@ -726,6 +726,10 @@ pub struct LoadEnv<'a> {
     pub config: serde_json::Value,
     pub identity: Arc<crate::identity::IdentityHub>,
     pub http: Arc<crate::host::CoreHttp>,
+    /// Native ids the operator has asserted are first-party (#156). Empty means
+    /// no native plugin may keep an id that [`crate::schema::core_grants`] keys
+    /// grants on.
+    pub first_party_plugins: &'a [String],
     /// Operator outbound-HTTP deny list (#155), passed to every plugin's
     /// [`crate::host::HttpPolicy`].
     pub http_deny_hosts: &'a [String],
@@ -827,6 +831,7 @@ pub async fn load_all(
     config: serde_json::Value,
     identity: std::sync::Arc<crate::identity::IdentityHub>,
     http: std::sync::Arc<crate::host::CoreHttp>,
+    first_party_plugins: &[String],
     http_deny_hosts: &[String],
 ) -> Result<PluginRegistry, PluginRuntimeError> {
     let env = LoadEnv {
@@ -836,6 +841,7 @@ pub async fn load_all(
         config,
         identity,
         http,
+        first_party_plugins,
         http_deny_hosts,
     };
     let mut slots: Vec<PluginSlot> = Vec::new();
@@ -892,7 +898,8 @@ pub async fn load_all(
             validate_untrusted_plugin_id(&id)
                 .map_err(|e| PluginRuntimeError::Invalid(id.clone(), e))?;
         } else {
-            validate_plugin_id(&id).map_err(|e| PluginRuntimeError::Invalid(id.clone(), e))?;
+            validate_native_plugin_id(&id, env.first_party_plugins)
+                .map_err(|e| PluginRuntimeError::Invalid(id.clone(), e))?;
         }
         if seen_ids.contains_key(&id) {
             return Err(PluginRuntimeError::Invalid(id, "duplicate plugin id".into()));
@@ -969,7 +976,8 @@ pub async fn load_plugin(
     if is_wasm {
         validate_untrusted_plugin_id(&id).map_err(|e| PluginRuntimeError::Invalid(id.clone(), e))?;
     } else {
-        validate_plugin_id(&id).map_err(|e| PluginRuntimeError::Invalid(id.clone(), e))?;
+        validate_native_plugin_id(&id, env.first_party_plugins)
+            .map_err(|e| PluginRuntimeError::Invalid(id.clone(), e))?;
     }
     load_opened(
         plugin,
@@ -1190,6 +1198,29 @@ async fn load_opened(
 /// the untrusted path in [`validate_untrusted_plugin_id`].
 pub fn validate_plugin_id(id: &str) -> Result<(), String> {
     validate_id(id)
+}
+
+/// **Native** (trusted) load-time id check: the shape rule, plus the grant
+/// provenance rule for ids that carry `core.*` grants.
+///
+/// Native plugins are trusted code, but `core_grants` keys its allowlist on the
+/// id string the plugin declares. A native library named `auth` in a deployment
+/// without the genuine auth plugin would therefore be handed auth's users,
+/// sessions and user_roles grants (#156). The operator must name such an id in
+/// [`Config::first_party_plugins`](crate::config::Config::first_party_plugins)
+/// before it loads; the list is empty by default, so a misnamed library fails
+/// closed instead of escalating silently. WASM guests can never opt in — see
+/// [`validate_untrusted_plugin_id`].
+pub fn validate_native_plugin_id(id: &str, first_party: &[String]) -> Result<(), String> {
+    validate_plugin_id(id)?;
+    if crate::schema::core_grants(id).is_some() && !first_party.iter().any(|p| p == id) {
+        return Err(format!(
+            "id {id:?} carries core.* grants; refusing an unconfigured native plugin. \
+             Add {id:?} to ADJUTANT_FIRST_PARTY_PLUGINS only if this deployment's \
+             {id} plugin is first-party"
+        ));
+    }
+    Ok(())
 }
 
 /// **Untrusted** load-time id check (sandboxed WASM guests): the shape rule plus
@@ -1684,6 +1715,33 @@ mod tests {
         assert!(validate_plugin_id("drop table").is_err());
     }
 
+    /// Issue #156: a native plugin is trusted code, but the id string it
+    /// declares is what [`crate::schema::core_grants`] keys its `core.*`
+    /// allowlist on. A grant-bearing id must be named by the operator as
+    /// first-party, or it is refused; there is no default opt-in.
+    #[test]
+    fn native_grant_bearing_ids_require_an_operator_opt_in() {
+        for id in ["auth", "membership"] {
+            assert!(crate::schema::core_grants(id).is_some(), "{id} carries grants");
+            let err = validate_native_plugin_id(id, &[])
+                .expect_err("an unconfigured native plugin must not inherit grants");
+            assert!(err.contains("core.* grants"), "{id}: {err}");
+            assert!(
+                validate_native_plugin_id(id, &[id.to_string()]).is_ok(),
+                "the operator can name {id} as first-party"
+            );
+        }
+        // Ids without core grants keep the shape rule alone: a trusted native
+        // plugin named `sdk` or `hello` is not refused for its name.
+        for id in ["hello", "sdk", "plugins", "core", "events", "audit"] {
+            assert!(validate_native_plugin_id(id, &[]).is_ok(), "{id}");
+        }
+        // Opting in one id does not opt in another.
+        assert!(validate_native_plugin_id("membership", &["auth".to_string()]).is_err());
+        // The shape rule still applies on the native path.
+        assert!(validate_native_plugin_id("Auth", &[]).is_err());
+    }
+
     #[test]
     fn untrusted_ids_cannot_take_a_reserved_name() {
         for r in RESERVED_IDS {
@@ -1761,6 +1819,7 @@ mod tests {
             serde_json::Value::Null,
             crate::identity::IdentityHub::new(),
             crate::host::CoreHttp::new(),
+            &[],
             &[],
         )
         .await
