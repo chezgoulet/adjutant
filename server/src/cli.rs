@@ -432,6 +432,15 @@ pub async fn bootstrap_isolation(
             .map_err(|e| format!("transfer core ownership to {app}: {e}"))?;
     }
 
+    // #152: a bundle recorded the finance guard migration, so move the record
+    // tables off the plugin role now — the restore gate must be able to see the
+    // hardened state before the server starts. When that migration is still
+    // pending (an older bundle, or a fresh install) the function is a no-op;
+    // the server hardens after it applies the migration.
+    crate::schema::protect_record_tables(pool.as_ref())
+        .await
+        .map_err(|e| format!("protect record tables: {e}"))?;
+
     // --- which plugins this deployment runs (issue #90) ----------------------
     //
     // **Additive, deliberately.** Absent means "leave the flags alone", which is
@@ -510,6 +519,18 @@ pub async fn verify_isolation(
     let mut checks = Vec::new();
     let mut failures = Vec::new();
 
+    // #152: once the finance guard migration is recorded, the record objects
+    // are expected to have been moved off the plugin role. A bundle from before
+    // that migration is checked in its provisioned (plugin-owned) state; the
+    // server hardens it after applying the migration.
+    let finance_hardened: bool = sqlx::query_scalar(
+        "SELECT EXISTS (SELECT 1 FROM core.schema_migrations \
+                        WHERE schema = 'finance' AND version >= 4)",
+    )
+    .fetch_one(pool.as_ref())
+    .await
+    .map_err(|e| format!("read finance migration state: {e}"))?;
+
     for id in &ids {
         let role = crate::schema::role_for(id);
 
@@ -538,8 +559,35 @@ pub async fn verify_isolation(
         .fetch_optional(pool.as_ref())
         .await
         .map_err(|e| format!("read schema {id}: {e}"))?;
+        let hardened_records = id == "finance" && finance_hardened;
         match schema_owner {
             None => failures.push(format!("missing schema {id} (plugin {id})")),
+            Some(owner) if hardened_records => {
+                // The schema must not belong to the writing role: an owner can
+                // DROP the schema (and the records in it). The plugin keeps the
+                // USAGE/CREATE its migrations need.
+                if owner == role {
+                    failures.push(format!(
+                        "schema {id} is owned by the plugin role {role}; the record tables can be dropped"
+                    ));
+                }
+                for privilege in ["USAGE", "CREATE"] {
+                    let held: bool = sqlx::query_scalar(
+                        "SELECT has_schema_privilege($1::name, $2::name, $3::text)",
+                    )
+                    .bind(&role)
+                    .bind(id)
+                    .bind(privilege)
+                    .fetch_one(pool.as_ref())
+                    .await
+                    .map_err(|e| format!("check schema grant {id}: {e}"))?;
+                    if !held {
+                        failures.push(format!(
+                            "role {role} is missing {privilege} on schema {id}"
+                        ));
+                    }
+                }
+            }
             Some(owner) if owner != role => failures.push(format!(
                 "schema {id} is owned by {owner}, expected {role}"
             )),
@@ -560,9 +608,21 @@ pub async fn verify_isolation(
         .await
         .map_err(|e| format!("read objects in schema {id}: {e}"))?;
         for (object, owner) in wrong_owners {
+            let protected = hardened_records
+                && (crate::schema::PROTECTED_RECORD_TABLES.contains(&object.as_str())
+                    || crate::schema::PROTECTED_RECORD_SEQUENCES.contains(&object.as_str()));
+            if protected {
+                // Checked explicitly below: it is *expected* not to be owned by
+                // the plugin role.
+                continue;
+            }
             failures.push(format!(
                 "table {id}.{object} is owned by {owner}, expected {role}"
             ));
+        }
+
+        if hardened_records {
+            check_protected_records(pool.as_ref(), &role, &mut failures).await?;
         }
 
         let allowlist = crate::schema::core_grants(id);
@@ -781,6 +841,146 @@ pub async fn verify_isolation(
     } else {
         Err(failures.join("\n"))
     }
+}
+
+/// #152: verify the hardened state of finance's record objects — they are not
+/// owned by the plugin role, the plugin can still write them (INSERT/SELECT) and
+/// cannot rewrite, delete or TRUNCATE them. Called only when the guard migration
+/// is recorded; an older bundle is checked in its provisioned state and the
+/// server hardens it after applying the migration.
+async fn check_protected_records(
+    pool: &sqlx::PgPool,
+    role: &str,
+    failures: &mut Vec<String>,
+) -> Result<(), String> {
+    for table in crate::schema::PROTECTED_RECORD_TABLES {
+        let qualified = format!("finance.{table}");
+        let exists: Option<String> = sqlx::query_scalar("SELECT to_regclass($1)::text")
+            .bind(&qualified)
+            .fetch_one(pool)
+            .await
+            .map_err(|e| format!("read record table {qualified}: {e}"))?;
+        if exists.is_none() {
+            failures.push(format!("missing record table {qualified}"));
+            continue;
+        }
+        let owner: Option<String> = sqlx::query_scalar(
+            "SELECT pg_get_userbyid(c.relowner)
+               FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
+              WHERE n.nspname = 'finance' AND c.relname = $1",
+        )
+        .bind(table)
+        .fetch_optional(pool)
+        .await
+        .map_err(|e| format!("read owner of {qualified}: {e}"))?;
+        if owner.as_deref() == Some(role) {
+            failures.push(format!(
+                "record table {qualified} is owned by the plugin role {role}; it can disable the immutability trigger"
+            ));
+        }
+        for privilege in ["SELECT", "INSERT"] {
+            let held: bool = sqlx::query_scalar(
+                "SELECT has_table_privilege($1::name, $2::text, $3::text)",
+            )
+            .bind(role)
+            .bind(&qualified)
+            .bind(privilege)
+            .fetch_one(pool)
+            .await
+            .map_err(|e| format!("check {privilege} on {qualified}: {e}"))?;
+            if !held {
+                failures.push(format!("role {role} is missing {privilege} on {qualified}"));
+            }
+        }
+        for privilege in ["UPDATE", "DELETE", "TRUNCATE"] {
+            let held: bool = sqlx::query_scalar(
+                "SELECT has_table_privilege($1::name, $2::text, $3::text)",
+            )
+            .bind(role)
+            .bind(&qualified)
+            .bind(privilege)
+            .fetch_one(pool)
+            .await
+            .map_err(|e| format!("check {privilege} on {qualified}: {e}"))?;
+            if held {
+                failures.push(format!(
+                    "role {role} still holds {privilege} on record table {qualified}; the plugin can rewrite records"
+                ));
+            }
+        }
+    }
+
+    for sequence in crate::schema::PROTECTED_RECORD_SEQUENCES {
+        let qualified = format!("finance.{sequence}");
+        let exists: Option<String> = sqlx::query_scalar("SELECT to_regclass($1)::text")
+            .bind(&qualified)
+            .fetch_one(pool)
+            .await
+            .map_err(|e| format!("read record sequence {qualified}: {e}"))?;
+        if exists.is_none() {
+            failures.push(format!("missing record sequence {qualified}"));
+            continue;
+        }
+        let owner: Option<String> = sqlx::query_scalar(
+            "SELECT pg_get_userbyid(c.relowner)
+               FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
+              WHERE n.nspname = 'finance' AND c.relname = $1",
+        )
+        .bind(sequence)
+        .fetch_optional(pool)
+        .await
+        .map_err(|e| format!("read owner of {qualified}: {e}"))?;
+        if owner.as_deref() == Some(role) {
+            failures.push(format!(
+                "record sequence {qualified} is owned by the plugin role {role}"
+            ));
+        }
+        let usage: bool = sqlx::query_scalar(
+            "SELECT has_sequence_privilege($1::name, $2::text, 'USAGE')",
+        )
+        .bind(role)
+        .bind(&qualified)
+        .fetch_one(pool)
+        .await
+        .map_err(|e| format!("check USAGE on {qualified}: {e}"))?;
+        if !usage {
+            failures.push(format!("role {role} is missing USAGE on {qualified}"));
+        }
+        let update: bool = sqlx::query_scalar(
+            "SELECT has_sequence_privilege($1::name, $2::text, 'UPDATE')",
+        )
+        .bind(role)
+        .bind(&qualified)
+        .fetch_one(pool)
+        .await
+        .map_err(|e| format!("check UPDATE on {qualified}: {e}"))?;
+        if update {
+            failures.push(format!(
+                "role {role} still holds UPDATE on record sequence {qualified}"
+            ));
+        }
+    }
+
+    for function in crate::schema::PROTECTED_RECORD_FUNCTIONS {
+        let owner: Option<String> = sqlx::query_scalar(
+            "SELECT pg_get_userbyid(p.proowner)
+               FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace
+              WHERE n.nspname = 'finance' AND p.proname = $1 AND p.pronargs = 0",
+        )
+        .bind(function)
+        .fetch_optional(pool)
+        .await
+        .map_err(|e| format!("read owner of finance.{function}(): {e}"))?;
+        match owner {
+            None => failures.push(format!("missing record guard function finance.{function}()")),
+            Some(owner) if owner == role => failures.push(format!(
+                "record guard function finance.{function}() is owned by the plugin role {role}; it can be replaced"
+            )),
+            Some(_) => {}
+        }
+    }
+
+    Ok(())
 }
 
 /// Boot the core against a pristine test database, then probe every registered

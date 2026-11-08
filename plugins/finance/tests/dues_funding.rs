@@ -180,9 +180,10 @@ async fn ensure_probe_role(admin: &PgPool) {
 /// Apply this plugin's migrations as the plugin role, in its own schema — the
 /// shape the runner uses (one transaction, `SET LOCAL search_path`).
 ///
-/// A database the ladder prepared has them already, and every statement is
-/// idempotent, so this is a no-op there. It is what makes the probes independent
-/// of the ladder having run migration 2.
+/// A database the ladder prepared has them already; applied versions are skipped
+/// exactly as the real runner skips them (and a hardened database's record tables
+/// are not re-owned by the plugin role, #152). Pending versions still apply, which
+/// is what makes the probes independent of the ladder having run migration 2.
 async fn ensure_plugin_schema(admin: &PgPool, plugin: &PgPool) {
     sqlx::query(&format!(
         "CREATE SCHEMA IF NOT EXISTS finance AUTHORIZATION {PLUGIN_ROLE}"
@@ -190,10 +191,17 @@ async fn ensure_plugin_schema(admin: &PgPool, plugin: &PgPool) {
     .execute(admin)
     .await
     .expect("the finance schema, as `bootstrap-isolation` creates it");
-    sqlx::query(&format!("ALTER SCHEMA finance OWNER TO {PLUGIN_ROLE}"))
-        .execute(admin)
-        .await
-        .expect("the plugin role owns its own schema");
+    // #152: a hardened database has the record tables owned by the deployment
+    // role, so the plugin may no longer re-run DDL that touches them. Apply only
+    // the versions the real runner would apply: it skips a version it has
+    // already recorded, and this fixture now mirrors that instead of replaying
+    // every migration's SQL.
+    let applied: Vec<i64> = sqlx::query_scalar(
+        "SELECT version FROM core.schema_migrations WHERE schema = 'finance'",
+    )
+    .fetch_all(admin)
+    .await
+    .expect("read the applied finance migrations");
     let mut declared = FinancePlugin::new();
     // `init` is what the probe needs migrations from; the context's database is
     // not read by `migrations()`.
@@ -202,6 +210,9 @@ async fn ensure_plugin_schema(admin: &PgPool, plugin: &PgPool) {
     let migrations = declared.migrations();
     let mut conn = plugin.acquire().await.expect("plugin connection");
     for migration in migrations {
+        if applied.contains(&migration.version) {
+            continue;
+        }
         let script = format!(
             "BEGIN; SET LOCAL search_path TO \"finance\"; {}; COMMIT;",
             migration.sql
@@ -213,17 +224,39 @@ async fn ensure_plugin_schema(admin: &PgPool, plugin: &PgPool) {
     }
 }
 
+/// Probe cleanup only: the ledger is a record now (#152) and refuses DELETE even
+/// to the operator. `session_replication_role = replica` is transaction-local,
+/// so it cannot leak to another statement or connection.
+async fn delete_probe_transactions(
+    admin: &PgPool,
+    reference: Option<&str>,
+    member_id: Option<&str>,
+) {
+    let Ok(mut tx) = admin.begin().await else {
+        return;
+    };
+    let _ = sqlx::query("SET LOCAL session_replication_role = replica")
+        .execute(&mut *tx)
+        .await;
+    if let Some(reference) = reference {
+        let _ = sqlx::query("DELETE FROM finance.transactions WHERE external_ref = $1")
+            .bind(reference)
+            .execute(&mut *tx)
+            .await;
+    }
+    if let Some(member_id) = member_id {
+        let _ = sqlx::query("DELETE FROM finance.transactions WHERE member_id = $1")
+            .bind(member_id)
+            .execute(&mut *tx)
+            .await;
+    }
+    let _ = tx.commit().await;
+}
+
 /// Clear anything a previous run left behind, for one member and year.
 async fn cleanup_member(admin: &PgPool, member_id: &str) {
     let reference = dues_draw_reference(FISCAL_YEAR, member_id);
-    let _ = sqlx::query("DELETE FROM finance.transactions WHERE external_ref = $1")
-        .bind(&reference)
-        .execute(admin)
-        .await;
-    let _ = sqlx::query("DELETE FROM finance.transactions WHERE member_id = $1")
-        .bind(member_id)
-        .execute(admin)
-        .await;
+    delete_probe_transactions(admin, Some(&reference), Some(member_id)).await;
     let _ = sqlx::query("DELETE FROM finance.dues WHERE member_id = $1")
         .bind(member_id)
         .execute(admin)
@@ -235,10 +268,7 @@ async fn cleanup_member(admin: &PgPool, member_id: &str) {
 const SCHOLARSHIP_DEPOSIT_REF: &str = "probe:dues_funding:scholarship_deposit";
 
 async fn fund_scholarship(admin: &PgPool) {
-    let _ = sqlx::query("DELETE FROM finance.transactions WHERE external_ref = $1")
-        .bind(SCHOLARSHIP_DEPOSIT_REF)
-        .execute(admin)
-        .await;
+    delete_probe_transactions(admin, Some(SCHOLARSHIP_DEPOSIT_REF), None).await;
     sqlx::query(
         "INSERT INTO finance.transactions \
            (fund_id, amount_cents, kind, category, description, member_id, fiscal_year, \
@@ -258,10 +288,7 @@ async fn fund_scholarship(admin: &PgPool) {
 }
 
 async fn unfund_scholarship(admin: &PgPool) {
-    let _ = sqlx::query("DELETE FROM finance.transactions WHERE external_ref = $1")
-        .bind(SCHOLARSHIP_DEPOSIT_REF)
-        .execute(admin)
-        .await;
+    delete_probe_transactions(admin, Some(SCHOLARSHIP_DEPOSIT_REF), None).await;
 }
 
 // ---------------------------------------------------------------------------

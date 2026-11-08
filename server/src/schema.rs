@@ -416,6 +416,176 @@ async fn transfer_schema_ownership(
     Ok(())
 }
 
+/// Record objects that must not be owned by the plugin role that writes them
+/// (#152): the ledger, receipts, their sequences and their guard functions.
+pub(crate) const PROTECTED_RECORD_TABLES: &[&str] = &["transactions", "receipts"];
+pub(crate) const PROTECTED_RECORD_SEQUENCES: &[&str] = &[
+    "transactions_id_seq",
+    "receipts_id_seq",
+    "receipts_number_seq",
+];
+pub(crate) const PROTECTED_RECORD_FUNCTIONS: &[&str] = &[
+    "finance_transactions_are_records",
+    "finance_receipts_are_records",
+    "finance_receipt_correction_matches",
+    "finance_ledger_no_truncate",
+];
+
+/// Make `finance`'s record tables append-only **by privilege**, not only by
+/// trigger (#152).
+///
+/// A trigger is enforcement only until the role that writes the table can
+/// `ALTER TABLE … DISABLE TRIGGER` — and until this function runs, that role is
+/// the table's owner. This moves ownership of the ledger, receipts, their
+/// sequences and their guard functions to the core/deployment role and leaves
+/// the plugin `INSERT`/`SELECT` (and sequence `USAGE`), so it can keep writing
+/// records but can no longer rewrite, delete or disarm them.
+///
+/// It runs after the plugin's migrations have applied (the guards must exist
+/// first) and is idempotent. Objects already owned by another role are left
+/// alone: a bootstrap run as an admin may have moved them to that admin, and
+/// this connection may not be able to take them back — the security property is
+/// "not the plugin role", not "this exact role".
+///
+/// Called on every boot and reload (`server/src/server.rs`), so a restored
+/// database and a fresh install both end in the hardened state.
+pub async fn protect_record_tables(pool: &PgPool) -> Result<(), sqlx::Error> {
+    let sql = format!(
+        "DO $protect$
+         DECLARE
+           plugin_role TEXT := 'adjutant_plugin_finance';
+           obj RECORD;
+           owner_name TEXT;
+         BEGIN
+           -- Nothing to harden until the finance plugin's guard migration is
+           -- recorded. This also keeps a fresh bootstrap (before any plugin
+           -- migration has run) from moving a table a pending migration still
+           -- needs to alter.
+           IF to_regnamespace('finance') IS NULL
+              OR NOT EXISTS (
+                   SELECT 1 FROM core.schema_migrations
+                    WHERE schema = 'finance' AND version >= 4) THEN
+             RETURN;
+           END IF;
+
+           -- A schema owner can DROP the schema and everything in it even when
+           -- it does not own each table. The schema must therefore not belong to
+           -- the plugin either; CREATE is what its migrations need.
+           SELECT pg_get_userbyid(nspowner) INTO owner_name
+             FROM pg_namespace WHERE nspname = 'finance';
+           IF owner_name = plugin_role THEN
+             EXECUTE format('ALTER SCHEMA finance OWNER TO %I', current_user);
+           END IF;
+           -- Grant only what is missing. After a bootstrap run as an admin the
+           -- grants already exist and this connection may not own the schema,
+           -- so an unconditional GRANT would fail on the next boot.
+           IF NOT has_schema_privilege(plugin_role::name, 'finance', 'USAGE') THEN
+             EXECUTE format('GRANT USAGE ON SCHEMA finance TO %I', plugin_role);
+           END IF;
+           IF NOT has_schema_privilege(plugin_role::name, 'finance', 'CREATE') THEN
+             EXECUTE format('GRANT CREATE ON SCHEMA finance TO %I', plugin_role);
+           END IF;
+
+           FOR obj IN SELECT * FROM (VALUES {tables}) AS t(name) LOOP
+             IF to_regclass(format('finance.%I', obj.name)) IS NOT NULL THEN
+               SELECT pg_get_userbyid(c.relowner) INTO owner_name
+                 FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
+                WHERE n.nspname = 'finance' AND c.relname = obj.name;
+               IF owner_name = plugin_role THEN
+                 EXECUTE format('ALTER TABLE finance.%I OWNER TO %I', obj.name, current_user);
+               END IF;
+               IF NOT has_table_privilege(plugin_role::name,
+                                          format('finance.%I', obj.name), 'SELECT') THEN
+                 EXECUTE format('GRANT SELECT ON finance.%I TO %I', obj.name, plugin_role);
+               END IF;
+               IF NOT has_table_privilege(plugin_role::name,
+                                          format('finance.%I', obj.name), 'INSERT') THEN
+                 EXECUTE format('GRANT INSERT ON finance.%I TO %I', obj.name, plugin_role);
+               END IF;
+               IF has_table_privilege(plugin_role::name,
+                                      format('finance.%I', obj.name), 'UPDATE') THEN
+                 EXECUTE format('REVOKE UPDATE ON finance.%I FROM %I', obj.name, plugin_role);
+               END IF;
+               IF has_table_privilege(plugin_role::name,
+                                      format('finance.%I', obj.name), 'DELETE') THEN
+                 EXECUTE format('REVOKE DELETE ON finance.%I FROM %I', obj.name, plugin_role);
+               END IF;
+               IF has_table_privilege(plugin_role::name,
+                                      format('finance.%I', obj.name), 'TRUNCATE') THEN
+                 EXECUTE format('REVOKE TRUNCATE ON finance.%I FROM %I', obj.name, plugin_role);
+               END IF;
+               IF has_table_privilege(plugin_role::name,
+                                      format('finance.%I', obj.name), 'REFERENCES') THEN
+                 EXECUTE format('REVOKE REFERENCES ON finance.%I FROM %I', obj.name, plugin_role);
+               END IF;
+               IF has_table_privilege(plugin_role::name,
+                                      format('finance.%I', obj.name), 'TRIGGER') THEN
+                 EXECUTE format('REVOKE TRIGGER ON finance.%I FROM %I', obj.name, plugin_role);
+               END IF;
+             END IF;
+           END LOOP;
+
+           FOR obj IN SELECT * FROM (VALUES {sequences}) AS t(name) LOOP
+             IF to_regclass(format('finance.%I', obj.name)) IS NOT NULL THEN
+               SELECT pg_get_userbyid(c.relowner) INTO owner_name
+                 FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
+                WHERE n.nspname = 'finance' AND c.relname = obj.name;
+               IF owner_name = plugin_role THEN
+                 EXECUTE format('ALTER SEQUENCE finance.%I OWNER TO %I', obj.name, current_user);
+               END IF;
+               IF NOT has_sequence_privilege(plugin_role::name,
+                                             format('finance.%I', obj.name), 'USAGE') THEN
+                 EXECUTE format('GRANT USAGE ON SEQUENCE finance.%I TO %I',
+                                obj.name, plugin_role);
+               END IF;
+               IF NOT has_sequence_privilege(plugin_role::name,
+                                             format('finance.%I', obj.name), 'SELECT') THEN
+                 EXECUTE format('GRANT SELECT ON SEQUENCE finance.%I TO %I',
+                                obj.name, plugin_role);
+               END IF;
+               IF has_sequence_privilege(plugin_role::name,
+                                         format('finance.%I', obj.name), 'UPDATE') THEN
+                 EXECUTE format('REVOKE UPDATE ON SEQUENCE finance.%I FROM %I',
+                                obj.name, plugin_role);
+               END IF;
+             END IF;
+           END LOOP;
+
+           FOR obj IN SELECT * FROM (VALUES {functions}) AS t(name) LOOP
+             IF to_regprocedure(format('finance.%I()', obj.name)) IS NOT NULL THEN
+               SELECT pg_get_userbyid(p.proowner) INTO owner_name
+                 FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace
+                WHERE n.nspname = 'finance' AND p.proname = obj.name AND p.pronargs = 0;
+               IF owner_name = plugin_role THEN
+                 EXECUTE format('ALTER FUNCTION finance.%I() OWNER TO %I',
+                                obj.name, current_user);
+               END IF;
+               IF NOT has_function_privilege(plugin_role::name,
+                                             format('finance.%I()', obj.name), 'EXECUTE') THEN
+                 EXECUTE format('GRANT EXECUTE ON FUNCTION finance.%I() TO %I',
+                                obj.name, plugin_role);
+               END IF;
+             END IF;
+           END LOOP;
+         END $protect$;",
+        tables = values_list(PROTECTED_RECORD_TABLES),
+        sequences = values_list(PROTECTED_RECORD_SEQUENCES),
+        functions = values_list(PROTECTED_RECORD_FUNCTIONS),
+    );
+    sqlx::query(&sql).execute(pool).await?;
+    Ok(())
+}
+
+/// `('a'), ('b')` for a static list of identifiers. The list is compiled in,
+/// never user input; this only saves repeating the SQL three times.
+fn values_list(items: &[&str]) -> String {
+    items
+        .iter()
+        .map(|item| format!("('{}')", item.replace('\'', "''")))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
