@@ -16,6 +16,7 @@ use serde_json::Value;
 use sqlx::postgres::PgRow;
 use sqlx::{Column, Row, TypeInfo};
 use sqlx::ValueRef as _;
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use tokio::sync::broadcast;
 
 /// Core-backed database access. The **pool** decides the principal:
@@ -302,9 +303,304 @@ impl HostDb for CoreDb {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Outbound HTTP policy (#155)
+// ---------------------------------------------------------------------------
+
+/// One declared scheme+host a guest may reach.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct HttpAllow {
+    scheme: String,
+    host: String,
+    /// Effective port, so `https://api.example.com` (443) does not silently
+    /// authorise `https://api.example.com:8443`.
+    port: u16,
+}
+
+/// What a plugin's `ctx.http` may reach.
+///
+/// Two layers, both enforced before a request is sent:
+///
+/// 1. **Never** loopback, link-local, private, carrier-grade-NAT, documentation
+///    or otherwise non-public addresses, and never a configured deny host.
+///    Resolution is filtered too (`PublicOnlyResolver`), so a public hostname
+///    that resolves to `127.0.0.1` cannot be used as a bypass.
+/// 2. **Sandboxed WASM guests** may reach only the scheme+host entries their
+///    manifest declares (`http_allow`), with no entries meaning no outbound
+///    HTTP at all. Native plugins keep their historical public reach because
+///    they are trusted code, but the same range/deny checks apply.
+#[derive(Debug, Clone)]
+pub struct HttpPolicy {
+    /// Scheme+host entries a sandboxed guest declared. Ignored when
+    /// `allow_public` is set.
+    allow: Vec<HttpAllow>,
+    /// Native (trusted) plugins may reach any public host.
+    allow_public: bool,
+    /// Operator deny list, exact host or any subdomain of it.
+    deny: Vec<String>,
+}
+
+impl HttpPolicy {
+    /// Native/trusted policy: any public host except the operator deny list.
+    pub fn public_only(deny_hosts: Vec<String>) -> Self {
+        Self {
+            allow: Vec::new(),
+            allow_public: true,
+            deny: normalize_deny_list(deny_hosts),
+        }
+    }
+
+    /// Sandboxed policy: only the declared scheme+host entries, default deny.
+    /// Entries are validated here so a malformed manifest fails at load, not at
+    /// the first request.
+    pub fn untrusted(allow: &[String], deny_hosts: Vec<String>) -> Result<Self, String> {
+        let mut parsed = Vec::with_capacity(allow.len());
+        for entry in allow {
+            let url = reqwest::Url::parse(entry.trim())
+                .map_err(|e| format!("http_allow entry {entry:?} is not a URL: {e}"))?;
+            if !matches!(url.scheme(), "http" | "https") {
+                return Err(format!(
+                    "http_allow entry {entry:?} must use http or https, not {:?}",
+                    url.scheme()
+                ));
+            }
+            if url.path() != "/" || url.query().is_some() || url.fragment().is_some() {
+                return Err(format!(
+                    "http_allow entry {entry:?} must name a scheme and host only \
+                     (no path, query or fragment)"
+                ));
+            }
+            let Some(host) = url_host_key(&url) else {
+                return Err(format!("http_allow entry {entry:?} has no host"));
+            };
+            let Some(port) = url.port_or_known_default() else {
+                return Err(format!(
+                    "http_allow entry {entry:?} has no known port for {:?}",
+                    url.scheme()
+                ));
+            };
+            parsed.push(HttpAllow {
+                scheme: url.scheme().to_string(),
+                host,
+                port,
+            });
+        }
+        Ok(Self {
+            allow: parsed,
+            allow_public: false,
+            deny: normalize_deny_list(deny_hosts),
+        })
+    }
+
+    /// Validate a manifest allowlist without constructing a policy.
+    pub fn validate_allowlist(allow: &[String]) -> Result<(), String> {
+        Self::untrusted(allow, Vec::new()).map(|_| ())
+    }
+
+    /// Enforce the policy for one URL. Returns the parsed URL so the caller need
+    /// not parse it again.
+    pub fn check_url(&self, url: &str) -> Result<reqwest::Url, SdkError> {
+        let parsed = reqwest::Url::parse(url)
+            .map_err(|e| SdkError::BadRequest(format!("invalid http URL {url:?}: {e}")))?;
+        if !matches!(parsed.scheme(), "http" | "https") {
+            return Err(SdkError::Forbidden(format!(
+                "http.request refuses scheme {:?}; only http and https are reachable",
+                parsed.scheme()
+            )));
+        }
+        if !parsed.username().is_empty() || parsed.password().is_some() {
+            return Err(SdkError::Forbidden(
+                "http.request refuses URLs with embedded credentials".into(),
+            ));
+        }
+        let host = url_host_key(&parsed).ok_or_else(|| {
+            SdkError::BadRequest(format!("http URL {url:?} has no host"))
+        })?;
+
+        if let Ok(ip) = host.parse::<IpAddr>() {
+            if !is_public_ip(ip) {
+                return Err(SdkError::Forbidden(format!(
+                    "http.request refuses non-public address {ip}"
+                )));
+            }
+        }
+        if is_internal_name(&host) || self.denied(&host) {
+            return Err(SdkError::Forbidden(format!(
+                "http.request refuses host {host:?} (loopback/link-local/private or deny list)"
+            )));
+        }
+        let port = parsed.port_or_known_default().ok_or_else(|| {
+            SdkError::BadRequest(format!("http URL {url:?} has no known port"))
+        })?;
+        if !self.allow_public
+            && !self
+                .allow
+                .iter()
+                .any(|a| a.scheme == parsed.scheme() && a.host == host && a.port == port)
+        {
+            return Err(SdkError::Forbidden(format!(
+                "http.request to {host:?} is not in this plugin's http_allow manifest \
+                 (scheme+host+port allowlist; default deny)"
+            )));
+        }
+        Ok(parsed)
+    }
+
+    fn denied(&self, host: &str) -> bool {
+        self.deny.iter().any(|d| {
+            host == d || host.strip_suffix(d).is_some_and(|prefix| prefix.ends_with('.'))
+        })
+    }
+}
+
+fn normalize_deny_list(entries: Vec<String>) -> Vec<String> {
+    entries
+        .into_iter()
+        .map(|entry| {
+            let entry = entry.trim();
+            let host = reqwest::Url::parse(entry)
+                .ok()
+                .and_then(|u| url_host_key(&u))
+                .unwrap_or_else(|| normalize_host(entry));
+            normalize_host(&host)
+        })
+        .filter(|h| !h.is_empty())
+        .collect()
+}
+
+fn normalize_host(raw: &str) -> String {
+    raw.trim()
+        .trim_start_matches('[')
+        .trim_end_matches(']')
+        .trim_end_matches('.')
+        .to_ascii_lowercase()
+}
+
+fn url_host_key(url: &reqwest::Url) -> Option<String> {
+    url.host_str().map(normalize_host).filter(|h| !h.is_empty())
+}
+
+/// Names that are internal regardless of what DNS says. `.local`,
+/// `.localhost` and `.internal` are commonly used for host-local services and
+/// cloud metadata, so the policy refuses them by name as well as by address.
+fn is_internal_name(host: &str) -> bool {
+    host == "localhost"
+        || host.ends_with(".localhost")
+        || host.ends_with(".local")
+        || host.ends_with(".internal")
+}
+
+/// True only for globally routable unicast addresses. Everything special-use
+/// (loopback, link-local, RFC1918, CGNAT, documentation, multicast, unspecified,
+/// broadcast, ULA, IPv4-mapped private, …) is false.
+pub fn is_public_ip(ip: IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(v4) => is_public_v4(v4),
+        IpAddr::V6(v6) => is_public_v6(v6),
+    }
+}
+
+fn is_public_v4(ip: Ipv4Addr) -> bool {
+    let o = ip.octets();
+    if ip.is_private()
+        || ip.is_loopback()
+        || ip.is_link_local()
+        || ip.is_broadcast()
+        || ip.is_documentation()
+        || ip.is_multicast()
+        || ip.is_unspecified()
+    {
+        return false;
+    }
+    // "This network" 0.0.0.0/8, CGNAT 100.64/10 (includes some cloud metadata),
+    // 192.0.0.0/24, 6to4 relay 192.88.99.0/24, benchmarking 198.18/15,
+    // reserved 240/4.
+    !(o[0] == 0
+        || (o[0] == 100 && (o[1] & 0xc0) == 64)
+        || (o[0] == 192 && o[1] == 0 && o[2] == 0)
+        || (o[0] == 192 && o[1] == 88 && o[2] == 99)
+        || (o[0] == 198 && (o[1] & 0xfe) == 18)
+        || o[0] >= 240)
+}
+
+fn is_public_v6(ip: Ipv6Addr) -> bool {
+    if let Some(v4) = ip.to_ipv4_mapped() {
+        return is_public_v4(v4);
+    }
+    let s = ip.segments();
+    !(ip.is_loopback()
+        || ip.is_unspecified()
+        || ip.is_multicast()
+        || ip.is_unique_local()
+        || ip.is_unicast_link_local()
+        || (s[0] & 0xffc0) == 0xfec0 // site-local (deprecated)
+        || (s[0] == 0x2001 && s[1] == 0x0db8)) // documentation
+}
+
+/// A resolver that only ever returns globally routable addresses. It closes the
+/// "public hostname resolves to a private IP" path (DNS rebinding, metadata
+/// hostnames) that a string-only host check cannot see.
+#[derive(Debug, Clone, Copy, Default)]
+struct PublicOnlyResolver;
+
+impl reqwest::dns::Resolve for PublicOnlyResolver {
+    fn resolve(&self, name: reqwest::dns::Name) -> reqwest::dns::Resolving {
+        let host = name.as_str().to_owned();
+        Box::pin(async move {
+            let addrs = tokio::net::lookup_host((host.as_str(), 0))
+                .await
+                .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?;
+            let public: Vec<SocketAddr> = addrs
+                .filter(|a| is_public_ip(a.ip()))
+                .collect();
+            if public.is_empty() {
+                return Err(Box::new(std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    format!("refusing to resolve {host}: no public address (SSRF guard)"),
+                ))
+                    as Box<dyn std::error::Error + Send + Sync>);
+            }
+            Ok(Box::new(public.into_iter()) as reqwest::dns::Addrs)
+        })
+    }
+}
+
+/// Per-plugin view of [`CoreHttp`]: the same client, with that plugin's
+/// [`HttpPolicy`] enforced before a request leaves the process.
+pub struct PluginHttp {
+    inner: std::sync::Arc<dyn HostHttp>,
+    policy: HttpPolicy,
+}
+
+impl PluginHttp {
+    pub fn new(inner: std::sync::Arc<dyn HostHttp>, policy: HttpPolicy) -> std::sync::Arc<Self> {
+        std::sync::Arc::new(Self { inner, policy })
+    }
+
+    pub fn policy(&self) -> &HttpPolicy {
+        &self.policy
+    }
+}
+
+#[async_trait]
+impl HostHttp for PluginHttp {
+    async fn request(
+        &self,
+        method: String,
+        url: String,
+        headers: Vec<(String, String)>,
+        body: Option<(String, Vec<u8>)>,
+    ) -> Result<HttpResponse, SdkError> {
+        self.policy.check_url(&url)?;
+        self.inner.request(method, url, headers, body).await
+    }
+}
+
 /// Core-backed HTTP for plugins (SPEC: host-mediated I/O — see SDK docs).
 /// One shared `reqwest::Client` (connection pooling, 15s timeout, no
-/// redirect-following surprises for OIDC endpoints).
+/// redirect-following surprises for OIDC endpoints). The client's resolver
+/// refuses non-public addresses for every caller; [`PluginHttp`] adds the
+/// per-plugin allowlist on top.
 pub struct CoreHttp {
     client: reqwest::Client,
 }
@@ -315,6 +611,7 @@ impl CoreHttp {
             client: reqwest::Client::builder()
                 .timeout(std::time::Duration::from_secs(15))
                 .redirect(reqwest::redirect::Policy::none())
+                .dns_resolver(std::sync::Arc::new(PublicOnlyResolver))
                 .build()
                 .expect("reqwest client"),
         })
@@ -432,3 +729,148 @@ impl HostEvents for CoreEvents {
 
 // Decode-order coverage needs a real PgRow, so it lives in
 // `server/tests/host_db.rs` (skipped unless ADJUTANT_TEST_DATABASE_URL is set).
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use adjutant_sdk::testing::MockHttp;
+
+    fn forbidden(r: Result<reqwest::Url, SdkError>) -> bool {
+        matches!(r, Err(SdkError::Forbidden(_)))
+    }
+
+    #[test]
+    fn non_public_ranges_and_internal_names_are_always_refused() {
+        let policy = HttpPolicy::public_only(Vec::new());
+        for url in [
+            "http://127.0.0.1/admin",
+            "http://10.1.2.3/",
+            "http://172.16.0.1/",
+            "http://192.168.0.1/",
+            "http://169.254.169.254/latest/meta-data/",
+            "http://100.100.100.200/",
+            "http://[::1]/",
+            "http://[fe80::1]/",
+            "http://[fd00::1]/",
+            "http://[::ffff:127.0.0.1]/",
+            "http://localhost:8787/api/plugins",
+            "http://metadata.google.internal/",
+            "file:///etc/passwd",
+            "ftp://example.com/",
+        ] {
+            assert!(forbidden(policy.check_url(url)), "{url} must be refused");
+        }
+        // A public literal and a public name are what the native policy allows.
+        assert!(policy.check_url("https://93.184.216.34/").is_ok());
+        assert!(policy.check_url("https://example.com/api").is_ok());
+    }
+
+    #[test]
+    fn guest_policy_is_default_deny_and_exact_scheme_host() {
+        // No declaration: no outbound HTTP at all.
+        let none = HttpPolicy::untrusted(&[], Vec::new()).expect("empty policy");
+        assert!(forbidden(none.check_url("https://api.example.com/")));
+
+        let policy = HttpPolicy::untrusted(
+            &["https://api.example.com".into()],
+            Vec::new(),
+        )
+        .expect("valid allowlist");
+        // Exact scheme+host (path is unrestricted; the entry names no path).
+        assert!(policy.check_url("https://api.example.com/v1/things?q=1").is_ok());
+        // Different host, subdomain, scheme, and non-http are all refused.
+        for url in [
+            "https://evil.example.com/",
+            "https://api.example.com.evil.test/",
+            "https://sub.api.example.com/",
+            "http://api.example.com/",
+            "https://api.example.com:8443/",
+        ] {
+            assert!(forbidden(policy.check_url(url)), "{url} must be refused");
+        }
+    }
+
+    #[test]
+    fn allowlist_entries_must_be_scheme_and_host_only() {
+        for bad in [
+            "api.example.com",
+            "https://api.example.com/path",
+            "https://api.example.com?q=1",
+            "ftp://api.example.com",
+        ] {
+            assert!(
+                HttpPolicy::validate_allowlist(&[bad.to_string()]).is_err(),
+                "{bad:?} must not become a policy entry"
+            );
+        }
+        assert!(HttpPolicy::validate_allowlist(&["https://api.example.com".into()]).is_ok());
+    }
+
+    #[test]
+    fn operator_deny_list_covers_subdomains() {
+        let policy = HttpPolicy::public_only(vec!["blocked.example".into()]);
+        assert!(forbidden(policy.check_url("https://blocked.example/")));
+        assert!(forbidden(policy.check_url("https://a.b.blocked.example/")));
+        assert!(policy.check_url("https://notblocked.example/").is_ok());
+    }
+
+    #[test]
+    fn private_addresses_are_not_public() {
+        for ip in [
+            "0.0.0.0",
+            "127.0.0.1",
+            "10.0.0.1",
+            "172.16.0.1",
+            "192.168.1.1",
+            "169.254.169.254",
+            "100.100.100.200",
+            "224.0.0.1",
+            "255.255.255.255",
+            "::1",
+            "fe80::1",
+            "fc00::1",
+            "::ffff:10.0.0.1",
+        ] {
+            assert!(!is_public_ip(ip.parse().expect("ip")), "{ip} is not public");
+        }
+        for ip in ["93.184.216.34", "2606:2800:220:1:248:1893:25c8:1946"] {
+            assert!(is_public_ip(ip.parse().expect("ip")), "{ip} is public");
+        }
+    }
+
+    /// The exact host call a guest uses goes through `PluginHttp`: a denied URL
+    /// must never reach the inner transport. This is the regression test for
+    /// "every WASM guest has unrestricted outbound HTTP" (#155).
+    #[tokio::test]
+    async fn plugin_http_refuses_before_the_transport() {
+        let inner = std::sync::Arc::new(MockHttp::new());
+        let guest = PluginHttp::new(
+            inner.clone(),
+            HttpPolicy::untrusted(&[], Vec::new()).expect("empty guest policy"),
+        );
+        let err = guest
+            .request("GET".into(), "http://127.0.0.1:8787/api/plugins".into(), vec![], None)
+            .await
+            .expect_err("a guest with no allowlist must not make the request");
+        assert!(matches!(err, SdkError::Forbidden(_)));
+        assert!(
+            inner.request_urls().is_empty(),
+            "the transport must not see a denied URL"
+        );
+
+        // An allowed entry does reach the transport (the mock then reports no
+        // queued response, which is its own error, not a policy refusal).
+        let allowed = PluginHttp::new(
+            inner.clone(),
+            HttpPolicy::untrusted(&["https://api.example.com".into()], Vec::new())
+                .expect("valid guest policy"),
+        );
+        let _ = allowed
+            .request("GET".into(), "https://api.example.com/v1".into(), vec![], None)
+            .await;
+        assert_eq!(
+            inner.request_urls(),
+            vec![("GET".to_string(), "https://api.example.com/v1".to_string())]
+        );
+    }
+}

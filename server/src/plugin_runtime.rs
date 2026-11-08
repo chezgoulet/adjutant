@@ -623,18 +623,31 @@ impl PluginRecord {
 }
 
 
+/// One opened plugin file, before validation and its per-plugin pool exist.
+struct OpenedPlugin {
+    plugin: Box<dyn AdjutantPlugin>,
+    library: Option<Arc<libloading::Library>>,
+    is_wasm: bool,
+    /// Sandboxed guests declare this; native plugins have none (their policy is
+    /// public-only, not an allowlist).
+    http_allowlist: Vec<String>,
+}
+
 /// Open one plugin file into a trait object. Native `.so`s are trusted code and
-/// are parked for the process lifetime; WASM guests are sandboxed. Returns the
-/// plugin, the (optional) library handle, and whether it is a WASM guest.
-async fn open_plugin(
-    path: &Path,
-) -> Result<(Box<dyn AdjutantPlugin>, Option<Arc<libloading::Library>>, bool), PluginRuntimeError> {
+/// are parked for the process lifetime; WASM guests are sandboxed.
+async fn open_plugin(path: &Path) -> Result<OpenedPlugin, PluginRuntimeError> {
     let is_wasm = path.extension().is_some_and(|x| x == "wasm");
     if is_wasm {
         let p = crate::wasm::WasmPlugin::open(path)
             .await
             .map_err(|e| PluginRuntimeError::Load(path.display().to_string(), e))?;
-        Ok((Box::new(p), None, true))
+        let http_allowlist = p.http_allowlist();
+        Ok(OpenedPlugin {
+            plugin: Box::new(p),
+            library: None,
+            is_wasm: true,
+            http_allowlist,
+        })
     } else {
         let lib = unsafe { libloading::Library::new(path) }
             .map_err(|e| PluginRuntimeError::Load(path.display().to_string(), e.to_string()))?;
@@ -655,7 +668,12 @@ async fn open_plugin(
                     })?;
             unsafe { Box::from_raw(factory()) }
         };
-        Ok((plugin, Some(lib), false))
+        Ok(OpenedPlugin {
+            plugin,
+            library: Some(lib),
+            is_wasm: false,
+            http_allowlist: Vec::new(),
+        })
     }
 }
 
@@ -676,15 +694,18 @@ pub async fn discover_plugins(dir: &Path) -> Result<Vec<DiscoveredPlugin>, Plugi
 
     let mut out = Vec::new();
     for path in entries {
-        let (plugin, _library, is_wasm) = open_plugin(&path).await?;
-        let id = plugin.id().to_string();
-        if is_wasm {
+        let opened = open_plugin(&path).await?;
+        let id = opened.plugin.id().to_string();
+        if opened.is_wasm {
             validate_untrusted_plugin_id(&id)
                 .map_err(|e| PluginRuntimeError::Invalid(id.clone(), e))?;
         } else {
             validate_plugin_id(&id).map_err(|e| PluginRuntimeError::Invalid(id.clone(), e))?;
         }
-        out.push(DiscoveredPlugin { id, version: plugin.version().to_string() });
+        out.push(DiscoveredPlugin {
+            id,
+            version: opened.plugin.version().to_string(),
+        });
     }
     Ok(out)
 }
@@ -705,6 +726,9 @@ pub struct LoadEnv<'a> {
     pub config: serde_json::Value,
     pub identity: Arc<crate::identity::IdentityHub>,
     pub http: Arc<crate::host::CoreHttp>,
+    /// Operator outbound-HTTP deny list (#155), passed to every plugin's
+    /// [`crate::host::HttpPolicy`].
+    pub http_deny_hosts: &'a [String],
 }
 
 /// The id a **staged native library** names, read from its file name without
@@ -794,6 +818,7 @@ async fn disabled_record_at_boot(
 /// `adjutant_plugin_<id>` role, using the credential `bootstrap-isolation`
 /// stored in `core.plugins.db_secret`. A plugin with no credential fails the
 /// load: there is no unisolated path to fall back to (design §3.7).
+#[allow(clippy::too_many_arguments)] // the boot load's explicit inputs; callers use LoadEnv for a single plugin
 pub async fn load_all(
     dir: &Path,
     database_url: &str,
@@ -802,6 +827,7 @@ pub async fn load_all(
     config: serde_json::Value,
     identity: std::sync::Arc<crate::identity::IdentityHub>,
     http: std::sync::Arc<crate::host::CoreHttp>,
+    http_deny_hosts: &[String],
 ) -> Result<PluginRegistry, PluginRuntimeError> {
     let env = LoadEnv {
         database_url,
@@ -810,6 +836,7 @@ pub async fn load_all(
         config,
         identity,
         http,
+        http_deny_hosts,
     };
     let mut slots: Vec<PluginSlot> = Vec::new();
     let mut seen_ids: HashMap<String, ()> = HashMap::new();
@@ -847,7 +874,12 @@ pub async fn load_all(
             continue;
         }
 
-        let (plugin, library, is_wasm) = open_plugin(&path).await?;
+        let OpenedPlugin {
+            plugin,
+            library,
+            is_wasm,
+            http_allowlist,
+        } = open_plugin(&path).await?;
         let id = plugin.id().to_string();
 
         // --- validation -----------------------------------------------------
@@ -894,7 +926,16 @@ pub async fn load_all(
             continue;
         }
 
-        let loaded = load_opened(plugin, library, is_wasm, &path, &env, &mut seen_routes).await?;
+        let loaded = load_opened(
+            plugin,
+            library,
+            is_wasm,
+            http_allowlist,
+            &path,
+            &env,
+            &mut seen_routes,
+        )
+        .await?;
         slots.push(PluginSlot::Live(loaded));
     }
 
@@ -918,14 +959,28 @@ pub async fn load_plugin(
     env: &LoadEnv<'_>,
     seen_routes: &mut HashMap<(String, String), ()>,
 ) -> Result<LoadedPlugin, PluginRuntimeError> {
-    let (plugin, library, is_wasm) = open_plugin(path).await?;
+    let OpenedPlugin {
+        plugin,
+        library,
+        is_wasm,
+        http_allowlist,
+    } = open_plugin(path).await?;
     let id = plugin.id().to_string();
     if is_wasm {
         validate_untrusted_plugin_id(&id).map_err(|e| PluginRuntimeError::Invalid(id.clone(), e))?;
     } else {
         validate_plugin_id(&id).map_err(|e| PluginRuntimeError::Invalid(id.clone(), e))?;
     }
-    load_opened(plugin, library, is_wasm, path, env, seen_routes).await
+    load_opened(
+        plugin,
+        library,
+        is_wasm,
+        http_allowlist,
+        path,
+        env,
+        seen_routes,
+    )
+    .await
 }
 
 /// The per-plugin load body, shared by boot and runtime enable.
@@ -938,11 +993,21 @@ async fn load_opened(
     mut plugin: Box<dyn AdjutantPlugin>,
     library: Option<Arc<libloading::Library>>,
     is_wasm: bool,
+    http_allowlist: Vec<String>,
     path: &Path,
     env: &LoadEnv<'_>,
     seen_routes: &mut HashMap<(String, String), ()>,
 ) -> Result<LoadedPlugin, PluginRuntimeError> {
     let id = plugin.id().to_string();
+    // Sandboxed guests get a default-deny scheme+host allowlist from their
+    // manifest; native plugins keep public-only reach. Both share the
+    // non-public-address and operator deny-list checks (#155).
+    let http_policy = if is_wasm {
+        crate::host::HttpPolicy::untrusted(&http_allowlist, env.http_deny_hosts.to_vec())
+            .map_err(|e| PluginRuntimeError::Invalid(id.clone(), e))?
+    } else {
+        crate::host::HttpPolicy::public_only(env.http_deny_hosts.to_vec())
+    };
     // One shared host DB impl for every plugin context (cheap: Arc clone).
     let core_db = crate::host::CoreDb::new(env.pool.clone());
 
@@ -1010,7 +1075,7 @@ async fn load_opened(
         permissions: PermissionService::new(core_db.clone()),
         audit: adjutant_sdk::AuditService::new(core_db.clone(), id.clone()),
         identity: env.identity.clone(),
-        http: env.http.clone(),
+        http: crate::host::PluginHttp::new(env.http.clone(), http_policy),
     };
 
     plugin
@@ -1696,6 +1761,7 @@ mod tests {
             serde_json::Value::Null,
             crate::identity::IdentityHub::new(),
             crate::host::CoreHttp::new(),
+            &[],
         )
         .await
         {

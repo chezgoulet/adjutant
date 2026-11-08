@@ -122,6 +122,11 @@ pub struct Config {
     /// `keyed: false`: the unkeyed chain is the only protection, and the boot
     /// log says so. Never logged; `ChainKey`'s `Debug` is redacted.
     pub audit_key: Option<ChainKey>,
+    /// Hosts (exact, or any subdomain) that no plugin's `ctx.http` may reach
+    /// (#155), on top of the always-denied non-public address ranges.
+    /// `ADJUTANT_HTTP_DENY_HOSTS=a.internal,metadata.example`
+    /// (or `[http] deny_hosts = [...]`).
+    pub http_deny_hosts: Vec<String>,
 }
 
 /// An operator-supplied first account. The password is held only in memory; it is
@@ -150,6 +155,7 @@ impl Default for Config {
             allow_superuser: false,
             bootstrap_chief: None,
             audit_key: None,
+            http_deny_hosts: Vec::new(),
         }
     }
 }
@@ -184,6 +190,9 @@ struct FileHttp {
     body_timeout_secs: Option<u64>,
     request_timeout_secs: Option<u64>,
     max_connections: Option<usize>,
+    /// Outbound-HTTP deny list for plugins (#155); see
+    /// [`Config::http_deny_hosts`].
+    deny_hosts: Option<Vec<String>>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -276,6 +285,7 @@ ENVIRONMENT (override file, overridden by flags):
     ADJUTANT_CORS (comma-separated origins), ADJUTANT_MAX_BODY,
     ADJUTANT_HTTP_HEADER_TIMEOUT / ADJUTANT_HTTP_BODY_TIMEOUT /
     ADJUTANT_HTTP_REQUEST_TIMEOUT (seconds) and ADJUTANT_HTTP_MAX_CONNECTIONS,
+    ADJUTANT_HTTP_DENY_HOSTS (outbound hosts/subdomains no plugin may reach),
     ADJUTANT_DEV_HEADERS (true enables the dev stub; off by default),
     ADJUTANT_TRUSTED_PROXIES, ADJUTANT_ALLOW_SUPERUSER (true permits a superuser
     connection; off by default),
@@ -400,6 +410,9 @@ pub fn load(cli: &CliArgs) -> Result<Config, String> {
     }
     if let Ok(v) = std::env::var("ADJUTANT_TRUSTED_PROXIES") {
         cfg.trusted_proxies = split_origins(&v);
+    }
+    if let Ok(v) = std::env::var("ADJUTANT_HTTP_DENY_HOSTS") {
+        cfg.http_deny_hosts = split_origins(&v);
     }
     if let Ok(v) = std::env::var("ADJUTANT_ALLOW_SUPERUSER") {
         cfg.allow_superuser = matches!(v.as_str(), "1" | "true" | "yes");
@@ -546,6 +559,9 @@ fn merge_file(cfg: &mut Config, path: &Path) -> Result<(), String> {
         }
         if let Some(v) = h.max_connections {
             cfg.http.max_connections = v;
+        }
+        if let Some(v) = h.deny_hosts {
+            cfg.http_deny_hosts = v;
         }
     }
     if let Some(c) = f.cors {

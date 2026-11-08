@@ -636,8 +636,11 @@ instead be compiled to WebAssembly and loaded from the plugin directory as a
 
 - **no filesystem** — WASI preview1 is linked (Rust `std` needs it) but with **no
   preopened directories**;
-- **no network** — preview1 exposes no socket API, and the core provides no
-  proxied network beyond the explicit `http.request` host call;
+- **no direct network** — preview1 exposes no socket API. Outbound HTTP is a
+  **declared capability**: the `http.request` host call is reachable only to the
+  scheme+host entries in the manifest's `http_allow` list, and never to
+  loopback, link-local, private, CGNAT or operator-denied hosts. An empty or
+  absent list means no outbound HTTP at all (#155);
 - **64 MiB** linear-memory cap;
 - **a fuel budget per call** — a tight `loop {}` traps instead of hanging the
   server.
@@ -651,8 +654,18 @@ imported function, `adjutant_host_call`, that carries JSON. Available methods:
 
 Exports: `adjutant_alloc`, `adjutant_free`, `adjutant_describe` (JSON manifest),
 `adjutant_handle` (one request → one response). The manifest declares
-`id`/`name`/`version`/`permissions`/`migrations`/`routes`; response JSON is
-`{"status", "headers", "body"}`.
+`id`/`name`/`version`/`permissions`/`migrations`/`routes`, and optionally
+`http_allow`; response JSON is `{"status", "headers", "body"}`.
+
+`http_allow` is a list of scheme+host origins (no paths), for example:
+
+```json
+{ "http_allow": ["https://api.example.com", "https://login.example.org"] }
+```
+
+Each entry authorises exactly that scheme, host and port. The guest reaches those
+and nothing else. `ADJUTANT_HTTP_DENY_HOSTS` (or `[http] deny_hosts`) removes
+hosts/subdomains even from a declared entry.
 
 Write a guest with the helper crate `wasm/guest` (`adjutant-wasm-guest`):
 
