@@ -1007,15 +1007,6 @@ async fn load_opened(
     seen_routes: &mut HashMap<(String, String), ()>,
 ) -> Result<LoadedPlugin, PluginRuntimeError> {
     let id = plugin.id().to_string();
-    // Sandboxed guests get a default-deny scheme+host allowlist from their
-    // manifest; native plugins keep public-only reach. Both share the
-    // non-public-address and operator deny-list checks (#155).
-    let http_policy = if is_wasm {
-        crate::host::HttpPolicy::untrusted(&http_allowlist, env.http_deny_hosts.to_vec())
-            .map_err(|e| PluginRuntimeError::Invalid(id.clone(), e))?
-    } else {
-        crate::host::HttpPolicy::public_only(env.http_deny_hosts.to_vec())
-    };
     // One shared host DB impl for every plugin context (cheap: Arc clone).
     let core_db = crate::host::CoreDb::new(env.pool.clone());
 
@@ -1063,6 +1054,23 @@ async fn load_opened(
     let plugin_config = match &row_config {
         v if v.as_object().map(|o| !o.is_empty()).unwrap_or(false) => v.clone(),
         _ => env.config.clone(),
+    };
+
+    // Sandboxed guests get a default-deny scheme+host allowlist from their
+    // manifest. Native plugins keep public reach but also get the exact
+    // endpoint the host configured for them (`base_url`) as a declared
+    // destination, so the core's own API stays reachable on loopback while
+    // every other local address and port stays refused (#155). Both share the
+    // non-public-address and operator deny-list checks.
+    let http_policy = if is_wasm {
+        crate::host::HttpPolicy::untrusted(&http_allowlist, env.http_deny_hosts.to_vec())
+            .map_err(|e| PluginRuntimeError::Invalid(id.clone(), e))?
+    } else {
+        crate::host::HttpPolicy::native(
+            env.http_deny_hosts.to_vec(),
+            &crate::host::declared_destinations(&plugin_config),
+        )
+        .map_err(|e| PluginRuntimeError::Invalid(id.clone(), e))?
     };
 
     let ctx = PluginContext {

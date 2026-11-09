@@ -307,7 +307,7 @@ impl HostDb for CoreDb {
 // Outbound HTTP policy (#155)
 // ---------------------------------------------------------------------------
 
-/// One declared scheme+host a guest may reach.
+/// One declared scheme+host+port a plugin may reach.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct HttpAllow {
     scheme: String,
@@ -321,19 +321,32 @@ struct HttpAllow {
 ///
 /// Two layers, both enforced before a request is sent:
 ///
-/// 1. **Never** loopback, link-local, private, carrier-grade-NAT, documentation
-///    or otherwise non-public addresses, and never a configured deny host.
-///    Resolution is filtered too (`PublicOnlyResolver`), so a public hostname
-///    that resolves to `127.0.0.1` cannot be used as a bypass.
-/// 2. **Sandboxed WASM guests** may reach only the scheme+host entries their
-///    manifest declares (`http_allow`), with no entries meaning no outbound
-///    HTTP at all. Native plugins keep their historical public reach because
-///    they are trusted code, but the same range/deny checks apply.
+/// 1. **Declared destinations win over the non-public refusal, exactly.** A
+///    scheme+host+port the host granted this plugin — the manifest
+///    `http_allow` for a WASM guest, or the `base_url` the host configured for
+///    a native plugin — is reachable even when it is loopback. The entry is
+///    exact: `http://127.0.0.1:8791` does not authorise `127.0.0.1:8792`, a
+///    different scheme, or a loopback range, so the SSRF hole stays closed.
+/// 2. **Everything not declared is refused.** Loopback, link-local, private,
+///    carrier-grade-NAT, documentation and other non-public addresses are
+///    refused by address; configured deny hosts are refused by name. Resolution
+///    is filtered too (`PublicOnlyResolver`), so a public hostname that
+///    resolves to `127.0.0.1` cannot be used as a bypass.
+///
+/// A sandboxed WASM guest may reach the entries its manifest declares and
+/// nothing else (an empty list means no outbound HTTP at all). Native plugins
+/// keep their historical public reach because they are trusted code, but only
+/// the exact destinations the host declared are exempt from the non-public
+/// rule.
 #[derive(Debug, Clone)]
 pub struct HttpPolicy {
-    /// Scheme+host entries a sandboxed guest declared. Ignored when
+    /// Scheme+host+port entries a sandboxed guest declared. Ignored when
     /// `allow_public` is set.
     allow: Vec<HttpAllow>,
+    /// Exact destinations the host granted this plugin (the core endpoint it
+    /// configured). These are the only non-public origins a native plugin may
+    /// dial; a guest's equivalent list is `allow`.
+    declared: Vec<HttpAllow>,
     /// Native (trusted) plugins may reach any public host.
     allow_public: bool,
     /// Operator deny list, exact host or any subdomain of it.
@@ -345,48 +358,32 @@ impl HttpPolicy {
     pub fn public_only(deny_hosts: Vec<String>) -> Self {
         Self {
             allow: Vec::new(),
+            declared: Vec::new(),
             allow_public: true,
             deny: normalize_deny_list(deny_hosts),
         }
+    }
+
+    /// Native/trusted policy with the exact destinations the host configured
+    /// for this plugin (its own API, typically). Public reach is unchanged;
+    /// the declared origins are the only non-public ones it may dial.
+    pub fn native(deny_hosts: Vec<String>, declared: &[String]) -> Result<Self, String> {
+        Ok(Self {
+            allow: Vec::new(),
+            declared: parse_allowlist(declared)?,
+            allow_public: true,
+            deny: normalize_deny_list(deny_hosts),
+        })
     }
 
     /// Sandboxed policy: only the declared scheme+host entries, default deny.
     /// Entries are validated here so a malformed manifest fails at load, not at
     /// the first request.
     pub fn untrusted(allow: &[String], deny_hosts: Vec<String>) -> Result<Self, String> {
-        let mut parsed = Vec::with_capacity(allow.len());
-        for entry in allow {
-            let url = reqwest::Url::parse(entry.trim())
-                .map_err(|e| format!("http_allow entry {entry:?} is not a URL: {e}"))?;
-            if !matches!(url.scheme(), "http" | "https") {
-                return Err(format!(
-                    "http_allow entry {entry:?} must use http or https, not {:?}",
-                    url.scheme()
-                ));
-            }
-            if url.path() != "/" || url.query().is_some() || url.fragment().is_some() {
-                return Err(format!(
-                    "http_allow entry {entry:?} must name a scheme and host only \
-                     (no path, query or fragment)"
-                ));
-            }
-            let Some(host) = url_host_key(&url) else {
-                return Err(format!("http_allow entry {entry:?} has no host"));
-            };
-            let Some(port) = url.port_or_known_default() else {
-                return Err(format!(
-                    "http_allow entry {entry:?} has no known port for {:?}",
-                    url.scheme()
-                ));
-            };
-            parsed.push(HttpAllow {
-                scheme: url.scheme().to_string(),
-                host,
-                port,
-            });
-        }
+        let parsed = parse_allowlist(allow)?;
         Ok(Self {
             allow: parsed,
+            declared: Vec::new(),
             allow_public: false,
             deny: normalize_deny_list(deny_hosts),
         })
@@ -416,28 +413,33 @@ impl HttpPolicy {
         let host = url_host_key(&parsed).ok_or_else(|| {
             SdkError::BadRequest(format!("http URL {url:?} has no host"))
         })?;
+        let port = parsed.port_or_known_default().ok_or_else(|| {
+            SdkError::BadRequest(format!("http URL {url:?} has no known port"))
+        })?;
+        // An exact, host-granted scheme+host+port is a declared destination.
+        // Nothing else on a non-public address is reachable (#155 + the
+        // declared-endpoint fix): the grant is one origin, not a range.
+        let declared = self.is_declared(parsed.scheme(), &host, port);
 
         if let Ok(ip) = host.parse::<IpAddr>() {
-            if !is_public_ip(ip) {
+            if !declared && !is_public_ip(ip) {
                 return Err(SdkError::Forbidden(format!(
                     "http.request refuses non-public address {ip}"
                 )));
             }
         }
-        if is_internal_name(&host) || self.denied(&host) {
+        if !declared && is_internal_name(&host) {
             return Err(SdkError::Forbidden(format!(
                 "http.request refuses host {host:?} (loopback/link-local/private or deny list)"
             )));
         }
-        let port = parsed.port_or_known_default().ok_or_else(|| {
-            SdkError::BadRequest(format!("http URL {url:?} has no known port"))
-        })?;
-        if !self.allow_public
-            && !self
-                .allow
-                .iter()
-                .any(|a| a.scheme == parsed.scheme() && a.host == host && a.port == port)
-        {
+        // The deny list wins even over a declared destination.
+        if self.denied(&host) {
+            return Err(SdkError::Forbidden(format!(
+                "http.request refuses host {host:?} (loopback/link-local/private or deny list)"
+            )));
+        }
+        if !self.allow_public && !declared {
             return Err(SdkError::Forbidden(format!(
                 "http.request to {host:?} is not in this plugin's http_allow manifest \
                  (scheme+host+port allowlist; default deny)"
@@ -446,11 +448,79 @@ impl HttpPolicy {
         Ok(parsed)
     }
 
+    fn is_declared(&self, scheme: &str, host: &str, port: u16) -> bool {
+        let matches = |a: &HttpAllow| a.scheme == scheme && a.host == host && a.port == port;
+        self.declared.iter().any(matches)
+            // A guest's manifest entries are declarations too: they are the
+            // whole grant, so an exact loopback origin in the list is reachable.
+            || (!self.allow_public && self.allow.iter().any(matches))
+    }
+
     fn denied(&self, host: &str) -> bool {
         self.deny.iter().any(|d| {
             host == d || host.strip_suffix(d).is_some_and(|prefix| prefix.ends_with('.'))
         })
     }
+}
+
+/// Parse declared scheme+host+port entries. Validation happens here so a
+/// malformed manifest or config fails at load, not at the first request.
+fn parse_allowlist(entries: &[String]) -> Result<Vec<HttpAllow>, String> {
+    let mut parsed = Vec::with_capacity(entries.len());
+    for entry in entries {
+        let url = reqwest::Url::parse(entry.trim())
+            .map_err(|e| format!("declared endpoint {entry:?} is not a URL: {e}"))?;
+        if !matches!(url.scheme(), "http" | "https") {
+            return Err(format!(
+                "declared endpoint {entry:?} must use http or https, not {:?}",
+                url.scheme()
+            ));
+        }
+        if url.path() != "/" || url.query().is_some() || url.fragment().is_some() {
+            return Err(format!(
+                "declared endpoint {entry:?} must name a scheme and host only \
+                 (no path, query or fragment)"
+            ));
+        }
+        let Some(host) = url_host_key(&url) else {
+            return Err(format!("declared endpoint {entry:?} has no host"));
+        };
+        let Some(port) = url.port_or_known_default() else {
+            return Err(format!(
+                "declared endpoint {entry:?} has no known port for {:?}",
+                url.scheme()
+            ));
+        };
+        parsed.push(HttpAllow {
+            scheme: url.scheme().to_string(),
+            host,
+            port,
+        });
+    }
+    Ok(parsed)
+}
+
+/// The destinations the host configured for this plugin. A plugin's `base_url`
+/// names *this* Adjutant instance — the cross-plugin convention `mcp`, `stripe`
+/// and `store` document — so the host grants exactly that origin, and nothing
+/// else, even when it is loopback (a harness or a local deployment).
+///
+/// This is operator configuration (`core.plugins.config`), not something the
+/// plugin can assert at request time: an undeclared port stays refused.
+pub fn declared_destinations(config: &serde_json::Value) -> Vec<String> {
+    config
+        .get("base_url")
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .filter(|url| !url.is_empty())
+        .map(|url| vec![url.to_string()])
+        .unwrap_or_default()
+        .into_iter()
+        // A base_url that is not a bare origin is a plugin-config problem the
+        // plugin itself reports; it must not stop the plugin loading. An
+        // unparsed entry simply grants nothing.
+        .filter(|url| parse_allowlist(std::slice::from_ref(url)).is_ok())
+        .collect()
 }
 
 fn normalize_deny_list(entries: Vec<String>) -> Vec<String> {
@@ -790,6 +860,80 @@ mod tests {
         }
     }
 
+    /// PR #210's failure: the host's own API is loopback, so #155's blanket
+    /// non-public refusal stopped the mcp plugin reaching it. The endpoint the
+    /// host configured for the plugin is now a declared destination — and it is
+    /// the *only* loopback origin reachable. Both directions are pinned here:
+    /// the declared scheme+host+port passes, a different loopback port does not.
+    #[test]
+    fn declared_endpoint_is_the_only_reachable_loopback_origin() {
+        // Exactly what the live harness writes to `mcp.base_url`.
+        let config = serde_json::json!({ "base_url": "http://127.0.0.1:8791" });
+        let declared = declared_destinations(&config);
+        assert_eq!(declared, vec!["http://127.0.0.1:8791".to_string()]);
+
+        let native = HttpPolicy::native(Vec::new(), &declared).expect("declared policy");
+        assert!(
+            native.check_url("http://127.0.0.1:8791/api/mcp/tools").is_ok(),
+            "the endpoint the host configured for the plugin must be reachable"
+        );
+
+        // Nothing else on loopback — a different port, port 80, a different
+        // scheme, a different loopback address, or the same port by name.
+        for url in [
+            "http://127.0.0.1:8792/",
+            "http://127.0.0.1:8787/",
+            "http://127.0.0.1/",
+            "https://127.0.0.1:8791/",
+            "http://127.0.0.2:8791/",
+            "http://localhost:8791/",
+            "http://169.254.169.254/latest/meta-data/",
+        ] {
+            assert!(forbidden(native.check_url(url)), "{url} must be refused");
+        }
+        // The refusal still names the address, as #155's did.
+        let err = native
+            .check_url("http://127.0.0.1:8792/")
+            .expect_err("another loopback port must be refused");
+        assert!(
+            err.to_string().contains("127.0.0.1"),
+            "the refusal must name the address: {err}"
+        );
+
+        // A guest gets the same boundary from its manifest: the declared origin
+        // and nothing else, with no declaration still meaning nothing at all.
+        let guest = HttpPolicy::untrusted(&declared, Vec::new()).expect("guest policy");
+        assert!(guest.check_url("http://127.0.0.1:8791/api/mcp").is_ok());
+        assert!(forbidden(guest.check_url("http://127.0.0.1:8792/")));
+        let undeclared = HttpPolicy::untrusted(&[], Vec::new()).expect("empty policy");
+        assert!(forbidden(undeclared.check_url("http://127.0.0.1:8791/")));
+
+        // The operator deny list still wins over a declared destination.
+        let denied =
+            HttpPolicy::native(vec!["127.0.0.1".into()], &declared).expect("denied policy");
+        assert!(forbidden(denied.check_url("http://127.0.0.1:8791/")));
+    }
+
+    #[test]
+    fn plugin_base_url_grants_exactly_one_origin() {
+        // No config, or a malformed one, grants nothing (and must not fail the
+        // load): the plugin's own config error is reported by the plugin.
+        assert!(declared_destinations(&serde_json::Value::Null).is_empty());
+        assert!(declared_destinations(&serde_json::json!({})).is_empty());
+        assert!(declared_destinations(&serde_json::json!({ "base_url": 42 })).is_empty());
+        assert!(declared_destinations(&serde_json::json!({
+            "base_url": "not-an-origin"
+        }))
+        .is_empty());
+        assert_eq!(
+            declared_destinations(&serde_json::json!({
+                "base_url": "http://127.0.0.1:8791/",
+                "something_else": true
+            })),
+            vec!["http://127.0.0.1:8791/".to_string()]
+        );
+    }
+
     #[test]
     fn allowlist_entries_must_be_scheme_and_host_only() {
         for bad in [
@@ -871,6 +1015,56 @@ mod tests {
         assert_eq!(
             inner.request_urls(),
             vec![("GET".to_string(), "https://api.example.com/v1".to_string())]
+        );
+    }
+
+    /// The declared-endpoint boundary at the wrapper the loader installs: the
+    /// host's own API reaches the transport, and a different loopback port is
+    /// stopped before it does. PR #210's failing call, and the SSRF case #155
+    /// closed, in one test.
+    #[tokio::test]
+    async fn declared_endpoint_reaches_the_transport_and_other_ports_do_not() {
+        let inner = std::sync::Arc::new(MockHttp::new());
+        let declared = declared_destinations(&serde_json::json!({
+            "base_url": "http://127.0.0.1:8791"
+        }));
+        let http = PluginHttp::new(
+            inner.clone(),
+            HttpPolicy::native(Vec::new(), &declared).expect("declared policy"),
+        );
+
+        let _ = http
+            .request(
+                "GET".into(),
+                "http://127.0.0.1:8791/api/mcp/tools".into(),
+                vec![],
+                None,
+            )
+            .await;
+        assert_eq!(
+            inner.request_urls(),
+            vec![(
+                "GET".to_string(),
+                "http://127.0.0.1:8791/api/mcp/tools".to_string()
+            )],
+            "the host's own endpoint must reach the transport"
+        );
+
+        // The same host on another loopback port is someone else's local
+        // service: refused, and the transport never sees it. So is the
+        // metadata address, which #155 exists to keep out.
+        let seen = inner.request_urls().len();
+        for url in ["http://127.0.0.1:8792/", "http://169.254.169.254/latest/meta-data/"] {
+            let err = http
+                .request("GET".into(), url.into(), vec![], None)
+                .await
+                .expect_err("an undeclared address must be refused");
+            assert!(matches!(err, SdkError::Forbidden(_)));
+        }
+        assert_eq!(
+            inner.request_urls().len(),
+            seen,
+            "the transport must not see an undeclared URL"
         );
     }
 }

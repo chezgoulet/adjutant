@@ -641,9 +641,11 @@ instead be compiled to WebAssembly and loaded from the plugin directory as a
   preopened directories**;
 - **no direct network** — preview1 exposes no socket API. Outbound HTTP is a
   **declared capability**: the `http.request` host call is reachable only to the
-  scheme+host entries in the manifest's `http_allow` list, and never to
-  loopback, link-local, private, CGNAT or operator-denied hosts. An empty or
-  absent list means no outbound HTTP at all (#155);
+  exact scheme+host+port entries in the manifest's `http_allow` list. Those
+  entries are the whole grant — a declared loopback origin (the core's own API)
+  is reachable, and every other loopback/link-local/private/CGNAT address and
+  port is refused by address, as are operator-denied hosts. An empty or absent
+  list means no outbound HTTP at all (#155);
 - **64 MiB** linear-memory cap;
 - **a fuel budget per call** — a tight `loop {}` traps instead of hanging the
   server.
@@ -667,8 +669,16 @@ Exports: `adjutant_alloc`, `adjutant_free`, `adjutant_describe` (JSON manifest),
 ```
 
 Each entry authorises exactly that scheme, host and port. The guest reaches those
-and nothing else. `ADJUTANT_HTTP_DENY_HOSTS` (or `[http] deny_hosts`) removes
-hosts/subdomains even from a declared entry.
+and nothing else: a declared `http://127.0.0.1:8791` does not authorise
+`127.0.0.1:8792`, another scheme or the rest of the loopback range.
+`ADJUTANT_HTTP_DENY_HOSTS` (or `[http] deny_hosts`) removes hosts/subdomains
+even from a declared entry.
+
+A **native plugin** declares the same thing through its `core.plugins.config`:
+`base_url` names *this* Adjutant instance, and the host grants exactly that
+origin (scheme+host+port) as the plugin's one non-public destination. That is
+how the `mcp`, `stripe` and `store` plugins reach the core's own API on
+`127.0.0.1` without opening loopback to anyone else.
 
 Write a guest with the helper crate `wasm/guest` (`adjutant-wasm-guest`):
 

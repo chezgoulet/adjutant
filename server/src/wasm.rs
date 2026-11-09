@@ -16,9 +16,10 @@
 //!
 //! **Outbound HTTP is a declared capability, not an implied one (#155).** The
 //! `http.request` host call is still available, but [`WasmPlugin`]'s manifest
-//! must list each reachable scheme+host in `http_allow` (default: empty, deny
-//! all), and the host refuses non-public addresses and the operator deny list
-//! as well. See [`crate::host::HttpPolicy`].
+//! must list each reachable scheme+host+port in `http_allow` (default: empty,
+//! deny all). The declaration is the whole grant: an exact declared loopback
+//! origin is reachable, while every other non-public address and the operator
+//! deny list are still refused. See [`crate::host::HttpPolicy`].
 //!
 //! The host wraps a guest in [`WasmPlugin`], which implements the ordinary
 //! [`AdjutantPlugin`] trait. The registry, validation, permission gate, and
