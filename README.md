@@ -114,7 +114,7 @@ Precedence is defaults < TOML file (./adjutant.toml or `--config`) < environment
 | `ADJUTANT_LOG_FORMAT` | `pretty` \| `json` |
 | `ADJUTANT_RATE_MAX`, `ADJUTANT_RATE_WINDOW` | fixed window per client IP; `0` disables |
 | `ADJUTANT_TRUSTED_PROXIES` | comma-separated peer IPs allowed to set `x-forwarded-for`. **Empty by default — the header is otherwise ignored**, because any client can send it |
-| `ADJUTANT_CORS` | comma-separated origins, `*` for any |
+| `ADJUTANT_CORS` | comma-separated origins that may call the API from a browser. **`*` is refused at boot**: sessions are cookies, so a wildcard is one `allow_credentials` away from a credential leak. Empty (the default) means no CORS headers at all |
 | `ADJUTANT_MAX_BODY` | request body cap in bytes |
 | `ADJUTANT_HTTP_HEADER_TIMEOUT` | seconds to receive a request's headers (default `5`) |
 | `ADJUTANT_HTTP_BODY_TIMEOUT` | total seconds allowed for a request body, not reset per chunk (default `10`) |
