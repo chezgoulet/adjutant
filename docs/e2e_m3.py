@@ -328,8 +328,12 @@ probe_raw("28 re-import updates, no new rows", csv_reimport)
 # Set per-plugin config, then hot-reload (M2 feature) so auth re-inits with it.
 subprocess.run(["psql", *PSQL, "-tAc",
                 f"UPDATE core.plugins SET config = "
+                # `id_token_alg` is pinned by the plugin config, not read from the
+                # token: this mock IdP signs with the shared secret, so the harness
+                # says so. Omit it and the deployment expects RS256.
                 f"'{{\"oidc\": {{\"issuer\": \"{ISSUER}\", \"client_id\": \"{CLIENT_ID}\", "
-                f"\"client_secret\": \"{SECRET}\", \"redirect_uri\": \"{BASE}/api/auth/oidc/callback\"}}}}' "
+                f"\"client_secret\": \"{SECRET}\", \"id_token_alg\": \"HS256\", "
+                f"\"redirect_uri\": \"{BASE}/api/auth/oidc/callback\"}}}}' "
                 f"WHERE id = 'auth';"], check=True, capture_output=True)
 probe("29 hot-reload picks up oidc config", "POST", "/api/plugins/reload",
       token=chief_token, expect_status=200, expect_in='"auth"')
