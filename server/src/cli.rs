@@ -387,8 +387,10 @@ pub async fn bootstrap_isolation(
     // cleartext, it lands in every `pg_dump`, and it is readable by anything that
     // can read the row. The file is the deployment's, `0600`, and the runtime
     // reads it at boot and on every reload.
+    // An operator running the bootstrap should not have to create the file
+    // first: absent a configured path, write the default one.
     let secrets_path = crate::secrets::resolved_path(cfg.secrets_file.as_deref())
-        .ok_or_else(|| "no secrets file: the plugin role passwords have to live somewhere".to_string())?;
+        .unwrap_or_else(|| std::path::PathBuf::from(crate::secrets::DEFAULT_SECRETS_FILE));
     let secrets_file = crate::secrets::SecretSource::load(Some(&secrets_path))?;
 
     let mut ids = Vec::new();

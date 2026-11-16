@@ -76,6 +76,8 @@ services:
       # container's filesystem: a bundle inside a container is lost the next
       # time the container is replaced, which is precisely when someone wants
       # it. `docs/backup-and-restore` is the host-side producer, if any.
+      # Keep identical to docker-compose.yml (verify.sh diffs the two).
+      ADJUTANT_SECRETS_FILE: /app/secrets/secrets.toml
       ADJUTANT_BACKUP_DIR: /app/backups
       # The age public key every bundle is encrypted to. No default: with this
       # unset the in-app backup fails closed rather than writing every plugin
@@ -90,6 +92,7 @@ services:
     # host path is Docker's business.
     volumes:
       - backups:/app/backups
+      - ./secrets:/app/secrets
     # Keep this block identical to docker-compose.yml: deploy/verify.sh compares
     # the two rendered `adjutant` services and fails on drift. The image's USER
     # is 10001:10001, the server needs no capability, and no setuid binary may

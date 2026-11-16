@@ -16,7 +16,11 @@ database. There is no Redis, no MinIO, and no separate cache (SPEC §2.6).
 export POSTGRES_PASSWORD="$(openssl rand -hex 24)"       # admin; bootstrap only
 export ADJUTANT_APP_PASSWORD="$(openssl rand -hex 24)"   # the server's runtime role
 
-# 2. Bootstrap, then start.
+# 2. A directory for the deployment's secrets, and the bootstrap, then start.
+#    `bootstrap-isolation` writes the plugin role passwords to
+#    ./secrets/secrets.toml (mode 0600, bind-mounted into the container). It
+#    creates the file; keep the directory out of git.
+mkdir -p secrets && chmod 700 secrets
 #    `bootstrap-isolation` is a ONE-OFF that creates the per-plugin roles,
 #    schema ownership, `core.*` grants and credentials, AND the `adjutant_app`
 #    runtime role. Three things to know:

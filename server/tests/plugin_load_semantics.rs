@@ -131,9 +131,12 @@ fn fixture_dir_named(tag: &str) -> PathBuf {
 /// not" — instead of about whatever a previous run left behind. It is the same
 /// discipline `adjutant test-plugin` uses on a throwaway `_test` database.
 async fn provision(dir: &Path) -> Arc<sqlx::PgPool> {
+    // Its own secrets file: the role passwords are written there now, and the
+    // tests run in parallel — a shared `./secrets.toml` would be a race.
     let cfg = Config {
         database_url: base_url(),
         plugin_dir: dir.to_path_buf(),
+        secrets_file: Some(secrets_path(dir)),
         ..Default::default()
     };
     let admin = db::connect_and_migrate(&cfg)
@@ -169,18 +172,24 @@ async fn set_enabled(admin: &sqlx::PgPool, id: &str, on: bool) {
     assert_eq!(n, 1, "core.plugins row for {id} exists");
 }
 
-fn env_for<'a>(url: &'a str, admin: &Arc<sqlx::PgPool>) -> LoadEnv<'a> {
+/// Where this fixture's plugin role passwords live.
+fn secrets_path(dir: &Path) -> std::path::PathBuf {
+    dir.join("secrets.toml")
+}
+
+fn env_for<'a>(url: &'a str, admin: &Arc<sqlx::PgPool>, dir: &Path) -> LoadEnv<'a> {
     let (tx, _rx) = tokio::sync::broadcast::channel(16);
     LoadEnv {
+        secrets: std::sync::Arc::new(std::sync::RwLock::new(
+            adjutant_server::secrets::SecretSource::load(Some(&secrets_path(dir)))
+                .expect("load the fixture secrets"),
+        )),
         database_url: url,
         pool: admin.clone(),
         event_tx: tx,
         config: serde_json::json!({}),
         identity: adjutant_server::identity::IdentityHub::new(),
         http: adjutant_server::host::CoreHttp::new(),
-        secrets: std::sync::Arc::new(std::sync::RwLock::new(
-            adjutant_server::secrets::SecretSource::default(),
-        )),
     }
 }
 
@@ -195,7 +204,8 @@ async fn boot(dir: &Path, url: &str, admin: &Arc<sqlx::PgPool>) -> PluginRegistr
         adjutant_server::identity::IdentityHub::new(),
         adjutant_server::host::CoreHttp::new(),
         std::sync::Arc::new(std::sync::RwLock::new(
-            adjutant_server::secrets::SecretSource::default(),
+            adjutant_server::secrets::SecretSource::load(Some(&secrets_path(dir)))
+                .expect("load the fixture secrets"),
         )),
     )
     .await
@@ -367,7 +377,7 @@ async fn probe_enable_disable_re_enable_is_idempotent() {
 
     let mut reg = boot(&dir, &url, &admin).await;
     let store_lib = dir.join(format!("libadjutant_{STORE}.so"));
-    let env = env_for(&url, &admin);
+    let env = env_for(&url, &admin, &dir);
 
     // --- enable: a load, exactly the boot body ------------------------------
     let mut seen_routes = reg.live_route_keys();
