@@ -19,8 +19,10 @@ export ADJUTANT_APP_PASSWORD="$(openssl rand -hex 24)"   # the server's runtime 
 # 2. A directory for the deployment's secrets, and the bootstrap, then start.
 #    `bootstrap-isolation` writes the plugin role passwords to
 #    ./secrets/secrets.toml (mode 0600, bind-mounted into the container). It
-#    creates the file; keep the directory out of git.
-mkdir -p secrets && chmod 700 secrets
+#    creates the file; keep the directory out of git. The image runs as
+#    10001:10001, so the host directory is owned by that uid — the same one-time
+#    chown any bind mount needs for a non-root container user.
+mkdir -p secrets && chmod 700 secrets && sudo chown -R 10001:10001 secrets
 #    `bootstrap-isolation` is a ONE-OFF that creates the per-plugin roles,
 #    schema ownership, `core.*` grants and credentials, AND the `adjutant_app`
 #    runtime role. Three things to know:

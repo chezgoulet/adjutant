@@ -244,7 +244,13 @@ pub fn write_plugin_password(path: &Path, plugin: &str, password: &str) -> Resul
     // mid-write must not leave a truncated secrets file that a restart then
     // refuses to parse.
     let tmp = path.with_extension("tmp");
-    std::fs::write(&tmp, rendered).map_err(|e| format!("write {}: {e}", tmp.display()))?;
+    std::fs::write(&tmp, rendered).map_err(|e| {
+        format!(
+            "write {}: {e} — the secrets directory must be writable by the user the server \
+             runs as (in the container: 10001:10001, so `chown 10001:10001` the bind mount)",
+            tmp.display()
+        )
+    })?;
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
