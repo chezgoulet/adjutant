@@ -199,14 +199,22 @@ subprocess.run(["psql", *PSQL, "-c",
 print("[e2e] data reset — starting from bootstrap state")
 
 # ---------------------------------------------------------------- 1. bootstrap
+# `register` is closed unless the server was started with a bootstrap secret; the
+# harness reads the same variable it expects in the server's environment.
+BOOTSTRAP_TOKEN = os.environ.get("ADJUTANT_BOOTSTRAP_TOKEN", "")
+if not BOOTSTRAP_TOKEN:
+    print("[E2E] ADJUTANT_BOOTSTRAP_TOKEN is unset: start the server with it and "
+          "export it here, or the bootstrap probe below answers 403")
 r = probe("1 register bootstrap chief", "POST", "/api/auth/register",
-          body={"username": "christopher", "password": "correct-horse-battery"},
+          body={"username": "christopher", "password": "correct-horse-battery",
+                "bootstrap_token": BOOTSTRAP_TOKEN},
           expect_status=201, expect_in='"bootstrap_role":"chief"')
 chief_token = r and r.get("token")
 assert chief_token, "bootstrap register failed — aborting"
 
 r2 = probe("2 register closed after first user", "POST", "/api/auth/register",
-           body={"username": "mallory", "password": "another-pass-9"}, expect_status=403)
+           body={"username": "mallory", "password": "another-pass-9",
+                 "bootstrap_token": BOOTSTRAP_TOKEN}, expect_status=403)
 
 # ---------------------------------------------------------------- 2. login / me / logout
 probe("3 wrong password rejected", "POST", "/api/auth/login",

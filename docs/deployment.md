@@ -60,10 +60,25 @@ Postgres is **not** exposed to the host; only the server is.
   **not** change the account, because an environment that can rewrite a password
   on restart is a backdoor. Remove the password from the environment after the
   first boot.
-- **First registration.** `POST /api/auth/register` is open only while no user
-  exists; the first caller becomes `chief`. The one bootstrap slot is a row
-  (`core.bootstrap_claim`), so two concurrent first registrations cannot both
-  win: exactly one gets `201`, the other `403`.
+- **First registration.** `POST /api/auth/register` creates the first `chief`
+  while `core.users` is empty, and only for a caller who presents the value of
+  `ADJUTANT_BOOTSTRAP_TOKEN`:
+
+  ```bash
+  export ADJUTANT_BOOTSTRAP_TOKEN="$(openssl rand -hex 24)"   # once, on a fresh install
+  curl -sX POST localhost:8787/api/auth/register \
+    -H 'content-type: application/json' \
+    -d "{\"username\":\"you\",\"password\":\"…\",\"bootstrap_token\":\"$ADJUTANT_BOOTSTRAP_TOKEN\"}"
+  ```
+
+  With the variable unset the route answers `403` and says so — a fresh
+  installation is not claimable by whoever reaches the port first. The one
+  bootstrap slot is a row (`core.bootstrap_claim`), so concurrent first
+  registrations have exactly one winner. Remove the variable afterwards: the
+  slot is spent, and the route stays closed for the life of the database.
+  **Preferred alternative:** set `ADJUTANT_BOOTSTRAP_USERNAME` and
+  `ADJUTANT_BOOTSTRAP_PASSWORD`, which creates the chief before the listener
+  opens and never exposes a route at all.
 
 `adjutant grant-role <username> <role>` is the operator's recovery hatch. It
 writes `core.user_roles` directly, so it works when the last admin has been
