@@ -383,36 +383,57 @@ pub async fn bootstrap_isolation(
         .await
         .map_err(|e| e.to_string())?;
 
+    // Where the generated role passwords go. Not the database: `db_secret` is
+    // cleartext, it lands in every `pg_dump`, and it is readable by anything that
+    // can read the row. The file is the deployment's, `0600`, and the runtime
+    // reads it at boot and on every reload.
+    let secrets_path = crate::secrets::resolved_path(cfg.secrets_file.as_deref())
+        .ok_or_else(|| "no secrets file: the plugin role passwords have to live somewhere".to_string())?;
+    let secrets_file = crate::secrets::SecretSource::load(Some(&secrets_path))?;
+
     let mut ids = Vec::new();
     for d in discovered {
-        let existing: Option<Option<String>> = sqlx::query_scalar::<_, Option<String>>(
+        // Reuse the password already in the file so a re-run does not rotate
+        // every role; the column is only read for an installation bootstrapped
+        // before the file existed.
+        let legacy: Option<Option<String>> = sqlx::query_scalar::<_, Option<String>>(
             "SELECT db_secret FROM core.plugins WHERE id = $1",
         )
         .bind(&d.id)
         .fetch_optional(pool.as_ref())
         .await
         .map_err(|e| format!("read {} credential: {e}", d.id))?;
+        let existing = secrets_file
+            .resolve(&d.id, "db_password")
+            .or_else(|| legacy.flatten());
         let secret = crate::schema::bootstrap_role(
             pool.as_ref(),
             &d.id,
-            existing.flatten().as_deref(),
+            existing.as_deref(),
             rotate,
         )
         .await
         .map_err(|e| format!("bootstrap {}: {e}", d.id))?;
+        crate::secrets::write_plugin_password(&secrets_path, &d.id, &secret)?;
+        // The row records the plugin; the credential is cleared from it so a
+        // database dump no longer carries the password.
         sqlx::query(
-            "INSERT INTO core.plugins (id, version, db_secret) VALUES ($1, $2, $3) \
+            "INSERT INTO core.plugins (id, version, db_secret) VALUES ($1, $2, NULL) \
              ON CONFLICT (id) DO UPDATE SET version = EXCLUDED.version, \
-             db_secret = EXCLUDED.db_secret, updated_at = now()",
+             db_secret = NULL, updated_at = now()",
         )
         .bind(&d.id)
         .bind(&d.version)
-        .bind(&secret)
         .execute(pool.as_ref())
         .await
-        .map_err(|e| format!("store {} credential: {e}", d.id))?;
+        .map_err(|e| format!("store {} plugin row: {e}", d.id))?;
         ids.push(d.id);
     }
+    println!(
+        "[bootstrap] plugin role passwords written to {} (0600); the database \
+         row no longer holds them",
+        secrets_path.display()
+    );
 
     if let Some(app) = app_role {
         crate::schema::bootstrap_app_role(pool.as_ref(), app, app_password)
@@ -723,10 +744,15 @@ pub async fn verify_isolation(
                 .bind(id)
                 .fetch_optional(pool.as_ref())
                 .await
-                .map_err(|e| format!("read {id} credential: {e}"))?;
-        match secret.flatten() {
+                .map_err(|e| format!("read {id} legacy credential: {e}"))?;
+        let from_file = crate::secrets::SecretSource::load(cfg.secrets_file.as_deref())
+            .map(|source| source.resolve(id, "db_password"))
+            .unwrap_or(None);
+        match from_file.or_else(|| secret.flatten()) {
             None => failures.push(format!(
-                "plugin {id} has no stored credential in core.plugins.db_secret"
+                "plugin {id} has no credential: expected `db_password` in the secrets file \
+                 ({:?}), or the legacy core.plugins.db_secret from before the move",
+                crate::secrets::resolved_path(cfg.secrets_file.as_deref())
             )),
             Some(secret) => {
                 match crate::host::plugin_pool(&cfg.database_url, id, &secret, 1).await {

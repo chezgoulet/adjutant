@@ -125,6 +125,38 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Security
 
+- **Plugin secrets come from the deployment, not the database.** `stripe`'s
+  `secret_key` and `webhook_secret`, `auth`'s `oidc.client_secret` and every
+  plugin's database password were read from `core.plugins.config` /
+  `core.plugins.db_secret` — admin-editable JSONB and a text column, both copied
+  into every backup bundle. They now resolve from the environment
+  (`ADJUTANT_SECRET_<PLUGIN>_<PATH>`, e.g. `ADJUTANT_SECRET_STRIPE_SECRET_KEY`)
+  or from a TOML file named by `ADJUTANT_SECRETS_FILE` / `--secrets-file`
+  (default `./secrets.toml`), and the value is injected into the plugin's config
+  before `init`. A secret still in `core.plugins.config` is **refused at load**
+  with an error naming the variable that should hold it, rather than ignored:
+  leaving it there means it is still in the backup. `bootstrap-isolation` writes
+  the plugin role passwords to the file (`0600`, temp-file-and-rename) and clears
+  the column; the runtime still reads the column for an installation bootstrapped
+  before the move, with a WARN. The file is re-read on `POST /api/plugins/reload`,
+  so rotation is a file edit and a reload. Plugins declare their secret paths
+  (`AdjutantPlugin::secret_config_keys`), so the check is part of the contract
+  rather than a list in the core.
+- **A tool that writes cannot be invoked without a confirmation the server
+  minted.** `/api/mcp/invoke` executed `missions:create`, `governance:propose`,
+  archive writes and store orders with the caller's authority and no policy gate:
+  an agent — or a prompt that steered one — could write in a loop, and the tools
+  carried no read-only/destructive annotations for a client to prompt on. Anything
+  that is not a `GET` now needs an **intent** from `POST /api/mcp/intent`, bound
+  to the caller, the tool and a canonical digest of the arguments, expiring in
+  five minutes and consumed by the first invocation; a write without one is
+  refused `428` before anything reaches the API, and a replayed or re-argumented
+  intent is refused the same way. A `confirm: true` field would be a value the
+  model can write itself; an intent has to be fetched with the arguments already
+  fixed and cannot be reused, so "the caller meant this" is a row in the server's
+  record. The catalogue also carries `annotations` (`readOnlyHint`,
+  `destructiveHint`) and `requiresIntent`, derived from the method so a tool added
+  later is covered without anyone remembering a flag.
 - **`POST /api/auth/register` is closed unless the deployment sets a bootstrap
   secret.** The route mints a `chief` out of nothing while `core.users` is empty,
   which made a fresh installation claimable by whoever reached port 8787 first —

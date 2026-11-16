@@ -867,8 +867,9 @@ Config lives in the `mcp` row's `core.plugins.config`:
 | Method | Path | Permission | Body / notes |
 |---|---|---|---|
 | POST | `/api/mcp/connect` | `mcp:connect` | `{client?, client_version?, protocolVersion?, capabilities?}` → `{connection_id, token, expires_at, protocolVersion, server, capabilities}`. Only the token's SHA-256 is stored; the token is returned once |
-| GET | `/api/mcp/tools` | `mcp:connect` | The filtered catalogue: `{name, description, inputSchema, requiredPermission, scope}` per tool, plus `warnings` |
-| POST | `/api/mcp/invoke` | `mcp:invoke` | `{tool, arguments, connection_id?}` or a connection token in `connection_token` / the `mcp-session-id` header → `{tool, status: ok\|denied\|error, http_status?, result?, error?, duration_ms, invocation_id}`. The tool's own permission is re-checked, arguments are strictly validated against the tool's schema, and the API's status is passed through |
+| GET | `/api/mcp/tools` | `mcp:connect` | The filtered catalogue: `{name, description, inputSchema, requiredPermission, scope, annotations: {readOnlyHint, destructiveHint, openWorldHint}, requiresIntent}` per tool, plus `warnings` |
+| POST | `/api/mcp/intent` | `mcp:invoke` | `{tool, arguments}` → `{intent, tool, expires_at, ttl_minutes}`. Required before any tool that is not a `GET`: the token is bound to the caller, the tool and a canonical digest of the arguments, expires in five minutes, and is spent by the first invocation. A read tool answers `400` ("only reads; call invoke directly") |
+| POST | `/api/mcp/invoke` | `mcp:invoke` | `{tool, arguments, connection_id?, intent?}` or a connection token in `connection_token` / the `mcp-session-id` header → `{tool, status: ok\|denied\|error, http_status?, result?, error?, duration_ms, invocation_id}`. The tool's own permission is re-checked, arguments are strictly validated against the tool's schema, and the API's status is passed through. **A write without a matching intent is refused `428` before anything reaches the API** |
 | GET | `/api/mcp/invocations?tool=&status=&limit=` | `mcp:connect` (own rows) / `mcp:audit` (troop) | The audit trail: user, connection, tool, arguments, the downstream request, status, HTTP status, duration |
 
 Tools (path and permission mirror the owning plugin's route exactly):

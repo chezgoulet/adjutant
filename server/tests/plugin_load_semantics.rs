@@ -178,6 +178,9 @@ fn env_for<'a>(url: &'a str, admin: &Arc<sqlx::PgPool>) -> LoadEnv<'a> {
         config: serde_json::json!({}),
         identity: adjutant_server::identity::IdentityHub::new(),
         http: adjutant_server::host::CoreHttp::new(),
+        secrets: std::sync::Arc::new(std::sync::RwLock::new(
+            adjutant_server::secrets::SecretSource::default(),
+        )),
     }
 }
 
@@ -191,6 +194,9 @@ async fn boot(dir: &Path, url: &str, admin: &Arc<sqlx::PgPool>) -> PluginRegistr
         serde_json::json!({}),
         adjutant_server::identity::IdentityHub::new(),
         adjutant_server::host::CoreHttp::new(),
+        std::sync::Arc::new(std::sync::RwLock::new(
+            adjutant_server::secrets::SecretSource::default(),
+        )),
     )
     .await
     .expect("load_all")

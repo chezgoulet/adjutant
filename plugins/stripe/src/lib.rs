@@ -2062,6 +2062,14 @@ impl AdjutantPlugin for StripePlugin {
         Ok(())
     }
 
+    /// The Stripe API key and the endpoint's signing secret are deployment
+    /// secrets, not plugin config: they resolve from
+    /// `ADJUTANT_SECRET_STRIPE_SECRET_KEY` / `ADJUTANT_SECRET_STRIPE_WEBHOOK_SECRET`
+    /// (or the secrets file) and are injected before `init`.
+    fn secret_config_keys(&self) -> Vec<&'static str> {
+        vec![CONFIG_SECRET_KEY, CONFIG_WEBHOOK_SECRET]
+    }
+
     fn permissions_granted(&self) -> Vec<Permission> {
         vec![
             Permission::new(

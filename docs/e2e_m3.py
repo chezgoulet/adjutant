@@ -326,13 +326,28 @@ probe_raw("28 re-import updates, no new rows", csv_reimport)
 
 # ---------------------------------------------------------------- 7. OIDC end-to-end
 # Set per-plugin config, then hot-reload (M2 feature) so auth re-inits with it.
+#
+# The client secret is NOT part of that config: secrets come from the deployment
+# (environment or the secrets file), never from `core.plugins.config`, which is
+# admin-editable and lands in every backup. So the harness writes the secret into
+# the secrets file the server was started with and puts only the non-secret half
+# in the row. Reload re-reads the file, which is also the rotation path.
+SECRETS_FILE = os.environ.get("ADJUTANT_SECRETS_FILE", "secrets.toml")
+existing = ""
+if os.path.exists(SECRETS_FILE):
+    existing = open(SECRETS_FILE).read()
+if "[auth" not in existing:
+    with open(SECRETS_FILE, "a") as fh:
+        fh.write(f"\n[auth.oidc]\nclient_secret = \"{SECRET}\"\n")
+    os.chmod(SECRETS_FILE, 0o600)
+print(f"[e2e] oidc client secret written to {SECRETS_FILE} (not the database)")
 subprocess.run(["psql", *PSQL, "-tAc",
                 f"UPDATE core.plugins SET config = "
                 # `id_token_alg` is pinned by the plugin config, not read from the
                 # token: this mock IdP signs with the shared secret, so the harness
                 # says so. Omit it and the deployment expects RS256.
                 f"'{{\"oidc\": {{\"issuer\": \"{ISSUER}\", \"client_id\": \"{CLIENT_ID}\", "
-                f"\"client_secret\": \"{SECRET}\", \"id_token_alg\": \"HS256\", "
+                f"\"id_token_alg\": \"HS256\", "
                 f"\"redirect_uri\": \"{BASE}/api/auth/oidc/callback\"}}}}' "
                 f"WHERE id = 'auth';"], check=True, capture_output=True)
 probe("29 hot-reload picks up oidc config", "POST", "/api/plugins/reload",

@@ -14,3 +14,6 @@ Cargo.lock.bak
 
 __pycache__/
 *.pyc
+# Deployment secrets (plugin role passwords, API keys). Never committed:
+# `adjutant bootstrap-isolation` writes it, mode 0600.
+secrets.toml

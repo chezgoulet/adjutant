@@ -602,6 +602,13 @@ impl AdjutantPlugin for AuthPlugin {
         Ok(())
     }
 
+    /// The OIDC client secret is a deployment secret, not plugin config: it is
+    /// resolved from `ADJUTANT_SECRET_AUTH_OIDC_CLIENT_SECRET` or the secrets
+    /// file and injected into `ctx.config` before `init`.
+    fn secret_config_keys(&self) -> Vec<&'static str> {
+        vec!["oidc.client_secret"]
+    }
+
     fn permissions_granted(&self) -> Vec<Permission> {
         vec![Permission::new(
             "auth:manage_users",
