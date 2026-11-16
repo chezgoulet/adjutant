@@ -230,7 +230,14 @@ async fn declared_manifest_satisfies_the_load_rules() {
         route(&routes, "GET", INVOCATIONS).required_permission.as_deref(),
         Some(PERM_CONNECT)
     );
-    assert_eq!(routes.len(), 4);
+    assert_eq!(
+        route(&routes, "POST", "/api/mcp/intent")
+            .required_permission
+            .as_deref(),
+        Some(PERM_INVOKE),
+        "minting a confirmation token is an invoke-scoped act"
+    );
+    assert_eq!(routes.len(), 5);
 }
 
 // --- connect ----------------------------------------------------------------
@@ -581,6 +588,134 @@ async fn invoke_refuses_a_tool_the_caller_was_not_granted_and_logs_the_refusal()
         bound_json_contains(&audit, "bea"),
         "the actor is named in details (no core.users row for a stub id): {audit:?}"
     );
+}
+
+#[tokio::test]
+async fn a_writing_tool_without_an_intent_is_refused_before_the_api_is_called() {
+    let (host, routes) = plugin_routes().await;
+    queue_permission(&host, true);
+    host.db.push_rows(vec![json!({ "id": 21 })]); // the refusal row
+
+    let mut req = TestRequest::post(INVOKE)
+        .json(&json!({ "tool": "missions_create_mission", "arguments": { "title": "x" } }))
+        .build();
+    req.identity = Some(troop_identity());
+
+    let (status, body) = call(&route(&routes, "POST", INVOKE).handler, req).await;
+    assert_eq!(status, 428, "{body}");
+    assert_eq!(body["status"], "denied");
+    assert!(
+        body["error"].as_str().unwrap().contains("/api/mcp/intent"),
+        "the refusal says how to confirm: {body}"
+    );
+    assert!(
+        host.http.request_urls().is_empty(),
+        "an unconfirmed write must not reach the API"
+    );
+}
+
+#[tokio::test]
+async fn a_matching_intent_lets_the_write_run_and_is_consumed() {
+    let (host, routes) = plugin_routes().await;
+    queue_permission(&host, true);
+    host.db.push_execute(Ok(1)); // the intent UPDATE consumed one row
+    host.http
+        .push_json(201, &json!({ "id": 5, "title": "Coyote survey" }));
+    host.db.push_rows(vec![json!({ "id": 22 })]); // the invocation row
+
+    let mut req = TestRequest::post(INVOKE)
+        .json(&json!({
+            "tool": "missions_create_mission",
+            "arguments": {
+                "title": "Coyote survey",
+                "purpose": "count the pack",
+                "objectives": "transects",
+                "expected_impact": "a population estimate"
+            },
+            "intent": "the-minted-intent"
+        }))
+        .build();
+    req.identity = Some(troop_identity());
+
+    let (status, body) = call(&route(&routes, "POST", INVOKE).handler, req).await;
+    assert_eq!(status, 201, "the answer mirrors the API's: {body}");
+    assert_eq!(body["status"], "ok");
+    assert_eq!(host.http.request_urls().len(), 1, "the write reached the API");
+
+    // The token is bound to the caller, the tool and the arguments — and it is
+    // the hash that is compared, never the token itself.
+    let params = host.db.last_execute_params("intents").expect("the intent UPDATE ran");
+    assert!(
+        bound_text(&params, &hash_token("the-minted-intent")),
+        "{params:?}"
+    );
+    assert!(bound_text(&params, "bea"), "{params:?}");
+    assert!(bound_text(&params, "missions_create_mission"), "{params:?}");
+}
+
+#[tokio::test]
+async fn an_intent_for_other_arguments_or_a_used_one_is_refused() {
+    let (host, routes) = plugin_routes().await;
+    queue_permission(&host, true);
+    host.db.push_execute(Ok(0)); // unknown, expired, spent, or other arguments
+    host.db.push_rows(vec![json!({ "id": 23 })]); // the refusal row
+
+    let mut req = TestRequest::post(INVOKE)
+        .json(&json!({
+            "tool": "missions_create_mission",
+            "arguments": { "title": "something else" },
+            "intent": "an-intent-for-other-arguments"
+        }))
+        .build();
+    req.identity = Some(troop_identity());
+
+    let (status, body) = call(&route(&routes, "POST", INVOKE).handler, req).await;
+    assert_eq!(status, 428, "{body}");
+    assert!(
+        body["error"].as_str().unwrap().contains("different arguments"),
+        "the refusal says why: {body}"
+    );
+    assert!(host.http.request_urls().is_empty());
+}
+
+#[tokio::test]
+async fn a_read_tool_needs_no_intent() {
+    let (host, routes) = plugin_routes().await;
+    queue_permission(&host, true);
+    host.http.push_json(200, &json!({ "missions": [] }));
+    host.db.push_rows(vec![json!({ "id": 24 })]);
+
+    let mut req = TestRequest::post(INVOKE)
+        .json(&json!({ "tool": "missions_list_missions", "arguments": {} }))
+        .build();
+    req.identity = Some(troop_identity());
+
+    let (status, body) = call(&route(&routes, "POST", INVOKE).handler, req).await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body["status"], "ok");
+}
+
+#[tokio::test]
+async fn the_catalogue_says_which_tools_need_an_intent() {
+    let (host, routes) = plugin_routes().await;
+    queue_troop_checks(&host, &["missions:read", "missions:create"]);
+    let mut req = TestRequest::get("/api/mcp/tools").build();
+    req.identity = Some(troop_identity());
+    let (status, body) = call(&route(&routes, "GET", "/api/mcp/tools").handler, req).await;
+    assert_eq!(status, 200, "{body}");
+    let tools = body["tools"].as_array().unwrap();
+    let read = tools
+        .iter()
+        .find(|t| t["name"] == "missions_list_missions")
+        .expect("the read tool");
+    assert_eq!(read["requiresIntent"], false, "{read}");
+    assert_eq!(read["annotations"]["readOnlyHint"], true, "{read}");
+    let write = tools
+        .iter()
+        .find(|t| t["name"] == "missions_create_mission")
+        .expect("the write tool");
+    assert_eq!(write["requiresIntent"], true, "{write}");
+    assert_eq!(write["annotations"]["destructiveHint"], true, "{write}");
 }
 
 #[tokio::test]

@@ -113,6 +113,9 @@ fn probe_state(pool: Arc<PgPool>) -> Arc<AppState> {
         }),
         identity: adjutant_server::identity::IdentityHub::new(),
         http: host::CoreHttp::new(),
+        secrets: std::sync::Arc::new(std::sync::RwLock::new(
+            adjutant_server::secrets::SecretSource::default(),
+        )),
         hierarchy: tokio::sync::RwLock::new(ScopeHierarchy::default()),
         scheduler: Scheduler::new(),
         outbox_mismatches: std::sync::Mutex::new(0),

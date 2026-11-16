@@ -41,8 +41,25 @@
 //! |---|---|---|---|
 //! | POST | `/api/mcp/connect` | `mcp:connect` | Open an MCP session; mint a connection token |
 //! | GET | `/api/mcp/tools` | `mcp:connect` | The tools **this** caller may use, with JSON Schemas |
-//! | POST | `/api/mcp/invoke` | `mcp:invoke` | Invoke one tool (re-checks the tool's own permission) |
+//! | POST | `/api/mcp/intent` | `mcp:invoke` | Confirm a write: mint a single-use token bound to one tool and its arguments |
+//! | POST | `/api/mcp/invoke` | `mcp:invoke` | Invoke one tool (re-checks the tool's own permission, and spends the intent a write requires) |
 //! | GET | `/api/mcp/invocations` | `mcp:connect` | The audit trail: own rows, or all rows with `mcp:audit` |
+//!
+//! ## Writing needs a confirmation, and the server is what asks
+//!
+//! Anything that is not a `GET` is a write, and a write cannot be invoked without
+//! an **intent**: `POST /api/mcp/intent` with the same tool and the same
+//! arguments, which returns a token that is bound to the caller, the tool and a
+//! canonical digest of the arguments, expires in five minutes, and is consumed by
+//! the first invocation. An agent that has not fetched one is refused with `428`,
+//! before anything reaches the API.
+//!
+//! The point is that a `"confirm": true` field would be a value the model can
+//! write itself, so it confirms nothing. An intent has to be asked for
+//! separately, with the arguments already fixed, and it cannot be reused — so
+//! "the caller meant this" becomes a row in the server's own record. The
+//! catalogue also carries `annotations` (`readOnlyHint` / `destructiveHint`) so a
+//! client can prompt, but the hint is a courtesy and the intent is the control.
 //!
 //! The surface is HTTP + JSON. `POST /api/mcp/invoke` is the `tools/call`
 //! analogue and `GET /api/mcp/tools` the `tools/list` analogue; a JSON-RPC facade
@@ -54,6 +71,10 @@
 //! `mcp.connections` — one row per MCP session: who opened it, which client, the
 //! **hash** of its token (never the token), when it was last used, how many
 //! times, and when it expires or was revoked.
+//!
+//! `mcp.intents` — one row per confirmation: who asked, for which tool, the hash
+//! of the arguments it was bound to, the token's hash (never the token), when it
+//! expires and when it was spent.
 //!
 //! `mcp.invocations` — the append-only audit trail: user, connection, tool,
 //! arguments, the downstream request that was made, status
@@ -312,14 +333,36 @@ impl ToolSpec {
         })
     }
 
+    /// Whether this tool changes something and therefore needs an intent.
+    ///
+    /// Derived from the method rather than declared per tool: a new write tool
+    /// added by an operator's `tools.add` is covered without anyone remembering
+    /// to tick a box, and a `GET` cannot accidentally require a confirmation it
+    /// does not need.
+    pub fn requires_confirmation(&self) -> bool {
+        !matches!(self.method.trim().to_ascii_uppercase().as_str(), "GET" | "HEAD")
+    }
+
     /// The catalogue entry as an MCP `tools/list` item.
+    ///
+    /// `annotations` carries the hints MCP clients use to decide whether to
+    /// prompt, and `requiresIntent` is this server's own rule — the hint is a
+    /// courtesy, the intent is the control. A client that ignores `annotations`
+    /// still cannot write without one.
     pub fn describe(&self) -> Value {
+        let write = self.requires_confirmation();
         json!({
             "name": self.name,
             "description": self.description,
             "inputSchema": self.input_schema(),
             "requiredPermission": self.permission,
             "scope": self.scope.as_str(),
+            "annotations": {
+                "readOnlyHint": !write,
+                "destructiveHint": write,
+                "openWorldHint": false,
+            },
+            "requiresIntent": write,
         })
     }
 
@@ -1292,6 +1335,14 @@ struct ConnectBody {
 }
 
 #[derive(Debug, Deserialize)]
+struct IntentBody {
+    #[serde(alias = "name")]
+    tool: String,
+    #[serde(default, alias = "params")]
+    arguments: Value,
+}
+
+#[derive(Debug, Deserialize)]
 struct InvokeBody {
     #[serde(alias = "name")]
     tool: String,
@@ -1301,6 +1352,52 @@ struct InvokeBody {
     connection_id: Option<i64>,
     #[serde(default)]
     connection_token: Option<String>,
+    /// The single-use token `/api/mcp/intent` minted for THIS tool and THESE
+    /// arguments. Required for anything that writes; refused when it does not
+    /// match.
+    #[serde(default)]
+    intent: Option<String>,
+}
+
+/// How long a minted intent stays usable. Long enough for a person to read the
+/// request and click once; short enough that a leaked intent is worthless.
+pub const INTENT_TTL_MINUTES: i64 = 5;
+
+/// The digest an intent is bound to: the tool's name and its arguments, in one
+/// canonical form.
+///
+/// Canonical because the same arguments may arrive with object keys in another
+/// order, and a confirmation that refuses a reordered payload would train
+/// callers to stop using it.
+pub fn intent_subject(tool: &str, arguments: &Value) -> String {
+    fn canonical(value: &Value, out: &mut String) {
+        match value {
+            Value::Object(map) => {
+                let mut keys: Vec<&String> = map.keys().collect();
+                keys.sort();
+                out.push('{');
+                for key in keys {
+                    out.push_str(&serde_json::to_string(key).unwrap_or_default());
+                    out.push(':');
+                    canonical(&map[key], out);
+                    out.push(',');
+                }
+                out.push('}');
+            }
+            Value::Array(items) => {
+                out.push('[');
+                for item in items {
+                    canonical(item, out);
+                    out.push(',');
+                }
+                out.push(']');
+            }
+            other => out.push_str(&other.to_string()),
+        }
+    }
+    let mut text = String::new();
+    canonical(arguments, &mut text);
+    hash_token(&format!("{tool}\n{text}"))
 }
 
 /// A live connection row (only the fields the plugin acts on).
@@ -1653,6 +1750,22 @@ impl AdjutantPlugin for McpPlugin {
              CREATE INDEX IF NOT EXISTS idx_mcp_invocations_user ON invocations(user_id, created_at DESC);\
              CREATE INDEX IF NOT EXISTS idx_mcp_invocations_tool ON invocations(tool);\
              CREATE INDEX IF NOT EXISTS idx_mcp_invocations_connection ON invocations(connection_id);",
+        ),
+        Migration::new(
+            2,
+            "mcp_intents",
+            "CREATE TABLE IF NOT EXISTS intents (\
+                 id BIGSERIAL PRIMARY KEY, \
+                 user_id TEXT NOT NULL, \
+                 tool TEXT NOT NULL, \
+                 args_hash TEXT NOT NULL, \
+                 token_hash TEXT NOT NULL UNIQUE, \
+                 created_at TIMESTAMPTZ NOT NULL DEFAULT now(), \
+                 expires_at TIMESTAMPTZ NOT NULL, \
+                 consumed_at TIMESTAMPTZ\
+             );\
+             CREATE INDEX IF NOT EXISTS idx_mcp_intents_user ON intents(user_id, created_at DESC);\
+             CREATE INDEX IF NOT EXISTS idx_mcp_intents_expiry ON intents(expires_at);",
         )]
     }
 
@@ -1787,6 +1900,120 @@ impl AdjutantPlugin for McpPlugin {
             }),
         );
 
+        // --- intent -----------------------------------------------------------
+        // The confirmation step, server-side. An agent calls this with the exact
+        // tool and arguments it intends to run; the token it gets back is the
+        // only thing that makes a writing tool executable, and it is spent by
+        // the first invocation.
+        //
+        // Why a token and not a `confirm: true` flag: a flag is a value the
+        // model can set itself, so it confirms nothing. An intent has to be
+        // fetched from a second endpoint with the arguments already fixed, it
+        // expires, and it cannot be reused — which is what makes "the caller
+        // meant to do this" a claim about the server's record rather than the
+        // caller's honesty.
+        let c = ctx.clone();
+        let intent_cat = catalogue.clone();
+        let mint = RouteDefinition::post_protected_any_scope(
+            "/api/mcp/intent",
+            PERM_INVOKE,
+            route_handler(move |req| {
+                let c = c.clone();
+                let cat = intent_cat.clone();
+                async move {
+                    let Some(identity) = req.identity.clone() else {
+                        return PluginResponse::error(401, "authentication required");
+                    };
+                    let body: IntentBody = req.json()?;
+                    let Some(tool) = cat.find(body.tool.trim()) else {
+                        return PluginResponse::error(
+                            404,
+                            format!("unknown tool {:?}", body.tool),
+                        );
+                    };
+                    if !permission_holds(&c, Some(&identity), &tool.permission, tool.scope).await {
+                        return PluginResponse::error(
+                            403,
+                            format!(
+                                "requires {} at {} scope",
+                                tool.permission,
+                                tool.scope.as_str()
+                            ),
+                        );
+                    }
+                    if !tool.requires_confirmation() {
+                        // A read needs no intent; saying so is friendlier than
+                        // minting a token nobody has to present.
+                        return PluginResponse::error(
+                            400,
+                            format!(
+                                "{} only reads; call /api/mcp/invoke directly",
+                                tool.name
+                            ),
+                        );
+                    }
+                    let arguments = match body.arguments {
+                        Value::Null => json!({}),
+                        Value::Object(map) => Value::Object(map),
+                        other => {
+                            return PluginResponse::error(
+                                400,
+                                format!("arguments must be a JSON object, got {other}"),
+                            )
+                        }
+                    };
+                    let token = mint_token();
+                    let row = c
+                        .db
+                        .query_one(
+                            format!(
+                                "INSERT INTO {} \
+                                   (user_id, tool, args_hash, token_hash, expires_at) \
+                                 VALUES ($1, $2, $3, $4, now() + ($5 || ' minutes')::interval) \
+                                 RETURNING id, expires_at::text AS expires_at",
+                                c.db.table("intents")
+                            ),
+                            vec![
+                                SqlValue::Text(identity.user_id.clone()),
+                                SqlValue::Text(tool.name.clone()),
+                                SqlValue::Text(intent_subject(&tool.name, &arguments)),
+                                SqlValue::Text(hash_token(&token)),
+                                SqlValue::Text(INTENT_TTL_MINUTES.to_string()),
+                            ],
+                        )
+                        .await?;
+                    let Some(row) = row else {
+                        return PluginResponse::error(
+                            500,
+                            "the intent insert returned no row",
+                        );
+                    };
+                    c.audit
+                        .log(
+                            Some(&identity),
+                            "mcp.intent",
+                            "mcp_intent",
+                            &row["id"].as_i64().unwrap_or_default().to_string(),
+                            json!({
+                                "tool": tool.name,
+                                "ttl_minutes": INTENT_TTL_MINUTES,
+                            }),
+                        )
+                        .await?;
+                    PluginResponse::json(
+                        201,
+                        &json!({
+                            "intent": token,
+                            "tool": tool.name,
+                            "expires_at": row["expires_at"],
+                            "ttl_minutes": INTENT_TTL_MINUTES,
+                            "note": "single use, bound to this tool and these arguments",
+                        }),
+                    )
+                }
+            }),
+        );
+
         // --- invoke -----------------------------------------------------------
         let c = ctx.clone();
         let invoke_cat = catalogue.clone();
@@ -1877,6 +2104,69 @@ impl AdjutantPlugin for McpPlugin {
                             "mcp.invoke.denied",
                         )
                         .await;
+                    }
+
+                    // The confirmation gate. Anything that writes needs an intent
+                    // minted for this exact tool and these exact arguments; the
+                    // token is spent by the first use, so a replayed request is a
+                    // refusal rather than a second write.
+                    if tool.requires_confirmation() {
+                        let Some(presented) = body.intent.as_deref().filter(|v| !v.is_empty())
+                        else {
+                            return refuse(
+                                &c,
+                                &identity,
+                                tool,
+                                &args_value,
+                                connection_id,
+                                started,
+                                428,
+                                format!(
+                                    "{} writes, so it needs a confirmation: POST /api/mcp/intent \
+                                     with the same tool and arguments, then send the returned \
+                                     `intent` with this call",
+                                    tool.name
+                                ),
+                                "mcp.invoke.unconfirmed",
+                            )
+                            .await;
+                        };
+                        let consumed = c
+                            .db
+                            .execute(
+                                format!(
+                                    "UPDATE {} SET consumed_at = now() \
+                                     WHERE token_hash = $1 AND user_id = $2 AND tool = $3 \
+                                       AND args_hash = $4 AND consumed_at IS NULL \
+                                       AND expires_at > now()",
+                                    c.db.table("intents")
+                                ),
+                                vec![
+                                    SqlValue::Text(hash_token(presented)),
+                                    SqlValue::Text(identity.user_id.clone()),
+                                    SqlValue::Text(tool.name.clone()),
+                                    SqlValue::Text(intent_subject(&tool.name, &args_value)),
+                                ],
+                            )
+                            .await?;
+                        if consumed == 0 {
+                            return refuse(
+                                &c,
+                                &identity,
+                                tool,
+                                &args_value,
+                                connection_id,
+                                started,
+                                428,
+                                format!(
+                                    "{}: that intent is unknown, expired, already used, or was \
+                                     minted for different arguments",
+                                    tool.name
+                                ),
+                                "mcp.invoke.unconfirmed",
+                            )
+                            .await;
+                        }
                     }
 
                     // Build the API call. A malformed invocation is answered
@@ -2090,7 +2380,7 @@ impl AdjutantPlugin for McpPlugin {
             }),
         );
 
-        vec![connect, tools, invoke, invocations]
+        vec![connect, tools, mint, invoke, invocations]
     }
 }
 
@@ -2105,6 +2395,39 @@ export_plugin!(McpPlugin);
 
 #[cfg(test)]
 mod tests {
+    /// The digest an intent is bound to must not depend on JSON key order: a
+    /// caller that re-serialises its arguments is still the caller that asked.
+    #[test]
+    fn intent_subject_is_canonical_and_tool_bound() {
+        let a: serde_json::Value = serde_json::from_str(
+            r#"{"title":"x","meta":{"b":2,"a":1}}"#,
+        )
+        .unwrap();
+        let b: serde_json::Value = serde_json::from_str(
+            r#"{"meta":{"a":1,"b":2},"title":"x"}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            crate::intent_subject("missions_create_mission", &a),
+            crate::intent_subject("missions_create_mission", &b),
+            "key order must not change the digest"
+        );
+        assert_ne!(
+            crate::intent_subject("missions_create_mission", &a),
+            crate::intent_subject("governance_propose", &a),
+            "the same arguments under another tool is another intent"
+        );
+        assert_ne!(
+            crate::intent_subject("missions_create_mission", &a),
+            crate::intent_subject("missions_create_mission", &serde_json_json_title_y()),
+            "different arguments are a different intent"
+        );
+    }
+
+    fn serde_json_json_title_y() -> serde_json::Value {
+        serde_json::json!({ "title": "y" })
+    }
+
     use super::*;
 
     fn tool(name: &str) -> ToolSpec {

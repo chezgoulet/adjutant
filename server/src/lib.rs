@@ -20,6 +20,7 @@ pub mod plugin_choice_routes;
 pub mod plugin_runtime;
 pub mod scheduler;
 pub mod schema;
+pub mod secrets;
 pub mod scope_hierarchy;
 pub mod serve;
 pub mod server;

@@ -133,6 +133,9 @@ fn state(http: HttpConfig) -> Arc<AppState> {
         bus: adjutant_server::events::EventBus::new(),
         config: Arc::new(cfg),
         identity: identity::IdentityHub::new(),
+        secrets: std::sync::Arc::new(std::sync::RwLock::new(
+            adjutant_server::secrets::SecretSource::default(),
+        )),
         http: host::CoreHttp::new(),
         hierarchy: tokio::sync::RwLock::new(scope_hierarchy::ScopeHierarchy::default()),
         scheduler: scheduler::Scheduler::new(),

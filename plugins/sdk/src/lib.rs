@@ -2231,6 +2231,19 @@ pub trait AdjutantPlugin: Send + Sync {
         Vec::new()
     }
 
+    /// Config paths whose values are **secrets**, dotted inside this plugin's own
+    /// config (`webhook_secret`, `oidc.client_secret`).
+    ///
+    /// The core resolves these from the deployment — `ADJUTANT_SECRET_<PLUGIN>_<PATH>`
+    /// or the secrets file — and **refuses to boot** if one is present in
+    /// `core.plugins.config`, because that column is admin-editable, copied into
+    /// every backup bundle and readable by anything that can read the row. The
+    /// resolved value is injected into `ctx.config` before `init`, so a plugin
+    /// reads its secrets from the same place it reads the rest of its config.
+    fn secret_config_keys(&self) -> Vec<&'static str> {
+        Vec::new()
+    }
+
     /// Event subscriptions. Registered after `init` (handlers may capture the
     /// context stored there).
     fn subscriptions(&self) -> Vec<EventSubscription> {

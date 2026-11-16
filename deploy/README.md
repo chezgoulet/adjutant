@@ -90,6 +90,12 @@ export ADJUTANT_BACKUP_AGE_RECIPIENT="age1..."
 # the one thing a second stack on the same host changes.
 export ADJUTANT_EDGE_PREFIX=172.31.7
 
+# The plugin role passwords are written to ../secrets (the repo root's
+# `secrets/`, mounted into the container). The image runs as 10001:10001, so the
+# host directory must be writable by that uid — the same one-time chown any bind
+# mount needs for a non-root container user.
+mkdir -p secrets && chmod 700 secrets && sudo chown -R 10001:10001 secrets
+
 docker compose -f deploy/compose.proxy.yml up -d --build
 
 # One-off, before the server will boot: create the app role and the plugin roles.

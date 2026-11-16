@@ -117,6 +117,11 @@ pub struct Config {
     /// `ADJUTANT_BOOTSTRAP_PASSWORD` when the database has no users (#173).
     /// `None` leaves the first-user-becomes-chief path to HTTP registration.
     pub bootstrap_chief: Option<BootstrapChief>,
+    /// Where the deployment keeps its secrets — the environment or this file,
+    /// never `core.plugins.config` (see [`crate::secrets`]).
+    /// `ADJUTANT_SECRETS_FILE`, `--secrets-file`, or `./secrets.toml` when that
+    /// file exists.
+    pub secrets_file: Option<PathBuf>,
     /// The keyed audit layer's key (`ADJUTANT_AUDIT_KEY`, #160). `None` means
     /// `core.audit_log.keyed_hash` stays NULL and `/api/audit/verify` reports
     /// `keyed: false`: the unkeyed chain is the only protection, and the boot
@@ -148,6 +153,7 @@ impl Default for Config {
             allow_dev_headers: false,
             trusted_proxies: Vec::new(),
             allow_superuser: false,
+            secrets_file: None,
             bootstrap_chief: None,
             audit_key: None,
         }
@@ -170,6 +176,13 @@ struct FileConfig {
     auth: Option<FileAuth>,
     trusted_proxies: Option<Vec<String>>,
     allow_superuser: Option<bool>,
+    /// `[secrets] file = "..."` — where the deployment's secrets live.
+    secrets: Option<FileSecrets>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct FileSecrets {
+    file: Option<String>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -214,6 +227,8 @@ pub struct CliArgs {
     pub no_dev_headers: bool,
     /// Explicit opt-out of the superuser boot refusal (dev/throwaway only).
     pub allow_superuser: bool,
+    /// Where the deployment's secrets live (`--secrets-file`).
+    pub secrets_file: Option<String>,
     pub help: bool,
 }
 
@@ -319,6 +334,7 @@ impl CliArgs {
                 "--allow-dev-headers" => out.allow_dev_headers = true,
                 "--no-dev-headers" => out.no_dev_headers = true,
                 "--allow-superuser" => out.allow_superuser = true,
+                "--secrets-file" => out.secrets_file = Some(take("--secrets-file")?),
                 other => return Err(format!("unknown argument {other:?} (try --help)")),
             }
         }
@@ -404,6 +420,11 @@ pub fn load(cli: &CliArgs) -> Result<Config, String> {
     if let Ok(v) = std::env::var("ADJUTANT_ALLOW_SUPERUSER") {
         cfg.allow_superuser = matches!(v.as_str(), "1" | "true" | "yes");
     }
+    if let Ok(v) = std::env::var(crate::secrets::SECRETS_FILE_ENV) {
+        if !v.trim().is_empty() {
+            cfg.secrets_file = Some(PathBuf::from(v.trim()));
+        }
+    }
     // #160: the keyed audit layer. Optional by design — local runs and the test
     // suite must boot — but anything present must be a real 32-byte key. A
     // malformed key is refused here, at boot, rather than silently degrading to
@@ -473,6 +494,9 @@ pub fn load(cli: &CliArgs) -> Result<Config, String> {
     }
     if cli.allow_superuser {
         cfg.allow_superuser = true;
+    }
+    if let Some(v) = cli.secrets_file.as_deref() {
+        cfg.secrets_file = Some(PathBuf::from(v));
     }
 
     // A zero deadline or zero connection slots does not disable a limit: it
@@ -567,6 +591,11 @@ fn merge_file(cfg: &mut Config, path: &Path) -> Result<(), String> {
     if let Some(c) = f.cors {
         if let Some(v) = c.origins {
             cfg.cors_origins = v;
+        }
+    }
+    if let Some(s) = f.secrets {
+        if let Some(v) = s.file {
+            cfg.secrets_file = Some(PathBuf::from(v));
         }
     }
     if let Some(a) = f.auth {

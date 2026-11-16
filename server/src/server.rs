@@ -63,6 +63,9 @@ pub struct AppState {
     pub identity: Arc<crate::identity::IdentityHub>,
     /// Core-mediated HTTP shared by all plugin contexts.
     pub http: Arc<crate::host::CoreHttp>,
+    /// The deployment's secret source (environment + secrets file). Shared so a
+    /// reload re-reads the same file and re-injects rotated values.
+    pub secrets: Arc<std::sync::RwLock<crate::secrets::SecretSource>>,
     /// Declared scope hierarchy (lodge→patrol), loaded at boot and on reload.
     /// Used to expand a caller's grants before the gate and handlers see them.
     pub hierarchy: RwLock<crate::scope_hierarchy::ScopeHierarchy>,
@@ -450,6 +453,14 @@ pub async fn build_app(cfg: &Config) -> Result<(Router, Arc<AppState>), BuildErr
     let http = crate::host::CoreHttp::new();
     let scheduler = crate::scheduler::Scheduler::new();
 
+    // Where this deployment's secrets come from. Loaded before the first plugin,
+    // because `init` reads its config; re-read on every reload, so a rotation
+    // takes effect without a restart.
+    let secrets = std::sync::Arc::new(std::sync::RwLock::new(
+        crate::secrets::SecretSource::load(cfg.secrets_file.as_deref())
+            .map_err(BuildError::Secrets)?,
+    ));
+
     let registry = load_all(
         &cfg.plugin_dir,
         &cfg.database_url,
@@ -458,6 +469,7 @@ pub async fn build_app(cfg: &Config) -> Result<(Router, Arc<AppState>), BuildErr
         serde_json::Value::Object(Default::default()),
         identity.clone(),
         http.clone(),
+        secrets.clone(),
     )
     .await
     .map_err(BuildError::Plugin)?;
@@ -537,6 +549,7 @@ pub async fn build_app(cfg: &Config) -> Result<(Router, Arc<AppState>), BuildErr
         config: Arc::new(cfg.clone()),
         identity,
         http,
+        secrets,
         hierarchy: RwLock::new(hierarchy),
         scheduler,
         outbox_mismatches: Mutex::new(0),
@@ -1267,6 +1280,7 @@ async fn enable_plugin(
         config: serde_json::Value::Object(Default::default()),
         identity: state.identity.clone(),
         http: state.http.clone(),
+        secrets: state.secrets.clone(),
     };
     let mut seen_routes = state.registry.read().await.live_route_keys();
     let loaded = match load_plugin(&path, &env, &mut seen_routes).await {
@@ -1585,6 +1599,7 @@ pub(crate) async fn load_fresh_generation(
         serde_json::Value::Object(Default::default()),
         state.identity.clone(),
         state.http.clone(),
+        state.secrets.clone(),
     )
     .await
     {
@@ -1913,6 +1928,7 @@ mod tests {
             config: Arc::new(config),
             identity: IdentityHub::new(),
             http: crate::host::CoreHttp::new(),
+            secrets: Arc::new(std::sync::RwLock::new(crate::secrets::SecretSource::default())),
             hierarchy: RwLock::new(crate::scope_hierarchy::ScopeHierarchy::default()),
             scheduler: crate::scheduler::Scheduler::new(),
             outbox_mismatches: Mutex::new(0),
@@ -2086,4 +2102,6 @@ pub enum BuildError {
     Superuser(String),
     #[error("bootstrap: {0}")]
     Bootstrap(String),
+    #[error("secrets: {0}")]
+    Secrets(String),
 }

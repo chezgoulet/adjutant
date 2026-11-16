@@ -108,27 +108,39 @@ fn with_role(url: &str, role: &str, secret: &str) -> String {
     }
 }
 
+/// The plugin role's password: the deployment's **secrets file**, not the
+/// database. `bootstrap-isolation` writes it there (`0600`) and clears
+/// `core.plugins.db_secret`, so a dump no longer carries every role's password.
+fn role_password(plugin_id: &str) -> String {
+    // `cargo test -p X` runs the test binary with the *package* directory as its
+    // working directory, not the workspace root — so the default path is derived
+    // from the manifest rather than from wherever the runner happens to stand.
+    let path = std::env::var("ADJUTANT_SECRETS_FILE").unwrap_or_else(|_| {
+        format!("{}/../../secrets.toml", env!("CARGO_MANIFEST_DIR"))
+    });
+    let text = std::fs::read_to_string(&path).unwrap_or_else(|e| {
+        panic!("read {path}: {e} — run `adjutant bootstrap-isolation` first")
+    });
+    let parsed: toml::Value = toml::from_str(&text).expect("parse the secrets file");
+    parsed
+        .get(plugin_id)
+        .and_then(|section| section.get("db_password"))
+        .and_then(|value| value.as_str())
+        .map(str::to_string)
+        .unwrap_or_else(|| {
+            panic!("{path} has no [{plugin_id}] db_password — re-run `adjutant bootstrap-isolation`")
+        })
+}
+
 async fn admin_pool() -> PgPool {
     PgPool::connect(&test_database_url())
         .await
         .expect("the database URL is set but unreachable")
 }
 
-async fn plugin_pool(admin: &PgPool) -> PgPool {
+async fn plugin_pool(_admin: &PgPool) -> PgPool {
     let url = test_database_url();
-    let secret: Option<String> =
-        sqlx::query_scalar("SELECT db_secret FROM core.plugins WHERE id = 'finance'")
-            .fetch_optional(admin)
-            .await
-            .expect("read the plugin's stored secret")
-            .flatten();
-    let Some(secret) = secret else {
-        panic!(
-            "this test database has no bootstrapped role for the `finance` plugin (no \
-             core.plugins.db_secret row). Run the live ladder against it first: \
-             `ADJUTANT_PLUGIN_DIR=plugins-built ./target/debug/adjutant test-plugin`"
-        );
-    };
+    let secret = role_password("finance");
     PgPool::connect(&with_role(&url, PLUGIN_ROLE, &secret))
         .await
         .unwrap_or_else(|e| {

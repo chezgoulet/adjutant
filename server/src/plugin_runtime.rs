@@ -705,6 +705,42 @@ pub struct LoadEnv<'a> {
     pub config: serde_json::Value,
     pub identity: Arc<crate::identity::IdentityHub>,
     pub http: Arc<crate::host::CoreHttp>,
+    /// Where this deployment keeps its secrets (environment or file, never the
+    /// database). Re-read on every load, so `reload` picks up a rotation.
+    pub secrets: std::sync::Arc<std::sync::RwLock<crate::secrets::SecretSource>>,
+}
+
+/// Resolve a plugin's declared secrets into its config, or refuse.
+///
+/// Two jobs, one pass, because they are the same decision: a secret in
+/// `core.plugins.config` is refused (it lives in the row, in every backup, and
+/// in the reach of anything that can read the table), and the value the
+/// deployment *does* hold is injected under the same dotted path the plugin
+/// parses. Absent everywhere is not an error here — the plugin already fails
+/// closed at the point of use and says what is missing.
+pub(crate) fn apply_secrets(
+    plugin: &dyn adjutant_sdk::AdjutantPlugin,
+    id: &str,
+    config: &mut serde_json::Value,
+    source: &crate::secrets::SecretSource,
+) -> Result<(), PluginRuntimeError> {
+    let mut resolved: Vec<(String, String)> = Vec::new();
+    for key in plugin.secret_config_keys() {
+        if crate::secrets::config_secret_present(config, key) {
+            return Err(PluginRuntimeError::SecretInConfig(
+                id.to_string(),
+                key.to_string(),
+                crate::secrets::SecretSource::env_name(id, key),
+            ));
+        }
+        if let Some(value) = source.resolve(id, key) {
+            resolved.push((key.to_string(), value));
+        }
+    }
+    for (key, value) in resolved {
+        crate::secrets::config_set(config, &key, value);
+    }
+    Ok(())
 }
 
 /// The id a **staged native library** names, read from its file name without
@@ -794,6 +830,7 @@ async fn disabled_record_at_boot(
 /// `adjutant_plugin_<id>` role, using the credential `bootstrap-isolation`
 /// stored in `core.plugins.db_secret`. A plugin with no credential fails the
 /// load: there is no unisolated path to fall back to (design §3.7).
+#[allow(clippy::too_many_arguments)]
 pub async fn load_all(
     dir: &Path,
     database_url: &str,
@@ -802,7 +839,15 @@ pub async fn load_all(
     config: serde_json::Value,
     identity: std::sync::Arc<crate::identity::IdentityHub>,
     http: std::sync::Arc<crate::host::CoreHttp>,
+    secrets: std::sync::Arc<std::sync::RwLock<crate::secrets::SecretSource>>,
 ) -> Result<PluginRegistry, PluginRuntimeError> {
+    // Re-read the secrets file before anything initializes: reload is the
+    // rotation path, and a stale copy here is how the old key survives a reload.
+    if let Ok(mut source) = secrets.write() {
+        if let Err(e) = source.read() {
+            return Err(PluginRuntimeError::Secrets(e));
+        }
+    }
     let env = LoadEnv {
         database_url,
         pool: pool.clone(),
@@ -810,6 +855,7 @@ pub async fn load_all(
         config,
         identity,
         http,
+        secrets,
     };
     let mut slots: Vec<PluginSlot> = Vec::new();
     let mut seen_ids: HashMap<String, ()> = HashMap::new();
@@ -956,6 +1002,28 @@ async fn load_opened(
             .await
             .map_err(|e| PluginRuntimeError::Migration(id.clone(), e.to_string()))?
             .flatten();
+    // The role password lives in the deployment's secrets file; the column is
+    // only read for a database bootstrapped before the move, and says so.
+    let from_file = {
+        let source = env
+            .secrets
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        source.resolve(&id, "db_password")
+    };
+    let secret = match (from_file, secret) {
+        (Some(secret), _) => Some(secret),
+        (None, Some(legacy)) => {
+            tracing::warn!(
+                plugin = %id,
+                "plugin credential read from core.plugins.db_secret — that column is \
+                 cleartext and lands in every dump; re-run `adjutant bootstrap-isolation` \
+                 to move it into the secrets file"
+            );
+            Some(legacy)
+        }
+        (None, None) => None,
+    };
     let Some(secret) = secret else {
         return Err(PluginRuntimeError::NotBootstrapped(id));
     };
@@ -987,10 +1055,27 @@ async fn load_opened(
     .await
     .map_err(|e| PluginRuntimeError::Migration(id.clone(), e.to_string()))?;
     // A non-empty row config wins over the global default from the caller.
-    let plugin_config = match &row_config {
+    let mut plugin_config = match &row_config {
         v if v.as_object().map(|o| !o.is_empty()).unwrap_or(false) => v.clone(),
         _ => env.config.clone(),
     };
+
+    // --- secrets ------------------------------------------------------------
+    // Each secret the plugin declares is resolved from the deployment (env, then
+    // the secrets file) and injected here. A value of the same name in the DB row
+    // is refused rather than ignored: leaving it there means it is still in every
+    // backup, and a WARN would be read as "fine" by exactly the people who will
+    // not go and rotate it.
+    {
+        // The guard is scoped tightly and only owned data leaves it: a std lock
+        // guard held anywhere near an await makes the whole handler future
+        // non-Send, and axum refuses the route.
+        let secrets = env
+            .secrets
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        apply_secrets(plugin.as_ref(), &id, &mut plugin_config, &secrets)?;
+    }
 
     let ctx = PluginContext {
         plugin_id: id.clone(),
@@ -1269,11 +1354,97 @@ pub enum PluginRuntimeError {
     NotBootstrapped(String),
     #[error("plugin {0} database pool failed: {1}")]
     Pool(String, String),
+    #[error("secrets: {0}")]
+    Secrets(String),
+    #[error(
+        "plugin {0}: `{1}` is set in core.plugins.config. Secrets come from the \
+         environment or the secrets file, not the database: that column is \
+         admin-editable, copied into every backup bundle and readable by anything \
+         that can read the row. Move it to {2} (or the `{0}` section of the \
+         secrets file) and reload"
+    )]
+    SecretInConfig(String, String, String),
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A plugin that declares one secret, so `apply_secrets` can be exercised
+    /// without a database or a staged library.
+    struct SecretPlugin;
+
+    #[adjutant_sdk::async_trait]
+    impl adjutant_sdk::AdjutantPlugin for SecretPlugin {
+        fn id(&self) -> &str {
+            "stripe"
+        }
+        fn name(&self) -> &str {
+            "Stripe"
+        }
+        fn version(&self) -> &str {
+            "0.0.0"
+        }
+        async fn init(
+            &mut self,
+            _ctx: adjutant_sdk::PluginContext,
+        ) -> Result<(), adjutant_sdk::SdkError> {
+            Ok(())
+        }
+        fn routes(&self) -> Vec<adjutant_sdk::RouteDefinition> {
+            Vec::new()
+        }
+        fn secret_config_keys(&self) -> Vec<&'static str> {
+            vec!["webhook_secret"]
+        }
+    }
+
+    fn source_with(text: &str) -> crate::secrets::SecretSource {
+        let dir = std::env::temp_dir().join(format!("adjutant-apply-secrets-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("secrets.toml");
+        std::fs::write(&path, text).unwrap();
+        crate::secrets::SecretSource::load(Some(&path)).expect("load")
+    }
+
+    #[test]
+    fn a_secret_in_the_database_row_is_refused_by_name() {
+        let source = crate::secrets::SecretSource::default();
+        let plugin = SecretPlugin;
+        let mut config = serde_json::json!({ "webhook_secret": "whsec_from_db" });
+        let err = apply_secrets(&plugin, "stripe", &mut config, &source)
+            .expect_err("a DB-held secret must stop the load");
+        let text = err.to_string();
+        assert!(text.contains("core.plugins.config"), "{text}");
+        assert!(text.contains("ADJUTANT_SECRET_STRIPE_WEBHOOK_SECRET"), "{text}");
+    }
+
+    #[test]
+    fn a_resolved_secret_is_injected_and_siblings_survive() {
+        let source = source_with("[stripe]\nwebhook_secret = \"whsec_from_file\"\n");
+        let plugin = SecretPlugin;
+        let mut config = serde_json::json!({ "base_url": "http://127.0.0.1:8787" });
+        apply_secrets(&plugin, "stripe", &mut config, &source).expect("apply");
+        assert_eq!(
+            config.get("webhook_secret").and_then(|v| v.as_str()),
+            Some("whsec_from_file")
+        );
+        assert_eq!(
+            config.get("base_url").and_then(|v| v.as_str()),
+            Some("http://127.0.0.1:8787"),
+            "the rest of the config is untouched"
+        );
+    }
+
+    #[test]
+    fn an_unconfigured_secret_is_left_absent() {
+        let source = crate::secrets::SecretSource::default();
+        let plugin = SecretPlugin;
+        let mut config = serde_json::json!({});
+        apply_secrets(&plugin, "stripe", &mut config, &source).expect("apply");
+        assert!(config.get("webhook_secret").is_none());
+    }
+
     use adjutant_sdk::{
         async_trait, route_handler, EventSubscription, PluginRequest, PluginResponse, SdkError,
     };
@@ -1696,6 +1867,9 @@ mod tests {
             serde_json::Value::Null,
             crate::identity::IdentityHub::new(),
             crate::host::CoreHttp::new(),
+            std::sync::Arc::new(std::sync::RwLock::new(
+                crate::secrets::SecretSource::default(),
+            )),
         )
         .await
         {

@@ -538,6 +538,12 @@ jobs:
         run: |
           set -euo pipefail
           compose=(docker compose -f deploy/compose.proxy.yml)
+          # The secrets file is a bind mount the container writes to (the
+          # bootstrap puts the plugin role passwords there). The image runs as
+          # 10001:10001, so the host directory must be writable by that uid —
+          # the same one-time `chown` a bind-mounted volume needs anywhere.
+          mkdir -p secrets
+          sudo chown -R 10001:10001 secrets
           "${compose[@]}" up -d --wait postgres
           # Connect as the bootstrap superuser, not as the role being created:
           # the compose file points the app at `adjutant_app`, which does not

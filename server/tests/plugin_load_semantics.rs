@@ -131,9 +131,12 @@ fn fixture_dir_named(tag: &str) -> PathBuf {
 /// not" — instead of about whatever a previous run left behind. It is the same
 /// discipline `adjutant test-plugin` uses on a throwaway `_test` database.
 async fn provision(dir: &Path) -> Arc<sqlx::PgPool> {
+    // Its own secrets file: the role passwords are written there now, and the
+    // tests run in parallel — a shared `./secrets.toml` would be a race.
     let cfg = Config {
         database_url: base_url(),
         plugin_dir: dir.to_path_buf(),
+        secrets_file: Some(secrets_path(dir)),
         ..Default::default()
     };
     let admin = db::connect_and_migrate(&cfg)
@@ -169,9 +172,18 @@ async fn set_enabled(admin: &sqlx::PgPool, id: &str, on: bool) {
     assert_eq!(n, 1, "core.plugins row for {id} exists");
 }
 
-fn env_for<'a>(url: &'a str, admin: &Arc<sqlx::PgPool>) -> LoadEnv<'a> {
+/// Where this fixture's plugin role passwords live.
+fn secrets_path(dir: &Path) -> std::path::PathBuf {
+    dir.join("secrets.toml")
+}
+
+fn env_for<'a>(url: &'a str, admin: &Arc<sqlx::PgPool>, dir: &Path) -> LoadEnv<'a> {
     let (tx, _rx) = tokio::sync::broadcast::channel(16);
     LoadEnv {
+        secrets: std::sync::Arc::new(std::sync::RwLock::new(
+            adjutant_server::secrets::SecretSource::load(Some(&secrets_path(dir)))
+                .expect("load the fixture secrets"),
+        )),
         database_url: url,
         pool: admin.clone(),
         event_tx: tx,
@@ -191,6 +203,10 @@ async fn boot(dir: &Path, url: &str, admin: &Arc<sqlx::PgPool>) -> PluginRegistr
         serde_json::json!({}),
         adjutant_server::identity::IdentityHub::new(),
         adjutant_server::host::CoreHttp::new(),
+        std::sync::Arc::new(std::sync::RwLock::new(
+            adjutant_server::secrets::SecretSource::load(Some(&secrets_path(dir)))
+                .expect("load the fixture secrets"),
+        )),
     )
     .await
     .expect("load_all")
@@ -227,13 +243,13 @@ async fn wait_no_connections(admin: &sqlx::PgPool, id: &str) -> i64 {
 
 /// The plugin's own pool, the way `bootstrap-isolation`'s stored credential
 /// allows it — used to plant a row that must survive every disable.
-async fn plugin_pool(admin: &sqlx::PgPool, url: &str, id: &str) -> Arc<sqlx::PgPool> {
-    let secret: String = sqlx::query_scalar::<_, Option<String>>("SELECT db_secret FROM core.plugins WHERE id = $1")
-        .bind(id)
-        .fetch_one(admin)
-        .await
-        .expect("stored credential")
-        .expect("credential is present");
+async fn plugin_pool(dir: &Path, url: &str, id: &str) -> Arc<sqlx::PgPool> {
+    // The fixture's secrets file, not `core.plugins.db_secret`: the bootstrap
+    // writes the password there now and clears the column.
+    let secret: String = adjutant_server::secrets::SecretSource::load(Some(&secrets_path(dir)))
+        .expect("load the fixture secrets")
+        .resolve(id, "db_password")
+        .expect("the bootstrap wrote a credential");
     host::plugin_pool(url, id, &secret, 2)
         .await
         .expect("plugin pool")
@@ -361,7 +377,7 @@ async fn probe_enable_disable_re_enable_is_idempotent() {
 
     let mut reg = boot(&dir, &url, &admin).await;
     let store_lib = dir.join(format!("libadjutant_{STORE}.so"));
-    let env = env_for(&url, &admin);
+    let env = env_for(&url, &admin, &dir);
 
     // --- enable: a load, exactly the boot body ------------------------------
     let mut seen_routes = reg.live_route_keys();
@@ -388,7 +404,7 @@ async fn probe_enable_disable_re_enable_is_idempotent() {
 
     // Plant a row through the plugin's own role: the data the cycles must keep.
     {
-        let pool = plugin_pool(&admin, &url, STORE).await;
+        let pool = plugin_pool(&dir, &url, STORE).await;
         host::CoreDb::new(pool)
             .execute(
                 "INSERT INTO catalogue_items (kind, name, category, base_price_cents) \
@@ -528,6 +544,11 @@ async fn spawn_app_with_dev_headers(
     let cfg = Config {
         database_url: url.to_string(),
         plugin_dir: dir.to_path_buf(),
+        // The fixture's own secrets, always explicit: an ambient `./secrets.toml`
+        // (the workspace root, left by a bootstrap in an earlier CI step) holds
+        // passwords for the same roles and would be read instead — a mismatch
+        // that looks like a wrong password rather than a wrong file.
+        secrets_file: Some(secrets_path(dir)),
         bind: "127.0.0.1:0".parse().expect("bind address"),
         allow_dev_headers,
         allow_superuser: true,
@@ -1013,6 +1034,10 @@ async fn probe_both_doors_to_the_choice_land_on_the_same_state() {
     let cfg = Config {
         database_url: url.clone(),
         plugin_dir: dir.clone(),
+        // This probe bootstraps a second time; without an explicit file it would
+        // write to the ambient `./secrets.toml` and rotate the role password away
+        // from the one this fixture's own file holds.
+        secrets_file: Some(secrets_path(&dir)),
         ..Default::default()
     };
 
