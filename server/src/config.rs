@@ -491,6 +491,22 @@ pub fn load(cli: &CliArgs) -> Result<Config, String> {
         return Err("HTTP max connections must be at least 1".into());
     }
 
+    // A wildcard origin is refused rather than accepted-with-a-warning.
+    //
+    // Sessions here are cookies (`adjutant_session`, HttpOnly, SameSite=Lax),
+    // so `*` is only harmless while nobody sets `allow_credentials` — one line
+    // in the CORS layer, added by whoever next needs a credentialed cross-origin
+    // call, and the wildcard becomes a site-wide credential leak. Refusing at
+    // boot means that edit cannot be enough on its own: the deployment has to
+    // name its origins.
+    if cfg.cors_origins.iter().any(|o| o.trim() == "*") {
+        return Err(
+            "cors origins: \"*\" is refused — sessions are cookie-authenticated, so list the \
+             exact origins (e.g. ADJUTANT_CORS_ORIGINS=https://app.example) instead"
+                .into(),
+        );
+    }
+
     Ok(cfg)
 }
 
@@ -660,6 +676,25 @@ mod tests {
                 None => std::env::remove_var(k),
             }
         }
+    }
+
+    /// A wildcard origin is refused at boot, not accepted and warned about: the
+    /// session is a cookie, so `*` is only safe until the day someone adds
+    /// `allow_credentials` to the CORS layer.
+    #[test]
+    fn a_wildcard_cors_origin_is_refused_at_boot() {
+        let _env = lock_env();
+        let dir = std::env::temp_dir().join(format!("adjutant-cors-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("adjutant.toml");
+        std::fs::write(&file, "[cors]\norigins = [\"*\"]\n").unwrap();
+        let cli = CliArgs {
+            config: Some(file),
+            ..Default::default()
+        };
+        let err = load(&cli).expect_err("a wildcard origin must not boot");
+        assert!(err.contains("cors origins"), "{err}");
+        assert!(err.contains("refused"), "{err}");
     }
 
     /// Precedence must hold: default < file < env < CLI. Runs all cases in one
