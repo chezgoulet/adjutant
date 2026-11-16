@@ -409,10 +409,15 @@ jobs:
           # roles/credentials before boot (the runtime has no CREATEROLE).
           ./target/debug/adjutant bootstrap-isolation \
             --database-url "$ADJUTANT_DATABASE_URL" --plugin-dir plugins-built
+          # `POST /api/auth/register` is closed unless the server carries a
+          # bootstrap secret, and the harness presents the same value to claim the
+          # chief. Generated per run: it never leaves this job.
+          export ADJUTANT_BOOTSTRAP_TOKEN="$(openssl rand -hex 16)"
           ADJUTANT_PLUGIN_DIR=plugins-built \
           ADJUTANT_DEV_HEADERS=false \
           ADJUTANT_RATE_MAX=0 \
           ADJUTANT_LOG=warn \
+          ADJUTANT_BOOTSTRAP_TOKEN="$ADJUTANT_BOOTSTRAP_TOKEN" \
             ./target/debug/adjutant &
           for _ in $(seq 1 100); do
             if python3 -c "import socket,sys; socket.create_connection(('127.0.0.1',8787),1); sys.exit(0)" 2>/dev/null; then break; fi
