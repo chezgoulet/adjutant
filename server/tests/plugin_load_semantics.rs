@@ -243,13 +243,13 @@ async fn wait_no_connections(admin: &sqlx::PgPool, id: &str) -> i64 {
 
 /// The plugin's own pool, the way `bootstrap-isolation`'s stored credential
 /// allows it — used to plant a row that must survive every disable.
-async fn plugin_pool(admin: &sqlx::PgPool, url: &str, id: &str) -> Arc<sqlx::PgPool> {
-    let secret: String = sqlx::query_scalar::<_, Option<String>>("SELECT db_secret FROM core.plugins WHERE id = $1")
-        .bind(id)
-        .fetch_one(admin)
-        .await
-        .expect("stored credential")
-        .expect("credential is present");
+async fn plugin_pool(dir: &Path, url: &str, id: &str) -> Arc<sqlx::PgPool> {
+    // The fixture's secrets file, not `core.plugins.db_secret`: the bootstrap
+    // writes the password there now and clears the column.
+    let secret: String = adjutant_server::secrets::SecretSource::load(Some(&secrets_path(dir)))
+        .expect("load the fixture secrets")
+        .resolve(id, "db_password")
+        .expect("the bootstrap wrote a credential");
     host::plugin_pool(url, id, &secret, 2)
         .await
         .expect("plugin pool")
@@ -404,7 +404,7 @@ async fn probe_enable_disable_re_enable_is_idempotent() {
 
     // Plant a row through the plugin's own role: the data the cycles must keep.
     {
-        let pool = plugin_pool(&admin, &url, STORE).await;
+        let pool = plugin_pool(&dir, &url, STORE).await;
         host::CoreDb::new(pool)
             .execute(
                 "INSERT INTO catalogue_items (kind, name, category, base_price_cents) \
@@ -544,6 +544,11 @@ async fn spawn_app_with_dev_headers(
     let cfg = Config {
         database_url: url.to_string(),
         plugin_dir: dir.to_path_buf(),
+        // The fixture's own secrets, always explicit: an ambient `./secrets.toml`
+        // (the workspace root, left by a bootstrap in an earlier CI step) holds
+        // passwords for the same roles and would be read instead — a mismatch
+        // that looks like a wrong password rather than a wrong file.
+        secrets_file: Some(secrets_path(dir)),
         bind: "127.0.0.1:0".parse().expect("bind address"),
         allow_dev_headers,
         allow_superuser: true,
