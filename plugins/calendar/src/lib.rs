@@ -304,15 +304,24 @@ async fn visibility(c: &PluginContext, identity: Option<&Identity>) -> (bool, Ve
     if troop_wide {
         return (true, Vec::new());
     }
-    let lodges = identity
-        .map(|i| {
-            i.grants
-                .iter()
-                .filter(|g| g.scope.scope_type == ScopeType::Lodge)
-                .filter_map(|g| g.scope.scope_id.clone())
-                .collect()
-        })
-        .unwrap_or_default();
+    // Only the lodges where the caller actually **holds** `calendar:read`.
+    //
+    // The route gate proves the permission at *some* scope, and a grant carries
+    // its role's permissions — so scanning every lodge grant listed lodges where
+    // this caller has no calendar:read at all, and the query's `scope_id = ANY`
+    // then returned their events. `scopes_for` is the permission-aware answer
+    // (and it resolves patrol grants through the hierarchy), which is how
+    // announcements already builds its audience.
+    let lodges = c
+        .permissions
+        .scopes_for(identity, &["calendar:read"])
+        .await
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|held| held.permission == "calendar:read")
+        .filter(|held| held.scope.scope_type == ScopeType::Lodge)
+        .filter_map(|held| held.scope.scope_id.clone())
+        .collect();
     (false, lodges)
 }
 
@@ -1531,28 +1540,11 @@ impl AdjutantPlugin for CalendarPlugin {
             }),
         );
 
-        let c = ctx.clone();
-        let rsvp_for_member = RouteDefinition::post_protected_any_scope(
-            "/api/calendar/event/{id}/rsvp/{member}",
-            "calendar:manage",
-            route_handler(move |req| {
-                let c = c.clone();
-                async move {
-                    let id = req.int_param("id")?;
-                    let body: RsvpBody = req.json()?;
-                    let Some(member) = req.param("member").map(str::to_string) else {
-                        return PluginResponse::error(
-                            400,
-                            "route has no {member} capture — declare it in the path",
-                        );
-                    };
-                    if member.trim().is_empty() {
-                        return PluginResponse::error(400, "member must not be blank");
-                    }
-                    record_rsvp(&c, &req, id, member.trim(), &body, true).await
-                }
-            }),
-        );
+        // Recording an RSVP for another member used to live here. The owner's
+        // ruling: a manager records their own response like everyone else.
+        // Writing another member's RSVP is exactly the IDOR this route was, and
+        // the legitimate need — take the answer by phone — is a quorum problem,
+        // not an authorization one.
 
         let c = ctx.clone();
         let list_rsvps = RouteDefinition::get_protected_any_scope(
@@ -1636,6 +1628,18 @@ impl AdjutantPlugin for CalendarPlugin {
                     };
                     let scope_id = trimmed(&body.scope_id)
                         .or_else(|| event["scope_id"].as_str().map(String::from));
+                    // Re-addressing the event is a write into the *target*
+                    // audience, so it needs authority there as well as on the row
+                    // as it stands. Without this a Lodge manager could move an
+                    // event into another Lodge's calendar, or make it troop-wide,
+                    // which `create` would never have allowed. Announcements
+                    // guards its re-address the same way.
+                    let target_scope = event_scope(&scope_type, scope_id.as_deref());
+                    if target_scope != scope {
+                        c.permissions
+                            .reach(req.identity.as_ref(), "calendar:manage", &target_scope)
+                            .await?;
+                    }
                     if scope_type == SCOPE_LODGE && scope_id.is_none() {
                         return PluginResponse::error(
                             400,
@@ -2169,7 +2173,7 @@ impl AdjutantPlugin for CalendarPlugin {
             occurrences,
             quorum,
             rsvp,
-            rsvp_for_member,
+            
             list_rsvps,
             edit_event,
             cancel_event,
