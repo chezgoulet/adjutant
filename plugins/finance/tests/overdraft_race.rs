@@ -112,7 +112,12 @@ fn with_role(url: &str, role: &str, secret: &str) -> String {
 /// database. `bootstrap-isolation` writes it there (`0600`) and clears
 /// `core.plugins.db_secret`, so a dump no longer carries every role's password.
 fn role_password(plugin_id: &str) -> String {
-    let path = std::env::var("ADJUTANT_SECRETS_FILE").unwrap_or_else(|_| "secrets.toml".into());
+    // `cargo test -p X` runs the test binary with the *package* directory as its
+    // working directory, not the workspace root — so the default path is derived
+    // from the manifest rather than from wherever the runner happens to stand.
+    let path = std::env::var("ADJUTANT_SECRETS_FILE").unwrap_or_else(|_| {
+        format!("{}/../../secrets.toml", env!("CARGO_MANIFEST_DIR"))
+    });
     let text = std::fs::read_to_string(&path).unwrap_or_else(|e| {
         panic!("read {path}: {e} — run `adjutant bootstrap-isolation` first")
     });
