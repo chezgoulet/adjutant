@@ -164,7 +164,11 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   from `plugins/auth/tests/fixtures/`. A private key in a repository is a private
   key in a repository whatever the comment above it says, and neither a reviewer
   nor a scanner can tell a throwaway from a live one: each test now generates
-  its own key and JWKS, and the fixture files are gone.
+  its own key and JWKS, and the fixture files are gone. That makes `rsa` a
+  dev-dependency, and `rsa` 0.9 carries RUSTSEC-2023-0071 (Marvin), so `deny.toml`
+  records a scoped exception: the crate only generates a throwaway key inside
+  the test process, nothing links it at runtime, and the ignore says to delete
+  itself if that ever changes.
 - **Backup bundles are encrypted, and fail closed without a key (#163).** Every
   bundle is written as `adjutant-<stamp>.dump.age`, encrypted to the age
   recipient in `ADJUTANT_BACKUP_AGE_RECIPIENT`; the private key never lives on
