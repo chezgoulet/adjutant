@@ -201,18 +201,22 @@ how early) are open for the owner: `design/notifications.md` §8.
 ## Auth plugin
 
 Config lives in the `auth` row's `core.plugins.config` (`{"oidc": {…},
-"session_ttl_hours": N}`); reload to apply. OIDC routes answer `501` when no
+"session_ttl_hours": N}`); reload to apply. The `oidc` block takes `issuer`,
+`client_id`, `client_secret`, `redirect_uri` and `id_token_alg` — `RS256` by
+default, `HS256`/`HS384`/`HS512` for a shared-secret IdP. A token signed with an
+algorithm other than the configured one is refused, whatever its header says.
+`state` is single-use and expires 15 minutes after it is issued. OIDC routes answer `501` when no
 `oidc` block is configured.
 
 | Method | Path | Permission | Body / notes |
 |---|---|---|---|
-| POST | `/api/auth/login` | — | `{username, password}` → session token + `adjutant_session` cookie |
+| POST | `/api/auth/login` | — | `{username, password}` → session token + `adjutant_session` cookie. After 10 failures for one username inside 15 minutes the name answers `429` until the window ends (counted on the submitted name, so it does not reveal whether the account exists); cleared on success |
 | POST | `/api/auth/logout` | — | Ends the session |
 | GET | `/api/auth/me` | session | Current user and scoped role grants |
 | GET | `/api/auth/sessions` | session | The caller's live sessions: `id`, `created_at`, `expires_at`, `device_info`, and `current` on the one the request presented |
 | DELETE | `/api/auth/sessions/{id}` | session | Revokes one of the caller's own sessions (sets `revoked_at`). Another user's session id and a missing id are indistinguishable: both answer `404` |
 | POST | `/api/auth/password` | session | `{current_password, new_password}` (min 8). Verifies the current password, replaces the hash, revokes every **other** session, and leaves the presented one alive |
-| POST | `/api/auth/register` | — | `{username, email?, password}`; **open only while no users exist**; first user becomes `chief` (min 8-char password). The bootstrap slot is a single row, so concurrent first registrations have exactly one winner; the loser gets `403` |
+| POST | `/api/auth/register` | — | `{username, email?, password, bootstrap_token}`; **closed unless `ADJUTANT_BOOTSTRAP_TOKEN` is set**, and then only while no user exists; the first user becomes `chief` (min 8-char password). Unset variable → `403` naming it; wrong or missing token → `403`. The bootstrap slot is a single row, so concurrent first registrations have exactly one winner; the loser gets `403` |
 | POST | `/api/auth/users` | `auth:manage_users` | `{username, email?, password, roles?}` |
 | POST | `/api/auth/roles` | `auth:manage_users` | `{username, roles: string[]}` (replaces grants). Refuses with `409` when the write would leave no user holding `core:admin` or `auth:manage_users` at troop scope — grant another chief first |
 | GET | `/api/auth/users` | `auth:manage_users` | List users |

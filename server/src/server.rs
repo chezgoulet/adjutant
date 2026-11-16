@@ -557,24 +557,20 @@ pub async fn build_app(cfg: &Config) -> Result<(Router, Arc<AppState>), BuildErr
     relay.start(&state);
     backups.start(&state);
 
+    // Origins are explicit; `*` never reaches here because `Config::from_*`
+    // refuses to boot with it (sessions are cookie-authenticated, so a wildcard
+    // is one `allow_credentials` away from a credential leak). Malformed
+    // entries are dropped rather than widening the list.
     let cors = cfg.cors_origins.first().map(|_| {
-        let layer = CorsLayer::new();
-        if cfg.cors_origins.iter().any(|o| o == "*") {
-            layer
-                .allow_origin(Any)
-                .allow_methods(Any)
-                .allow_headers(Any)
-        } else {
-            let origins: Vec<_> = cfg
-                .cors_origins
-                .iter()
-                .filter_map(|o| o.parse().ok())
-                .collect();
-            layer
-                .allow_origin(origins)
-                .allow_methods(Any)
-                .allow_headers(Any)
-        }
+        let origins: Vec<_> = cfg
+            .cors_origins
+            .iter()
+            .filter_map(|o| o.parse().ok())
+            .collect();
+        CorsLayer::new()
+            .allow_origin(origins)
+            .allow_methods(Any)
+            .allow_headers(Any)
     });
 
     let app = build_router(state.clone());

@@ -117,12 +117,17 @@ psql "$LIVE_URL" -v ON_ERROR_STOP=1 -q \
   -c "UPDATE core.plugins SET config = jsonb_set(config, '{base_url}', '\"$BASE\"'::jsonb), updated_at = now() WHERE id = 'mcp'"
 
 echo "==> booting the server on $BASE (dev headers OFF)"
+# The secret that claims the harness's own chief. Registration is closed unless
+# the server was started with one, so the harness makes it and passes both ways.
+BOOTSTRAP_TOKEN="$(openssl rand -hex 16)"
+export BOOTSTRAP_TOKEN
 ADJUTANT_DATABASE_URL="$LIVE_URL" \
 ADJUTANT_PLUGIN_DIR="$PLUGIN_DIR" \
 ADJUTANT_DEV_HEADERS=false \
 ADJUTANT_RATE_MAX=0 \
 ADJUTANT_ALLOW_SUPERUSER=true \
 ADJUTANT_LOG=warn \
+ADJUTANT_BOOTSTRAP_TOKEN="$BOOTSTRAP_TOKEN" \
 ADJUTANT_BIND="127.0.0.1:$PORT" \
   "$SERVER" >"$LOG" 2>&1 &
 SERVER_PID=$!
@@ -145,7 +150,7 @@ echo "==> server is listening (pid $SERVER_PID); its log is $LOG"
 
 echo "==> registering the bootstrap chief, and a scout with three permissions"
 "$PROBE_PY" - "$BASE" "$LIVE_URL" "$TMP" "$CHIEF_USER" "$CHIEF_PASS" "$SCOUT_USER" "$SCOUT_PASS" "$SCOUT_ROLE" <<'PY'
-import json, sys, urllib.error, urllib.request
+import json, os, sys, urllib.error, urllib.request
 
 base, live, tmp, chief_user, chief_pass, scout_user, scout_pass, scout_role = sys.argv[1:9]
 
@@ -167,7 +172,13 @@ def call(method, path, body=None, token=None):
         return error.code, json.loads(error.read().decode() or "{}")
 
 
-status, body = call("POST", "/api/auth/register", {"username": chief_user, "password": chief_pass})
+status, body = call("POST", "/api/auth/register", {
+    "username": chief_user,
+    "password": chief_pass,
+    # The harness started the server with this secret (see the env block above);
+    # without it the route is closed and the bootstrap below cannot happen.
+    "bootstrap_token": os.environ.get("BOOTSTRAP_TOKEN", ""),
+})
 if status == 403:
     # The database was already bootstrapped by an earlier run.
     status, body = call("POST", "/api/auth/login", {"username": chief_user, "password": chief_pass})
@@ -196,7 +207,7 @@ PY
 psql "$LIVE_URL" -v ON_ERROR_STOP=1 -q -f "$TMP/sql"
 
 "$PROBE_PY" - "$BASE" "$TMP" "$CHIEF_USER" "$CHIEF_PASS" "$SCOUT_USER" "$SCOUT_PASS" "$SCOUT_ROLE" <<'PY'
-import json, sys, urllib.error, urllib.request
+import json, os, sys, urllib.error, urllib.request
 
 base, tmp, chief_user, chief_pass, scout_user, scout_pass, scout_role = sys.argv[1:8]
 

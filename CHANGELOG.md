@@ -125,6 +125,50 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Security
 
+- **`POST /api/auth/register` is closed unless the deployment sets a bootstrap
+  secret.** The route mints a `chief` out of nothing while `core.users` is empty,
+  which made a fresh installation claimable by whoever reached port 8787 first —
+  a race between the operator and the internet that the single-row claim only
+  made orderly, not safe. Registration now requires the value of
+  `ADJUTANT_BOOTSTRAP_TOKEN`, compared against a hash in constant time, and
+  refuses with a message naming the variable when it is unset. The environment
+  bootstrap (`ADJUTANT_BOOTSTRAP_USERNAME`/`_PASSWORD`) remains the path the
+  deployment guide recommends, because it creates the chief before the listener
+  opens.
+- **The archive's graph reads are filtered by the caller's visibility, both
+  ends.** `GET /api/archive/record/{id}/links` and `/record/{id}` joined the far
+  node of every edge with no scope predicate, and `/lineage` returned the title,
+  kind and outcome of every node its walk discovered. A caller with
+  `archive:read` in one Lodge could read a troop-wide record by design and then
+  receive the titles of records in another Lodge it had no grant for. Both ends
+  of a link are now checked with the same predicate the catalogue uses, and the
+  lineage node query carries it too; the tests assert the predicate rather than
+  the row count.
+- **Logins are counted per username, not only per address.** The core limiter is
+  keyed on the client IP, so an attacker rotating addresses had an unbounded
+  number of guesses against one name at 8-character minimums. Ten failures
+  inside fifteen minutes now cool that username off with `429` for the rest of
+  the window — counted on the submitted name, so a refusal says nothing about
+  whether the account exists, and cleared on success.
+- **OIDC: the `state` TTL is enforced where the state is redeemed, and the
+  `id_token` algorithm is pinned by config.** The 15-minute sweep only ran when
+  someone started another login, so a stale `state` stayed redeemable; the
+  callback now refuses anything older than the TTL. `id_token_alg`
+  (`RS256` by default, `HS256`/`HS384`/`HS512` for a shared-secret IdP) decides
+  which signature is accepted, and a token whose header claims another algorithm
+  is refused — the verifier no longer takes the token's word for what it is.
+- **A wildcard CORS origin is refused at boot.** Sessions are cookies, so
+  `cors.origins = ["*"]` was harmless only until the day someone added
+  `allow_credentials` to the layer. The deployment must now name its origins.
+- **The OIDC test key is generated, not committed.** The RS256 tests read a PEM
+  from `plugins/auth/tests/fixtures/`. A private key in a repository is a private
+  key in a repository whatever the comment above it says, and neither a reviewer
+  nor a scanner can tell a throwaway from a live one: each test now generates
+  its own key and JWKS, and the fixture files are gone. That makes `rsa` a
+  dev-dependency, and `rsa` 0.9 carries RUSTSEC-2023-0071 (Marvin), so `deny.toml`
+  records a scoped exception: the crate only generates a throwaway key inside
+  the test process, nothing links it at runtime, and the ignore says to delete
+  itself if that ever changes.
 - **Backup bundles are encrypted, and fail closed without a key (#163).** Every
   bundle is written as `adjutant-<stamp>.dump.age`, encrypted to the age
   recipient in `ADJUTANT_BACKUP_AGE_RECIPIENT`; the private key never lives on

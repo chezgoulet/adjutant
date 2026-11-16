@@ -12,13 +12,19 @@
 //!    lesson). id_tokens verified with `jsonwebtoken` (HS256 client-secret or
 //!    RS256 via JWKS).
 //!
-//! Bootstrap: while `core.users` is empty, `POST /api/auth/register` is open
-//! and the first user becomes `chief`. Afterwards registration is closed —
-//! only `auth:manage_users` may create users.
+//! Bootstrap: while `core.users` is empty, `POST /api/auth/register` creates the
+//! first `chief` — but only for a caller presenting `ADJUTANT_BOOTSTRAP_TOKEN`,
+//! and only with that variable set. Unset means closed: the route that mints an
+//! admin out of nothing must not be answered by whoever reaches the port first.
+//! Afterwards registration is closed — only `auth:manage_users` may create users.
+//!
+//! Login counts failures per username: ten inside fifteen minutes cools the name
+//! off with `429` for the rest of the window. The core's per-IP limiter is the
+//! other half; this is the half that an attacker rotating addresses cannot dodge.
 //!
 //! Config (per-plugin row `core.plugins.config`, admin-set, reload to apply):
-//! `{"oidc": {"issuer", "client_id", "client_secret", "redirect_uri"},
-//!   "session_ttl_hours": 720}`
+//! `{"oidc": {"issuer", "client_id", "client_secret", "redirect_uri",
+//!   "id_token_alg": "RS256"}, "session_ttl_hours": 720}`
 
 use std::collections::HashMap;
 use std::sync::OnceLock;
@@ -28,6 +34,110 @@ use serde::{Deserialize, Serialize};
 
 const SESSION_COOKIE: &str = "adjutant_session";
 const DEFAULT_TTL_HOURS: i64 = 720; // 30 days
+
+/// The `id_token` algorithm assumed when the deployment does not name one.
+const DEFAULT_ID_TOKEN_ALG: &str = "RS256";
+
+/// How old an OIDC `state` may be when it is redeemed. Enforced where the state
+/// is consumed, and swept here as housekeeping — not the other way round.
+const OIDC_STATE_TTL_MINUTES: i64 = 15;
+
+/// The environment variable carrying the one-time secret that claims a fresh
+/// installation.
+///
+/// `/api/auth/register` is the only route that mints a `chief` from nothing, so
+/// it must not be open to whoever reaches the port first. With this unset,
+/// registration is CLOSED — a fresh deployment is claimed by setting it, or by
+/// the CLI. Off-by-default is the whole point: the earlier design left a race
+/// between the operator and the internet.
+const BOOTSTRAP_TOKEN_ENV: &str = "ADJUTANT_BOOTSTRAP_TOKEN";
+
+/// Failed logins for one username before that username is cooled off, and for
+/// how long. Keyed on the submitted name (existing or not), so a refusal says
+/// nothing about whether the account exists.
+const LOGIN_FAILURE_LIMIT: u32 = 10;
+const LOGIN_COOLOFF_SECS: u64 = 900;
+
+/// Per-username failure window for `/api/auth/login`.
+///
+/// The core's rate limiter is per client IP; this is the other half — an
+/// attacker who rotates addresses still has to spend guesses against one name.
+/// In-process on purpose: a restart forgives, and the IP limiter is the outer
+/// bound, so this is defence in depth rather than the only wall.
+///
+/// **The trade is a lockout an attacker can trigger.** Ten bad guesses against
+/// `chris` refuse `chris` for fifteen minutes, including from the person who
+/// owns it — that is the price of counting per name rather than per guess. For a
+/// troop this size it is the right side of the trade (the window expires by
+/// itself and a restart clears it), and the alternative — no per-name limit —
+/// leaves one name open to an unbounded distributed guess.
+
+#[derive(Default)]
+struct LoginThrottle {
+    hits: std::sync::Mutex<std::collections::HashMap<String, (std::time::Instant, u32)>>,
+}
+
+impl LoginThrottle {
+    /// How long this username is still refused for, `None` when it may try.
+    fn cooling(&self, key: &str, now: std::time::Instant) -> Option<u64> {
+        let mut map = self.hits.lock().unwrap_or_else(|e| e.into_inner());
+        let (started, count) = map.get(key).copied()?;
+        if count < LOGIN_FAILURE_LIMIT {
+            return None;
+        }
+        let window = std::time::Duration::from_secs(LOGIN_COOLOFF_SECS);
+        let elapsed = now.duration_since(started);
+        if elapsed >= window {
+            map.remove(key);
+            return None;
+        }
+        Some((window - elapsed).as_secs().max(1))
+    }
+
+    fn failure(&self, key: &str, now: std::time::Instant) {
+        let mut map = self.hits.lock().unwrap_or_else(|e| e.into_inner());
+        if map.len() > 10_000 {
+            let window = std::time::Duration::from_secs(LOGIN_COOLOFF_SECS);
+            map.retain(|_, (started, _)| now.duration_since(*started) < window);
+        }
+        let entry = map.entry(key.to_string()).or_insert((now, 0));
+        // A window that has run out starts again rather than resuming a spent one.
+        if now.duration_since(entry.0) >= std::time::Duration::from_secs(LOGIN_COOLOFF_SECS) {
+            *entry = (now, 0);
+        }
+        entry.1 += 1;
+    }
+
+    fn success(&self, key: &str) {
+        self.hits
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(key);
+    }
+}
+
+/// The configured bootstrap secret, if the deployment set one.
+fn bootstrap_token() -> Option<String> {
+    std::env::var(BOOTSTRAP_TOKEN_ENV)
+        .ok()
+        .map(|v| v.trim().to_string())
+        .filter(|v| !v.is_empty())
+}
+
+/// Compare two secrets without returning early on the first differing byte.
+///
+/// Both sides are hashed first so the comparison is over a fixed-length value
+/// and the loop cost does not depend on where the strings diverge.
+fn secret_matches(presented: &str, expected: &str) -> bool {
+    use sha2::{Digest, Sha256};
+    let a = Sha256::digest(presented.as_bytes());
+    let b = Sha256::digest(expected.as_bytes());
+    let mut diff = 0u8;
+    for (x, y) in a.iter().zip(b.iter()) {
+        diff |= x ^ y;
+    }
+    diff == 0
+}
 
 // ---------------------------------------------------------------------------
 // Config
@@ -39,6 +149,13 @@ struct OidcCfg {
     client_id: String,
     client_secret: String,
     redirect_uri: String,
+    /// The `id_token` algorithm this deployment will accept. Pinned from config
+    /// rather than read out of the token: a verifier that believes the token's
+    /// own header is one misconfiguration away from being told what to trust.
+    /// Defaults to RS256 (the normal OIDC case); set `"HS256"` for a shared-secret
+    /// IdP.
+    #[serde(default)]
+    id_token_alg: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -425,6 +542,9 @@ impl IdentityProvider for SessionIdentityProvider {
 pub struct AuthPlugin {
     ctx: OnceLock<PluginContext>,
     cfg: AuthConfig,
+    /// Per-username failed-login window (see [`LoginThrottle`]). Shared with the
+    /// login route's closure, so the count survives the per-request clone.
+    throttle: std::sync::Arc<LoginThrottle>,
 }
 
 impl AuthPlugin {
@@ -432,6 +552,7 @@ impl AuthPlugin {
         Self {
             ctx: OnceLock::new(),
             cfg: AuthConfig::default(),
+            throttle: std::sync::Arc::new(LoginThrottle::default()),
         }
     }
 
@@ -509,10 +630,12 @@ impl AdjutantPlugin for AuthPlugin {
         // --- login ----------------------------------------------------------
         let c = ctx.clone();
         let ttl = self.ttl();
+        let throttle = self.throttle.clone();
         let login = RouteDefinition::post(
             "/api/auth/login",
             route_handler(move |req| {
                 let c = c.clone();
+                let throttle = throttle.clone();
                 async move {
                     #[derive(Deserialize)]
                     struct Body {
@@ -520,6 +643,20 @@ impl AdjutantPlugin for AuthPlugin {
                         password: String,
                     }
                     let body: Body = req.json()?;
+                    // The per-username window, checked before the database: a
+                    // cooled-off name is refused without spending a hash, and
+                    // the answer is the same whether or not the account exists
+                    // (the key is the submitted name, not a lookup result).
+                    let key = body.username.trim().to_ascii_lowercase();
+                    if let Some(secs) = throttle.cooling(&key, std::time::Instant::now()) {
+                        return PluginResponse::error(
+                            429,
+                            format!(
+                                "too many failed attempts for this username; \
+                                 try again in {secs}s"
+                            ),
+                        );
+                    }
                     let rows =
                         c.db.query(
                             "SELECT id::text AS id, username, password_hash, is_active \
@@ -528,21 +665,25 @@ impl AdjutantPlugin for AuthPlugin {
                         )
                         .await?;
                     let Some(row) = rows.into_iter().next() else {
+                        throttle.failure(&key, std::time::Instant::now());
                         audit_login_failure(&c.audit, &body.username, "unknown_user").await?;
                         return Err(SdkError::BadRequest("invalid credentials".into()));
                     };
                     let stored = row["password_hash"].as_str().unwrap_or("");
                     if stored.is_empty() || !verify_password(&body.password, stored) {
+                        throttle.failure(&key, std::time::Instant::now());
                         // The reason is recorded for auditors; the response is the
                         // same for an unknown user and a bad password (no enumeration).
                         audit_login_failure(&c.audit, &body.username, "bad_password").await?;
                         return Err(SdkError::BadRequest("invalid credentials".into()));
                     }
                     if row["is_active"] != serde_json::json!(true) {
+                        throttle.failure(&key, std::time::Instant::now());
                         audit_login_failure(&c.audit, &body.username, "inactive").await?;
                         return Err(SdkError::BadRequest("invalid credentials".into()));
                     }
                     let uid = row["id"].as_str().unwrap_or_default().to_string();
+                    throttle.success(&key);
                     let (token, expires) = create_session(&c.db, &uid, ttl).await?;
                     // Success is attributed to the user; the token itself is never
                     // part of the audit record.
@@ -781,6 +922,7 @@ impl AdjutantPlugin for AuthPlugin {
         let me_self = AuthPlugin {
             ctx: self.ctx.clone(),
             cfg: self.cfg.clone(),
+            throttle: self.throttle.clone(),
         };
         let me = RouteDefinition::get(
             "/api/auth/me",
@@ -788,6 +930,7 @@ impl AdjutantPlugin for AuthPlugin {
                 let me = AuthPlugin {
                     ctx: me_self.ctx.clone(),
                     cfg: me_self.cfg.clone(),
+                    throttle: me_self.throttle.clone(),
                 };
                 async move {
                     match me.require_session(&req).await {
@@ -821,6 +964,11 @@ impl AdjutantPlugin for AuthPlugin {
                         #[serde(default)]
                         email: Option<String>,
                         password: String,
+                        /// The deployment's one-time claim secret
+                        /// (`ADJUTANT_BOOTSTRAP_TOKEN`). Absent on every
+                        /// registration after the first, which is closed.
+                        #[serde(default)]
+                        bootstrap_token: Option<String>,
                     }
                     // Column-level grants: `COUNT(*)` needs table-level SELECT,
                     // which auth no longer holds on `core.users`. `COUNT(id)`
@@ -838,6 +986,31 @@ impl AdjutantPlugin for AuthPlugin {
                         );
                     }
                     let body: Body = req.json()?;
+                    // The bootstrap gate. `register` is the only route that mints
+                    // a `chief` from nothing, so it must not be answered by
+                    // whoever reaches the port first: the deployment sets
+                    // ADJUTANT_BOOTSTRAP_TOKEN, and the first registration must
+                    // present it. Unset means closed — a fresh install is claimable
+                    // only by someone who can read the server's configuration.
+                    // No log line on refusal on purpose: this route is open to
+                    // the network, and an audit row per guess is a free way to
+                    // grow the table. The response says what is missing.
+                    let Some(expected) = bootstrap_token() else {
+                        return PluginResponse::error(
+                            403,
+                            format!(
+                                "registration is closed: set {BOOTSTRAP_TOKEN_ENV} on the server \
+                                 and send it as `bootstrap_token` to claim a fresh installation"
+                            ),
+                        );
+                    };
+                    let presented = body.bootstrap_token.clone().unwrap_or_default();
+                    if !secret_matches(&presented, &expected) {
+                        return PluginResponse::error(
+                            403,
+                            "registration is closed: bootstrap token missing or wrong",
+                        );
+                    }
                     if body.password.len() < 8 {
                         return PluginResponse::error(
                             400,
@@ -1183,8 +1356,8 @@ impl AuthPlugin {
                     // command only ("cannot insert multiple commands").
                     c.db.execute(
                         "DELETE FROM oidc_states \
-                             WHERE created_at < now() - interval '15 minutes'",
-                        vec![],
+                             WHERE created_at < now() - make_interval(mins => $1::int)",
+                        vec![SqlValue::Int(OIDC_STATE_TTL_MINUTES)],
                     )
                     .await?;
                     let redirect = req.query_param("redirect").unwrap_or("1").to_string();
@@ -1234,11 +1407,19 @@ impl AuthPlugin {
                     if code.is_empty() || state.is_empty() {
                         return PluginResponse::error(400, "missing code or state");
                     }
-                    // Consume state (single-use, 15 min TTL enforced on insert).
+                    // Consume state: single use, and only while it is fresh.
+                    //
+                    // The TTL is enforced HERE, not only by the sweep in
+                    // `oidc/login` — a state row must not become redeemable
+                    // forever just because nobody started another login to
+                    // prune it. A stale state and an unknown one take the same
+                    // path, so the answer says nothing about which it was.
                     let consumed =
                         c.db.query(
-                            "DELETE FROM oidc_states WHERE state = $1 RETURNING state",
-                            vec![SqlValue::Text(state)],
+                            "DELETE FROM oidc_states WHERE state = $1 \
+                               AND created_at > now() - make_interval(mins => $2::int) \
+                             RETURNING state",
+                            vec![SqlValue::Text(state), SqlValue::Int(OIDC_STATE_TTL_MINUTES)],
                         )
                         .await?;
                     if consumed.is_empty() {
@@ -1462,7 +1643,36 @@ async fn verify_id_token(
     let header =
         decode_header(token).map_err(|e| SdkError::BadRequest(format!("id_token header: {e}")))?;
 
-    let key = match header.alg {
+    // The algorithm is a property of the deployment, not of the token: read it
+    // from config, then refuse a token that claims another one. `Validation`
+    // would reject the mismatch later anyway; checking here makes the refusal
+    // say why, and keeps the key choice tied to the configured algorithm.
+    let configured = oidc
+        .id_token_alg
+        .as_deref()
+        .map(str::trim)
+        .filter(|v| !v.is_empty())
+        .unwrap_or(DEFAULT_ID_TOKEN_ALG)
+        .to_ascii_uppercase();
+    let algorithm = match configured.as_str() {
+        "HS256" => Algorithm::HS256,
+        "HS384" => Algorithm::HS384,
+        "HS512" => Algorithm::HS512,
+        "RS256" => Algorithm::RS256,
+        other => {
+            return Err(SdkError::Internal(format!(
+                "auth plugin: id_token_alg {other:?} is not supported (HS256|HS384|HS512|RS256)"
+            )))
+        }
+    };
+    if header.alg != algorithm {
+        return Err(SdkError::BadRequest(format!(
+            "id_token alg {:?} does not match the configured {algorithm:?}",
+            header.alg
+        )));
+    }
+
+    let key = match algorithm {
         Algorithm::HS256 | Algorithm::HS384 | Algorithm::HS512 => {
             DecodingKey::from_secret(oidc.client_secret.as_bytes())
         }
@@ -1488,7 +1698,7 @@ async fn verify_id_token(
         }
     };
 
-    let mut validation = Validation::new(header.alg);
+    let mut validation = Validation::new(algorithm);
     validation.set_issuer(&[oidc.issuer.trim_end_matches('/')]);
     validation.set_audience(std::slice::from_ref(&oidc.client_id));
     let data = decode::<IdClaims>(token, &key, &validation)
@@ -1792,6 +2002,24 @@ mod tests {
         req.header("cookie", "adjutant_session=raw-token")
     }
 
+    /// The bootstrap secret is process-wide state. Tests that touch it hold this
+    /// lock and put the environment back, so a parallel test never sees another's
+    /// token. A `tokio` lock rather than a std one: these tests await while they
+    /// hold it, and a `std::sync` guard must not cross an await point.
+    const CONST_TEST_TOKEN: &str = "test-bootstrap-token";
+
+    async fn bootstrap_env() -> tokio::sync::MutexGuard<'static, ()> {
+        static LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+        LOCK.lock().await
+    }
+
+    fn set_bootstrap_token(token: Option<&str>) {
+        match token {
+            Some(token) => std::env::set_var(BOOTSTRAP_TOKEN_ENV, token),
+            None => std::env::remove_var(BOOTSTRAP_TOKEN_ENV),
+        }
+    }
+
     async fn call(
         host: &TestHost,
         method: &str,
@@ -2079,6 +2307,8 @@ mod tests {
 
     #[tokio::test]
     async fn registration_is_audited() {
+        let _env = bootstrap_env().await;
+        set_bootstrap_token(Some(CONST_TEST_TOKEN));
         let host = TestHost::new();
         host.db.push_rows(vec![serde_json::json!({"n": 0})]); // no users yet
         host.db
@@ -2089,6 +2319,7 @@ mod tests {
             .json(&serde_json::json!({
                 "username": "christopher",
                 "password": "correct-horse-battery",
+                "bootstrap_token": CONST_TEST_TOKEN,
             }))
             .build();
         let (status, body) = call(&host, "POST", "/api/auth/register", req).await;
@@ -2097,6 +2328,63 @@ mod tests {
         assert!(audit.contains("auth.register"), "{audit}");
         assert!(audit.contains("christopher"), "{audit}");
         assert!(!audit.contains("correct-horse-battery"));
+        set_bootstrap_token(None);
+    }
+
+    /// A fresh installation must not be claimable by whoever reaches the port:
+    /// no configured secret means registration is closed, whatever the caller
+    /// sends.
+    #[tokio::test]
+    async fn registration_is_closed_when_no_bootstrap_secret_is_configured() {
+        let _env = bootstrap_env().await;
+        set_bootstrap_token(None);
+        let host = TestHost::new();
+        host.db.push_rows(vec![serde_json::json!({"n": 0})]); // no users yet
+        let req = TestRequest::post("/api/auth/register")
+            .json(&serde_json::json!({
+                "username": "squatter",
+                "password": "correct-horse-battery",
+                "bootstrap_token": "guess",
+            }))
+            .build();
+        let (status, body) = call(&host, "POST", "/api/auth/register", req).await;
+        assert_eq!(status, 403, "{body}");
+        assert!(
+            body["error"]
+                .as_str()
+                .unwrap()
+                .contains(BOOTSTRAP_TOKEN_ENV),
+            "the refusal has to name the switch: {body}"
+        );
+        // Nothing was written: no claim, no user.
+        assert_eq!(host.db.query_count(), 1, "only the user count ran");
+        assert!(host.db.executed_sql().is_empty(), "no INSERT may run");
+    }
+
+    /// The secret is required, and a wrong one is refused the same way a missing
+    /// one is — no answer tells an attacker which of the two they got wrong.
+    #[tokio::test]
+    async fn registration_refuses_a_missing_or_wrong_bootstrap_secret() {
+        let _env = bootstrap_env().await;
+        set_bootstrap_token(Some(CONST_TEST_TOKEN));
+        for presented in [serde_json::Value::Null, serde_json::json!("not-the-token")] {
+            let host = TestHost::new();
+            host.db.push_rows(vec![serde_json::json!({"n": 0})]);
+            let mut payload = serde_json::json!({
+                "username": "squatter",
+                "password": "correct-horse-battery",
+            });
+            if !presented.is_null() {
+                payload["bootstrap_token"] = presented;
+            }
+            let req = TestRequest::post("/api/auth/register")
+                .json(&payload)
+                .build();
+            let (status, body) = call(&host, "POST", "/api/auth/register", req).await;
+            assert_eq!(status, 403, "{body}");
+            assert!(host.db.executed_sql().is_empty(), "no INSERT may run");
+        }
+        set_bootstrap_token(None);
     }
 }
 
@@ -2151,15 +2439,67 @@ mod id_token_tests {
     const ISSUER: &str = "https://idp.example";
     const SECRET: &str = "shared-secret";
     const CLIENT: &str = "adjutant-test";
-    const RSA_PEM: &str = include_str!("../tests/fixtures/rs256-test-key.pem");
-    const JWKS: &str = include_str!("../tests/fixtures/rs256-jwks.json");
+    /// An RSA key for the test run, with the JWKS that publishes its public half.
+    ///
+    /// Generated rather than committed. A PEM in a repository is a private key in
+    /// a repository whatever the comment above it says, and neither a reviewer
+    /// nor a scanner can tell a throwaway from a live one — so the test makes its
+    /// own, and there is nothing to leak, rotate or waive.
+    struct TestKey {
+        pem: String,
+        kid: String,
+        jwks: String,
+    }
 
+    fn rsa_test_key(kid: &str) -> TestKey {
+        use rsa::pkcs8::{EncodePrivateKey, LineEnding};
+        use rsa::traits::PublicKeyParts;
+
+        let mut rng = rand::thread_rng();
+        let key = rsa::RsaPrivateKey::new(&mut rng, 2048).expect("generate an RSA key");
+        let pem = key
+            .to_pkcs8_pem(LineEnding::LF)
+            .expect("export PKCS#8 PEM")
+            .to_string();
+        let jwks = serde_json::json!({
+            "keys": [{
+                "kty": "RSA",
+                "use": "sig",
+                "alg": "RS256",
+                "kid": kid,
+                "n": b64url(&key.n().to_bytes_be()),
+                "e": b64url(&key.e().to_bytes_be()),
+            }]
+        })
+        .to_string();
+        TestKey {
+            pem,
+            kid: kid.to_string(),
+            jwks,
+        }
+    }
+
+    fn b64url(bytes: &[u8]) -> String {
+        use base64::Engine;
+        base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes)
+    }
+
+    /// The default deployment shape: RS256 against a JWKS.
     fn oidc() -> OidcCfg {
         OidcCfg {
             issuer: ISSUER.into(),
             client_id: CLIENT.into(),
             client_secret: SECRET.into(),
             redirect_uri: "https://app.example/cb".into(),
+            id_token_alg: None,
+        }
+    }
+
+    /// The same IdP, pinned to a shared-secret signature instead.
+    fn oidc_hs256() -> OidcCfg {
+        OidcCfg {
+            id_token_alg: Some("HS256".into()),
+            ..oidc()
         }
     }
 
@@ -2188,11 +2528,24 @@ mod id_token_tests {
     async fn hs256_valid_token_is_accepted() {
         let http: Arc<dyn HostHttp> = Arc::new(StubHttp { jwks: None });
         let tok = hs256(&claims(ISSUER, CLIENT, 3600), SECRET.as_bytes());
-        let got = verify_id_token(&http, &oidc(), &tok)
+        let got = verify_id_token(&http, &oidc_hs256(), &tok)
             .await
             .expect("valid token");
         assert_eq!(got.sub, "idp-user-1");
         assert_eq!(got.email.as_deref(), Some("u@example.org"));
+    }
+
+    #[tokio::test]
+    async fn a_token_signed_with_another_algorithm_is_refused() {
+        let http: Arc<dyn HostHttp> = Arc::new(StubHttp { jwks: None });
+        let tok = hs256(&claims(ISSUER, CLIENT, 3600), SECRET.as_bytes());
+        // The deployment is pinned to RS256 (the default). An HS256 token is a
+        // header claim, not a decision the verifier gets to take: accepting it
+        // is the algorithm-confusion shape.
+        let err = verify_id_token(&http, &oidc(), &tok)
+            .await
+            .expect_err("an HS256 token must not pass an RS256 deployment");
+        assert!(err.to_string().contains("does not match"), "{err}");
     }
 
     #[tokio::test]
@@ -2202,7 +2555,7 @@ mod id_token_tests {
         // clock-skew leeway (which is why -60 would still be accepted).
         let tok = hs256(&claims(ISSUER, CLIENT, -3600), SECRET.as_bytes());
         assert!(
-            verify_id_token(&http, &oidc(), &tok).await.is_err(),
+            verify_id_token(&http, &oidc_hs256(), &tok).await.is_err(),
             "expired token must fail"
         );
     }
@@ -2219,7 +2572,7 @@ mod id_token_tests {
             hs256(&claims(ISSUER, CLIENT, 3600), b"wrong-secret"),
         ] {
             assert!(
-                verify_id_token(&http, &oidc(), &tok).await.is_err(),
+                verify_id_token(&http, &oidc_hs256(), &tok).await.is_err(),
                 "iss/aud/secret mismatch must fail"
             );
         }
@@ -2227,18 +2580,19 @@ mod id_token_tests {
 
     #[tokio::test]
     async fn rs256_token_is_verified_against_jwks() {
+        let key = rsa_test_key("generated-key-1");
         let http: Arc<dyn HostHttp> = Arc::new(StubHttp {
-            jwks: Some(JWKS.into()),
+            jwks: Some(key.jwks.clone()),
         });
         let header = jsonwebtoken::Header {
             alg: jsonwebtoken::Algorithm::RS256,
-            kid: Some("test-key-1".into()),
+            kid: Some(key.kid.clone()),
             ..Default::default()
         };
         let tok = jsonwebtoken::encode(
             &header,
             &claims(ISSUER, CLIENT, 3600),
-            &jsonwebtoken::EncodingKey::from_rsa_pem(RSA_PEM.as_bytes()).unwrap(),
+            &jsonwebtoken::EncodingKey::from_rsa_pem(key.pem.as_bytes()).unwrap(),
         )
         .unwrap();
         let got = verify_id_token(&http, &oidc(), &tok)
@@ -2249,8 +2603,9 @@ mod id_token_tests {
 
     #[tokio::test]
     async fn rs256_token_with_unknown_kid_is_rejected() {
+        let key = rsa_test_key("generated-key-1");
         let http: Arc<dyn HostHttp> = Arc::new(StubHttp {
-            jwks: Some(JWKS.into()),
+            jwks: Some(key.jwks.clone()),
         });
         let header = jsonwebtoken::Header {
             alg: jsonwebtoken::Algorithm::RS256,
@@ -2260,7 +2615,7 @@ mod id_token_tests {
         let tok = jsonwebtoken::encode(
             &header,
             &claims(ISSUER, CLIENT, 3600),
-            &jsonwebtoken::EncodingKey::from_rsa_pem(RSA_PEM.as_bytes()).unwrap(),
+            &jsonwebtoken::EncodingKey::from_rsa_pem(key.pem.as_bytes()).unwrap(),
         )
         .unwrap();
         assert!(verify_id_token(&http, &oidc(), &tok).await.is_err());

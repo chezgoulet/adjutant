@@ -199,14 +199,22 @@ subprocess.run(["psql", *PSQL, "-c",
 print("[e2e] data reset — starting from bootstrap state")
 
 # ---------------------------------------------------------------- 1. bootstrap
+# `register` is closed unless the server was started with a bootstrap secret; the
+# harness reads the same variable it expects in the server's environment.
+BOOTSTRAP_TOKEN = os.environ.get("ADJUTANT_BOOTSTRAP_TOKEN", "")
+if not BOOTSTRAP_TOKEN:
+    print("[E2E] ADJUTANT_BOOTSTRAP_TOKEN is unset: start the server with it and "
+          "export it here, or the bootstrap probe below answers 403")
 r = probe("1 register bootstrap chief", "POST", "/api/auth/register",
-          body={"username": "christopher", "password": "correct-horse-battery"},
+          body={"username": "christopher", "password": "correct-horse-battery",
+                "bootstrap_token": BOOTSTRAP_TOKEN},
           expect_status=201, expect_in='"bootstrap_role":"chief"')
 chief_token = r and r.get("token")
 assert chief_token, "bootstrap register failed — aborting"
 
 r2 = probe("2 register closed after first user", "POST", "/api/auth/register",
-           body={"username": "mallory", "password": "another-pass-9"}, expect_status=403)
+           body={"username": "mallory", "password": "another-pass-9",
+                 "bootstrap_token": BOOTSTRAP_TOKEN}, expect_status=403)
 
 # ---------------------------------------------------------------- 2. login / me / logout
 probe("3 wrong password rejected", "POST", "/api/auth/login",
@@ -320,8 +328,12 @@ probe_raw("28 re-import updates, no new rows", csv_reimport)
 # Set per-plugin config, then hot-reload (M2 feature) so auth re-inits with it.
 subprocess.run(["psql", *PSQL, "-tAc",
                 f"UPDATE core.plugins SET config = "
+                # `id_token_alg` is pinned by the plugin config, not read from the
+                # token: this mock IdP signs with the shared secret, so the harness
+                # says so. Omit it and the deployment expects RS256.
                 f"'{{\"oidc\": {{\"issuer\": \"{ISSUER}\", \"client_id\": \"{CLIENT_ID}\", "
-                f"\"client_secret\": \"{SECRET}\", \"redirect_uri\": \"{BASE}/api/auth/oidc/callback\"}}}}' "
+                f"\"client_secret\": \"{SECRET}\", \"id_token_alg\": \"HS256\", "
+                f"\"redirect_uri\": \"{BASE}/api/auth/oidc/callback\"}}}}' "
                 f"WHERE id = 'auth';"], check=True, capture_output=True)
 probe("29 hot-reload picks up oidc config", "POST", "/api/plugins/reload",
       token=chief_token, expect_status=200, expect_in='"auth"')

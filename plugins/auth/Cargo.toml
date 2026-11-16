@@ -27,3 +27,12 @@ jsonwebtoken = "9"
 
 [dev-dependencies]
 tokio.workspace = true
+# The OIDC tests generate their own RSA key rather than reading a committed PEM:
+# a private key in the repository is a private key in the repository, and a
+# scanner cannot tell a fixture from a live one.
+# 0.9 carries RUSTSEC-2023-0071 (Marvin). `deny.toml` records the scoped
+# exception: this is a dev-dependency that only generates a throwaway key inside
+# the tests, nothing links it at runtime, and no live key is exposed. If it ever
+# becomes a runtime dependency, the ignore goes — not the advisory.
+rsa = { version = "0.9", features = ["pem"] }
+base64.workspace = true

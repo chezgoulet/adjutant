@@ -1315,6 +1315,9 @@ async fn links_traverse_both_directions_and_the_sentence_reads_both_ways() {
         None,
     )]);
     host.db.push_rows(vec![json!({ "n": 1 })]);
+    // The edge query now asks the permission service for the caller's lodges
+    // before it runs: `fetch_links` filters both ends, not only the root.
+    host.db.push_rows(vec![json!({ "n": 1 })]);
     host.db.push_rows(vec![
         {
             let mut edge = edge_row(3, "incoming", 91, 90, RELATION_DECIDES, 1);
@@ -1362,13 +1365,20 @@ async fn links_traverse_both_directions_and_the_sentence_reads_both_ways() {
         .db
         .queried_sql()
         .into_iter()
-        .find(|s| s.contains("CASE WHEN l.from_id = $1"))
+        .find(|s| s.contains("CASE WHEN l.from_id = $4"))
         .expect("the edge query ran");
     assert!(
-        sql.contains("WHERE l.from_id = $1 OR l.to_id = $1"),
+        sql.contains("WHERE l.from_id = $4 OR l.to_id = $4"),
         "edges are read from both ends: {sql}"
     );
     assert!(sql.contains("JOIN") && sql.contains("from_title"), "{sql}");
+    // The regression this pins: the far end of an edge is a record the caller
+    // has to be allowed to read. Both joins carry the visibility predicate, or a
+    // Lodge grant on one record leaks the titles of everything linked to it.
+    assert!(
+        sql.contains("JOIN") && sql.matches("filed_by = $3 OR $1::bool").count() == 2,
+        "both ends of an edge must be filtered by the caller's visibility: {sql}"
+    );
 }
 
 #[tokio::test]
@@ -1393,6 +1403,9 @@ async fn lineage_walks_the_chain_both_ways_and_says_so_in_prose() {
         json!({ "direction": "upstream", "link_id": 3, "from_id": 91, "to_id": 90,
                 "relation": RELATION_DECIDES, "depth": 1 }),
     ]);
+    // The node query asks for the caller's lodges before it runs: the walk is
+    // not the authorization.
+    host.db.push_rows(vec![json!({ "n": 1 })]);
     host.db.push_rows(vec![
         json!({ "id": 90, "kind": KIND_POLICY, "title": "Lead-free ammunition policy",
                 "outcome": "", "superseded_by": null }),
@@ -1445,6 +1458,23 @@ async fn lineage_walks_the_chain_both_ways_and_says_so_in_prose() {
         "a hand-drawn cycle must not run forever: {sql}"
     );
     assert!(sql.contains("d.depth < $2"), "{sql}");
+
+    // And the nodes it discovered are filtered by visibility: an id the walk
+    // reached is not an id the caller may read.
+    let node_sql = host
+        .db
+        .queried_sql()
+        .into_iter()
+        .find(|s| s.contains("SELECT r.id, r.kind, r.title, r.outcome"))
+        .expect("the node query ran");
+    assert!(
+        node_sql.contains("filed_by = $3 OR $1::bool"),
+        "discovered nodes must be filtered by the caller's visibility: {node_sql}"
+    );
+    assert!(
+        node_sql.contains("r.id = ANY($4)"),
+        "the walk's ids are still the set being asked for: {node_sql}"
+    );
 
     // An unknown direction is the caller's mistake, and it is the *first* thing
     // checked — so it is still a 400 with no rows queued at all.
