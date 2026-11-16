@@ -336,7 +336,9 @@ SECRETS_FILE = os.environ.get("ADJUTANT_SECRETS_FILE", "secrets.toml")
 existing = ""
 if os.path.exists(SECRETS_FILE):
     existing = open(SECRETS_FILE).read()
-if "[auth" not in existing:
+# `[auth]` almost certainly already exists — `bootstrap-isolation` writes the
+# auth plugin's `db_password` there — so the check is for the sub-table itself.
+if "[auth.oidc]" not in existing:
     with open(SECRETS_FILE, "a") as fh:
         fh.write(f"\n[auth.oidc]\nclient_secret = \"{SECRET}\"\n")
     os.chmod(SECRETS_FILE, 0o600)

@@ -1034,6 +1034,10 @@ async fn probe_both_doors_to_the_choice_land_on_the_same_state() {
     let cfg = Config {
         database_url: url.clone(),
         plugin_dir: dir.clone(),
+        // This probe bootstraps a second time; without an explicit file it would
+        // write to the ambient `./secrets.toml` and rotate the role password away
+        // from the one this fixture's own file holds.
+        secrets_file: Some(secrets_path(&dir)),
         ..Default::default()
     };
 
