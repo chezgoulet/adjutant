@@ -99,7 +99,7 @@ pub type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 /// the plugin factory and refuses a library whose value differs, so a stale
 /// build becomes a clear load error instead of undefined behaviour (the native
 /// loading caveat: core and plugin must be built against the same SDK).
-pub const SDK_ABI_VERSION: u32 = 5;
+pub const SDK_ABI_VERSION: u32 = 6;
 
 /// The SDK crate's SemVer version, for diagnostics and error messages.
 pub const SDK_VERSION: &str = env!("CARGO_PKG_VERSION");
