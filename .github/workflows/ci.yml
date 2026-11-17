@@ -167,16 +167,24 @@ jobs:
       - name: PostgreSQL client 18 + age (for the backup probes)
         run: |
           sudo install -d /usr/share/postgresql-common/pgdg
-          sudo curl -fsSL https://www.postgresql.org/media/keys/ACCC4CF8.asc \
+          # Every fetch here retries. This step failed three runs in six with
+          # `curl: (55) OpenSSL SSL_read: unexpected eof` on the key download, and
+          # a dropped connection is not a fact about the code being tested — it
+          # cost ~15 minutes of pipeline each time and skipped every probe after
+          # it. `--retry-all-errors` covers TLS/read failures, which plain
+          # `--retry` does not.
+          sudo curl -fsSL --retry 5 --retry-all-errors --retry-delay 2 \
+            --connect-timeout 15 --max-time 120 \
+            https://www.postgresql.org/media/keys/ACCC4CF8.asc \
             -o /usr/share/postgresql-common/pgdg/apt.postgresql.org.asc
           echo "deb [signed-by=/usr/share/postgresql-common/pgdg/apt.postgresql.org.asc] \
           https://apt.postgresql.org/pub/repos/apt $(lsb_release -cs)-pgdg main" \
             | sudo tee /etc/apt/sources.list.d/pgdg.list
-          sudo apt-get update -qq
+          sudo apt-get update -qq -o Acquire::Retries=5
           # `age` is not optional: without it the encrypted-bundle probe fails
           # rather than skipping. A probe that passes when the thing it exists
           # to exercise is missing is not evidence.
-          sudo apt-get install -y -qq postgresql-client-18 age
+          sudo apt-get install -y -qq -o Acquire::Retries=5 postgresql-client-18 age
           age --version
           echo "wrapper:  $(pg_dump --version)"
           echo "real 18:  $(/usr/lib/postgresql/18/bin/pg_dump --version)"
