@@ -27,7 +27,7 @@ members = [
 ]
 
 [workspace.package]
-version = "0.3.0"
+version = "0.4.0"
 edition = "2021"
 # Minimum supported Rust version. wasmtime 49 (the WASM host) requires 1.96;
 # that is the binding constraint. Bump only when a dependency (or we) require it.
@@ -36,12 +36,24 @@ license = "MIT"
 repository = "https://github.com/chezgoulet/adjutant"
 
 [workspace.dependencies]
-adjutant-sdk = { path = "plugins/sdk", version = "0.3.0" }
+adjutant-sdk = { path = "plugins/sdk", version = "0.4.0" }
 axum = "0.8"
+# The server loop needs hyper's HTTP/1 header-read deadline, which `axum::serve`
+# does not expose (issue #172). These are already axum's own dependencies.
+hyper = { version = "1", features = ["server", "http1"] }
+hyper-util = { version = "0.1", features = ["tokio", "service"] }
+http-body = "1"
+http-body-util = "0.1"
+tower = { version = "0.5", features = ["util"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "signal", "net", "process"] }
 # Hashing a backup bundle on disk. The audit chain hashes in SQL, so nothing
 # needed a Rust digest until the backup runner had to read a file back.
 sha2 = "0.10"
+# The keyed audit layer: HMAC-SHA256 over the same canonical payload the SQL
+# chain hashes. The key never leaves the server process.
+hmac = "0.12"
+# `ADJUTANT_AUDIT_KEY` accepts base64 as well as hex.
+base64 = "0.22"
 sqlx = { version = "0.8", default-features = false, features = ["postgres", "runtime-tokio", "macros", "chrono", "uuid"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
@@ -51,7 +63,7 @@ chrono = { version = "0.4", features = ["serde"] }
 thiserror = "2"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
-tower-http = { version = "0.6", features = ["cors"] }
+tower-http = { version = "0.6", features = ["cors", "timeout", "limit"] }
 toml = "0.9"
 wasmtime = "49"
 wasmtime-wasi = "49"

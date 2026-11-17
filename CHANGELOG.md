@@ -11,6 +11,294 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+Nothing yet.
+
+---
+
+## [0.4.0] — 2026-11-17 — Security, secrets, and a shop that prices dues
+
+Pre-deploy security review (J.A.S.O.N.), then the two items it deferred: plugin
+secrets moved out of the database, and MCP writes gated behind an intent. A
+`_any_scope` authorization audit across all 83 plugin routes, and the dues
+checkout priced from finance rather than from the payer.
+
+**Breaking for a deployment:** secrets come from `ADJUTANT_SECRET_*` or the
+secrets file now, a secret left in `core.plugins.config` stops the boot, the MCP
+write surface needs an intent, a wildcard CORS origin is refused, and
+`POST /api/calendar/event/{id}/rsvp/{member}` is gone. `SDK_ABI_VERSION` is 6:
+`AdjutantPlugin::secret_config_keys` changed the trait surface, so a plugin built
+against 5 refuses to load.
+
+### Added
+
+- **A dues checkout is priced by finance, not by the payer.** `purpose: "dues"`
+  now charges what the member still owes, from the shop's mirror of
+  `finance.dues.assessed` (`stripe.dues_mirror`, migration 3, filled by a
+  subscription and re-published by finance's five-minute sweep). A payer may
+  deliberately pay **less** — the owner's ruling — and the session records
+  `assessed_cents` beside `amount_cents`, so a shortfall reads as a choice rather
+  than as a payment that went missing. More than is owed is a `400` (an extra
+  amount is a donation); no mirrored assessment is a `409` naming finance; and an
+  amount under Stripe's 50-cent minimum, including zero, is a `409` explaining
+  that paying nothing is a **waiver in finance**, not a session, because Stripe
+  cannot charge zero. Before this the amount was whatever the caller sent, so dues
+  standing could be satisfied for a penny.
+- **Finance re-announces dues standing, so the shop can price a dues checkout.**
+  `finance.dues.assessed` and `finance.dues.payment` already carry a member's
+  assessment and their paid/outstanding figures; a five-minute `dues_standing`
+  schedule now re-publishes every member's current standing in the same shape
+  (`assessed_cents`, `funded_cents`, `paid_cents`, `outstanding_cents`,
+  `settled`), so a consumer — the shop, next — converges from a cold start or
+  after a path that did not publish, without a watermark to keep. The event
+  vocabulary gains the constant (`event_type::DUES_ASSESSED`) rather than a
+  string repeated at each publisher.
+
+- **The audit chain has an off-database anchor** (#160). Setting
+  `ADJUTANT_AUDIT_KEY` (64 hex characters or base64 of 32 bytes) makes every
+  audit insert carry `keyed_hash = HMAC-SHA256(key, canonical payload)`,
+  computed by the server before the INSERT; the key is never sent to PostgreSQL.
+  `GET /api/audit/verify` reports both layers (`keyed`, `keyed_first_bad`,
+  `keyed_rows_checked`, `keyed_rows_unkeyed`) and the new `adjutant audit-verify`
+  subcommand verifies without HTTP. Unset, the column stays NULL, boot logs a
+  WARN, and verification says `keyed: false` rather than pretending to be
+  keyed. `docs/deployment.md` states the threat model and the cost of losing the
+  key.
+- **The first chief can be created from the environment.** Setting
+  `ADJUTANT_BOOTSTRAP_USERNAME` and `ADJUTANT_BOOTSTRAP_PASSWORD` (with optional
+  `ADJUTANT_BOOTSTRAP_EMAIL`) creates that account with the `chief` role on the
+  first boot against an empty database, before the listener opens. Half a
+  credential pair refuses to boot. Once any user exists the variables are
+  ignored — they never rewrite an existing account (#173).
+- **`adjutant verify-isolation [--app-role <name>]`** — asserts the roles,
+  schema/table ownership, allowlist grants and per-role session identity a
+  working deployment must have. `deploy/restore.sh` runs it before it starts the
+  app or reports success (#161).
+- **`adjutant grant-role <username> <role>`** — writes `core.user_roles`
+  directly, so it recovers a troop whose last admin has been removed and whose
+  API is therefore unreachable (#147).
+- **Session management routes** (#149 AUTH-3). `GET /api/auth/sessions` lists
+  the caller's live sessions and marks the current one; `DELETE
+  /api/auth/sessions/{id}` revokes one of them (another user's id is a `404`,
+  never a `403`); `POST /api/auth/password` changes the password and revokes
+  every other session. Session validation now rejects `core.sessions.revoked_at`
+  everywhere, not only at login.
+
+### Changed
+
+- **The audit digest now covers `user_id` and `created_at`** (#159). Migration
+  17 replaces `core.audit_chain_fill()` and `core.audit_verify()` with a v2
+  canonical payload that includes the actor and the timestamp in UTC at
+  microsecond precision, and recomputes the chain over existing rows so an
+  upgrade does not leave every row bad. Changing only who or when a row records
+  now makes `first_bad` name it. The append-only and TRUNCATE guards are
+  unchanged. `core.audit_canonical()` is declared `STABLE`, not `IMMUTABLE`:
+  `to_char(timestamp with time zone, text)` is `STABLE`, and the verifier reads
+  every row so the planner optimisation an `IMMUTABLE` marker would promise is
+  not used.
+- **Migration 17 rewrites the whole audit log once.** It disables the append-only
+  trigger and recomputes every existing `core.audit_log` row in one transaction.
+  Upgrade time and lock duration are proportional to the table's size, so a large
+  deployment should expect an upgrade window. An error rolls the whole migration
+  back, leaving the old chain intact and the trigger armed.
+- **The SDK ABI is 5.** `HostDb` gains `append_audit` (with a default that
+  performs the plain INSERT), the additive seam that lets the server compute a
+  keyed hash before the row exists. Existing `HostDb` implementations compile
+  unchanged, but a plugin built against ABI 4 is refused rather than loaded with
+  a mismatched vtable — rebuild and re-stage plugins on upgrade.
+- **Registration has exactly one winner.** `POST /api/auth/register` claims a
+  single row in the new `core.bootstrap_claim` table before it creates the user;
+  the primary key is the mutex. Two concurrent first registrations can no longer
+  both become `chief`, and a failed registration gives the slot back (#173).
+  The auth plugin holds a narrow `SELECT, INSERT, DELETE` grant on that table, so
+  an existing deployment must re-run `bootstrap-isolation` on upgrade.
+- **The last admin cannot be removed by any writer.** An `AFTER DELETE` trigger
+  on `core.user_roles` refuses a delete that would leave
+  nobody holding `core:admin` or `auth:manage_users` at troop scope; the roles
+  route reports it as `409`. `POST /api/auth/roles` now grants before it revokes,
+  so a valid replacement is not caught between two statements (#147).
+- **The session cookie is `Secure` by default** (#149 AUTH-4). Local plain-HTTP
+  development must set `ADJUTANT_INSECURE_COOKIES=true`; the flag is never
+  inferred from the bind address and is documented as development-only.
+- **Local authentication is audited** (#149 AUTH-5). Login success and failure,
+  logout, registration, session revocation and password change now append to
+  `core.audit_log`; failures record the attempted username and a reason
+  category, never the submitted secret or a session token.
+- **Auth's `core.users` UPDATE is column-level.** The password-change route
+  needs to write one column, so the allowlist grants `UPDATE (password_hash)`
+  and still no table-level `UPDATE`; `core.sessions` keeps its whole-table grant
+  with `UPDATE` added for `revoked_at` (#149). Re-run `bootstrap-isolation` on
+  upgrade so the role picks up both changes.
+
+### Fixed
+
+- **The DB-gated host suite is re-runnable against the same database (#189).**
+  `probe_scope_id_is_opaque_text_and_round_trips` left a troop-scoped `chief`
+  grant behind, so the next run's `DELETE FROM core.user_roles` tripped the
+  last-admin guard. The probe now resets `core.user_roles` with an admin-only
+  `TRUNCATE` before and after (row triggers do not fire), and a new
+  `rerunnable_suite` target runs `host_db` twice in CI. The guard itself is
+  unchanged.
+- **A partial restore fails instead of printing `ok` (#161).** `deploy/restore.sh`
+  now restores with `--no-owner --no-acl` (there are no roles to own or grant to
+  yet), checks `PIPESTATUS[0]`, treats `errors ignored` as data loss, and runs
+  the new `adjutant verify-isolation` after `bootstrap-isolation`. That command
+  checks every installed plugin's role, schema/table ownership, allowlist grants,
+  an unlisted `core.*` table being unreachable, and a live connection as the
+  plugin role — and names the specific missing role or table.
+- **Collection routes decode the wrapper the server actually sends (#167).**
+  `_asList` accepted a hard-coded list of wrapper names, so
+  `GET /api/calendar/upcoming` (`{"occurrences": …}`) and
+  `GET /api/membership/stewards` (`{"stewards": …}`) silently decoded to an empty
+  list — and the dashboard and calendar cached that emptiness as the truth. It
+  now unwraps a bare array, a named wrapper the server uses (`occurrences`,
+  `stewards`, `checkouts`, `plugins`, `receipts`, `categories`, `runs`, `presets`,
+  `sessions`, and the keys already known), or an object with exactly one
+  array-valued field. Every list route has a decode test built from the plugin's
+  own `json!` payload.
+- **A 401 at boot ends the session, not just the token (#166).** The
+  unauthorized branch of `SessionState.boot()` now clears the read cache and the
+  queued-write list exactly as sign-out does. Cache keys are scoped to the
+  authenticated member id, and the outbox records its owner in the entry and its
+  idempotency key; a replay pass refuses an entry that is not the current
+  member's. Identity B is no longer served A's roster offline, and A's queued
+  dues self-report no longer replays under B's token.
+
+### Security
+
+- **A mentor can no longer write another member's registry row.** `POST
+  /api/missions/mentor/profile` took `member_id` from the body and compared it to
+  nothing: any `missions:mentor` holder, at any scope, could overwrite or blank
+  any member's profile troop-wide, and the row's `declared_by` became theirs. It
+  was also the blanking bug's home — omitted fields were bound as `''` and `'{}'`,
+  so a body naming only the member erased their name and expertise, and the
+  COALESCE on `EXCLUDED` guarded nothing. Declaring your **own** profile needs no
+  authority beyond the permission; declaring another's needs `missions:approve`
+  covering that member's Lodge, which is why `lodge_id` is now part of the body
+  and of the row. Omitted fields are bound as NULL and the UPDATE coalesces them
+  against the stored value.
+- **The calendar and missions lists only see Lodges where the caller holds the
+  read permission.** Both built their lodge array from every lodge *grant* the
+  identity carried, without asking whether that role has the permission — the
+  route gate only proves it somewhere. A member holding `calendar:read` at one
+  Lodge and an unrelated role at another saw the second Lodge's events (and
+  missions), while `GET /event/{id}` on the same row answered 403. Both now use
+  `scopes_for`, the permission-aware primitive announcements already used.
+- **`PATCH /api/calendar/event/{id}` authorizes the scope it moves the event
+  into.** It checked `calendar:manage` on the row as stored and then wrote a new
+  `scope_type`/`scope_id` from the body, so a Lodge manager could plant an event
+  in another Lodge's calendar or make it troop-wide — which `create` would have
+  refused. The target scope is checked when it differs, as announcements' re-
+  address already did.
+- **Recording an RSVP for another member is no longer a route.** By the owner's
+  ruling a manager answers for themselves; `POST
+  /api/calendar/event/{id}/rsvp/{member}` is removed rather than guarded, because
+  the member id came from the path with no roster check at all. Reading another
+  member's RSVP — notes included — stays open to anyone who can read the event,
+  which the owner confirmed is intended.
+- **Plugin secrets come from the deployment, not the database.** `stripe`'s
+  `secret_key` and `webhook_secret`, `auth`'s `oidc.client_secret` and every
+  plugin's database password were read from `core.plugins.config` /
+  `core.plugins.db_secret` — admin-editable JSONB and a text column, both copied
+  into every backup bundle. They now resolve from the environment
+  (`ADJUTANT_SECRET_<PLUGIN>_<PATH>`, e.g. `ADJUTANT_SECRET_STRIPE_SECRET_KEY`)
+  or from a TOML file named by `ADJUTANT_SECRETS_FILE` / `--secrets-file`
+  (default `./secrets.toml`), and the value is injected into the plugin's config
+  before `init`. A secret still in `core.plugins.config` is **refused at load**
+  with an error naming the variable that should hold it, rather than ignored:
+  leaving it there means it is still in the backup. `bootstrap-isolation` writes
+  the plugin role passwords to the file (`0600`, temp-file-and-rename) and clears
+  the column; the runtime still reads the column for an installation bootstrapped
+  before the move, with a WARN. The file is re-read on `POST /api/plugins/reload`,
+  so rotation is a file edit and a reload. Plugins declare their secret paths
+  (`AdjutantPlugin::secret_config_keys`), so the check is part of the contract
+  rather than a list in the core.
+- **A tool that writes cannot be invoked without a confirmation the server
+  minted.** `/api/mcp/invoke` executed `missions:create`, `governance:propose`,
+  archive writes and store orders with the caller's authority and no policy gate:
+  an agent — or a prompt that steered one — could write in a loop, and the tools
+  carried no read-only/destructive annotations for a client to prompt on. Anything
+  that is not a `GET` now needs an **intent** from `POST /api/mcp/intent`, bound
+  to the caller, the tool and a canonical digest of the arguments, expiring in
+  five minutes and consumed by the first invocation; a write without one is
+  refused `428` before anything reaches the API, and a replayed or re-argumented
+  intent is refused the same way. A `confirm: true` field would be a value the
+  model can write itself; an intent has to be fetched with the arguments already
+  fixed and cannot be reused, so "the caller meant this" is a row in the server's
+  record. The catalogue also carries `annotations` (`readOnlyHint`,
+  `destructiveHint`) and `requiresIntent`, derived from the method so a tool added
+  later is covered without anyone remembering a flag.
+- **`POST /api/auth/register` is closed unless the deployment sets a bootstrap
+  secret.** The route mints a `chief` out of nothing while `core.users` is empty,
+  which made a fresh installation claimable by whoever reached port 8787 first —
+  a race between the operator and the internet that the single-row claim only
+  made orderly, not safe. Registration now requires the value of
+  `ADJUTANT_BOOTSTRAP_TOKEN`, compared against a hash in constant time, and
+  refuses with a message naming the variable when it is unset. The environment
+  bootstrap (`ADJUTANT_BOOTSTRAP_USERNAME`/`_PASSWORD`) remains the path the
+  deployment guide recommends, because it creates the chief before the listener
+  opens.
+- **The archive's graph reads are filtered by the caller's visibility, both
+  ends.** `GET /api/archive/record/{id}/links` and `/record/{id}` joined the far
+  node of every edge with no scope predicate, and `/lineage` returned the title,
+  kind and outcome of every node its walk discovered. A caller with
+  `archive:read` in one Lodge could read a troop-wide record by design and then
+  receive the titles of records in another Lodge it had no grant for. Both ends
+  of a link are now checked with the same predicate the catalogue uses, and the
+  lineage node query carries it too; the tests assert the predicate rather than
+  the row count.
+- **Logins are counted per username, not only per address.** The core limiter is
+  keyed on the client IP, so an attacker rotating addresses had an unbounded
+  number of guesses against one name at 8-character minimums. Ten failures
+  inside fifteen minutes now cool that username off with `429` for the rest of
+  the window — counted on the submitted name, so a refusal says nothing about
+  whether the account exists, and cleared on success.
+- **OIDC: the `state` TTL is enforced where the state is redeemed, and the
+  `id_token` algorithm is pinned by config.** The 15-minute sweep only ran when
+  someone started another login, so a stale `state` stayed redeemable; the
+  callback now refuses anything older than the TTL. `id_token_alg`
+  (`RS256` by default, `HS256`/`HS384`/`HS512` for a shared-secret IdP) decides
+  which signature is accepted, and a token whose header claims another algorithm
+  is refused — the verifier no longer takes the token's word for what it is.
+- **A wildcard CORS origin is refused at boot.** Sessions are cookies, so
+  `cors.origins = ["*"]` was harmless only until the day someone added
+  `allow_credentials` to the layer. The deployment must now name its origins.
+- **The OIDC test key is generated, not committed.** The RS256 tests read a PEM
+  from `plugins/auth/tests/fixtures/`. A private key in a repository is a private
+  key in a repository whatever the comment above it says, and neither a reviewer
+  nor a scanner can tell a throwaway from a live one: each test now generates
+  its own key and JWKS, and the fixture files are gone. That makes `rsa` a
+  dev-dependency, and `rsa` 0.9 carries RUSTSEC-2023-0071 (Marvin), so `deny.toml`
+  records a scoped exception: the crate only generates a throwaway key inside
+  the test process, nothing links it at runtime, and the ignore says to delete
+  itself if that ever changes.
+- **Backup bundles are encrypted, and fail closed without a key (#163).** Every
+  bundle is written as `adjutant-<stamp>.dump.age`, encrypted to the age
+  recipient in `ADJUTANT_BACKUP_AGE_RECIPIENT`; the private key never lives on
+  the server. With no recipient a backup fails with an error naming that
+  variable unless `ADJUTANT_BACKUP_ALLOW_PLAINTEXT=true` explicitly accepts a
+  plaintext `.dump` and logs a WARN. `deploy/restore.sh` decrypts with
+  `ADJUTANT_BACKUP_AGE_IDENTITY` and refuses to drop the database when the
+  identity is missing or unusable. Both directions are pipelines: `pg_dump`'s
+  stdout goes straight into `age` on the backup side, and the decrypt goes
+  straight into `pg_restore -l` and the restore on the other, so no clear-text
+  dump is ever written to disk — not even a `chmod 600` file in the backups
+  volume or `/tmp` that a crash could leave behind. The runtime image installs
+  `age` for the in-app backup button.
+- **The session token is in platform secure storage, not preferences (#169).**
+  `flutter_secure_storage` (Keystore/Keychain/libsecret), with a one-time
+  migration from `adjutant.token` that deletes the plaintext key. Android backup
+  is disabled and the preferences file is excluded from `dataExtractionRules` and
+  `fullBackupContent`. On the web, `localStorage` remains the only store and is
+  documented as such.
+- **The release APK is signed with the release key (#168).** The release workflow
+  reads `ANDROID_KEYSTORE_BASE64`, `ANDROID_KEYSTORE_PASSWORD`,
+  `ANDROID_KEY_ALIAS` and `ANDROID_KEY_PASSWORD`, writes a never-committed
+  `key.properties`, and fails if any is absent — it never falls back to the
+  public Android debug key. After the build, `apksigner verify --print-certs`
+  prints the signer DN and fails the job if it contains `CN=Android Debug`.
+  Anyone upgrading from a debug-signed build must uninstall it once; the
+  signatures are unrelated.
+
 ---
 
 ## [0.3.0] — 2026-09-27 — Milestones 5 and 6: the client, and the operational plugins

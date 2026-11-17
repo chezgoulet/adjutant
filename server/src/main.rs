@@ -1,7 +1,7 @@
 //! `adjutant` — the core server binary.
 
-use adjutant_server::config::{self, CliArgs, LogFormat};
 use adjutant_server::build_app;
+use adjutant_server::config::{self, CliArgs, LogFormat};
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -196,11 +196,102 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
             }
         }
+        Some("verify-isolation") => {
+            let mut app_role: Option<String> = None;
+            let mut passthrough: Vec<String> = Vec::new();
+            let mut it = args[1..].iter();
+            while let Some(a) = it.next() {
+                match a.as_str() {
+                    "--app-role" => app_role = it.next().cloned(),
+                    _ if a.starts_with("--app-role=") => {
+                        app_role = Some(a["--app-role=".len()..].to_string())
+                    }
+                    _ => passthrough.push(a.clone()),
+                }
+            }
+            let cli = config::CliArgs::parse(passthrough).unwrap_or_else(|e| {
+                eprintln!("error: {e}\n\n{}", config::USAGE);
+                std::process::exit(2);
+            });
+            let cfg = config::load(&cli)?;
+            tracing_subscriber::fmt()
+                .with_env_filter(
+                    tracing_subscriber::EnvFilter::try_from_default_env()
+                        .unwrap_or_else(|_| cfg.log_filter.clone().into()),
+                )
+                .with_writer(std::io::stderr)
+                .init();
+            match adjutant_server::cli::verify_isolation(&cfg, app_role.as_deref()).await {
+                Ok(checks) => {
+                    for check in checks {
+                        println!("PASS {check}");
+                    }
+                    println!(
+                        "isolation verified{}",
+                        app_role
+                            .as_deref()
+                            .map(|a| format!(" (application role {a})"))
+                            .unwrap_or_default()
+                    );
+                    return Ok(());
+                }
+                Err(e) => {
+                    eprintln!("FAIL: the restore is incomplete:");
+                    for line in e.lines() {
+                        eprintln!("  - {line}");
+                    }
+                    std::process::exit(1);
+                }
+            }
+        }
+        Some("grant-role") => {
+            let username = args
+                .get(1)
+                .filter(|a| !a.starts_with('-'))
+                .ok_or("usage: adjutant grant-role <username> <role> [--database-url <URL>]")?;
+            let role = args
+                .get(2)
+                .filter(|a| !a.starts_with('-'))
+                .ok_or("usage: adjutant grant-role <username> <role> [--database-url <URL>]")?;
+            let cli = config::CliArgs::parse(args[3..].iter().cloned()).unwrap_or_default();
+            let cfg = config::load(&cli)?;
+            match adjutant_server::cli::grant_role(&cfg, username, role).await {
+                Ok(message) => {
+                    println!("{message}");
+                    return Ok(());
+                }
+                Err(e) => {
+                    eprintln!("error: {e}");
+                    std::process::exit(2);
+                }
+            }
+        }
+        Some("audit-verify") => {
+            let cli = config::CliArgs::parse(args[1..].iter().cloned()).unwrap_or_else(|e| {
+                eprintln!("error: {e}\n\n{}", config::USAGE);
+                std::process::exit(2);
+            });
+            let cfg = config::load(&cli)?;
+            match adjutant_server::cli::audit_verify(&cfg).await {
+                Ok((good, report)) => {
+                    println!("{report}");
+                    if !good {
+                        std::process::exit(1);
+                    }
+                    return Ok(());
+                }
+                Err(e) => {
+                    eprintln!("error: {e}");
+                    std::process::exit(2);
+                }
+            }
+        }
         Some("serve") => {}
         Some("-h") | Some("--help") | Some("help") => {
             print!("{}", config::USAGE);
             return Ok(());
-        }        Some(other) if !other.starts_with('-') => {
+        }
+        Some(other) if !other.starts_with('-') => {
             eprintln!("error: unknown command {other:?}\n\n{}", config::USAGE);
             std::process::exit(2);
         }
@@ -222,7 +313,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .unwrap_or_else(|_| cfg.log_filter.clone().into());
     match cfg.log_format {
         LogFormat::Pretty => tracing_subscriber::fmt().with_env_filter(filter).init(),
-        LogFormat::Json => tracing_subscriber::fmt().with_env_filter(filter).json().init(),
+        LogFormat::Json => tracing_subscriber::fmt()
+            .with_env_filter(filter)
+            .json()
+            .init(),
     }
 
     tracing::info!(bind = %cfg.bind, plugin_dir = %cfg.plugin_dir.display(), "starting adjutant");
@@ -232,12 +326,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let listener = tokio::net::TcpListener::bind(cfg.bind).await?;
     tracing::info!(addr = %listener.local_addr()?, "listening");
 
-    // ConnectInfo feeds the rate limiter's per-IP key.
-    axum::serve(
+    // ConnectInfo feeds the rate limiter's per-IP key. The serve loop also
+    // carries the header-read deadline and the connection cap (issue #172).
+    adjutant_server::serve::serve(
         listener,
-        app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+        app,
+        shutdown_signal(),
+        std::time::Duration::from_secs(cfg.http.header_timeout_secs),
+        cfg.http.max_connections,
     )
-    .with_graceful_shutdown(shutdown_signal())
     .await?;
 
     // Give plugins their shutdown hook and stop event handlers before exiting.
@@ -259,7 +356,9 @@ fn find_repo_root() -> Result<std::path::PathBuf, Box<dyn std::error::Error>> {
             }
         }
         if !dir.pop() {
-            return Err("not inside an adjutant workspace (no [workspace] Cargo.toml found)".into());
+            return Err(
+                "not inside an adjutant workspace (no [workspace] Cargo.toml found)".into(),
+            );
         }
     }
 }
@@ -279,7 +378,9 @@ fn plugin_list(raw: &str) -> Vec<String> {
 
 async fn shutdown_signal() {
     let ctrl_c = async {
-        tokio::signal::ctrl_c().await.expect("install ctrl-c handler");
+        tokio::signal::ctrl_c()
+            .await
+            .expect("install ctrl-c handler");
     };
 
     #[cfg(unix)]

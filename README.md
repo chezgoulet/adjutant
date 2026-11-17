@@ -7,9 +7,12 @@
 > anything that matters, and expect changes that break things with no migration
 > path until we reach beta.
 >
-> **Every build we publish is unsigned, and will stay unsigned until beta.** We
-> are not buying code-signing certificates for something this early, and we would
-> rather say so plainly than let your operating system spring it on you.
+> **The server tarball and the web bundle are unsigned, and will stay unsigned
+> until beta.** We are not buying code-signing certificates for something this
+> early, and we would rather say so plainly than let your operating system spring
+> it on you. The Android APK is the exception in one direction only: since #168 it
+> is signed with the troop's own release key, so it installs and updates without
+> the public debug key's forgery risk.
 > [What to do about that ↓](#unsigned-builds)
 
 Sovereignty-first administration for democratic scout troops.
@@ -111,9 +114,15 @@ Precedence is defaults < TOML file (./adjutant.toml or `--config`) < environment
 | `ADJUTANT_LOG_FORMAT` | `pretty` \| `json` |
 | `ADJUTANT_RATE_MAX`, `ADJUTANT_RATE_WINDOW` | fixed window per client IP; `0` disables |
 | `ADJUTANT_TRUSTED_PROXIES` | comma-separated peer IPs allowed to set `x-forwarded-for`. **Empty by default — the header is otherwise ignored**, because any client can send it |
-| `ADJUTANT_CORS` | comma-separated origins, `*` for any |
+| `ADJUTANT_CORS` | comma-separated origins that may call the API from a browser. **`*` is refused at boot**: sessions are cookies, so a wildcard is one `allow_credentials` away from a credential leak. Empty (the default) means no CORS headers at all |
 | `ADJUTANT_MAX_BODY` | request body cap in bytes |
-| `ADJUTANT_DEV_HEADERS` | **`false` by default.** Set `true` (or pass `--allow-dev-headers`) to enable the spoofable `x-dev-user`/`x-dev-role` identity stub for development. Only consulted when no plugin identity provider answered |
+| `ADJUTANT_HTTP_HEADER_TIMEOUT` | seconds to receive a request's headers (default `5`) |
+| `ADJUTANT_HTTP_BODY_TIMEOUT` | total seconds allowed for a request body, not reset per chunk (default `10`) |
+| `ADJUTANT_HTTP_REQUEST_TIMEOUT` | seconds for the whole request, handler included (default `300`; the backup bundle gets the same five minutes the client does) |
+| `ADJUTANT_HTTP_MAX_CONNECTIONS` | concurrent accepted connections (default `128`); further sockets wait in the kernel backlog |
+| `ADJUTANT_SECRETS_FILE` | Where the deployment's secrets live — plugin role passwords, `stripe.secret_key`/`webhook_secret`, `auth.oidc.client_secret` — in TOML (`[stripe]` / `[auth.oidc]` sections). Default `./secrets.toml` when it exists; `--secrets-file` overrides. **Secrets are never read from `core.plugins.config`**: a value there is refused at load, because that column is admin-editable and copied into every backup. Each secret can also come from `ADJUTANT_SECRET_<PLUGIN>_<PATH>`, which wins over the file |
+| `ADJUTANT_BOOTSTRAP_TOKEN` | **Unset by default, and unset means `POST /api/auth/register` is closed.** Set it to claim a fresh installation over HTTP: the first registration must send the same value as `bootstrap_token`. Compared against a SHA-256 in constant time; the route is closed for good once any user exists. `ADJUTANT_BOOTSTRAP_USERNAME`/`_PASSWORD` (below) is the recommended path because it creates the chief before the listener opens |
+| `ADJUTANT_DEV_HEADERS` | **`false` by default.** Set `true` (or pass `--allow-dev-headers`) to enable the spoofable `x-dev-user`/`x-dev-role` identity stub for development. Only consulted when no plugin identity provider answered. `--no-dev-headers` forces it off, overriding a config file or environment that enabled it |
 | `ADJUTANT_ALLOW_SUPERUSER` | **`false` by default.** The server refuses to boot on a PostgreSQL superuser connection (a plugin escape would be total compromise). Set `true` (or pass `--allow-superuser`) only for a throwaway database |
 | `ADJUTANT_TEST_DATABASE_URL` | overrides the derived `_test` database for `adjutant test-plugin` and the DB-backed tests |
 
@@ -122,8 +131,10 @@ Precedence is defaults < TOML file (./adjutant.toml or `--config`) < environment
 - **Dev headers are off by default — and spoofable when on.** With
   `ADJUTANT_DEV_HEADERS=true` (or `--allow-dev-headers`), anyone who can reach
   the port can claim any role by setting two headers. Keep it off (the default)
-  and rely on the auth plugin's sessions. The milestone harnesses assert this
-  for you.
+  and rely on the auth plugin's sessions. `--no-dev-headers` overrides a config
+  file that enabled it. When it is on, the boot log warns and
+  `GET /api/plugins` reports `dev_headers.enabled` with the risk. The milestone
+  harnesses assert this for you.
 - **Disabling the last identity provider is refused.** With dev headers off the
   auth plugin is the only source of identity, so disabling or uninstalling it
   would make every authenticated route — including the admin route that would
@@ -146,7 +157,10 @@ Roles, schema ownership and credentials are created once with
 `adjutant bootstrap-isolation` (needs `CREATEROLE`); the runtime reads the
 stored credential and needs no `CREATEROLE`. A plugin with no credential
 refuses to load. The allowlist lives in `server/src/schema.rs` (`core_grants`);
-a plugin needing another core table must add it there deliberately.
+it grants whole tables where nothing sensitive is involved and individual
+columns where it is (`core.users` is column-granted, so `membership` cannot read
+`password_hash`). A plugin needing another core table or column must add it
+there deliberately.
 
 ## Smoke test
 
@@ -204,9 +218,11 @@ files:**
   serve as static files;
 - `adjutant-client-vX.Y.Z-android.apk` — the same client as an APK: the file a
   phone installs, which is how a scout receives it (Obtainium). It is built in
-  **release** mode from the same tag, signed with Flutter's throwaway debug key
-  (see *Unsigned builds* below), and carries a `.sha256` like the rest. The job
-  fails rather than attach an APK that is missing or a stub.
+  **release** mode from the same tag, signed with the troop's **release key**
+  (provisioned as repository secrets; see *Unsigned builds* below), and carries a
+  `.sha256` like the rest. The job fails rather than attach an APK that is
+  missing, a stub, or signed with `CN=Android Debug` — `apksigner verify
+  --print-certs` runs on the built file and prints the signer's real DN.
 
 **Nothing else is packaged — not on a pull request, and not on a tag.** There is
 no macOS build, no Windows build, no `.aab`, no `.deb`, `.rpm`, `.AppImage`,
@@ -240,13 +256,18 @@ exercised with before a tag is cut.
 
 ### Unsigned builds
 
-**Nothing we publish is signed, and nothing will be signed until beta.** A
-certificate costs money and asserts a level of care this software has not earned
-yet. Today there are three artifacts to receive unsigned — the Linux tarball, the
-client's web bundle, and the **Android APK**, the one platform that refuses an
-unsigned install outright (hence the debug key, below). As the remaining
-per-platform builds land, each will complain in its own way, and none of it will
-be a fault:
+**The server tarball and the client's web bundle are unsigned, and will stay
+unsigned until beta.** A certificate costs money and asserts a level of care this
+software has not earned yet. Today there are three artifacts — the Linux tarball,
+the web bundle, and the **Android APK**. The APK is the one platform that refuses
+an unsigned install outright, and since
+[#168](https://github.com/chezgoulet/adjutant/issues/168) it is **not** signed
+with Flutter's throwaway debug key: the release workflow reads the troop's release
+keystore from four Actions secrets, writes a never-committed `key.properties`,
+builds, and then checks the artifact with `apksigner verify --print-certs`. A
+missing secret fails the job; it never falls back to the public debug key. As the
+remaining per-platform builds land, each will complain in its own way, and none
+of it will be a fault:
 
 - **macOS** — Gatekeeper quarantines the download. Right-click → **Open**, or
   clear the flag yourself: `xattr -d com.apple.quarantine <file>`. The builds are
@@ -259,13 +280,18 @@ be a fault:
   outright**: both formats expect a signature for an ordinary install, so you need
   the escape hatch (`snap install --dangerous`; `--no-gpg-verify` for flatpak).
   That inconvenience disappears when signing arrives at beta.
-- **Android** — if you build the client yourself (`flutter build apk`) the
-  platform will not install an unsigned APK at all, so Flutter signs it with a
-  throwaway debug key. It installs from a file manager or Obtainium, but that key
-  is not one we keep — so a properly signed build later may not upgrade over it
-  cleanly. The `.aab` is for the Play Store, not for sideloading. **The APK every
-  tag attaches is that debug-signed file**: install it, use it, and expect to
-  uninstall it before a signed build can take its place.
+- **Android** — the APK every tag attaches is signed with the troop's release key,
+  not the debug key. **If you installed an APK built before this change, you must
+  uninstall it once** before installing a release-signed one: Android only
+  upgrades an APK whose signature matches, and the debug key and the release key
+  are not related. Nothing on the server is lost — the session token and the
+  device cache are local — but the local read cache and any queued writes are
+  discarded by the uninstall. The old debug key was public, so while it signed
+  this app anybody could have produced an update Android accepted as ours; that
+  update path is now closed.
+- **Web** — the bundle is static files with no signature to check. Serve it over
+  HTTPS. The browser's session token is in `localStorage`, which is the only
+  store a browser offers; the native builds use the Keystore/Keychain instead.
 
 If any of that surprises you, it is worth repeating: **this is alpha software, and
 a warning from your operating system is the correct response to it.**
@@ -368,26 +394,40 @@ device-side migration, because the device stores the server's JSON, not a model
 of it.
 
 - **Reads** are cached on every success (`shared_preferences`, one key per
-  resource, with the hour it was written) and served **only when the server
-  cannot be reached** — never in preference to a live answer, so a cached read is
-  never shown as though it were live: the screen says `Offline` and shows when
-  its data is from. There is no TTL, and the cache dies with the session:
-  signing out drops every cached read, because a roster that outlives the session
-  is one member's troop shown to the next.
+  resource **per member**, with the hour it was written) and served **only when
+  the server cannot be reached** — never in preference to a live answer, so a
+  cached read is never shown as though it were live: the screen says `Offline` and
+  shows when its data is from. There is no TTL, and the cache dies with the
+  session: signing out drops every cached read, because a roster that outlives the
+  session is one member's troop shown to the next. A 401 at boot is the same end
+  and drops the same keys (#166), and the keys are scoped to the authenticated
+  member id, so an artefact that did survive is not a name the next member's
+  session looks up.
 - **Writes** go through `SessionState.mutate`. Online they are sent. Offline they
   are recorded in a durable queue — the request, plus an idempotency key derived
-  from that request — and replayed **in order** when the server answers again (the
-  next read does it, a relaunch does it, and the app bar's cloud button does it on
-  demand). Only writes the server treats as the same act when repeated are queued
-  (a read receipt, a dues tier, a plugin's enable/disable). A write the server
-  would *append* — placing an order, opening a Checkout session, booking a draw —
-  is **refused in words** while offline instead of being queued: a duplicate is
-  worse than a wait, and a queue that pretended otherwise would be a promise this
-  client cannot keep.
+  from that request **and its owner** — and replayed **in order** when the server
+  answers again (the next read does it, a relaunch does it, and the app bar's
+  cloud button does it on demand). A replay pass only sends entries whose owner
+  is the current member; another identity's entries stay on disk for that
+  identity. Only writes the server treats as the same act when repeated are
+  queued (a read receipt, a dues tier, a plugin's enable/disable). A write the
+  server would *append* — placing an order, opening a Checkout session, booking a
+  draw — is **refused in words** while offline instead of being queued: a
+  duplicate is worse than a wait, and a queue that pretended otherwise would be a
+  promise this client cannot keep.
 - A queued write the server **refuses** (a 4xx) is parked with the server's own
   sentence and shown on a strip above whatever screen is open, and it does not
   hold up the writes behind it. Nothing is dropped quietly, and nothing blocks
   the queue forever.
+- **The session token is not in `shared_preferences`** (#169). It lives in
+  `flutter_secure_storage` — Keystore on Android, Keychain on iOS/macOS,
+  libsecret on Linux — and an existing token under `adjutant.token` is moved there
+  and the old key deleted on first run. Android backup is disabled
+  (`android:allowBackup="false"` plus `dataExtractionRules`/`fullBackupContent`
+  excluding the preferences file). **On the web there is no OS keystore**:
+  `localStorage` is the only store, so the browser build keeps the token there.
+  That is stated rather than papered over; the native builds are the ones that
+  gain encryption at rest.
 
 `client/test/offline_test.dart` holds its tests: ordering and replay, the
 recorded request matching the one the online path sends, the refusal path, the
@@ -416,7 +456,8 @@ House standard ([chezgoulet-git-flow]): `testing` = integration target,
 
 ---
 
-**Adjutant is alpha software.** Unsigned, unstable, and not ready for a troop's
-real records — every build will say so again when your operating system stops you
-from opening it. If you are considering putting real scouts into it, wait for
-beta, or keep a backup you have actually restored.
+**Adjutant is alpha software.** Unstable, not ready for a troop's real records,
+and — apart from the release-signed Android APK — unsigned; every build will say
+so again when your operating system stops you from opening it. If you are
+considering putting real scouts into it, wait for beta, or keep a backup you have
+actually restored.

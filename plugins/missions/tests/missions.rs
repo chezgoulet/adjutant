@@ -7,6 +7,7 @@
 
 use adjutant_sdk::prelude::*;
 use adjutant_sdk::testing::{response_json, TestHost, TestRequest};
+use serde_json::json;
 use adjutant_missions::{
     is_iso_date, rank_mentors, require_stage, require_stage_in, MissionsPlugin, Proposal,
     CATEGORIES, STAGE_APPROVAL, STAGE_DEBRIEF, STAGE_EXECUTION, STAGE_REPORT, STAGE_REQUEST,
@@ -790,6 +791,14 @@ async fn list_passes_the_callers_lodge_scopes_as_an_array() {
     let (host, routes) = plugin_routes().await;
     let list = route(&routes, "GET", "/api/missions/missions");
 
+    // First the permission-aware scope lookup (`scopes_for`), then the page. The
+    // lookup is what stops a grant at a lodge the caller cannot *read* from
+    // widening the list.
+    host.db.push_rows(vec![serde_json::json!({
+        "permission": "missions:read",
+        "scope_type": "lodge",
+        "scope_id": "3"
+    })]);
     host.db.push_rows(vec![serde_json::json!({ "id": 1, "title": "Survey" })]);
 
     let req = TestRequest::get("/api/missions/missions")
@@ -804,11 +813,143 @@ async fn list_passes_the_callers_lodge_scopes_as_an_array() {
     assert_eq!(resp.status, 200);
     assert_eq!(response_json(&resp)["scope"], serde_json::json!("scoped"));
 
-    let call = host.db.queried.lock().unwrap()[0].clone();
+    let call = host.db.queried.lock().unwrap()[1].clone();
     match &call.params[1] {
         SqlValue::TextArray(lodges) => assert_eq!(lodges, &vec!["3".to_string()]),
         other => panic!("expected the caller's lodge ids, got {other:?}"),
     }
     assert!(matches!(&call.params[3], SqlValue::Text(s) if s == "execution"));
     assert!(matches!(&call.params[7], SqlValue::Int(10)));
+}
+
+// ---------------------------------------------------------------------------
+// Mentor profiles: whose row may a mentor write
+// ---------------------------------------------------------------------------
+
+/// Declaring a profile for **another** member is curatorial, so it needs approve
+/// authority covering that member's lodge — and the lodge has to be named. The
+/// route gate only proves `missions:mentor` somewhere.
+#[tokio::test]
+async fn declaring_another_members_profile_needs_approve_at_that_lodge() {
+    let (host, routes) = plugin_routes().await;
+    let profile = route(&routes, "POST", "/api/missions/mentor/profile");
+
+    // No lodge named: refused before any query.
+    let (status, body) = call(
+        &profile.handler,
+        TestRequest::post("/api/missions/mentor/profile")
+            .identity_grants(
+                "bea",
+                vec![RoleGrant {
+                    role_id: "mentor".into(),
+                    scope: Scope::lodge("3"),
+                }],
+            )
+            .json(&json!({ "member_id": "carl", "expertise": ["tracking"] }))
+            .build(),
+    )
+    .await;
+    assert_eq!(status, 400, "{body}");
+    assert!(
+        body["error"].as_str().unwrap().contains("lodge_id"),
+        "the refusal says what is missing: {body}"
+    );
+    assert_eq!(host.db.query_count(), 0, "no query before the refusal");
+
+    // Lodge named, but no approve authority there.
+    host.db.push_rows(vec![json!({ "n": 0 })]);
+    let (status, body) = call(
+        &profile.handler,
+        TestRequest::post("/api/missions/mentor/profile")
+            .identity_grants(
+                "bea",
+                vec![RoleGrant {
+                    role_id: "mentor".into(),
+                    scope: Scope::lodge("3"),
+                }],
+            )
+            .json(&json!({ "member_id": "carl", "lodge_id": "3", "expertise": ["tracking"] }))
+            .build(),
+    )
+    .await;
+    assert_eq!(status, 403, "{body}");
+    assert!(
+        host.db.last_query_params("role_permissions").is_some(),
+        "the approve check ran"
+    );
+    assert!(
+        host.db.executed_sql().is_empty() && host.db.queried_sql().len() == 1,
+        "a refused declaration writes nothing"
+    );
+}
+
+/// A member declaring their own profile needs no lodge and no approve: it is
+/// their row.
+#[tokio::test]
+async fn a_member_may_declare_their_own_profile() {
+    let (host, routes) = plugin_routes().await;
+    let profile = route(&routes, "POST", "/api/missions/mentor/profile");
+    host.db
+        .push_rows(vec![json!({ "member_id": "bea", "display_name": "Bea",
+                                "expertise": ["tracking"], "capacity": 1, "is_active": true })]);
+
+    let (status, body) = call(
+        &profile.handler,
+        TestRequest::post("/api/missions/mentor/profile")
+            .identity_grants(
+                "bea",
+                vec![RoleGrant {
+                    role_id: "mentor".into(),
+                    scope: Scope::lodge("3"),
+                }],
+            )
+            .json(&json!({ "member_id": "bea", "expertise": ["tracking"] }))
+            .build(),
+    )
+    .await;
+    assert_eq!(status, 201, "{body}");
+    assert_eq!(body["mentor"]["member_id"], "bea");
+}
+
+/// An omitted field must bind as NULL so the UPDATE preserves the stored value.
+/// It used to bind as `''` and `{}`, and the COALESCE on EXCLUDED guarded
+/// nothing: a body naming only the member blanked their name and wiped their
+/// expertise.
+#[tokio::test]
+async fn an_omitted_field_does_not_blank_the_stored_row() {
+    let (host, routes) = plugin_routes().await;
+    let profile = route(&routes, "POST", "/api/missions/mentor/profile");
+    host.db.push_rows(vec![json!({ "member_id": "bea" })]);
+
+    let (status, _body) = call(
+        &profile.handler,
+        TestRequest::post("/api/missions/mentor/profile")
+            .identity_grants(
+                "bea",
+                vec![RoleGrant {
+                    role_id: "mentor".into(),
+                    scope: Scope::lodge("3"),
+                }],
+            )
+            .json(&json!({ "member_id": "bea" }))
+            .build(),
+    )
+    .await;
+    assert_eq!(status, 201);
+
+    let params = host.db.last_query_params("ON CONFLICT").expect("the upsert ran");
+    let rendered: Vec<String> = params.iter().map(|p| format!("{p:?}")).collect();
+    assert!(
+        rendered.iter().any(|p| p == "Null"),
+        "an omitted field is bound as NULL, so the UPDATE keeps what is stored: {rendered:?}"
+    );
+    assert!(
+        !rendered.iter().any(|p| p.contains("TextArray([])")),
+        "an omitted expertise must not arrive as an empty array: {rendered:?}"
+    );
+    let sql = host.db.queried_sql().join("\n");
+    assert!(
+        sql.contains("display_name = COALESCE($2"),
+        "the UPDATE coalesces the parameter, not EXCLUDED: {sql}"
+    );
 }

@@ -79,9 +79,15 @@ async fn fresh_ledger(url: &str, plugins: &Path) -> Arc<sqlx::PgPool> {
 /// Boot the real application on an ephemeral port, with its backup directory
 /// pointed at `backups`.
 async fn spawn_app(plugins: &Path, backups: &Path, url: &str) -> (String, tokio::task::JoinHandle<()>) {
-    // Process-wide, because `backup::backup_dir()` reads the environment the same
-    // way the server does. The caller holds SERIAL for the whole test.
+    // Process-wide, because `backup::backup_dir()` and the encryption settings
+    // read the environment the same way the server does. The caller holds SERIAL
+    // for the whole test.
     std::env::set_var("ADJUTANT_BACKUP_DIR", backups);
+    // These probes assert the dump/retention/download mechanics, not age; a test
+    // host is not required to have a key pair. The opt-in is explicit, and the
+    // fail-closed default has its own probe below.
+    std::env::remove_var("ADJUTANT_BACKUP_AGE_RECIPIENT");
+    std::env::set_var("ADJUTANT_BACKUP_ALLOW_PLAINTEXT", "true");
 
     let cfg = Config {
         database_url: url.to_string(),
@@ -288,6 +294,242 @@ async fn probe_a_manual_run_produces_a_bundle_the_admin_can_download() {
     assert_eq!(status, 200, "{body}");
     assert_eq!(body["schedule"]["cadence_secs"], serde_json::Value::Null);
     assert_eq!(body["schedule"]["enabled"], serde_json::json!(false));
+
+    let _ = std::fs::remove_dir_all(backups.parent().expect("root"));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "DB-gated: needs ADJUTANT_TEST_DATABASE_URL + CREATEROLE + age"]
+async fn probe_an_encrypted_run_writes_dump_age() {
+    // A throwaway public key: encryption needs no private key, which is the
+    // property being asserted. Never a real deployment's key.
+    const RECIPIENT: &str = "age1jxz8v8fphxqj8qhpew3akhwsyvqug2fr8fu5n46u26ux624svujqplk9ez";
+    if std::process::Command::new("age")
+        .arg("--version")
+        .output()
+        .is_err()
+    {
+        eprintln!("age is not installed; skipping the encrypted-bundle probe");
+        return;
+    }
+
+    let _serial = SERIAL.lock().await;
+    let (plugins, backups) = scratch("enc");
+    let url = base_url();
+    let _ledger = fresh_ledger(&url, &plugins).await;
+    let (base, _serve) = spawn_app(&plugins, &backups, &url).await;
+    std::env::remove_var("ADJUTANT_BACKUP_ALLOW_PLAINTEXT");
+    std::env::set_var("ADJUTANT_BACKUP_AGE_RECIPIENT", RECIPIENT);
+
+    let (status, body) = post(&base, "/api/backups/run").await;
+    assert_eq!(status, 200, "the encrypted run succeeds: {body}");
+    let run = &body["run"];
+    assert_eq!(run["status"], serde_json::json!("done"), "{run}");
+    let filename = run["filename"].as_str().expect("a filename");
+    assert!(
+        filename.ends_with(".dump.age"),
+        "the name makes the encryption state visible: {filename}"
+    );
+    let path = backups.join(filename);
+    let bytes = std::fs::read(&path).expect("the encrypted bundle");
+    assert!(
+        bytes.starts_with(b"age-encryption.org/v1"),
+        "the bundle is age ciphertext, not a plaintext pg_dump"
+    );
+    assert!(
+        Path::new(&format!("{}.sha256", path.display())).is_file(),
+        "the checksum sidecar follows the artifact name"
+    );
+
+    let (status, got) = download(&base, filename).await;
+    assert_eq!(status, 200, "the encrypted bundle downloads");
+    assert_eq!(got, bytes, "and is the whole ciphertext");
+
+    let _ = std::fs::remove_dir_all(backups.parent().expect("root"));
+}
+
+/// A throwaway key pair. Encryption needs only the recipient, so the private
+/// half proves the bundle is decrypt-only without ever putting a deployment's
+/// key in the repository. Generated for this probe; it protects nothing.
+const TEST_IDENTITY: &str = "AGE-SECRET-KEY-16PRCWWZZ0JW4M2C657T24MDFXZFXZRA8LPKP3GVET0KH547AR9KQYDLMWU";
+const TEST_RECIPIENT: &str = "age1dggq8y3565sdgcwvn8mdyfrvyk893732vn2j07ndhqlfa5uf5y2sl7wc4d";
+
+/// The password a `probe163` plugin role would have. Only the probe writes it.
+const PLUGIN_SECRET: &str = "adjutant-163-known-plugin-password-5c1f0a7e";
+
+/// The bundle is a real backup that only a holder of the identity can read.
+///
+/// This is the #163 assurance in one probe. `core.plugins.db_secret` really is
+/// inside the archive (the positive control below decrypts it and finds the
+/// password), so the protection is the encryption rather than an accident of
+/// `pg_dump` compression. Without the identity the bundle yields nothing; with
+/// it, `pg_restore` can read the credential. And because `pg_dump` is piped
+/// straight into `age`, there is no plaintext intermediate anywhere in the
+/// backup directory — not even one a crash could leave behind.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "DB-gated: needs ADJUTANT_TEST_DATABASE_URL + CREATEROLE + age + pg_restore"]
+async fn probe_an_encrypted_bundle_carries_no_plaintext_dump() {
+    // Not a silent skip: the CI job installs both, and a probe that quietly
+    // passes when the tool it exists to exercise is missing proves nothing.
+    for tool in ["age", "pg_restore"] {
+        assert!(
+            std::process::Command::new(tool)
+                .arg("--version")
+                .output()
+                .is_ok(),
+            "{tool} is required by this probe (the DB-backed CI job installs it)"
+        );
+    }
+
+    let _serial = SERIAL.lock().await;
+    let (plugins, backups) = scratch("sealed");
+    let url = base_url();
+    let _ledger = fresh_ledger(&url, &plugins).await;
+    let (base, _serve) = spawn_app(&plugins, &backups, &url).await;
+
+    // A plugin row carrying a password we can look for afterwards. The fixture's
+    // plugin directory is empty, so nothing else reads it.
+    sqlx::query(
+        "INSERT INTO core.plugins (id, version, db_secret) VALUES ('probe163', '0.0.0', $1) \
+         ON CONFLICT (id) DO UPDATE SET db_secret = EXCLUDED.db_secret",
+    )
+    .bind(PLUGIN_SECRET)
+    .execute(_ledger.as_ref())
+    .await
+    .expect("seed a plugin credential");
+
+    std::env::remove_var("ADJUTANT_BACKUP_ALLOW_PLAINTEXT");
+    std::env::set_var("ADJUTANT_BACKUP_AGE_RECIPIENT", TEST_RECIPIENT);
+
+    let (status, body) = post(&base, "/api/backups/run").await;
+    assert_eq!(status, 200, "the encrypted run succeeds: {body}");
+    let run = &body["run"];
+    assert_eq!(run["status"], serde_json::json!("done"), "{run}");
+    let filename = run["filename"].as_str().expect("a filename");
+    let path = backups.join(filename);
+    let bundle = std::fs::read(&path).expect("the encrypted bundle");
+    assert!(
+        bundle.starts_with(b"age-encryption.org/v1"),
+        "the bundle is age ciphertext"
+    );
+
+    // The pipeline leaves exactly one artifact (plus its sidecar): no `.dump`,
+    // no `.dump.*.plaintext`, nothing that carries the archive in the clear.
+    let names: Vec<String> = std::fs::read_dir(&backups)
+        .expect("backup dir")
+        .flatten()
+        .map(|e| e.file_name().to_string_lossy().to_string())
+        .collect();
+    assert!(
+        names.iter().all(|n| n.ends_with(".dump.age") || n.ends_with(".sha256")),
+        "no plaintext dump or temporary was left behind: {names:?}"
+    );
+    // Exact, not best-effort: the secret's bytes are absent from the artifact.
+    assert!(
+        !bundle.windows(PLUGIN_SECRET.len()).any(|w| w == PLUGIN_SECRET.as_bytes()),
+        "the known plugin password must not appear in the bundle"
+    );
+
+    // Without the identity the bundle is unreadable — the point of encrypting.
+    let identity = backups.join("test-identity.txt");
+    std::fs::write(&identity, TEST_IDENTITY).expect("write the test identity");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&identity, std::fs::Permissions::from_mode(0o600))
+            .expect("identity is private");
+    }
+    let no_key = std::process::Command::new("age")
+        .arg("--decrypt")
+        .arg(&path)
+        .output()
+        .expect("run age without an identity");
+    assert!(
+        !no_key.status.success(),
+        "age decrypted the bundle without an identity"
+    );
+
+    // Positive control: with the identity this is a complete pg_dump archive,
+    // and the credential really is in it. A leak of the plaintext archive is
+    // exactly the exposure #163 names; the ciphertext above is why it does not
+    // leak with the bundle.
+    let decrypted = std::process::Command::new("age")
+        .arg("--decrypt")
+        .arg("--identity")
+        .arg(&identity)
+        .arg(&path)
+        .output()
+        .expect("run age");
+    assert!(
+        decrypted.status.success(),
+        "the test identity decrypts the bundle: {}",
+        String::from_utf8_lossy(&decrypted.stderr)
+    );
+    assert!(
+        decrypted.stdout.starts_with(b"PGDMP"),
+        "the decrypted stream is a pg_dump custom-format archive"
+    );
+
+    let mut restore = std::process::Command::new("pg_restore")
+        .args(["--data-only", "-f", "-"])
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("run pg_restore");
+    {
+        use std::io::Write;
+        restore
+            .stdin
+            .take()
+            .expect("pg_restore stdin")
+            .write_all(&decrypted.stdout)
+            .expect("feed the archive to pg_restore");
+    }
+    let restored = restore.wait_with_output().expect("pg_restore finishes");
+    assert!(
+        restored.status.success(),
+        "pg_restore reads the decrypted archive: {}",
+        String::from_utf8_lossy(&restored.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&restored.stdout).contains(PLUGIN_SECRET),
+        "the known plugin password is in the decrypted archive — this probe \
+         would see it if the bundle were not encrypted"
+    );
+
+    sqlx::query("DELETE FROM core.plugins WHERE id = 'probe163'")
+        .execute(_ledger.as_ref())
+        .await
+        .expect("remove the probe's plugin row");
+    let _ = std::fs::remove_dir_all(backups.parent().expect("root"));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "DB-gated: needs ADJUTANT_TEST_DATABASE_URL + CREATEROLE; run with `-- --ignored`"]
+async fn probe_a_run_without_a_recipient_fails_closed() {
+    let _serial = SERIAL.lock().await;
+    let (plugins, backups) = scratch("nokey");
+    let url = base_url();
+    let _ledger = fresh_ledger(&url, &plugins).await;
+    let (base, _serve) = spawn_app(&plugins, &backups, &url).await;
+
+    // No key pair, no opt-in: the one thing this must not do is write a plaintext
+    // bundle because the configuration was absent.
+    std::env::remove_var("ADJUTANT_BACKUP_AGE_RECIPIENT");
+    std::env::remove_var("ADJUTANT_BACKUP_ALLOW_PLAINTEXT");
+
+    let (status, body) = post(&base, "/api/backups/run").await;
+    assert_eq!(status, 409, "a run without a recipient is refused: {body}");
+    let error = body["error"].as_str().unwrap_or_default();
+    assert!(
+        error.contains("ADJUTANT_BACKUP_AGE_RECIPIENT"),
+        "the refusal names the variable to set: {body}"
+    );
+    assert!(
+        bundles(&backups).is_empty(),
+        "no bundle — and no zero-byte placeholder — was left behind"
+    );
 
     let _ = std::fs::remove_dir_all(backups.parent().expect("root"));
 }

@@ -12,7 +12,10 @@ use sqlx::PgPool;
 use crate::config::Config;
 
 /// Core schema DDL (SPEC §8.1). Idempotent — `IF NOT EXISTS` throughout.
-const CORE_MIGRATIONS: &[(i64, &str, &str)] = &[(1, "core_schema", "
+///
+/// Public so the DB-gated upgrade test can re-run one migration's SQL against a
+/// database that already has rows (the one path a fresh migration never takes).
+pub const CORE_MIGRATIONS: &[(i64, &str, &str)] = &[(1, "core_schema", "
 CREATE SCHEMA IF NOT EXISTS core;
 
 CREATE TABLE IF NOT EXISTS core.users (
@@ -242,9 +245,16 @@ ALTER TABLE core.user_roles ALTER COLUMN scope_id DROP DEFAULT;
 ALTER TABLE core.user_roles ALTER COLUMN scope_id DROP NOT NULL;
 ALTER TABLE core.user_roles ALTER COLUMN scope_id TYPE TEXT USING scope_id::text;
 
--- Normalise existing (all troop-wide) rows to NULL.
+-- Normalise troop-wide rows to NULL. Only troop rows: migration 1 gave EVERY
+-- row the zero-UUID default regardless of scope_type, so a deployed
+-- (scope_type='lodge', scope_id=zero-UUID) grant is a plausible legacy shape.
+-- Nulling it here used to violate the CHECK added below in the same migration,
+-- aborting the whole transaction and leaving the server unable to boot (#158).
+-- A non-troop zero UUID is a valid opaque id under #33, so it is kept as-is
+-- rather than deleted; the only rows whose meaning is troop-wide are the
+-- scope_type='troop' ones.
 UPDATE core.user_roles SET scope_id = NULL
-  WHERE scope_type = 'troop' OR scope_id = '00000000-0000-0000-0000-000000000000';
+  WHERE scope_type = 'troop';
 
 CREATE UNIQUE INDEX IF NOT EXISTS idx_user_roles_unique
   ON core.user_roles (user_id, role_id, COALESCE(scope_id, ''));
@@ -853,6 +863,250 @@ CREATE TRIGGER notifications_identity_immutable BEFORE UPDATE ON core.notificati
   FOR EACH ROW EXECUTE FUNCTION core.notification_identity_is_fixed();
 "
     ),
+    (14, "bootstrap_claim", "
+-- #173: the bootstrap slot is a row, so 'the first user becomes chief' has
+-- exactly one winner. The route inserts here **before** creating the user; the
+-- primary key is the mutex, so two concurrent first registrations cannot both
+-- pass the empty-table check. A row is spent forever once claimed — the same
+-- 'refuse rather than trust' shape the last-admin and last-identity-provider
+-- guards use.
+CREATE TABLE IF NOT EXISTS core.bootstrap_claim (
+    id          SMALLINT PRIMARY KEY DEFAULT 1 CHECK (id = 1),
+    claim_token TEXT NOT NULL,
+    claimed_at  TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+-- An installation that already has users has already spent its bootstrap. This
+-- backfill is what closes registration on every upgrade; without it an existing
+-- deployment would look unclaimed and the next caller would become chief.
+INSERT INTO core.bootstrap_claim (id, claim_token)
+SELECT 1, encode(public.gen_random_bytes(32), 'hex')
+WHERE EXISTS (SELECT 1 FROM core.users)
+ON CONFLICT DO NOTHING;
+"
+    ),
+    (15, "keep_an_admin", "
+-- #147: a write that leaves no user holding an administrative grant at troop
+-- scope is refused by the schema, not by one handler. Recovery from that state
+-- is otherwise psql-only: `chief` is the only role carrying `core:admin`, and
+-- nothing in the CLI could grant it back.
+--
+-- A trigger rather than a check in `POST /api/auth/roles`, because the concern
+-- is every writer of `core.user_roles` — today's handler, a future route, an
+-- operator's SQL. It is also where the cascade from a deleted last admin lands.
+--
+-- **Writers must grant before they revoke.** A transfer implemented as
+-- delete-then-insert trips this between the two statements even though its end
+-- state is valid; the auth handler inserts the new set first for that reason.
+--
+-- The role whose row is being deleted is not consulted: the question is only
+-- whether *somebody* still holds the authority afterwards. `auth:manage_users`
+-- is included because a troop that renamed its admin role should not lose the
+-- guard.
+CREATE OR REPLACE FUNCTION core.refuse_last_admin_removal() RETURNS trigger
+LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog, core AS $fn$
+BEGIN
+    IF NOT EXISTS (
+        SELECT 1
+        FROM core.user_roles ur
+        JOIN core.role_permissions rp ON rp.role_id = ur.role_id
+        WHERE rp.permission_id IN ('core:admin', 'auth:manage_users')
+          AND ur.scope_type = 'troop'
+    ) THEN
+        RAISE EXCEPTION 'last_admin: this write would leave no user holding core:admin or auth:manage_users at troop scope; grant another user chief first'
+            USING ERRCODE = 'check_violation';
+    END IF;
+    RETURN NULL;
+END
+$fn$;
+
+DROP TRIGGER IF EXISTS user_roles_keep_an_admin ON core.user_roles;
+CREATE TRIGGER user_roles_keep_an_admin
+  AFTER DELETE ON core.user_roles
+  FOR EACH ROW EXECUTE FUNCTION core.refuse_last_admin_removal();
+"
+    ),
+    (16, "session_revocation", "
+-- #149 AUTH-3: a session can be revoked without deleting the row, so a leaked
+-- token stops working before its 30-day expiry and the fact of revocation is
+-- kept for the audit trail. NULL means live; a timestamp means revoked at
+-- that instant.
+--
+-- The identity lookup filters on `revoked_at IS NULL`; the existing
+-- `idx_core_sessions_hash` (token_hash) already serves that equality lookup, so
+-- this migration adds no second index for it. The route that lists a caller's
+-- sessions and the password-change revocation both filter by user_id, which had
+-- no index at all.
+ALTER TABLE core.sessions ADD COLUMN IF NOT EXISTS revoked_at TIMESTAMPTZ;
+CREATE INDEX IF NOT EXISTS idx_core_sessions_user_live
+  ON core.sessions (user_id) WHERE revoked_at IS NULL;
+"
+    ),
+    (17, "audit_chain_v2_and_keyed", "
+-- #159: the v1 digest covered id/action/resource_type/resource_id/details/source.
+-- Changing user_id or created_at (who and when — the two things an audit log
+-- exists to establish) left the chain verifying. v2 adds both, as a new
+-- migration so an applied v1 is never edited.
+--
+-- #160: keyed_hash is an HMAC-SHA256 computed by the server over the same
+-- canonical payload. The database role that owns this table never holds the
+-- key, so it can recompute the unkeyed chain but not this column. Rows that
+-- predate the key (and every deployment without ADJUTANT_AUDIT_KEY) keep it
+-- NULL; the app verifier reports them as unkeyed, never as protected.
+ALTER TABLE core.audit_log ADD COLUMN IF NOT EXISTS keyed_hash TEXT;
+
+-- The canonical form, in one place so the trigger, the verifier and the
+-- migration's recompute cannot drift apart. The Rust twin is
+-- adjutant_sdk::canonical_payload; change both together.
+--
+--   prev_hash | id | action | resource_type | resource_id | details::text |
+--   source | coalesce(user_id::text,'') |
+--   to_char(created_at AT TIME ZONE 'UTC','YYYY-MM-DD\"T\"HH24:MI:SS.US')||'+00:00'
+--
+-- details::text is jsonb's rendering (sorted keys), not the caller's JSON
+-- text: jsonb normalises on the way in, and both sides hash what is stored.
+--
+-- STABLE, not IMMUTABLE. PostgreSQL catalogues to_char(timestamp with time
+-- zone, text) at provolatile = 's' (STABLE): it is not independent of session
+-- settings. The wrapper is accepted either way, which is the trap — IMMUTABLE
+-- is a promise to the planner that the expression can be folded at plan time
+-- and indexed, and that promise is false here.
+--
+-- STABLE is honest and costs nothing today: core.audit_verify() reads and
+-- recomputes every row, so there is no index or plan-time fold to lose. The
+-- alternative, earning IMMUTABLE with explicit field extraction, would change
+-- the canonical string and force the Rust twin and this migration's recompute
+-- to change in the same commit, for an optimisation nothing uses.
+CREATE OR REPLACE FUNCTION core.audit_canonical(
+    p_prev_hash     TEXT,
+    p_id            BIGINT,
+    p_action        TEXT,
+    p_resource_type TEXT,
+    p_resource_id   TEXT,
+    p_details       JSONB,
+    p_source        TEXT,
+    p_user_id       UUID,
+    p_created_at    TIMESTAMPTZ
+) RETURNS TEXT
+LANGUAGE sql STABLE AS $fn$
+SELECT p_prev_hash || '|' || p_id::text || '|' || p_action || '|' ||
+       p_resource_type || '|' || p_resource_id || '|' || p_details::text || '|' ||
+       p_source || '|' || COALESCE(p_user_id::text, '') || '|' ||
+       to_char(p_created_at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS.US') || '+00:00'
+$fn$;
+
+-- Recompute the chain over existing rows with the v2 formula, or an upgrade
+-- would leave every row reporting as bad. The append-only trigger would refuse
+-- these UPDATEs, so it is disabled for the recompute and re-enabled in the same
+-- transaction: an error anywhere rolls the disable back too.
+--
+-- Cost: this rewrites every existing row in one transaction. Upgrade time and
+-- lock duration scale with core.audit_log's row count, so a large deployment
+-- should expect an upgrade window. An error rolls the whole migration back,
+-- leaving the old chain intact and the append-only trigger armed.
+ALTER TABLE core.audit_log DISABLE TRIGGER audit_append_only;
+
+DO $fn$
+DECLARE r RECORD; prev TEXT := repeat('0', 64); h TEXT;
+BEGIN
+  FOR r IN
+    SELECT id, user_id, action, resource_type, resource_id, details, source, created_at
+    FROM core.audit_log ORDER BY id
+  LOOP
+    h := encode(public.digest(core.audit_canonical(
+        prev, r.id, r.action, r.resource_type, r.resource_id, r.details, r.source,
+        r.user_id, r.created_at), 'sha256'), 'hex');
+    UPDATE core.audit_log SET prev_hash = prev, entry_hash = h WHERE id = r.id;
+    prev := h;
+  END LOOP;
+END
+$fn$;
+
+ALTER TABLE core.audit_log ENABLE TRIGGER audit_append_only;
+
+CREATE OR REPLACE FUNCTION core.audit_chain_fill() RETURNS trigger
+LANGUAGE plpgsql AS $fn$
+DECLARE prev TEXT;
+BEGIN
+  PERFORM pg_advisory_xact_lock(918273645);
+  SELECT entry_hash INTO prev FROM core.audit_log ORDER BY id DESC LIMIT 1;
+  NEW.prev_hash := COALESCE(prev, repeat('0', 64));
+  -- The canonical form is pinned in core.audit_canonical(): v2 includes
+  -- user_id and created_at, in UTC with microsecond precision. Do not inline a
+  -- second copy here — see the Rust twin adjutant_sdk::canonical_payload.
+  NEW.entry_hash := encode(public.digest(core.audit_canonical(
+    NEW.prev_hash, NEW.id, NEW.action, NEW.resource_type, NEW.resource_id,
+    NEW.details, NEW.source, NEW.user_id, NEW.created_at), 'sha256'), 'hex');
+  RETURN NEW;
+END
+$fn$;
+
+DROP TRIGGER IF EXISTS audit_chain_fill ON core.audit_log;
+CREATE TRIGGER audit_chain_fill BEFORE INSERT ON core.audit_log
+  FOR EACH ROW EXECUTE FUNCTION core.audit_chain_fill();
+
+-- The append-only and TRUNCATE guards are deliberately untouched: the keyed
+-- column is written on INSERT only (the SDK computes it first), and any UPDATE
+-- remains refused.
+CREATE OR REPLACE FUNCTION core.audit_verify()
+RETURNS TABLE(first_bad BIGINT, rows_checked BIGINT)
+LANGUAGE sql STABLE AS $fn$
+SELECT min(id) FILTER (WHERE bad)::BIGINT, count(*)::BIGINT FROM (
+  SELECT a.id,
+    (a.prev_hash IS DISTINCT FROM COALESCE(lag(a.entry_hash, 1) OVER w, repeat('0', 64)))
+    OR (a.entry_hash IS DISTINCT FROM encode(public.digest(core.audit_canonical(
+        COALESCE(lag(a.entry_hash, 1) OVER w, repeat('0', 64)),
+        a.id, a.action, a.resource_type, a.resource_id, a.details, a.source,
+        a.user_id, a.created_at), 'sha256'), 'hex')) AS bad
+  FROM core.audit_log a WINDOW w AS (ORDER BY a.id)
+) t
+$fn$;
+"
+    ),
+    (
+        18,
+        "events_replay_gap_free",
+        "-- #162: a cursor replay could silently skip an event that committed late.
+--
+-- BIGSERIAL allocates an id at INSERT but a row becomes visible at COMMIT, so
+-- one transaction can hold a lower id while a higher id is already visible. A
+-- reader that advances its cursor to the higher id never sees the lower one
+-- after it commits -- the event is durable in core.events and unreachable by
+-- replay, which defeats the durability the bus promises.
+--
+-- The fix makes id allocation and commit order the same. A BEFORE INSERT
+-- trigger takes a transaction-scoped advisory lock BEFORE assigning the id and
+-- holds it until this transaction commits or rolls back. A concurrent insert
+-- waits for that resolution, so it can only be allocated a higher id after the
+-- lower one is visible (committed) or gone forever (rolled back). `id > cursor
+-- ORDER BY id` is then gap-free for every writer, including raw SQL that never
+-- goes through the host publisher.
+--
+-- The column default is dropped so an ordinary insert arrives with NEW.id NULL
+-- and the trigger is the only allocator. An explicit id (a dump restore, a
+-- fixture) is kept as given and still serialised by the lock; restoring a dump
+-- is single-threaded, so it cannot interleave with live allocation.
+--
+-- The lock key is distinct from the audit chain's 918273645: the two chains are
+-- independent and must not block each other.
+ALTER TABLE core.events ALTER COLUMN id DROP DEFAULT;
+
+CREATE OR REPLACE FUNCTION core.events_serialize_id() RETURNS trigger
+LANGUAGE plpgsql AS $fn$
+BEGIN
+  PERFORM pg_advisory_xact_lock(918273646);
+  IF NEW.id IS NULL THEN
+    NEW.id := nextval('core.events_id_seq');
+  END IF;
+  RETURN NEW;
+END
+$fn$;
+
+DROP TRIGGER IF EXISTS events_serialize_id ON core.events;
+CREATE TRIGGER events_serialize_id BEFORE INSERT ON core.events
+  FOR EACH ROW EXECUTE FUNCTION core.events_serialize_id();
+"
+    ),
 ];
 
 /// Bootstrap roles + permissions grants. `chief` gets everything (SPEC §9 —
@@ -893,7 +1147,9 @@ pub async fn connect(cfg: &Config) -> Result<Arc<PgPool>, sqlx::Error> {
 pub async fn migrate_core(pool: &PgPool) -> Result<(), sqlx::Error> {
     // The schema must exist before run_migration can create its bookkeeping
     // table (core.schema_migrations) — fresh databases don't have it yet.
-    sqlx::query("CREATE SCHEMA IF NOT EXISTS core").execute(pool).await?;
+    sqlx::query("CREATE SCHEMA IF NOT EXISTS core")
+        .execute(pool)
+        .await?;
 
     for (version, name, sql) in CORE_MIGRATIONS {
         run_migration(pool, "core", *version, name, sql).await?;
@@ -1045,8 +1301,13 @@ fn validate_migration_name(name: &str) -> Result<(), sqlx::Error> {
 fn validate_schema_name(schema: &str) -> Result<(), sqlx::Error> {
     let ok = !schema.is_empty()
         && schema.len() <= 31
-        && schema.chars().next().is_some_and(|c| c.is_ascii_lowercase())
-        && schema.chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_');
+        && schema
+            .chars()
+            .next()
+            .is_some_and(|c| c.is_ascii_lowercase())
+        && schema
+            .chars()
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_');
     if ok {
         Ok(())
     } else {

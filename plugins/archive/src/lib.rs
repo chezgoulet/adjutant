@@ -632,6 +632,19 @@ fn kinds_of(req: &PluginRequest) -> Result<Option<Vec<String>>, SdkError> {
 const VISIBILITY_CLAUSE: &str =
     "(r.filed_by = $3 OR $1::bool OR r.scope_type = 'troop' OR r.scope_id = ANY($2))";
 
+/// The same clause against another table alias.
+///
+/// The catalogue reaches records through `r`; the graph reads both ends of an
+/// edge through `f` and `t`. One predicate, three aliases — a second copy
+/// written by hand is how the far end of a link ends up unfiltered, which is
+/// exactly the defect this exists to prevent.
+fn visibility_clause_for(alias: &str) -> String {
+    format!(
+        "({alias}.filed_by = $3 OR $1::bool OR {alias}.scope_type = 'troop' \
+         OR {alias}.scope_id = ANY($2))"
+    )
+}
+
 /// The columns of a record, without the derived ones. Safe in a `RETURNING` list
 /// as well as a `SELECT` (the target table is always aliased `r`).
 const RECORD_FIELDS: &str = "\
@@ -745,6 +758,16 @@ impl Predicates {
         self.clauses.push(format!(
             "NOT EXISTS (SELECT 1 FROM {table_records} c WHERE c.supersedes_id = r.id)"
         ));
+    }
+
+    /// Restrict to a set of ids — the lineage walk's discovered nodes.
+    ///
+    /// Added on top of [`VISIBILITY_CLAUSE`] rather than instead of it: a walk
+    /// discovers ids from the graph, and an id discovered is not an id read.
+    fn id_in(&mut self, ids: &[i64]) {
+        self.params.push(SqlValue::IntArray(ids.to_vec()));
+        let placeholder = self.params.len();
+        self.clauses.push(format!("r.id = ANY(${placeholder})"));
     }
 
     fn where_sql(&self) -> String {
@@ -2254,7 +2277,7 @@ async fn list_records(c: &PluginContext, req: PluginRequest) -> Result<PluginRes
 async fn record_detail(c: &PluginContext, req: PluginRequest) -> Result<PluginResponse, SdkError> {
     let id = req.int_param("id")?;
     let record = fetch_visible(c, req.identity.as_ref(), "archive:read", id).await?;
-    let edges = fetch_links(c, id).await?;
+    let edges = fetch_links(c, req.identity.as_ref(), id).await?;
     let steps = describe_edges_any(&edges);
     let superseded_by = record["superseded_by"].clone();
     PluginResponse::json(
@@ -2277,7 +2300,7 @@ async fn record_detail(c: &PluginContext, req: PluginRequest) -> Result<PluginRe
 async fn list_links(c: &PluginContext, req: PluginRequest) -> Result<PluginResponse, SdkError> {
     let id = req.int_param("id")?;
     let record = fetch_visible(c, req.identity.as_ref(), "archive:read", id).await?;
-    let edges = fetch_links(c, id).await?;
+    let edges = fetch_links(c, req.identity.as_ref(), id).await?;
     PluginResponse::json(
         200,
         &json!({
@@ -2295,7 +2318,21 @@ async fn list_links(c: &PluginContext, req: PluginRequest) -> Result<PluginRespo
 
 /// Every edge touching one record, from both ends, with the far node's kind and
 /// title already joined on — a relationship nobody can read is a foreign key.
-async fn fetch_links(c: &PluginContext, id: i64) -> Result<Vec<Value>, SdkError> {
+///
+/// **Both ends are filtered by the caller's visibility**, not only the record the
+/// route was asked about. An edge is a statement about two records, and the far
+/// node's title, kind and timestamp are a read of it: the root passed
+/// `fetch_visible`, so letting the join run unfiltered handed a Lodge grant on
+/// one record the titles of every record linked to it, including another Lodge's.
+/// An edge whose far end the caller cannot read is dropped rather than blanked,
+/// so the graph never advertises a relationship it will not describe.
+async fn fetch_links(
+    c: &PluginContext,
+    identity: Option<&Identity>,
+    id: i64,
+) -> Result<Vec<Value>, SdkError> {
+    let (troop_wide, lodges) = visibility(c, identity, "archive:read").await;
+    let caller = identity.map(|i| i.user_id.clone()).unwrap_or_default();
     c.db.query(
         format!(
             "SELECT l.id, l.relation, l.note, l.created_by, l.created_at::text AS created_at, \
@@ -2304,16 +2341,23 @@ async fn fetch_links(c: &PluginContext, id: i64) -> Result<Vec<Value>, SdkError>
                     f.occurred_at::text AS from_occurred_at, \
                     t.kind AS to_kind, t.title AS to_title, \
                     t.occurred_at::text AS to_occurred_at, \
-                    CASE WHEN l.from_id = $1 THEN 'outgoing' ELSE 'incoming' END AS direction \
+                    CASE WHEN l.from_id = $4 THEN 'outgoing' ELSE 'incoming' END AS direction \
              FROM {links} l \
-             JOIN {records} f ON f.id = l.from_id \
-             JOIN {records} t ON t.id = l.to_id \
-             WHERE l.from_id = $1 OR l.to_id = $1 \
+             JOIN {records} f ON f.id = l.from_id AND {from_visible} \
+             JOIN {records} t ON t.id = l.to_id AND {to_visible} \
+             WHERE l.from_id = $4 OR l.to_id = $4 \
              ORDER BY l.relation, l.id",
             links = c.db.table("links"),
-            records = c.db.table("records")
+            records = c.db.table("records"),
+            from_visible = visibility_clause_for("f"),
+            to_visible = visibility_clause_for("t"),
         ),
-        vec![SqlValue::Int(id)],
+        vec![
+            SqlValue::Bool(troop_wide),
+            SqlValue::TextArray(lodges),
+            SqlValue::Text(caller),
+            SqlValue::Int(id),
+        ],
     )
     .await
 }
@@ -2942,6 +2986,13 @@ async fn lineage(c: &PluginContext, req: PluginRequest) -> Result<PluginResponse
 
     // One query for the titles of every node involved, rather than a join per
     // edge: the client gets a graph it can draw, not a list of id pairs.
+    //
+    // The walk started from a record the caller may read, but the nodes it
+    // discovered are not thereby readable: a chain that crosses a Lodge
+    // boundary would hand back the titles and outcomes of records in a Lodge the
+    // caller holds no grant for. So the node query carries the same visibility
+    // predicate the catalogue uses, and a node the caller cannot read is absent
+    // from the graph rather than named in it.
     let mut node_ids: Vec<i64> = vec![id];
     for edge in downstream.iter().chain(upstream.iter()) {
         for key in ["from_id", "to_id"] {
@@ -2952,15 +3003,24 @@ async fn lineage(c: &PluginContext, req: PluginRequest) -> Result<PluginResponse
             }
         }
     }
+    let (troop_wide, lodges) = visibility(c, req.identity.as_ref(), "archive:read").await;
+    let caller = req
+        .identity
+        .as_ref()
+        .map(|i| i.user_id.clone())
+        .unwrap_or_default();
+    let mut node_preds = Predicates::new(troop_wide, lodges, &caller);
+    node_preds.id_in(&node_ids);
     let nodes =
         c.db.query(
             format!(
                 "SELECT r.id, r.kind, r.title, r.outcome, {superseded_by} \
-                 FROM {records} r WHERE r.id = ANY($1) ORDER BY r.id",
+                 FROM {records} r {where_sql} ORDER BY r.id",
                 superseded_by = superseded_by_expr(c),
-                records = c.db.table("records")
+                records = c.db.table("records"),
+                where_sql = node_preds.where_sql(),
             ),
-            vec![SqlValue::IntArray(node_ids)],
+            node_preds.params,
         )
         .await?;
 

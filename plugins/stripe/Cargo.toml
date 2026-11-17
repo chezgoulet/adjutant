@@ -31,3 +31,6 @@ tokio.workspace = true
 # `core.outbox_enqueue` derives the producer from `session_user` and the whole
 # point is to prove what the *plugin's* statement does.
 sqlx.workspace = true
+# Reading the secrets file the tests need the plugin role's password from
+# (dev only: the plugin itself never touches the filesystem).
+toml.workspace = true

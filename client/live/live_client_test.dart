@@ -177,8 +177,13 @@ void main() {
             '${_short(health.body)}');
       }
 
-      final registered = await raw.send('POST', '/api/auth/register',
-          body: {'username': _username, 'password': _password});
+      // `register` is closed unless the server carries a bootstrap secret; the
+      // harness script generates one and exports it for this side to present.
+      final registered = await raw.send('POST', '/api/auth/register', body: {
+        'username': _username,
+        'password': _password,
+        'bootstrap_token': Platform.environment['ADJUTANT_BOOTSTRAP_TOKEN'] ?? '',
+      });
       if (registered.statusCode == 201) {
         chiefToken = _decode(registered)['token'].toString();
       } else if (registered.statusCode == 403) {

@@ -34,6 +34,7 @@ import '../api/api_client.dart';
 class OutboxEntry {
   const OutboxEntry({
     required this.key,
+    required this.owner,
     required this.method,
     required this.path,
     this.body,
@@ -41,14 +42,20 @@ class OutboxEntry {
     this.attempts = 0,
   });
 
-  /// The entry's idempotency key: a stable digest of *what the write is*
-  /// (method, path and body), not a random id.
+  /// The entry's idempotency key: a stable digest of *what the write is* and
+  /// *whose write it is* (owner, method, path and body), not a random id.
   ///
   /// Two consequences, both of them the point. The same write queued twice —
   /// a double tap, a screen rebuilt — lands as one entry, because the key is
   /// derived and the second enqueue finds the first. And an entry replayed
   /// after a crash carries the key it was queued with, so the queue's own
   /// record of "this one act" is never two records.
+  ///
+  /// The owner is part of the digest because a request digest alone is
+  /// identical for every member who makes the same request (#166): identity A's
+  /// queued dues self-report would have found identity B's entry, or replayed
+  /// under B's token. The identity is not a secret and is not sent to the
+  /// server; it names whose queue this entry belongs to on this device.
   ///
   /// It is deliberately **not** sent to the server. No route on the client's
   /// writing surface accepts a caller-supplied idempotency key, and inventing
@@ -57,6 +64,10 @@ class OutboxEntry {
   /// the server already has, which is what makes `replaySafe` a decision taken
   /// per call site rather than a claim made here.
   final String key;
+
+  /// The authenticated member id that made this write. An entry is only ever
+  /// replayed while that member is the current user.
+  final String owner;
 
   final String method;
   final String path;
@@ -70,6 +81,7 @@ class OutboxEntry {
 
   OutboxEntry withAttempt() => OutboxEntry(
         key: key,
+        owner: owner,
         method: method,
         path: path,
         body: body,
@@ -79,6 +91,7 @@ class OutboxEntry {
 
   Map<String, dynamic> toJson() => {
         'key': key,
+        'owner': owner,
         'method': method,
         'path': path,
         if (body != null) 'body': body,
@@ -89,14 +102,22 @@ class OutboxEntry {
   /// Read one entry back, or null when it cannot be read. A corrupt entry is
   /// skipped rather than crashing the queue — but see [Outbox.flush]: it is
   /// reported, not swallowed.
+  ///
+  /// An entry with no `owner` predates identity-keyed queues. It cannot be
+  /// attributed to a member, so it is refused rather than replayed as whoever
+  /// is signed in now — the exact defect #166 records. It is dropped from the
+  /// stored list the next time the queue is rewritten.
   static OutboxEntry? fromJson(Object? raw) {
     if (raw is! Map) return null;
     final key = raw['key'];
+    final owner = raw['owner'];
     final method = raw['method'];
     final path = raw['path'];
-    if (key is! String || method is! String || path is! String) return null;
+    if (key is! String || owner is! String || owner.isEmpty) return null;
+    if (method is! String || path is! String) return null;
     return OutboxEntry(
       key: key,
+      owner: owner,
       method: method,
       path: path,
       body: raw['body'],
@@ -205,16 +226,24 @@ class Outbox {
 
   final DateTime Function() _clock;
 
-  /// The idempotency key for one write: a stable digest of method, path and
-  /// body, so the same act queued twice is one entry ([OutboxEntry.key]).
+  /// The idempotency key for one write: a stable digest of the owner and the
+  /// request (method, path and body), so the same act queued twice by the same
+  /// member is one entry ([OutboxEntry.key]) and the same act by two different
+  /// members is two.
   ///
   /// FNV-1a over the UTF-8 bytes of the canonical form. It is not a
   /// cryptographic hash and does not need to be: it is a name for a write
   /// inside one device's list, not a security boundary. `String.hashCode` would
   /// not do — Dart does not promise it is stable across runs, and this key has
   /// to mean the same thing after a restart.
-  static String keyFor(String method, String path, Object? body) {
-    final canonical = '$method $path ${body == null ? '' : jsonEncode(body)}';
+  static String keyFor(
+    String method,
+    String path,
+    Object? body, {
+    required String owner,
+  }) {
+    final canonical =
+        '$owner $method $path ${body == null ? '' : jsonEncode(body)}';
     var hash = 0x811c9dc5;
     for (final byte in utf8.encode(canonical)) {
       hash ^= byte;
@@ -223,14 +252,19 @@ class Outbox {
     return 'outbox-${hash.toRadixString(36)}';
   }
 
-  Future<List<OutboxEntry>> pending() async {
+  /// What this member still owes, oldest first.
+  ///
+  /// [owner] is the authenticated member id. Passing null returns the whole
+  /// stored list (used by diagnostics and the queue's own tests); replay always
+  /// names an owner.
+  Future<List<OutboxEntry>> pending({String? owner}) async {
     final prefs = await SharedPreferences.getInstance();
-    return _queue(prefs);
+    return _ownedEntries(_queue(prefs), owner);
   }
 
-  Future<List<RefusedWrite>> refused() async {
+  Future<List<RefusedWrite>> refused({String? owner}) async {
     final prefs = await SharedPreferences.getInstance();
-    return _refused(prefs);
+    return _ownedRefusals(_refused(prefs), owner);
   }
 
   /// Record one write. Idempotent by key: a write already owed is not queued
@@ -252,41 +286,52 @@ class Outbox {
   /// answered 2xx; it throws [OfflineException] when the server cannot be
   /// reached and [ApiException] for any non-2xx answer.
   ///
+  /// Only entries whose [OutboxEntry.owner] is [owner] are replayed. Another
+  /// member's entries are left exactly where they are — not sent, and not
+  /// deleted — because this device may be shared and that member's queue is
+  /// still theirs. This is the half of #166 that survives a cache clear: an
+  /// artefact is refused unless its owner is the current user.
+  ///
   /// The loop is deliberate about three things:
   ///
-  /// 1. **Order.** An entry is only ever sent after every entry in front of it
-  ///    has left the queue. A transport failure stops the pass where it stands;
-  ///    nothing behind it jumps ahead.
+  /// 1. **Order.** An entry is only ever sent after every *owned* entry in front
+  ///    of it has left the queue. A transport failure stops the pass where it
+  ///    stands; nothing behind it jumps ahead.
   /// 2. **A refusal is not a loss and not a wall.** A 4xx parks that entry in
   ///    the refused list, with the server's words, and the pass carries on with
   ///    the next one. A 5xx keeps the entry in place and counts; past
   ///    [maxAttempts] it is parked too.
   /// 3. **Crash-safety.** The stored queue is rewritten after *each* entry
   ///    resolves, so the worst an interrupted pass can do is replay the one
-  ///    entry in flight — never lose the ones behind it.
+  ///    entry in flight — never lose the ones behind it, and never lose another
+  ///    owner's entries.
   Future<FlushReport> flush({
+    required String owner,
     required Future<dynamic> Function(OutboxEntry) send,
   }) async {
     final prefs = await SharedPreferences.getInstance();
-    final queue = _queue(prefs);
-    if (queue.isEmpty) return const FlushReport();
+    final all = _queue(prefs);
+    final mine = all.where((entry) => entry.owner == owner).toList();
+    if (mine.isEmpty) return const FlushReport();
 
     final refused = _refused(prefs);
-    final kept = <OutboxEntry>[];
+    // The whole list, owned and foreign alike. Foreign entries are never
+    // touched; owned ones leave it as they resolve.
+    final remaining = List<OutboxEntry>.of(all);
     var sent = 0;
     var parked = 0;
     var stopped = false;
 
-    for (var i = 0; i < queue.length && !stopped; i++) {
-      final entry = queue[i];
+    for (final entry in mine) {
+      if (stopped) break;
       try {
         await send(entry);
         sent++;
+        remaining.removeWhere((e) => e.key == entry.key);
       } on OfflineException {
         // The server is gone again. Stop here, keep this entry and everything
         // behind it, in order.
         stopped = true;
-        kept.add(entry);
       } on ApiException catch (e) {
         if (e.statusCode >= 400 && e.statusCode < 500) {
           // A refusal is an answer: this write will never succeed by waiting,
@@ -299,6 +344,7 @@ class Outbox {
             refusedAt: _clock(),
           ));
           parked++;
+          remaining.removeWhere((e) => e.key == entry.key);
         } else {
           final retried = entry.withAttempt();
           if (retried.attempts >= maxAttempts) {
@@ -311,11 +357,13 @@ class Outbox {
               attempts: retried.attempts,
             ));
             parked++;
+            remaining.removeWhere((e) => e.key == entry.key);
           } else {
             // Busy, not broken: this entry keeps its place and is tried again
             // on the next pass, while the writes behind it are not held up by
             // one server hiccup.
-            kept.add(retried);
+            final at = remaining.indexWhere((e) => e.key == entry.key);
+            if (at >= 0) remaining[at] = retried;
           }
         }
       } on Object catch (e) {
@@ -329,34 +377,43 @@ class Outbox {
           refusedAt: _clock(),
         ));
         parked++;
+        remaining.removeWhere((e) => e.key == entry.key);
       }
 
       // Rewritten per entry (see the crash-safety note above): what is kept,
-      // then what has not been reached yet.
-      await _writeQueue(prefs, [...kept, ...queue.sublist(i + 1)]);
+      // including every other owner's entry, untouched.
+      await _writeQueue(prefs, remaining);
       await _writeRefused(prefs, refused);
     }
 
     return FlushReport(
       sent: sent,
       refused: parked,
-      remaining: (await pending()).length,
+      remaining: remaining.where((entry) => entry.owner == owner).length,
       unreachable: stopped,
     );
   }
 
   /// Drop the refused list. Used when the person has read it and dismissed it —
   /// the queue is theirs to clear.
-  Future<void> clearRefused() async {
+  Future<void> clearRefused({String? owner}) async {
     final prefs = await SharedPreferences.getInstance();
-    await prefs.remove(refusedKey);
+    if (owner == null) {
+      await prefs.remove(refusedKey);
+      return;
+    }
+    final kept = _refused(prefs).where((write) => write.entry.owner != owner);
+    await _writeRefused(prefs, kept.toList());
   }
 
   /// Drop everything: the queue and the refused list.
   ///
-  /// Called when the session ends. A queued write belongs to the session that
-  /// made it — a queue that outlived the session would replay one person's
-  /// change as whoever signs in next.
+  /// Called when the session ends — by `signOut`, and by a 401 at boot, which
+  /// is the same end from the server's side. A queued write belongs to the
+  /// session that made it — a queue that outlived the session would replay one
+  /// person's change as whoever signs in next. Per-owner filtering already
+  /// refuses that replay; clearing is the stronger act, and the one the session
+  /// documents.
   Future<void> clear() async {
     final prefs = await SharedPreferences.getInstance();
     await prefs.remove(queueKey);
@@ -364,6 +421,22 @@ class Outbox {
   }
 
   // --- storage --------------------------------------------------------------
+
+  static List<OutboxEntry> _ownedEntries(
+    List<OutboxEntry> writes,
+    String? owner,
+  ) =>
+      owner == null
+          ? writes
+          : writes.where((entry) => entry.owner == owner).toList();
+
+  static List<RefusedWrite> _ownedRefusals(
+    List<RefusedWrite> writes,
+    String? owner,
+  ) =>
+      owner == null
+          ? writes
+          : writes.where((write) => write.entry.owner == owner).toList();
 
   List<OutboxEntry> _queue(SharedPreferences prefs) {
     final raw = prefs.getStringList(queueKey) ?? const <String>[];

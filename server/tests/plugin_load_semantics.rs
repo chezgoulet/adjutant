@@ -23,10 +23,11 @@
 //! Run with `ADJUTANT_TEST_DATABASE_URL=…` and `-- --ignored`. A missing,
 //! empty or unreachable URL is a hard failure (issue #25).
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use adjutant_sdk::HostDb;
+use adjutant_sdk::{async_trait, HostDb, Identity, IdentityProvider, SdkError};
 use adjutant_server::config::Config;
 use adjutant_server::plugin_runtime::{self, LoadEnv, PluginRegistry};
 use adjutant_server::{cli, db, host, schema};
@@ -130,9 +131,12 @@ fn fixture_dir_named(tag: &str) -> PathBuf {
 /// not" — instead of about whatever a previous run left behind. It is the same
 /// discipline `adjutant test-plugin` uses on a throwaway `_test` database.
 async fn provision(dir: &Path) -> Arc<sqlx::PgPool> {
+    // Its own secrets file: the role passwords are written there now, and the
+    // tests run in parallel — a shared `./secrets.toml` would be a race.
     let cfg = Config {
         database_url: base_url(),
         plugin_dir: dir.to_path_buf(),
+        secrets_file: Some(secrets_path(dir)),
         ..Default::default()
     };
     let admin = db::connect_and_migrate(&cfg)
@@ -168,9 +172,18 @@ async fn set_enabled(admin: &sqlx::PgPool, id: &str, on: bool) {
     assert_eq!(n, 1, "core.plugins row for {id} exists");
 }
 
-fn env_for<'a>(url: &'a str, admin: &Arc<sqlx::PgPool>) -> LoadEnv<'a> {
+/// Where this fixture's plugin role passwords live.
+fn secrets_path(dir: &Path) -> std::path::PathBuf {
+    dir.join("secrets.toml")
+}
+
+fn env_for<'a>(url: &'a str, admin: &Arc<sqlx::PgPool>, dir: &Path) -> LoadEnv<'a> {
     let (tx, _rx) = tokio::sync::broadcast::channel(16);
     LoadEnv {
+        secrets: std::sync::Arc::new(std::sync::RwLock::new(
+            adjutant_server::secrets::SecretSource::load(Some(&secrets_path(dir)))
+                .expect("load the fixture secrets"),
+        )),
         database_url: url,
         pool: admin.clone(),
         event_tx: tx,
@@ -190,6 +203,10 @@ async fn boot(dir: &Path, url: &str, admin: &Arc<sqlx::PgPool>) -> PluginRegistr
         serde_json::json!({}),
         adjutant_server::identity::IdentityHub::new(),
         adjutant_server::host::CoreHttp::new(),
+        std::sync::Arc::new(std::sync::RwLock::new(
+            adjutant_server::secrets::SecretSource::load(Some(&secrets_path(dir)))
+                .expect("load the fixture secrets"),
+        )),
     )
     .await
     .expect("load_all")
@@ -226,13 +243,13 @@ async fn wait_no_connections(admin: &sqlx::PgPool, id: &str) -> i64 {
 
 /// The plugin's own pool, the way `bootstrap-isolation`'s stored credential
 /// allows it — used to plant a row that must survive every disable.
-async fn plugin_pool(admin: &sqlx::PgPool, url: &str, id: &str) -> Arc<sqlx::PgPool> {
-    let secret: String = sqlx::query_scalar::<_, Option<String>>("SELECT db_secret FROM core.plugins WHERE id = $1")
-        .bind(id)
-        .fetch_one(admin)
-        .await
-        .expect("stored credential")
-        .expect("credential is present");
+async fn plugin_pool(dir: &Path, url: &str, id: &str) -> Arc<sqlx::PgPool> {
+    // The fixture's secrets file, not `core.plugins.db_secret`: the bootstrap
+    // writes the password there now and clears the column.
+    let secret: String = adjutant_server::secrets::SecretSource::load(Some(&secrets_path(dir)))
+        .expect("load the fixture secrets")
+        .resolve(id, "db_password")
+        .expect("the bootstrap wrote a credential");
     host::plugin_pool(url, id, &secret, 2)
         .await
         .expect("plugin pool")
@@ -360,7 +377,7 @@ async fn probe_enable_disable_re_enable_is_idempotent() {
 
     let mut reg = boot(&dir, &url, &admin).await;
     let store_lib = dir.join(format!("libadjutant_{STORE}.so"));
-    let env = env_for(&url, &admin);
+    let env = env_for(&url, &admin, &dir);
 
     // --- enable: a load, exactly the boot body ------------------------------
     let mut seen_routes = reg.live_route_keys();
@@ -387,7 +404,7 @@ async fn probe_enable_disable_re_enable_is_idempotent() {
 
     // Plant a row through the plugin's own role: the data the cycles must keep.
     {
-        let pool = plugin_pool(&admin, &url, STORE).await;
+        let pool = plugin_pool(&dir, &url, STORE).await;
         host::CoreDb::new(pool)
             .execute(
                 "INSERT INTO catalogue_items (kind, name, category, base_price_cents) \
@@ -511,11 +528,29 @@ async fn spawn_app(
     dir: &Path,
     url: &str,
 ) -> (String, Arc<adjutant_server::server::AppState>, tokio::task::JoinHandle<()>) {
+    spawn_app_with_dev_headers(dir, url, true).await
+}
+
+/// The same boot, with the spoofable stub under the test's control.
+///
+/// AUTH-7 needs `allow_dev_headers = false` (the guard is gated on it) while
+/// still authenticating an admin, so the probe registers an identity provider
+/// of its own; the ordinary lifecycle probes keep the stub on and use it.
+async fn spawn_app_with_dev_headers(
+    dir: &Path,
+    url: &str,
+    allow_dev_headers: bool,
+) -> (String, Arc<adjutant_server::server::AppState>, tokio::task::JoinHandle<()>) {
     let cfg = Config {
         database_url: url.to_string(),
         plugin_dir: dir.to_path_buf(),
+        // The fixture's own secrets, always explicit: an ambient `./secrets.toml`
+        // (the workspace root, left by a bootstrap in an earlier CI step) holds
+        // passwords for the same roles and would be read instead — a mismatch
+        // that looks like a wrong password rather than a wrong file.
+        secrets_file: Some(secrets_path(dir)),
         bind: "127.0.0.1:0".parse().expect("bind address"),
-        allow_dev_headers: true,
+        allow_dev_headers,
         allow_superuser: true,
         ..Default::default()
     };
@@ -798,6 +833,145 @@ async fn probe_a_failed_init_is_a_409_and_records_the_reason() {
 }
 
 // ============================================================================
+// AUTH-7 — the last identity provider cannot be removed (and the guard lifts
+// when a second provider exists)
+// ============================================================================
+
+/// A provider the probe controls: it answers only for its own header and gives
+/// that caller the `chief` role at troop scope, like a real session with the
+/// chief grant. It is registered under a **non-required** plugin id (`finance`),
+/// because the declarative minimum (`REQUIRED_PLUGINS`) is checked first and
+/// would otherwise hide the situational guard this test exists to exercise.
+struct ChiefStub;
+
+#[async_trait]
+impl IdentityProvider for ChiefStub {
+    async fn identify(
+        &self,
+        headers: &HashMap<String, String>,
+    ) -> Result<Option<Identity>, SdkError> {
+        if headers.get("x-stub-user").map(String::as_str) != Some("probe-chief") {
+            return Ok(None);
+        }
+        Ok(Some(Identity::new("probe-chief", vec!["chief".to_string()])))
+    }
+}
+
+/// An admin request carrying the stub provider's credential (never dev headers:
+/// this probe boots with `allow_dev_headers = false`, which the guard requires).
+async fn provider_admin_req(
+    base: &str,
+    method: reqwest::Method,
+    path: &str,
+) -> (u16, serde_json::Value) {
+    let resp = reqwest::Client::new()
+        .request(method, format!("{base}{path}"))
+        .header("x-stub-user", "probe-chief")
+        .send()
+        .await
+        .unwrap_or_else(|e| panic!("{path}: {e}"));
+    let status = resp.status().as_u16();
+    let body = resp.json().await.unwrap_or(serde_json::Value::Null);
+    (status, body)
+}
+
+/// AUTH-7: `disable_plugin` and `uninstall_plugin` must both refuse to remove
+/// the only enabled identity provider while dev headers are off — with the
+/// reason — and must not refuse once a second provider exists.
+///
+/// The guard was covered only as a predicate. This drives the real handlers
+/// through the real router: a stub provider is registered under `finance` (a
+/// non-required plugin), so removing it would leave the process with no way to
+/// authenticate anybody. The second registration is the release condition, and
+/// the successful disable is the proof that the refusal is situational rather
+/// than a blanket ban.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "DB-gated: needs ADJUTANT_TEST_DATABASE_URL + CREATEROLE; run with `-- --ignored`"]
+async fn probe_the_last_identity_provider_refusal_is_live_and_lifts() {
+    let _serial = SERIAL.lock().await;
+    let dir = fixture_dir_named("sole-provider");
+    let url = base_url();
+    let admin = provision(&dir).await;
+    set_enabled(&admin, FINANCE, true).await;
+    set_enabled(&admin, STORE, false).await;
+
+    // Dev headers off: the guard is `!allow_dev_headers && sole provider`.
+    let (base, state, _serve) = spawn_app_with_dev_headers(&dir, &url, false).await;
+
+    // The one and only provider, owned by a non-required plugin.
+    state.identity.register(FINANCE, Arc::new(ChiefStub));
+    assert!(
+        state.identity.is_sole_enabled_provider(FINANCE),
+        "the fixture is the only enabled provider"
+    );
+
+    // AUTH-9's admin surface reports the stub as off (and no risk text) while
+    // the caller is nonetheless authenticated — by the provider, not the stub.
+    let (status, inventory) =
+        provider_admin_req(&base, reqwest::Method::GET, "/api/plugins").await;
+    assert_eq!(status, 200, "the stub provider authenticates an admin: {inventory}");
+    assert_eq!(inventory["dev_headers"]["enabled"], serde_json::json!(false));
+    assert!(
+        inventory["dev_headers"]["risk"].is_null(),
+        "the stub is off, so the inventory carries no risk warning: {inventory}"
+    );
+
+    // --- disable is refused, with the reason and no side effect -------------
+    let (status, body) =
+        provider_admin_req(&base, reqwest::Method::POST, "/api/plugins/finance/disable").await;
+    assert_eq!(status, 409, "the last provider must not be disabled: {body}");
+    let reason = body["error"].as_str().unwrap_or_default();
+    assert!(
+        reason.contains("only identity provider"),
+        "the refusal names the condition: {reason}"
+    );
+    assert!(
+        reason.contains("dev headers are off"),
+        "and says which configuration makes it dangerous: {reason}"
+    );
+    assert!(
+        state.registry.read().await.info(FINANCE).is_some_and(|i| i.loaded),
+        "a refusal changes nothing: finance is still loaded"
+    );
+
+    // --- uninstall is refused too -------------------------------------------
+    let (status, body) =
+        provider_admin_req(&base, reqwest::Method::DELETE, "/api/plugins/finance").await;
+    assert_eq!(status, 409, "the last provider must not be uninstalled: {body}");
+    assert!(
+        body["error"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("only identity provider"),
+        "uninstall carries the same reason: {body}"
+    );
+    assert!(
+        body["hint"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("ADJUTANT_DEV_HEADERS"),
+        "and the hint says how a dev instance may proceed: {body}"
+    );
+    assert!(
+        state.registry.read().await.contains(FINANCE),
+        "uninstall refusal left the record in place"
+    );
+
+    // --- a second provider lifts the refusal --------------------------------
+    state.identity.register(STORE, Arc::new(ChiefStub));
+    assert!(
+        !state.identity.is_sole_enabled_provider(FINANCE),
+        "finance is no longer the only provider"
+    );
+    let (status, body) =
+        provider_admin_req(&base, reqwest::Method::POST, "/api/plugins/finance/disable").await;
+    assert_eq!(status, 200, "with a second provider the disable proceeds: {body}");
+    assert_eq!(body["enabled"], serde_json::json!(false));
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+// ============================================================================
 // #90 — the choice, and the two doors to it
 // ============================================================================
 
@@ -860,11 +1034,22 @@ async fn probe_both_doors_to_the_choice_land_on_the_same_state() {
     let cfg = Config {
         database_url: url.clone(),
         plugin_dir: dir.clone(),
+        // This probe bootstraps a second time; without an explicit file it would
+        // write to the ambient `./secrets.toml` and rotate the role password away
+        // from the one this fixture's own file holds.
+        secrets_file: Some(secrets_path(&dir)),
         ..Default::default()
     };
 
     // ---- door A: the scripted install, with no browser --------------------
     let admin = provision(&dir).await;
+    // Provisioning recreates plugin rows but not the recorded choice, which is
+    // a core-level row another probe in this file may have left behind. Clear
+    // it so this probe's "nobody has chosen" premise is about *this* run.
+    sqlx::query("DELETE FROM core.plugin_choice")
+        .execute(admin.as_ref())
+        .await
+        .expect("clear any recorded choice");
     assert!(
         adjutant_server::plugin_choice::recorded(admin.as_ref())
             .await

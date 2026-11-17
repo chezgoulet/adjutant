@@ -21,6 +21,15 @@ Adjutant's HTTP API is JSON over HTTP. Plugin routes live under
   the access log.
 - **Rate limiting:** fixed window per client IP (config `ADJUTANT_RATE_MAX`,
   `ADJUTANT_RATE_WINDOW`; `0` disables). A `429` includes `retry-after`.
+- **Timeouts and size:** a connection must send its first byte within
+  `ADJUTANT_HTTP_HEADER_TIMEOUT` (default 5 s), and the header block then gets
+  that same deadline. A request body has one total
+  `ADJUTANT_HTTP_BODY_TIMEOUT` (default 10 s, never renewed by a slow drip), and
+  the whole request is bounded by `ADJUTANT_HTTP_REQUEST_TIMEOUT` (default
+  300 s). A stalled body answers `408`; a body over `ADJUTANT_MAX_BODY` answers
+  `413`. At most `ADJUTANT_HTTP_MAX_CONNECTIONS` (default 128) sockets are
+  served at once. On a plugin route the permission gate runs before the body is
+  read, so an unauthenticated caller gets `401` without the body.
 - **CORS:** controlled by `ADJUTANT_CORS` (empty = same-origin only).
 
 ## Core
@@ -40,6 +49,54 @@ Adjutant's HTTP API is JSON over HTTP. Plugin routes live under
 | POST | `/api/outbox/intent/{id}/retry` | `core:admin` | Re-arm an exhausted or refused intent (`409` unless it is terminal) |
 | GET | `/api/notifications?unread=&limit=` | authenticated (**ownership**, not a grant) | The caller's own notification records, newest first, with the unread badge. No permission is declared: SPEC §9.2 — a caller reading their own record is an ownership check, not a grant (§ Notifications) |
 | POST | `/api/notifications/{id}/read` | authenticated (**ownership**, not a grant) | Marks the caller's own record read. `404` for a record that is not theirs (not `403`). Does **not** deliver anything |
+
+### The audit chain (`GET /api/audit/verify`)
+
+Two layers, reported separately. **`ok` describes the unkeyed SQL chain only**
+— it is the field's pre-#160 meaning — while `keyed` says whether the HMAC
+layer was checked at all.
+
+```json
+{
+  "ok": true,
+  "first_bad": null,
+  "rows_checked": 41,
+  "keyed": true,
+  "keyed_first_bad": null,
+  "keyed_rows_checked": 41,
+  "keyed_rows_unkeyed": 0
+}
+```
+
+- **Unkeyed (SQL).** `core.audit_verify()` walks rows in `id` order and
+  recomputes SHA-256 over the canonical payload
+  `prev_hash | id | action | resource_type | resource_id | details::text |
+  source | coalesce(user_id::text,'') |
+  to_char(created_at AT TIME ZONE 'UTC','YYYY-MM-DD"T"HH24:MI:SS.US')+00:00`.
+  The migration-17 formula covers **`user_id` and `created_at`** as well as
+  every field written by the app. `first_bad` is the lowest id that does not
+  verify. Changing any of those fields — including only the actor or the
+  timestamp — invalidates the row and every row after it.
+- **Keyed (app).** When `ADJUTANT_AUDIT_KEY` is set, every insert also lands
+  with `keyed_hash = HMAC-SHA256(key, the same canonical payload)`, computed by
+  the server before the INSERT. The app verifier walks the rows and compares
+  each hash, reporting `keyed_first_bad` and `keyed_rows_checked`.
+  `keyed_rows_unkeyed` counts rows whose `keyed_hash` is NULL (written before
+  the key was enabled, or by a writer that had no key); they are **not**
+  counted as protected.
+- **No key.** The column stays NULL, `/api/audit/verify` reports
+  `"keyed": false`, `keyed_rows_checked: 0`, and the boot log emits a WARN. The
+  unkeyed chain still verifies; it is simply not an off-database anchor.
+- **What the keyed layer does and does not prove.** It detects a writer who can
+  change `core.audit_log` (including the table's owning role, which can disable
+  the triggers and recompute the unkeyed chain) but does not hold the server's
+  environment. It does **not** protect against a compromised server process,
+  which holds the key by definition. Losing the key makes past keyed hashes
+  unverifiable; the unkeyed chain remains verifiable. See
+  [`deployment.md`](deployment.md#the-audit-log-and-adjutant_audit_key).
+
+`GET /api/audit/verify` **fails closed**: if either verification query errors,
+it answers `500`, never `{"ok":true,"rows_checked":0}`.
 
 ### The outbox (`core.outbox`)
 
@@ -144,17 +201,24 @@ how early) are open for the owner: `design/notifications.md` §8.
 ## Auth plugin
 
 Config lives in the `auth` row's `core.plugins.config` (`{"oidc": {…},
-"session_ttl_hours": N}`); reload to apply. OIDC routes answer `501` when no
+"session_ttl_hours": N}`); reload to apply. The `oidc` block takes `issuer`,
+`client_id`, `client_secret`, `redirect_uri` and `id_token_alg` — `RS256` by
+default, `HS256`/`HS384`/`HS512` for a shared-secret IdP. A token signed with an
+algorithm other than the configured one is refused, whatever its header says.
+`state` is single-use and expires 15 minutes after it is issued. OIDC routes answer `501` when no
 `oidc` block is configured.
 
 | Method | Path | Permission | Body / notes |
 |---|---|---|---|
-| POST | `/api/auth/login` | — | `{username, password}` → session token + `adjutant_session` cookie |
+| POST | `/api/auth/login` | — | `{username, password}` → session token + `adjutant_session` cookie. After 10 failures for one username inside 15 minutes the name answers `429` until the window ends (counted on the submitted name, so it does not reveal whether the account exists); cleared on success |
 | POST | `/api/auth/logout` | — | Ends the session |
 | GET | `/api/auth/me` | session | Current user and scoped role grants |
-| POST | `/api/auth/register` | — | `{username, email?, password}`; **open only while no users exist**; first user becomes `chief` (min 8-char password) |
+| GET | `/api/auth/sessions` | session | The caller's live sessions: `id`, `created_at`, `expires_at`, `device_info`, and `current` on the one the request presented |
+| DELETE | `/api/auth/sessions/{id}` | session | Revokes one of the caller's own sessions (sets `revoked_at`). Another user's session id and a missing id are indistinguishable: both answer `404` |
+| POST | `/api/auth/password` | session | `{current_password, new_password}` (min 8). Verifies the current password, replaces the hash, revokes every **other** session, and leaves the presented one alive |
+| POST | `/api/auth/register` | — | `{username, email?, password, bootstrap_token}`; **closed unless `ADJUTANT_BOOTSTRAP_TOKEN` is set**, and then only while no user exists; the first user becomes `chief` (min 8-char password). Unset variable → `403` naming it; wrong or missing token → `403`. The bootstrap slot is a single row, so concurrent first registrations have exactly one winner; the loser gets `403` |
 | POST | `/api/auth/users` | `auth:manage_users` | `{username, email?, password, roles?}` |
-| POST | `/api/auth/roles` | `auth:manage_users` | `{username, roles: string[]}` (replaces grants) |
+| POST | `/api/auth/roles` | `auth:manage_users` | `{username, roles: string[]}` (replaces grants). Refuses with `409` when the write would leave no user holding `core:admin` or `auth:manage_users` at troop scope — grant another chief first |
 | GET | `/api/auth/users` | `auth:manage_users` | List users |
 | GET | `/api/auth/oidc/login` | — | Redirects to the IdP authorize endpoint (state stored server-side) |
 | GET | `/api/auth/oidc/callback` | — | Code exchange, id_token verification, session creation |
@@ -202,7 +266,7 @@ to the Troop Council, which decides it once one other Council member seconds it.
 | POST | `/api/missions/mission/{id}/debrief` | `missions:update` | `{notes, goals_met?, lessons?, service_hours?, participant_count?}` → `execution → debrief` |
 | POST | `/api/missions/mission/{id}/report` | `missions:update` | `{summary, impact_metrics?, service_hours?, participant_count?}` → `debrief → report` |
 | POST | `/api/missions/mission/{id}/complete` | `missions:approve` | `report → completed`; publishes `mission.completed` |
-| POST | `/api/missions/mentor/profile` | `missions:mentor` | `{member_id, display_name?, affiliation?, expertise?, capacity?, is_active?, notes?}` |
+| POST | `/api/missions/mentor/profile` | `missions:mentor` | `{member_id, display_name?, affiliation?, expertise?, capacity?, is_active?, notes?, lodge_id?}`. A member may declare their **own** row. Declaring for somebody else needs `missions:approve` covering that member's Lodge, so `lodge_id` is required then. An omitted field is left as stored; it does not blank the row |
 | GET | `/api/missions/mission/{id}/mentor/suggestions` | `missions:approve` | Ranked mentors: expertise overlap, then spare capacity |
 | POST | `/api/missions/mission/{id}/mentor` | `missions:approve` | `{mentor_member, mentee_member?, role?, notes?}` |
 | POST | `/api/missions/mentorship/{id}/close` | `missions:update` | `{status?: completed\|ended, notes?}` |
@@ -379,7 +443,12 @@ a replayed event is a no-op rather than a second deposit. `external_ref` is also
 how the ledger route and the dues-payment route detect a replay.
 
 **Schedules:** `ledger_audit`, daily — re-derives the totals and the transfer
-groups and stays silent unless something is wrong.
+groups and stays silent unless something is wrong. `dues_standing`, every five
+minutes — re-publishes every member's current dues figures on
+`finance.dues.assessed` (with `paid_cents`, `outstanding_cents` and `settled`), so
+a consumer that mirrors them converges without a watermark to lose. The main path
+is the events an assessment and a payment already publish; the sweep is the
+backstop.
 
 **The six funds.** Migration 1 seeds General, Scholarship, Equipment,
 Expedition, Impact and Commencement; `kind` is one of those six and `code` is
@@ -555,7 +624,6 @@ clock too, beside the base occurrence's absolute `starts_at`.
 | GET | `/api/calendar/event/{id}/occurrences?from=&limit=` | `calendar:read` | The expanded series, `EXDATE`s removed |
 | GET | `/api/calendar/event/{id}/quorum?occurrence=` | `calendar:read` | The quorum projection for one occurrence |
 | POST | `/api/calendar/event/{id}/rsvp` | `calendar:rsvp` at the event's scope | `{response: going\|not_going\|maybe\|pending, occurrence?, note?}` — omitted `occurrence` answers for the whole series; a re-answer updates |
-| POST | `/api/calendar/event/{id}/rsvp/{member}` | `calendar:manage` | The same body, recorded for another member (the phoned-in RSVP) |
 | GET | `/api/calendar/event/{id}/rsvps` | `calendar:read` | Every answer, plus the counts for the next occurrence |
 | PATCH | `/api/calendar/event/{id}` | `calendar:manage` at the event's scope | Any subset of the create body; validated against the whole event |
 | POST | `/api/calendar/event/{id}/cancel` | `calendar:manage` at the event's scope | Cancels the series, keeping its RSVPs and the record |
@@ -803,8 +871,9 @@ Config lives in the `mcp` row's `core.plugins.config`:
 | Method | Path | Permission | Body / notes |
 |---|---|---|---|
 | POST | `/api/mcp/connect` | `mcp:connect` | `{client?, client_version?, protocolVersion?, capabilities?}` → `{connection_id, token, expires_at, protocolVersion, server, capabilities}`. Only the token's SHA-256 is stored; the token is returned once |
-| GET | `/api/mcp/tools` | `mcp:connect` | The filtered catalogue: `{name, description, inputSchema, requiredPermission, scope}` per tool, plus `warnings` |
-| POST | `/api/mcp/invoke` | `mcp:invoke` | `{tool, arguments, connection_id?}` or a connection token in `connection_token` / the `mcp-session-id` header → `{tool, status: ok\|denied\|error, http_status?, result?, error?, duration_ms, invocation_id}`. The tool's own permission is re-checked, arguments are strictly validated against the tool's schema, and the API's status is passed through |
+| GET | `/api/mcp/tools` | `mcp:connect` | The filtered catalogue: `{name, description, inputSchema, requiredPermission, scope, annotations: {readOnlyHint, destructiveHint, openWorldHint}, requiresIntent}` per tool, plus `warnings` |
+| POST | `/api/mcp/intent` | `mcp:invoke` | `{tool, arguments}` → `{intent, tool, expires_at, ttl_minutes}`. Required before any tool that is not a `GET`: the token is bound to the caller, the tool and a canonical digest of the arguments, expires in five minutes, and is spent by the first invocation. A read tool answers `400` ("only reads; call invoke directly") |
+| POST | `/api/mcp/invoke` | `mcp:invoke` | `{tool, arguments, connection_id?, intent?}` or a connection token in `connection_token` / the `mcp-session-id` header → `{tool, status: ok\|denied\|error, http_status?, result?, error?, duration_ms, invocation_id}`. The tool's own permission is re-checked, arguments are strictly validated against the tool's schema, and the API's status is passed through. **A write without a matching intent is refused `428` before anything reaches the API** |
 | GET | `/api/mcp/invocations?tool=&status=&limit=` | `mcp:connect` (own rows) / `mcp:audit` (troop) | The audit trail: user, connection, tool, arguments, the downstream request, status, HTTP status, duration |
 
 Tools (path and permission mirror the owning plugin's route exactly):

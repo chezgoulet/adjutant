@@ -16,7 +16,7 @@
 #     superuser boot refusal passable.
 services:
   postgres:
-    image: postgres:18-alpine
+    image: postgres@sha256:3b0ef735388b2cb097fc29b8bb421d86d57d0ddbe7aa1fbd6493e06d65028503  # postgres:18-alpine (linux/amd64)
     environment:
       # Admin/bootstrap superuser. The server does not run as it.
       POSTGRES_USER: adjutant
@@ -36,6 +36,11 @@ services:
       interval: 5s
       timeout: 5s
       retries: 12
+    # initdb and the entrypoint's drop to the `postgres` user need the default
+    # capabilities (CHOWN, SETUID, SETGID, DAC_OVERRIDE, FOWNER), so this service
+    # keeps them. It never needs to gain a *new* privilege, though.
+    security_opt:
+      - no-new-privileges:true
     restart: unless-stopped
 
   adjutant:
@@ -65,13 +70,38 @@ services:
       # container's filesystem: a bundle inside a container is lost the next
       # time the container is replaced, which is precisely when someone wants
       # it. `docs/backup-and-restore` is the host-side producer, if any.
+      # Where the deployment's secrets live — plugin role passwords (written by
+      # `bootstrap-isolation`), the Stripe keys, the OIDC client secret. A bind
+      # mount, so the file belongs to the operator and survives the container:
+      # a secrets file inside the container is lost the next time it is replaced,
+      # which is exactly when the plugins cannot boot.
+      ADJUTANT_SECRETS_FILE: /app/secrets/secrets.toml
       ADJUTANT_BACKUP_DIR: /app/backups
+      # The age public key every bundle is encrypted to. No default: with this
+      # unset the in-app backup fails closed rather than writing every plugin
+      # role's password in clear text. ADJUTANT_BACKUP_ALLOW_PLAINTEXT=true is
+      # the explicit, loud opt-out for a development box with no key.
+      ADJUTANT_BACKUP_AGE_RECIPIENT: ${ADJUTANT_BACKUP_AGE_RECIPIENT:-}
+      ADJUTANT_BACKUP_ALLOW_PLAINTEXT: ${ADJUTANT_BACKUP_ALLOW_PLAINTEXT:-false}
     ports:
       - "8787:8787"
     # The bundles survive the container. Named rather than a bind mount so the
     # host path is Docker's business.
     volumes:
       - backups:/app/backups
+      - ./secrets:/app/secrets
+    # Matches the image's USER. Stated here as well so `docker inspect` and a
+    # future Dockerfile edit cannot diverge silently. A volume created by this
+    # image inherits 10001:10001; an existing volume from before the change
+    # needs a one-time chown (docs/deployment.md, "Container user").
+    user: "10001:10001"
+    # The server binds 8787 and spawns pg_dump/age; none of that needs a Linux
+    # capability. No new privileges means a setuid binary cannot raise the bar
+    # if one ever appears in the image.
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
     restart: unless-stopped
 
 volumes:

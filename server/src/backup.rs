@@ -9,6 +9,19 @@
 //! the bundle directory with `core.backups`: files nothing claims appear as runs
 //! nobody recorded, and the admin sees one list either way.
 //!
+//! A bundle is **credential material**: `core.plugins.db_secret` holds every
+//! plugin role's password, and `pg_dump -Fc` compresses but does not encrypt.
+//! [`run`] therefore encrypts to the age recipient in
+//! `ADJUTANT_BACKUP_AGE_RECIPIENT` (`.dump.age`) and fails closed when none is
+//! configured, unless `ADJUTANT_BACKUP_ALLOW_PLAINTEXT=true` deliberately opts
+//! into a `.dump` with a WARN. The private key is not on the server.
+//!
+//! `pg_dump`'s stdout is piped straight into `age`. There is no intermediate
+//! plaintext file: the complete credential-bearing dump never has a path, not
+//! even a `0600` one in the backups volume that a crash or an OOM kill could
+//! leave behind for the next person who copies that volume. Only the deliberate
+//! plaintext opt-in writes the archive to disk unencrypted.
+//!
 //! What a bundle is *not*: a complete backup. A `pg_dump` carries the database
 //! and not the cluster's roles, so restoring one onto a clean host needs
 //! `bootstrap-isolation` afterwards. That is `deploy/restore.sh`'s job and
@@ -72,6 +85,63 @@ pub fn backup_dir() -> PathBuf {
     std::env::var("ADJUTANT_BACKUP_DIR")
         .map(PathBuf::from)
         .unwrap_or_else(|_| PathBuf::from("/var/backups/adjutant"))
+}
+
+/// The age recipient (public key) every bundle is encrypted to.
+///
+/// There is deliberately no default. The private key must not live on the
+/// server, so the server can only ever encrypt; a missing recipient is a
+/// configuration error rather than a reason to write a plaintext bundle.
+pub fn age_recipient() -> Option<String> {
+    std::env::var("ADJUTANT_BACKUP_AGE_RECIPIENT")
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+}
+
+/// The explicit, loud opt-out used by a development box that has no key.
+///
+/// Exactly `true` or `1` (case-insensitive for `true`) enables it; anything
+/// else — including an empty value — leaves the fail-closed default in place.
+pub fn allow_plaintext() -> bool {
+    match std::env::var("ADJUTANT_BACKUP_ALLOW_PLAINTEXT") {
+        Ok(v) => v == "1" || v.eq_ignore_ascii_case("true"),
+        Err(_) => false,
+    }
+}
+
+/// A bundle's name, with its encryption state visible in the extension.
+fn artifact_name(stamp: &str, encrypted: bool) -> String {
+    if encrypted {
+        format!("adjutant-{stamp}.dump.age")
+    } else {
+        format!("adjutant-{stamp}.dump")
+    }
+}
+
+/// The sidecar next to a bundle. Kept as `<bundle>.sha256` (not
+/// `with_extension`, which would turn `x.dump.age` into `x.dump.dump.sha256`).
+fn sha_sidecar(path: &Path) -> PathBuf {
+    PathBuf::from(format!("{}.sha256", path.display()))
+}
+
+/// Both bundle shapes. The name says whether the file is credential material
+/// in the clear (`.dump`) or ciphertext (`.dump.age`), which is the point of
+/// the suffix.
+fn is_bundle_name(name: &str) -> bool {
+    name.ends_with(".dump") || name.ends_with(".dump.age")
+}
+
+/// Open a file that holds a plaintext dump, readable only by the server user.
+fn create_private(path: &Path) -> std::io::Result<std::fs::File> {
+    let mut opts = std::fs::OpenOptions::new();
+    opts.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.mode(0o600);
+    }
+    opts.open(path)
 }
 
 pub async fn read_schedule(pool: &PgPool) -> Result<Schedule, sqlx::Error> {
@@ -184,7 +254,7 @@ pub async fn list_runs(pool: &PgPool, limit: i64) -> Result<Vec<BackupRun>, sqlx
     if let Ok(entries) = std::fs::read_dir(backup_dir()) {
         for entry in entries.flatten() {
             let name = entry.file_name().to_string_lossy().to_string();
-            if !name.ends_with(".dump") || claimed.contains(&name) {
+            if !is_bundle_name(&name) || claimed.contains(&name) {
                 continue;
             }
             let meta = match entry.metadata() {
@@ -226,7 +296,7 @@ pub fn bundle_path(dir: &Path, filename: &str) -> Option<PathBuf> {
         || filename.contains('/')
         || filename.contains('\\')
         || filename.contains("..")
-        || !filename.ends_with(".dump")
+        || !is_bundle_name(filename)
     {
         return None;
     }
@@ -256,7 +326,7 @@ async fn mark_failed(pool: &PgPool, id: i64, why: &str) {
 
 /// Delete bundles beyond the schedule's `keep`, oldest first.
 ///
-/// Only files this directory holds, and never a `.dump` whose row says it is
+/// Only files this directory holds, and never a bundle whose row says it is
 /// still running — pruning a bundle the running dump is still writing to would
 /// be a spectacular own goal.
 pub async fn prune(pool: &PgPool, dir: &Path) -> Result<usize, String> {
@@ -265,7 +335,12 @@ pub async fn prune(pool: &PgPool, dir: &Path) -> Result<usize, String> {
         .map_err(|e| format!("cannot read {}: {e}", dir.display()))?
         .flatten()
         .map(|e| e.path())
-        .filter(|p| p.extension().map(|x| x == "dump").unwrap_or(false))
+        .filter(|p| {
+            p.file_name()
+                .and_then(|n| n.to_str())
+                .map(is_bundle_name)
+                .unwrap_or(false)
+        })
         .collect();
     // Newest first by mtime; the names sort too, but the filesystem is the truth
     // about what exists and mtime is the truth about when.
@@ -288,7 +363,7 @@ pub async fn prune(pool: &PgPool, dir: &Path) -> Result<usize, String> {
             continue;
         }
         let _ = std::fs::remove_file(&old);
-        let _ = std::fs::remove_file(old.with_extension("dump.sha256"));
+        let _ = std::fs::remove_file(sha_sidecar(&old));
         let _ = sqlx::query("DELETE FROM core.backups WHERE filename = $1 AND status <> 'running'")
             .bind(&name)
             .execute(pool)
@@ -296,6 +371,163 @@ pub async fn prune(pool: &PgPool, dir: &Path) -> Result<usize, String> {
         removed += 1;
     }
     Ok(removed)
+}
+
+/// The one message a missing `pg_dump` gets: it names the fix, not the symptom.
+fn pg_dump_missing() -> String {
+    "pg_dump is not on this server. The container image must carry a client \
+     new enough for the database it dumps — see the Dockerfile."
+        .to_string()
+}
+
+/// The same for `age`: the runtime image installs it for exactly this reason.
+fn age_missing() -> String {
+    "age is not on this server. The runtime image installs it for exactly \
+     this reason — see the Dockerfile."
+        .to_string()
+}
+
+/// The stderr of a failed command, or its exit status when it said nothing.
+fn command_failure(name: &str, output: &std::process::Output) -> String {
+    let err = String::from_utf8_lossy(&output.stderr).trim().to_string();
+    if err.is_empty() {
+        format!("{name} exited {}", output.status)
+    } else {
+        err
+    }
+}
+
+/// Run `pg_dump -Fc` with its stdout pointed at `path` — the plaintext opt-in.
+///
+/// The file is created `0600`: a plaintext dump is the one artifact that carries
+/// every plugin credential, so it is not readable by anyone else on the host.
+/// This is only reached when `ADJUTANT_BACKUP_ALLOW_PLAINTEXT=true`; the normal
+/// path is [`dump_and_encrypt_to`], which never writes the dump to disk.
+async fn dump_to(path: &Path, database_url: &str) -> Result<(), String> {
+    let file = create_private(path)
+        .map_err(|e| format!("cannot create {}: {e}", path.display()))?;
+    // `Command::output()` forces stdout to a pipe, which would silently discard
+    // the `Stdio::from(file)` above (tokio sets it unconditionally). Spawn and
+    // wait instead, with only stderr captured.
+    let child = tokio::process::Command::new("pg_dump")
+        .arg("--dbname")
+        .arg(database_url)
+        .arg("--format=custom")
+        .stdout(std::process::Stdio::from(file))
+        .stderr(std::process::Stdio::piped())
+        .spawn();
+
+    let output = match child {
+        Ok(child) => child.wait_with_output().await,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Err(pg_dump_missing()),
+        Err(e) => return Err(format!("cannot run pg_dump: {e}")),
+    };
+
+    match output {
+        Ok(o) if o.status.success() => Ok(()),
+        Ok(o) => Err(command_failure("pg_dump", &o)),
+        Err(e) => Err(format!("cannot wait for pg_dump: {e}")),
+    }
+}
+
+/// Stream `pg_dump -Fc` into `age` and write only the ciphertext to `path`.
+///
+/// The credential-bearing archive exists only inside the pipe between the two
+/// processes. A plaintext dump written to the backups volume first — even `0600`
+/// and even if `age` consumes it a moment later — is one crash, OOM kill or
+/// full disk away from becoming a stray copy of the artifact this issue is
+/// about. The private key is not present here by design: this server can write
+/// bundles it cannot read.
+async fn dump_and_encrypt_to(
+    path: &Path,
+    database_url: &str,
+    recipient: &str,
+) -> Result<(), String> {
+    if path.exists() {
+        return Err(format!(
+            "refusing to overwrite an existing bundle: {}",
+            path.display()
+        ));
+    }
+
+    let mut dump = match tokio::process::Command::new("pg_dump")
+        .arg("--dbname")
+        .arg(database_url)
+        .arg("--format=custom")
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .kill_on_drop(true)
+        .spawn()
+    {
+        Ok(child) => child,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Err(pg_dump_missing()),
+        Err(e) => return Err(format!("cannot run pg_dump: {e}")),
+    };
+    let Some(stdout) = dump.stdout.take() else {
+        let _ = dump.kill().await;
+        return Err("pg_dump started without a stdout pipe".to_string());
+    };
+    // `age` reads the dump from its stdin, which *is* pg_dump's stdout pipe.
+    let stdin: std::process::Stdio = match stdout.try_into() {
+        Ok(stdio) => stdio,
+        Err(e) => {
+            let _ = dump.kill().await;
+            return Err(format!("cannot pass pg_dump's output to age: {e}"));
+        }
+    };
+
+    let encrypt = match tokio::process::Command::new("age")
+        .arg("--recipient")
+        .arg(recipient)
+        .arg("--output")
+        .arg(path)
+        .stdin(stdin)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::piped())
+        .kill_on_drop(true)
+        .spawn()
+    {
+        Ok(child) => child,
+        Err(e) => {
+            let _ = dump.kill().await;
+            let _ = dump.wait().await;
+            return Err(if e.kind() == std::io::ErrorKind::NotFound {
+                age_missing()
+            } else {
+                format!("cannot run age: {e}")
+            });
+        }
+    };
+
+    // `age` ends when `pg_dump` closes the pipe; waiting on both concurrently
+    // drains both stderr pipes, so neither can block the other on a full pipe.
+    let (encrypted, dumped) = tokio::join!(encrypt.wait_with_output(), dump.wait_with_output());
+
+    let dump_err = match &dumped {
+        Ok(o) if o.status.success() => None,
+        Ok(o) => Some(command_failure("pg_dump", o)),
+        Err(e) => Some(format!("cannot wait for pg_dump: {e}")),
+    };
+    let enc_err = match &encrypted {
+        Ok(o) if o.status.success() => None,
+        Ok(o) => Some(format!("age could not encrypt the bundle: {}", command_failure("age", o))),
+        Err(e) => Some(format!("cannot wait for age: {e}")),
+    };
+
+    if dump_err.is_none() && enc_err.is_none() {
+        return Ok(());
+    }
+    // A partial or unencrypted output is not a bundle; do not leave one behind
+    // for the reconciler to list as a run that looks complete.
+    let _ = std::fs::remove_file(path);
+    match (dump_err, enc_err) {
+        // Report both legs: a bad recipient makes `pg_dump` die of a broken pipe
+        // too, and the recipient error is the one that names the real fault.
+        (Some(d), Some(a)) => Err(format!("{d}; and {a}")),
+        (Some(d), None) => Err(d),
+        (None, Some(a)) => Err(a),
+        (None, None) => Ok(()),
+    }
 }
 
 /// Produce a bundle now, record it, prune, and hand back the row.
@@ -312,8 +544,30 @@ pub async fn run(
     let dir = backup_dir();
     std::fs::create_dir_all(&dir).map_err(|e| format!("cannot create {}: {e}", dir.display()))?;
 
-    let filename = format!("adjutant-{}.dump", chrono::Utc::now().format("%F-%H%M%S"));
+    let recipient = age_recipient();
+    if recipient.is_none() && !allow_plaintext() {
+        return Err(
+            "refusing to write an unencrypted backup: a `pg_dump -Fc` contains every \
+             plugin role's password in clear text. Set ADJUTANT_BACKUP_AGE_RECIPIENT to \
+             the age public key that should decrypt the bundle (the private key must \
+             not live on this server), or set ADJUTANT_BACKUP_ALLOW_PLAINTEXT=true to \
+             accept a plaintext bundle deliberately."
+                .to_string(),
+        );
+    }
+    let encrypted = recipient.is_some();
+
+    let stamp = chrono::Utc::now().format("%F-%H%M%S").to_string();
+    let filename = artifact_name(&stamp, encrypted);
     let path = dir.join(&filename);
+
+    if !encrypted {
+        tracing::warn!(
+            bundle = %filename,
+            "writing a PLAINTEXT backup bundle: it is credential material (every plugin \
+             role's password). ADJUTANT_BACKUP_ALLOW_PLAINTEXT=true was set."
+        );
+    }
 
     let id: i64 = sqlx::query_scalar(
         "INSERT INTO core.backups (trigger, requested_by, status, filename)
@@ -326,26 +580,22 @@ pub async fn run(
     .await
     .map_err(|e| e.to_string())?;
 
-    let output = tokio::process::Command::new("pg_dump")
-        .arg("--dbname")
-        .arg(database_url)
-        .arg("--format=custom")
-        .arg("--file")
-        .arg(&path)
-        .output()
-        .await;
+    let outcome = match recipient.as_deref() {
+        Some(recipient) => dump_and_encrypt_to(&path, database_url, recipient).await,
+        None => dump_to(&path, database_url).await,
+    };
 
-    let outcome = match output {
-        Ok(o) if o.status.success() => {
+    let outcome = match outcome {
+        Ok(()) => {
             let bytes = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
             if bytes == 0 {
                 // A zero-byte dump is a failed backup, not a small one. Same rule
                 // as deploy/backup.sh, for the same reason.
-                Err("pg_dump wrote an empty file".to_string())
+                Err("the bundle is empty — that is a failed backup, not a small one".to_string())
             } else {
                 match sha256_file(&path) {
                     Ok(sha) => {
-                        let _ = std::fs::write(dir.join(format!("{filename}.sha256")), format!("{sha}  {filename}\n"));
+                        let _ = std::fs::write(sha_sidecar(&path), format!("{sha}  {filename}\n"));
                         sqlx::query(
                             "UPDATE core.backups
                                 SET status = 'done', finished_at = now(), bytes = $2, sha256 = $3
@@ -363,16 +613,7 @@ pub async fn run(
                 }
             }
         }
-        Ok(o) => {
-            let err = String::from_utf8_lossy(&o.stderr).trim().to_string();
-            Err(if err.is_empty() { format!("pg_dump exited {}", o.status) } else { err })
-        }
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Err(
-            "pg_dump is not on this server. The container image must carry a client \
-             new enough for the database it dumps — see the Dockerfile."
-                .to_string(),
-        ),
-        Err(e) => Err(format!("cannot run pg_dump: {e}")),
+        Err(e) => Err(e),
     };
 
     if let Err(why) = outcome {
@@ -517,6 +758,34 @@ mod tests {
                 "accepted {bad:?}"
             );
         }
+    }
+
+    #[test]
+    fn bundle_path_accepts_an_encrypted_bundle() {
+        let dir = std::env::temp_dir().join(format!(
+            "adjutant-bundle-path-{}-{}",
+            std::process::id(),
+            std::thread::current().name().unwrap_or("test")
+        ));
+        std::fs::create_dir_all(&dir).expect("temp backup dir");
+        let name = "adjutant-2026-10-20-120000.dump.age";
+        std::fs::write(dir.join(name), b"age-encryption.org/v1\n").expect("bundle");
+        assert_eq!(bundle_path(&dir, name), Some(dir.join(name)));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn bundle_name_shows_whether_it_is_encrypted() {
+        assert_eq!(artifact_name("2026-10-20-120000", true), "adjutant-2026-10-20-120000.dump.age");
+        assert_eq!(artifact_name("2026-10-20-120000", false), "adjutant-2026-10-20-120000.dump");
+        assert!(is_bundle_name("adjutant-2026-10-20-120000.dump.age"));
+        assert!(is_bundle_name("adjutant-2026-10-20-120000.dump"));
+        // The in-flight plaintext is never mistaken for a finished bundle.
+        assert!(!is_bundle_name(".adjutant-2026-10-20-120000.dump.age.123.plaintext"));
+        assert_eq!(
+            sha_sidecar(Path::new("/b/adjutant.dump.age")),
+            Path::new("/b/adjutant.dump.age.sha256")
+        );
     }
 
     #[test]

@@ -1559,6 +1559,16 @@ const DUES_FUNDING_MIGRATION: &str = include_str!("../migrations/002_dues_fundin
 /// index that allows a receipt one correction and no more.
 const RECEIPTS_MIGRATION: &str = include_str!("../migrations/003_receipts.sql");
 
+/// Migration 4's SQL, embedded at compile time from
+/// `migrations/004_ledger_append_only.sql`.
+///
+/// It makes the ledger a record: UPDATE and DELETE are refused by a trigger, and
+/// a statement-level guard refuses TRUNCATE on both `transactions` and
+/// `receipts`. Ownership of those tables (and their guard functions) is moved to
+/// the deployment role after this migration, so the plugin role that writes them
+/// cannot disable the triggers (#152).
+const LEDGER_APPEND_ONLY_MIGRATION: &str = include_str!("../migrations/004_ledger_append_only.sql");
+
 #[async_trait]
 impl AdjutantPlugin for FinancePlugin {
     fn id(&self) -> &str {
@@ -1609,6 +1619,7 @@ impl AdjutantPlugin for FinancePlugin {
             Migration::new(1, "finance_schema", MIGRATION_SCHEMA),
             Migration::new(2, "dues_funding", DUES_FUNDING_MIGRATION),
             Migration::new(3, "receipts", RECEIPTS_MIGRATION),
+            Migration::new(4, "ledger_append_only", LEDGER_APPEND_ONLY_MIGRATION),
         ]
     }
 
@@ -1630,6 +1641,23 @@ impl AdjutantPlugin for FinancePlugin {
     fn schedules(&self) -> Vec<Schedule> {
         let ctx = self.ctx().clone();
         vec![Schedule::new(
+            // The backstop for the standing events, not their main path: an
+            // assessment and a payment each publish their own change
+            // (`finance.dues.assessed`, `finance.dues.payment`), and this sweep
+            // re-publishes every member's current figures so a consumer that
+            // started late, or an edit made by a path that does not publish,
+            // still converges. Idempotent on the consumer side by design.
+            "dues_standing",
+            std::time::Duration::from_secs(5 * 60),
+            schedule_handler({
+                let c = ctx.clone();
+                move || {
+                    let c = c.clone();
+                    async move { publish_all_standings(&c).await }
+                }
+            }),
+        ),
+        Schedule::new(
             "ledger_audit",
             std::time::Duration::from_secs(24 * 60 * 60),
             schedule_handler(move || {
@@ -1646,6 +1674,49 @@ impl AdjutantPlugin for FinancePlugin {
             }),
         )]
     }
+}
+
+/// One member's space on the `finance.dues.assessed` event.
+///
+/// The figure the shop needs is `outstanding_cents` — what is still owed after
+/// the scholarship drew down and the payments landed — and it is derived here
+/// from the same fields the standing route publishes, so a checkout and the
+/// member's own dues page cannot disagree about what is owed.
+pub fn standing_event(row: &serde_json::Value) -> serde_json::Value {
+    serde_json::json!({
+        "member_id": row["member_id"],
+        "fiscal_year": row["fiscal_year"],
+        "assessed_cents": row["assessed_cents"],
+        "funded_cents": row["funded_cents"],
+        "paid_cents": row["paid_cents"],
+        "outstanding_cents": row["outstanding_cents"],
+        "settled": row["settled"],
+        "status": row["status"],
+    })
+}
+
+/// Publish every member's standing. Idempotent by design: the consumer upserts,
+/// so re-publishing the whole troop costs a few rows and makes a late or
+/// restarted consumer converge without a watermark to lose.
+async fn publish_all_standings(c: &PluginContext) -> Result<(), SdkError> {
+    let rows =
+        c.db.query(
+            sql_dues_standing(
+                c,
+                &format!("d.dues_kind = '{DUES_KIND_MEMBER}' ORDER BY d.fiscal_year, d.member_id"),
+            ),
+            vec![],
+        )
+        .await?;
+    for row in rows {
+        if row["member_id"].as_str().unwrap_or("").is_empty() {
+            continue;
+        }
+        c.events
+            .publish(event_type::DUES_ASSESSED, standing_event(&row))
+            .await?;
+    }
+    Ok(())
 }
 
 /// Every route this plugin serves, in the order the API reference lists them.
@@ -5812,6 +5883,50 @@ fn config_str(config: &Value, key: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The event the shop prices a dues checkout from must carry the same four
+    /// figures the member's own dues page shows, and nothing else: a consumer
+    /// that had to re-derive the outstanding amount would be a second
+    /// implementation of the rule.
+    #[test]
+    fn a_standing_event_carries_the_figures_and_no_others() {
+        let row = serde_json::json!({
+            "id": 7,
+            "fiscal_year": 2027,
+            "dues_kind": "member",
+            "member_id": "bea",
+            "lodge_id": "",
+            "tier": "regular",
+            "share_bps": null,
+            "base_cents": 12000,
+            "assessed_cents": 12000,
+            "funded_cents": 2000,
+            "draw_status": "none",
+            "draw_ref": null,
+            "self_reported": false,
+            "status": "assessed",
+            "note": "",
+            "recorded_by": "treasurer",
+            "assessed_at": "2026-11-16T00:00:00Z",
+            "updated_at": "2026-11-16T00:00:00Z",
+            "paid_cents": 4000,
+            "outstanding_cents": 6000,
+            "settled": false,
+        });
+        let event = standing_event(&row);
+        assert_eq!(event["member_id"], json!("bea"));
+        assert_eq!(event["fiscal_year"], json!(2027));
+        assert_eq!(event["assessed_cents"], json!(12000));
+        assert_eq!(event["funded_cents"], json!(2000));
+        assert_eq!(event["paid_cents"], json!(4000));
+        assert_eq!(event["outstanding_cents"], json!(6000));
+        assert_eq!(event["settled"], json!(false));
+        // Not the internal bookkeeping: a consumer mirroring this must not start
+        // depending on fields finance can change freely.
+        assert!(event.get("recorded_by").is_none(), "{event}");
+        assert!(event.get("note").is_none(), "{event}");
+        assert!(event.get("draw_ref").is_none(), "{event}");
+    }
 
     #[test]
     fn money_formats_grouped_and_signed() {

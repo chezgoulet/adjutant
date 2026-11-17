@@ -48,6 +48,10 @@ def workspace_version() -> str:
 DSN = os.environ.get("ADJUTANT_DATABASE_URL", "postgres://adjutant@127.0.0.1:5433/adjutant_dev")
 BIND = "127.0.0.1:8787"
 BASE = f"http://{BIND}"
+# The one origin this instance allows. The server refuses `*` outright (sessions
+# are cookies, so a wildcard is one `allow_credentials` away from a leak), so the
+# CORS probes name an origin and check that it — and only it — is echoed.
+PROBE_ORIGIN = "https://probe.example"
 PLUGIN_DIR = ROOT / ".probe-plugins"
 LOG = Path("/tmp/adjutant-probes.log")
 CHIEF = {"x-dev-user": "christopher", "x-dev-role": "chief"}
@@ -170,7 +174,7 @@ def start_server(extra_env, log_path):
         "ADJUTANT_PLUGIN_DIR": str(PLUGIN_DIR),
         "ADJUTANT_DATABASE_URL": DSN,
         "ADJUTANT_DEV_HEADERS": "true",
-        "ADJUTANT_CORS": "*",
+        "ADJUTANT_CORS": PROBE_ORIGIN,
         "ADJUTANT_LOG": "info,adjutant_server=debug",
     })
     env.update(extra_env)
@@ -252,11 +256,16 @@ def batch_m1_regression():
 
 def batch_middleware_phase1():
     b = "middleware"
-    got, raw, hdrs = http("GET", "/api/hello")
+    got, raw, hdrs = http("GET", "/api/hello", headers={"origin": PROBE_ORIGIN})
     rid = next((v for k, v in hdrs.items() if k.lower() == "x-request-id"), None)
     check(b, "M1 x-request-id present", bool(rid) and bool(re.match(r"^[0-9a-f]+-[0-9a-f]+$", rid or "")), f"rid={rid}")
     cors = next((v for k, v in hdrs.items() if k.lower() == "access-control-allow-origin"), None)
-    check(b, "M2 CORS allow-origin on 200", cors == "*", f"allow-origin={cors}")
+    check(b, "M2 CORS echoes the allowed origin on 200", cors == PROBE_ORIGIN, f"allow-origin={cors}")
+    # The list is a list, not a formality: an origin that is not on it gets no
+    # allow-origin header at all.
+    _, _, other = http("GET", "/api/hello", headers={"origin": "https://not-allowed.example"})
+    cors_other = next((v for k, v in other.items() if k.lower() == "access-control-allow-origin"), None)
+    check(b, "M2 CORS refuses an origin that is not on the list", cors_other is None, f"allow-origin={cors_other}")
     # replay cursor semantics
     _, raw = probe(b, "M4 replay since=0", "GET", "/api/events/recent?since=0&limit=1", status=200,
                    contains='"cursor"', headers=CHIEF)
@@ -385,12 +394,12 @@ def batch_middleware_phase2():
     first_eight_ok = all(c == 200 for c in codes[:8])
     ninth = codes[8]
     check(b, "M3 ninth request 429", first_eight_ok and ninth == 429, f"codes={codes}")
-    s, raw, hdrs = http("GET", "/api/hello")
+    s, raw, hdrs = http("GET", "/api/hello", headers={"origin": PROBE_ORIGIN})
     ra = next((v for k, v in hdrs.items() if k.lower() == "retry-after"), None)
     cors = next((v for k, v in hdrs.items() if k.lower() == "access-control-allow-origin"), None)
     rid = next((v for k, v in hdrs.items() if k.lower() == "x-request-id"), None)
     check(b, "M3b retry-after set", ra == "60", f"retry-after={ra}")
-    check(b, "M3c CORS header survives 429", cors == "*", f"allow-origin={cors}")
+    check(b, "M3c CORS header survives 429", cors == PROBE_ORIGIN, f"allow-origin={cors}")
     check(b, "M3d request-id on 429", bool(rid), f"rid={rid}")
     # JSON logging (server started with ADJUTANT_LOG_FORMAT=json)
     line = None

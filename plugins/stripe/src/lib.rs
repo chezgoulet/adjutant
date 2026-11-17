@@ -149,6 +149,26 @@
 //! mystery. `stripe.webhook_events` — the raw receipt ledger.
 //! `stripe.payments` — the confirmed payments, with the ledger outcome and
 //! `ledger_intent_id`, the intent its booking rides on when it has one.
+//! `stripe.dues_mirror` — each member's dues standing as finance last announced
+//! it, so a dues checkout can be priced without the payer holding a finance
+//! permission.
+//!
+//! ## Dues are priced by finance
+//!
+//! `POST /api/stripe/checkout` with `purpose: "dues"` charges **what the member
+//! still owes**, taken from `stripe.dues_mirror`: a five-minute sweep in finance
+//! re-publishes every member's standing on `finance.dues.assessed`, and
+//! `finance.dues.payment` carries the same figures after a payment, so the mirror
+//! converges from a cold start by upsert.
+//!
+//! A payer may deliberately pay **less** — the owner's ruling, because a member
+//! short of money should still be able to pay something rather than nothing — and
+//! the session records `assessed_cents` beside `amount_cents`, so an
+//! under-payment is legible as a choice rather than looking like a payment that
+//! went missing. More than is owed is refused: an extra amount is a donation,
+//! which is a different purpose. And paying **nothing** is not a session at all —
+//! Stripe cannot charge zero — so it is refused with a pointer at finance, where
+//! a waiver belongs.
 //!
 //! ## Configuration
 //!
@@ -1662,7 +1682,12 @@ const SESSION_FIELDS: &str = r#"
     s.id, s.purpose, s.amount_cents, s.currency, s.member_id, s.fund_code, s.category,
     s.description, s.related_event_id, s.dues_year, s.status, s.stripe_session_id,
     s.checkout_url, s.created_by, s.created_at::text AS created_at,
-    s.updated_at::text AS updated_at
+    s.updated_at::text AS updated_at,
+    -- What the shop assessed the session against, beside what the payer chose to
+    -- pay. A dues session where `amount_cents < assessed_cents` is a deliberate
+    -- under-payment (the owner's ruling), and the pair is how that stays legible
+    -- instead of looking like a payment that went missing.
+    s.assessed_cents
 "#;
 
 /// A confirmed payment as the API states it (alias `p`).
@@ -1849,12 +1874,92 @@ fn sql_set_ledger_outcome(c: &PluginContext) -> String {
     )
 }
 
+/// The smallest charge Stripe will accept, in cents. A dues payment below it is
+/// not a session at all: it is a waiver, and finance is where a waiver lives.
+pub const STRIPE_MINIMUM_CHARGE_CENTS: i64 = 50;
+
+/// The mirrored standing for a member — the most recent fiscal year when the
+/// caller names none, because the shop does not know finance's fiscal-year
+/// start month and re-deriving it here would be a second implementation of it.
+fn mirror_lookup_sql(c: &PluginContext) -> String {
+    format!(
+        "SELECT member_id, fiscal_year, assessed_cents, funded_cents, paid_cents, \
+                outstanding_cents, settled, status \
+         FROM {m} WHERE member_id = $1 AND ($2::integer IS NULL OR fiscal_year = $2) \
+         ORDER BY fiscal_year DESC LIMIT 1",
+        m = c.db.table("dues_mirror")
+    )
+}
+
+fn mirror_lookup_params(member: &str, fiscal_year: Option<i32>) -> Vec<SqlValue> {
+    vec![
+        SqlValue::Text(member.to_string()),
+        fiscal_year.map(|y| SqlValue::Int(i64::from(y))).unwrap_or(SqlValue::NullInt),
+    ]
+}
+
+/// Mirror one of finance's standing announcements.
+///
+/// `finance.dues.assessed` (an assessment) carries no paid/outstanding figure
+/// because nothing has been paid yet; `finance.dues.payment` and the
+/// `dues_standing` sweep carry both. The missing case is derived exactly as
+/// finance derives it — `assessed - funded - paid` — so the shop and the member's
+/// dues page cannot disagree. Events without a `member_id` (a Lodge levy) are
+/// somebody else's business and are passed over.
+async fn mirror_standing(c: &PluginContext, ev: &Event) -> Result<(), SdkError> {
+    let payload = &ev.payload;
+    let Some(member_id) = payload["member_id"].as_str().filter(|m| !m.is_empty()) else {
+        return Ok(());
+    };
+    let Some(fiscal_year) = payload["fiscal_year"].as_i64() else {
+        return Ok(());
+    };
+    let assessed = payload["assessed_cents"].as_i64().unwrap_or(0);
+    let funded = payload["funded_cents"].as_i64().unwrap_or(0);
+    let paid = payload["paid_cents"].as_i64().unwrap_or(0);
+    let outstanding = payload["outstanding_cents"]
+        .as_i64()
+        .unwrap_or_else(|| (assessed - funded - paid).max(0));
+    let settled = payload["settled"]
+        .as_bool()
+        .unwrap_or(paid >= assessed - funded);
+    c.db.execute(
+        format!(
+            "INSERT INTO {m} \
+               (member_id, fiscal_year, assessed_cents, funded_cents, paid_cents, \
+                outstanding_cents, settled, status, updated_at) \
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, now()) \
+             ON CONFLICT (member_id, fiscal_year) DO UPDATE SET \
+               assessed_cents = EXCLUDED.assessed_cents, \
+               funded_cents = EXCLUDED.funded_cents, \
+               paid_cents = EXCLUDED.paid_cents, \
+               outstanding_cents = EXCLUDED.outstanding_cents, \
+               settled = EXCLUDED.settled, \
+               status = EXCLUDED.status, \
+               updated_at = now()",
+            m = c.db.table("dues_mirror")
+        ),
+        vec![
+            SqlValue::Text(member_id.to_string()),
+            SqlValue::Int(fiscal_year),
+            SqlValue::Int(assessed),
+            SqlValue::Int(funded),
+            SqlValue::Int(paid),
+            SqlValue::Int(outstanding),
+            SqlValue::Bool(settled),
+            SqlValue::Text(payload["status"].as_str().unwrap_or("").to_string()),
+        ],
+    )
+    .await?;
+    Ok(())
+}
+
 fn sql_insert_session(c: &PluginContext) -> String {
     format!(
         "INSERT INTO {sessions} AS s \
            (purpose, amount_cents, currency, member_id, fund_code, category, description, \
-            related_event_id, dues_year, created_by) \
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10) \
+            related_event_id, dues_year, created_by, assessed_cents) \
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11) \
          RETURNING {SESSION_FIELDS}",
         sessions = c.db.table("checkout_sessions")
     )
@@ -2024,6 +2129,7 @@ pub mod migrations {
     adjutant_sdk::migrations! {
         1 => "stripe_schema" => "../migrations/001_stripe_schema.sql";
         2 => "payment_ledger_intent" => "../migrations/002_payment_ledger_intent.sql";
+        3 => "dues_mirror" => "../migrations/003_dues_mirror.sql";
     }
 }
 
@@ -2060,6 +2166,14 @@ impl AdjutantPlugin for StripePlugin {
         let _ = self.config.set(cfg);
         let _ = self.ctx.set(ctx);
         Ok(())
+    }
+
+    /// The Stripe API key and the endpoint's signing secret are deployment
+    /// secrets, not plugin config: they resolve from
+    /// `ADJUTANT_SECRET_STRIPE_SECRET_KEY` / `ADJUTANT_SECRET_STRIPE_WEBHOOK_SECRET`
+    /// (or the secrets file) and are injected before `init`.
+    fn secret_config_keys(&self) -> Vec<&'static str> {
+        vec![CONFIG_SECRET_KEY, CONFIG_WEBHOOK_SECRET]
     }
 
     fn permissions_granted(&self) -> Vec<Permission> {
@@ -2102,7 +2216,24 @@ impl AdjutantPlugin for StripePlugin {
     /// cannot make a booking invisible or invent one.
     fn subscriptions(&self) -> Vec<EventSubscription> {
         let ctx = self.ctx().clone();
-        vec![EventSubscription::new(
+        let mirror_ctx = ctx.clone();
+        vec![
+            // Finance's announcement of a member's dues standing. The shop
+            // mirrors it so a dues checkout can be priced from what is owed
+            // without asking the payer to hold a finance permission — role
+            // grants are operator work, and a troop that never granted
+            // `finance:read` would otherwise find dues checkout unable to price
+            // itself. `finance.dues.payment` carries the same figures after a
+            // payment, and finance re-publishes everything on a five-minute
+            // sweep, so an upsert here converges from a cold start.
+            EventSubscription::new(
+                "finance.dues",
+                event_handler(move |ev| {
+                    let c = mirror_ctx.clone();
+                    async move { mirror_standing(&c, &ev).await }
+                }),
+            ),
+            EventSubscription::new(
             OUTBOX_EVENT_PREFIX,
             event_handler(move |ev| {
                 let c = ctx.clone();
@@ -2313,9 +2444,90 @@ fn route_checkout(ctx: &PluginContext, cfg: &StripeConfig) -> RouteDefinition {
                         format!("purpose must be one of {}", PURPOSES.join(", ")),
                     );
                 }
-                let amount_cents = match resolve_amount(body.amount_cents, &body.amount) {
-                    Ok(amount) => amount,
-                    Err(reason) => return PluginResponse::error(400, reason),
+                let caller = caller_of(&req);
+                let member_id = trimmed(&body.member_id).unwrap_or_default();
+
+                // --- a dues session is priced by finance, not by the payer ----
+                // The assessment lives in finance; the shop mirrors it (see
+                // `mirror_standing`) so pricing does not depend on the payer
+                // holding a finance permission. The payer may deliberately pay
+                // **less** than they owe — the owner's ruling — but not more
+                // (that is a donation, a different purpose) and not zero (Stripe
+                // cannot charge zero; a waiver is finance's record, not a
+                // session).
+                let mut assessed_cents: Option<i64> = None;
+                let amount_cents = if purpose == PURPOSE_DUES {
+                    let subject = if member_id.is_empty() {
+                        caller.clone().unwrap_or_default()
+                    } else {
+                        member_id.clone()
+                    };
+                    if subject.is_empty() {
+                        return PluginResponse::error(
+                            400,
+                            "a dues session needs a member: place it for yourself, or name the \
+                             member as the treasurer",
+                        );
+                    }
+                    let Some(standing) = c
+                        .db
+                        .query_one(mirror_lookup_sql(&c), mirror_lookup_params(&subject, body.dues_year))
+                        .await?
+                    else {
+                        return PluginResponse::error(
+                            409,
+                            format!(
+                                "no dues assessment for {subject} has reached the shop yet — \
+                                 finance announces it and this shop mirrors it; try again in a \
+                                 minute, or ask the treasurer to assess it"
+                            ),
+                        );
+                    };
+                    let owed = standing["outstanding_cents"].as_i64().unwrap_or(0);
+                    let assessed = standing["assessed_cents"].as_i64().unwrap_or(0);
+                    assessed_cents = Some(assessed);
+                    if owed <= 0 {
+                        return PluginResponse::error(
+                            409,
+                            format!("{subject} has nothing outstanding for that year — the dues \
+                                     are settled"),
+                        );
+                    }
+                    let chosen = match resolve_amount(body.amount_cents, &body.amount) {
+                        // No amount given: charge what is owed.
+                        Err(_) if body.amount_cents.is_none() && trimmed(&body.amount).is_none() => {
+                            owed
+                        }
+                        Ok(amount) => amount,
+                        Err(reason) => return PluginResponse::error(400, reason),
+                    };
+                    if chosen > owed {
+                        return PluginResponse::error(
+                            400,
+                            format!(
+                                "a dues session may not exceed what is owed ({owed} cents); an \
+                                 extra amount is a donation — open one with purpose \"donation\""
+                            ),
+                        );
+                    }
+                    if chosen < STRIPE_MINIMUM_CHARGE_CENTS {
+                        return PluginResponse::error(
+                            409,
+                            format!(
+                                "Stripe cannot charge less than {STRIPE_MINIMUM_CHARGE_CENTS} \
+                                 cents, so paying nothing (or almost nothing) is a **waiver**, not \
+                                 a session: record it with finance (POST /api/finance/dues/{\
+                                 subject}/waiver or the self-report route), where it shows against \
+                                 the standing as deliberate rather than unpaid"
+                            ),
+                        );
+                    }
+                    chosen
+                } else {
+                    match resolve_amount(body.amount_cents, &body.amount) {
+                        Ok(amount) => amount,
+                        Err(reason) => return PluginResponse::error(400, reason),
+                    }
                 };
                 if amount_cents <= 0 {
                     return PluginResponse::error(
@@ -2324,8 +2536,6 @@ fn route_checkout(ctx: &PluginContext, cfg: &StripeConfig) -> RouteDefinition {
                          refund (a refund is an expense in finance's ledger)",
                     );
                 }
-                let caller = caller_of(&req);
-                let member_id = trimmed(&body.member_id).unwrap_or_default();
                 // Opening a session on somebody else's behalf is the treasurer's
                 // act, and it is checked here because the *object* is the member.
                 if !member_id.is_empty() && Some(member_id.as_str()) != caller.as_deref() {
@@ -2391,6 +2601,7 @@ fn route_checkout(ctx: &PluginContext, cfg: &StripeConfig) -> RouteDefinition {
                                 .map(|year| SqlValue::Int(i64::from(year)))
                                 .unwrap_or(SqlValue::NullInt),
                             SqlValue::Text(caller.clone().unwrap_or_default()),
+                            assessed_cents.map(SqlValue::Int).unwrap_or(SqlValue::NullInt),
                         ],
                     )
                     .await?;

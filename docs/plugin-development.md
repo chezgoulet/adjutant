@@ -532,18 +532,21 @@ gets a `LOGIN` role `adjutant_plugin_<id>` that owns its PostgreSQL schema, and
 
 - bare table names resolve in your schema (the role's default `search_path`);
 - you own your schema and everything in it;
-- you can touch only an explicit allowlist of `core.*` tables (see
+- you can touch only an explicit allowlist of `core.*` tables — and, where a
+  table holds sensitive columns, an explicit list of columns within it (see
   `core_grants` in `server/src/schema.rs` — auth and membership have entries;
   other plugins get none, and missions/governance need none because they keep to
-  their own schema);
+  their own schema). `core.users` is granted column by column: `membership` can
+  read roster identity columns but not `password_hash`, and column-level grants
+  mean `SELECT *` fails for these roles;
 - reaching into **another plugin's** schema fails with `permission denied`;
 - `SET ROLE`/`RESET ROLE` cannot lift you out: the session user *is* your role
   and it is a member of nothing, so the old `DO`-block escape is inert.
 
 Roles, schema ownership and passwords are created by the operator with
 `adjutant bootstrap-isolation`; the runtime cannot create them. If your plugin
-needs a core table, request it be added to `core_grants`; do not assume `core.*`
-is open.
+needs a core table or column, request it be added to `core_grants`; do not
+assume `core.*` is open.
 
 **Migrations run on your role and pool too**, inside your schema, so they may
 create/alter objects **in your schema only** — a migration that writes `core.*`

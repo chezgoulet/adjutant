@@ -1542,6 +1542,9 @@ mod tests {
         };
         Arc::new(AppState {
             pool: pool.clone(),
+            secrets: Arc::new(std::sync::RwLock::new(
+                crate::secrets::SecretSource::default(),
+            )),
             permissions: PermissionService::new(CoreDb::new(pool.clone())),
             audit: AuditService::new(CoreDb::new(pool.clone()), "core".into()),
             registry: tokio::sync::RwLock::new(PluginRegistry {

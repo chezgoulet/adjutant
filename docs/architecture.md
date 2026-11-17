@@ -112,7 +112,10 @@ Schema isolation (below) applies to both.
   authenticated as that role, so the boundary is the identity of the connection,
   not a statement filter: the plugin cannot `SET ROLE`/`RESET ROLE` into anything
   else, and a query into another plugin's schema is denied by the database.
-  Cross-`core` access is an explicit allowlist (`server/src/schema.rs`).
+  Cross-`core` access is an explicit allowlist (`server/src/schema.rs`): whole
+  tables where nothing sensitive is involved, and individual columns where it
+  is — `core.users` is granted column by column, so a role that maps sessions to
+  roster entries cannot read `password_hash`.
 - **Plugin credentials** live in `core.plugins.db_secret` (never in `config`,
   which is handed to the plugin as `ctx.config`). Roles, schema ownership, the
   allowlist and passwords are created by `adjutant bootstrap-isolation`; the

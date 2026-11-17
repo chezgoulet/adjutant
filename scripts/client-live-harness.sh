@@ -85,12 +85,18 @@ echo "==> booting the server on $BASE (dev headers OFF)"
 # ADJUTANT_DEV_HEADERS=false is the point: with the stub on, a caller could name
 # its own identity with two headers, and the client's session would prove
 # nothing. ADJUTANT_RATE_MAX=0 because this run issues a burst of requests.
+# The client's first registration is the bootstrap chief, and that route is
+# closed unless the server carries a bootstrap secret: mint one and hand it to
+# the server. The Dart harness reads the same variable from its environment.
+ADJUTANT_BOOTSTRAP_TOKEN="$(openssl rand -hex 16)"
+export ADJUTANT_BOOTSTRAP_TOKEN
 ADJUTANT_DATABASE_URL="$LIVE_URL" \
 ADJUTANT_PLUGIN_DIR="$PLUGIN_DIR" \
 ADJUTANT_DEV_HEADERS=false \
 ADJUTANT_RATE_MAX=0 \
 ADJUTANT_ALLOW_SUPERUSER=true \
 ADJUTANT_LOG=warn \
+ADJUTANT_BOOTSTRAP_TOKEN="$ADJUTANT_BOOTSTRAP_TOKEN" \
 ADJUTANT_BIND="127.0.0.1:$PORT" \
   "$SERVER" >"$LOG" 2>&1 &
 SERVER_PID=$!

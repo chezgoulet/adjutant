@@ -16,7 +16,6 @@
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
-use axum::body::to_bytes;
 use axum::extract::{Path, Request, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
@@ -25,6 +24,8 @@ use axum::{Json, Router};
 use serde_json::json;
 use tokio::sync::RwLock;
 use tower_http::cors::{Any, CorsLayer};
+use tower_http::limit::RequestBodyLimitLayer;
+use tower_http::timeout::TimeoutLayer;
 
 use adjutant_sdk::{AuditService, Identity, PermissionService, PluginRequest};
 
@@ -36,6 +37,15 @@ use crate::permissions::{authorize, extract_identity};
 use crate::plugin_runtime::{
     close_pool, load_all, load_plugin, LoadEnv, PluginRegistry, PluginSlot, RouteLookup,
 };
+
+/// The warning an operator must see when the spoofable identity stub is on.
+///
+/// One string, used both by the boot `WARN` and by `GET /api/plugins`, so the
+/// risk cannot be described one way at boot and another way in the admin
+/// surface an auditor actually reads.
+pub const DEV_HEADERS_RISK: &str = "the dev-header identity stub is ON: x-dev-user/x-dev-role are \
+     honoured and anyone who can reach this port can claim any identity and role. Disable it \
+     (ADJUTANT_DEV_HEADERS=false or --no-dev-headers) outside throwaway development";
 
 /// Shared app state. The registry lives behind a lock: admin lifecycle ops
 /// (enable/disable/uninstall/reload) mutate it while requests dispatch through
@@ -53,6 +63,9 @@ pub struct AppState {
     pub identity: Arc<crate::identity::IdentityHub>,
     /// Core-mediated HTTP shared by all plugin contexts.
     pub http: Arc<crate::host::CoreHttp>,
+    /// The deployment's secret source (environment + secrets file). Shared so a
+    /// reload re-reads the same file and re-injects rotated values.
+    pub secrets: Arc<std::sync::RwLock<crate::secrets::SecretSource>>,
     /// Declared scope hierarchy (lodge→patrol), loaded at boot and on reload.
     /// Used to expand a caller's grants before the gate and handlers see them.
     pub hierarchy: RwLock<crate::scope_hierarchy::ScopeHierarchy>,
@@ -106,7 +119,10 @@ impl InFlight {
             .expect("in-flight map poisoned")
             .entry(plugin.to_string())
             .or_insert(0) += 1;
-        InFlightGuard { inner: self.clone(), plugin: plugin.to_string() }
+        InFlightGuard {
+            inner: self.clone(),
+            plugin: plugin.to_string(),
+        }
     }
 
     pub fn count(&self, plugin: &str) -> usize {
@@ -127,7 +143,11 @@ impl InFlight {
     /// admin's request open forever — the caller decides what to do when it
     /// expires (the server keeps the pool open until the request really ends;
     /// see `disable_plugin`).
-    pub async fn wait_idle(&self, plugin: &str, timeout: std::time::Duration) -> Option<std::time::Duration> {
+    pub async fn wait_idle(
+        &self,
+        plugin: &str,
+        timeout: std::time::Duration,
+    ) -> Option<std::time::Duration> {
         let start = std::time::Instant::now();
         loop {
             if self.count(plugin) == 0 {
@@ -265,7 +285,10 @@ impl AppState {
     /// must use this — reading dev headers directly meant admin routes 401'd
     /// for real sessions once `allow_dev_headers=false`, and audit rows lost
     /// their actor entirely.
-    pub(crate) async fn resolve_identity(&self, headers: &axum::http::HeaderMap) -> Option<adjutant_sdk::Identity> {
+    pub(crate) async fn resolve_identity(
+        &self,
+        headers: &axum::http::HeaderMap,
+    ) -> Option<adjutant_sdk::Identity> {
         let map: HashMap<String, String> = headers
             .iter()
             .filter_map(|(k, v)| Some((k.as_str().to_string(), v.to_str().ok()?.to_string())))
@@ -300,7 +323,11 @@ impl AppState {
         // A disabled plugin has no instance to shut down: it was already dropped
         // when it was disabled (issue #89). Retired generations keep theirs, so
         // their documented `shutdown()` hook still runs.
-        for lp in plugins.iter_mut().filter_map(crate::plugin_runtime::PluginSlot::live_mut).chain(retired.iter_mut()) {
+        for lp in plugins
+            .iter_mut()
+            .filter_map(crate::plugin_runtime::PluginSlot::live_mut)
+            .chain(retired.iter_mut())
+        {
             if let Err(e) = lp.plugin.shutdown().await {
                 tracing::warn!(plugin = %lp.info.id, error = %e, "plugin shutdown failed");
             }
@@ -370,6 +397,35 @@ pub fn superuser_refusal(is_superuser: bool, allow_superuser: bool) -> Result<()
 
 /// Build the full application: connect DB, load plugins, assemble router.
 pub async fn build_app(cfg: &Config) -> Result<(Router, Arc<AppState>), BuildError> {
+    // AUTH-9: the stub is not a quiet convenience. Anyone who can reach the
+    // port becomes whoever they name, so the boot log says so at WARN — and
+    // `GET /api/plugins` reports the same risk (§ list_plugins).
+    if cfg.allow_dev_headers {
+        tracing::warn!("{}", DEV_HEADERS_RISK);
+    }
+
+    // #160: install the keyed layer before anything can append an audit row.
+    // The key is process-global (so `AuditService::new` and every plugin keep
+    // compiling), and it never reaches SQL, a log line, or the database role.
+    match &cfg.audit_key {
+        Some(key) => {
+            if !adjutant_sdk::audit::set_chain_key(key.clone()) {
+                tracing::warn!(
+                    "ADJUTANT_AUDIT_KEY: a chain key was already installed in this process; \
+                     the first one stays in force"
+                );
+            }
+            tracing::info!("audit: keyed chain enabled (HMAC-SHA256 over the v2 payload)");
+        }
+        None => tracing::warn!(
+            "ADJUTANT_AUDIT_KEY is not set: the audit chain covers action, resource, details, \
+             source, user_id and created_at, but it is NOT keyed. A role that owns core.audit_log \
+             can disable the triggers, rewrite a row, recompute the chain and verify ok:true. \
+             Set a 32-byte key (64 hex characters or base64) to make that detectable; \
+             GET /api/audit/verify reports keyed:false until then."
+        ),
+    }
+
     let pool = db::connect(cfg).await.map_err(BuildError::Db)?;
 
     // Refuse a superuser before running any DDL.
@@ -380,12 +436,30 @@ pub async fn build_app(cfg: &Config) -> Result<(Router, Arc<AppState>), BuildErr
             .map_err(BuildError::Db)?;
     superuser_refusal(is_superuser, cfg.allow_superuser).map_err(BuildError::Superuser)?;
 
-    db::migrate_core(pool.as_ref()).await.map_err(BuildError::Db)?;
+    db::migrate_core(pool.as_ref())
+        .await
+        .map_err(BuildError::Db)?;
+
+    // The first chief from the environment, before the listener opens (#173).
+    // Registering a claim row and a user in one transaction is what makes the
+    // HTTP bootstrap path's race irrelevant: by the time a caller can reach the
+    // route, either a user exists or the slot is still free.
+    crate::bootstrap::ensure_first_chief(pool.as_ref(), cfg.bootstrap_chief.as_ref())
+        .await
+        .map_err(|e| BuildError::Bootstrap(e.to_string()))?;
 
     let bus = EventBus::new();
     let identity = crate::identity::IdentityHub::new();
     let http = crate::host::CoreHttp::new();
     let scheduler = crate::scheduler::Scheduler::new();
+
+    // Where this deployment's secrets come from. Loaded before the first plugin,
+    // because `init` reads its config; re-read on every reload, so a rotation
+    // takes effect without a restart.
+    let secrets = std::sync::Arc::new(std::sync::RwLock::new(
+        crate::secrets::SecretSource::load(cfg.secrets_file.as_deref())
+            .map_err(BuildError::Secrets)?,
+    ));
 
     let registry = load_all(
         &cfg.plugin_dir,
@@ -395,9 +469,17 @@ pub async fn build_app(cfg: &Config) -> Result<(Router, Arc<AppState>), BuildErr
         serde_json::Value::Object(Default::default()),
         identity.clone(),
         http.clone(),
+        secrets.clone(),
     )
     .await
     .map_err(BuildError::Plugin)?;
+
+    // #152: the finance plugin's record tables are written by its own role, but
+    // must not be owned by it — an owner can disable the immutability triggers.
+    // Migrations have run by now, so this is the first point the guards exist.
+    crate::schema::protect_record_tables(pool.as_ref())
+        .await
+        .map_err(BuildError::Db)?;
 
     // Bind event subscriptions before any traffic flows — but only for plugins
     // that are actually **loaded**. A disabled plugin is not in the live set at
@@ -467,6 +549,7 @@ pub async fn build_app(cfg: &Config) -> Result<(Router, Arc<AppState>), BuildErr
         config: Arc::new(cfg.clone()),
         identity,
         http,
+        secrets,
         hierarchy: RwLock::new(hierarchy),
         scheduler,
         outbox_mismatches: Mutex::new(0),
@@ -480,29 +563,59 @@ pub async fn build_app(cfg: &Config) -> Result<(Router, Arc<AppState>), BuildErr
     // under `outbox::SUBSCRIBER_OWNER` so a reload's sweep (which clears every
     // *plugin* generation) leaves it alone. Started after the state exists:
     // `start` takes a `Weak` to it.
-    state
-        .bus
-        .subscribe(crate::outbox::SUBSCRIBER_OWNER, crate::outbox::outcome_subscription());
+    state.bus.subscribe(
+        crate::outbox::SUBSCRIBER_OWNER,
+        crate::outbox::outcome_subscription(),
+    );
     relay.start(&state);
     backups.start(&state);
 
+    // Origins are explicit; `*` never reaches here because `Config::from_*`
+    // refuses to boot with it (sessions are cookie-authenticated, so a wildcard
+    // is one `allow_credentials` away from a credential leak). Malformed
+    // entries are dropped rather than widening the list.
     let cors = cfg.cors_origins.first().map(|_| {
-        let layer = CorsLayer::new();
-        if cfg.cors_origins.iter().any(|o| o == "*") {
-            layer.allow_origin(Any).allow_methods(Any).allow_headers(Any)
-        } else {
-            let origins: Vec<_> = cfg
-                .cors_origins
-                .iter()
-                .filter_map(|o| o.parse().ok())
-                .collect();
-            layer
-                .allow_origin(origins)
-                .allow_methods(Any)
-                .allow_headers(Any)
-        }
+        let origins: Vec<_> = cfg
+            .cors_origins
+            .iter()
+            .filter_map(|o| o.parse().ok())
+            .collect();
+        CorsLayer::new()
+            .allow_origin(origins)
+            .allow_methods(Any)
+            .allow_headers(Any)
     });
 
+    let app = build_router(state.clone());
+
+    // CORS is outermost, so its headers are present on 429s and errors too.
+    let app = match cors {
+        Some(c) => app.layer(c),
+        None => app,
+    };
+
+    tracing::info!(
+        routes = route_count,
+        "router assembled (dynamic plugin dispatch)"
+    );
+    Ok((app, state))
+}
+
+/// Assemble the application router from `state`.
+///
+/// Kept separate from [`build_app`] so tests (and any future embedding) can
+/// mount the exact production middleware stack without a database boot. Issue
+/// #172's limits live here, not in handlers:
+///
+/// * `RequestBodyLimitLayer` caps body size before an extractor sees it;
+/// * `body_deadline` puts one total deadline on the body, so a slow drip cannot
+///   renew it frame by frame;
+/// * `TimeoutLayer` bounds the whole request, handler included.
+///
+/// The header-read deadline and connection cap are below this router, in
+/// [`crate::serve::serve`].
+pub fn build_router(state: Arc<AppState>) -> Router {
+    let cfg = &state.config;
     let app = Router::new()
         .route("/", get(health))
         .route("/api/plugins", get(list_plugins))
@@ -562,22 +675,23 @@ pub async fn build_app(cfg: &Config) -> Result<(Router, Arc<AppState>), BuildErr
         .fallback(dynamic_dispatch)
         .with_state(state.clone());
 
-    // Layer order: later call = outermost. CORS outermost (headers on 429s and
-    // errors), then access log (sees every response incl. rate-limited), then
-    // the limiter (cheap rejection before any handler work).
+    // Later call = outermost. The limiter stays cheap and outside the timeout
+    // so rate-limited requests do not consume a connection's handler slots.
+    let app = app.layer(RequestBodyLimitLayer::new(cfg.max_body_bytes));
+    let app = app.layer(axum::middleware::from_fn_with_state(
+        std::time::Duration::from_secs(cfg.http.body_timeout_secs),
+        crate::middleware::body_deadline,
+    ));
+    let app = app.layer(TimeoutLayer::with_status_code(
+        StatusCode::REQUEST_TIMEOUT,
+        std::time::Duration::from_secs(cfg.http.request_timeout_secs),
+    ));
     let limiter = RateLimiter::new(cfg.rate.clone(), cfg.trusted_proxies.clone());
     let app = app.layer(axum::middleware::from_fn_with_state(
         limiter,
         rate_limit_layer,
     ));
-    let app = app.layer(axum::middleware::from_fn(request_log));
-    let app = match cors {
-        Some(c) => app.layer(c),
-        None => app,
-    };
-
-    tracing::info!(routes = route_count, "router assembled (dynamic plugin dispatch)");
-    Ok((app, state))
+    app.layer(axum::middleware::from_fn(request_log))
 }
 
 /// Clear every **plugin's** event subscriptions before rebinding the new
@@ -707,7 +821,16 @@ async fn dynamic_dispatch(State(state): State<Arc<AppState>>, req: Request) -> R
         }
     };
 
-    dispatch(state, plugin_id, required, required_scope, handler, params, req).await
+    dispatch(
+        state,
+        plugin_id,
+        required,
+        required_scope,
+        handler,
+        params,
+        req,
+    )
+    .await
 }
 
 /// Permission gate → build SDK request → call handler.
@@ -721,9 +844,6 @@ async fn dispatch(
     req: Request,
 ) -> Response {
     let (parts, body) = req.into_parts();
-    let body_bytes = to_bytes(body, state.config.max_body_bytes)
-        .await
-        .unwrap_or_default();
 
     // 1. Identity: plugin providers first (the auth plugin owns real
     // sessions), dev headers only as a gated fallback (SPEC §7.1 — spoofable,
@@ -736,9 +856,16 @@ async fn dispatch(
     let identity = state.resolve_identity(&parts.headers).await;
 
     // 2. Permission gate — enforced by core, never by the plugin (SPEC §9).
+    // This runs BEFORE the body is read: an unauthenticated caller cannot make
+    // the server wait on a body (issue #172's `/api/auth/login` companion).
     if let Some(perm) = &required {
-        if let Err(status) =
-            authorize(identity.as_ref(), &state.permissions, perm, required_scope.as_ref()).await
+        if let Err(status) = authorize(
+            identity.as_ref(),
+            &state.permissions,
+            perm,
+            required_scope.as_ref(),
+        )
+        .await
         {
             let msg = if status == 401 {
                 "authentication required"
@@ -749,7 +876,15 @@ async fn dispatch(
         }
     }
 
-    // 3. Convert Axum request → SDK request.
+    // 3. Only an authorized (or public) request gets to spend the body
+    // deadline. `read_body` turns a stalled body into a 408 instead of letting
+    // the handler see an empty body.
+    let body_bytes = match crate::middleware::read_body(body, state.config.max_body_bytes).await {
+        Ok(bytes) => bytes,
+        Err(resp) => return resp,
+    };
+
+    // 4. Convert Axum request → SDK request.
     let query = parts
         .uri
         .query()
@@ -777,11 +912,11 @@ async fn dispatch(
         params,
         query,
         headers,
-        body: body_bytes.to_vec(),
+        body: body_bytes,
         identity,
     };
 
-    // 4. Call the plugin.
+    // 5. Call the plugin.
     match handler(preq).await {
         Ok(resp) => {
             let status =
@@ -800,8 +935,8 @@ async fn dispatch(
         Err(e) => {
             // The SDK owns the error → status mapping (SdkError::status), so the
             // core and plugins agree on 400/401/403/404/409/500.
-            let status = StatusCode::from_u16(e.status())
-                .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
+            let status =
+                StatusCode::from_u16(e.status()).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
             if status.is_server_error() {
                 // Never echo Db/Internal detail (it can carry SQL) to the client.
                 internal_error("plugin handler", &e)
@@ -922,6 +1057,13 @@ async fn list_plugins(State(state): State<Arc<AppState>>, req: Request) -> Respo
         // its source and the actor, so a reader can tell a switched-off plugin
         // from one that is merely not loaded.
         "choice": choice,
+        // AUTH-9: the admin inventory is where a reviewer checks the running
+        // deployment, so it reports the spoofable stub explicitly. `risk` is
+        // the same sentence as the boot WARN; `null` means the stub is off.
+        "dev_headers": {
+            "enabled": state.config.allow_dev_headers,
+            "risk": state.config.allow_dev_headers.then_some(DEV_HEADERS_RISK),
+        },
     }))
     .into_response()
 }
@@ -929,10 +1071,7 @@ async fn list_plugins(State(state): State<Arc<AppState>>, req: Request) -> Respo
 /// Last N events with cursor replay: `?since=<id>&limit=<1..500>`
 /// (SPEC §15 M2: event bus persistence + replay). Admin-gated: event payloads
 /// carry plugin data (member ids, messages) and the route is not public API.
-async fn recent_events(
-    State(state): State<Arc<AppState>>,
-    req: Request,
-) -> Response {
+async fn recent_events(State(state): State<Arc<AppState>>, req: Request) -> Response {
     if let Some(resp) = state.require_admin(req.headers()).await {
         return resp;
     }
@@ -982,25 +1121,17 @@ async fn recent_events(
     Json(json!({ "events": events, "cursor": last })).into_response()
 }
 
-/// Recompute the audit hash chain (SPEC §15 M2: tamper-evident audit log).
-/// FAILS CLOSED: if the verification query itself errors, the endpoint answers
-/// 500 — never `{"ok":true,"rows_checked":0}`, which is what the old
+/// Recompute the audit hash chain (SPEC §15 M2: tamper-evident audit log) and,
+/// when `ADJUTANT_AUDIT_KEY` is configured, the keyed HMAC layer (#159, #160).
+/// FAILS CLOSED: if a verification query errors, the endpoint answers 500 —
+/// never `{"ok":true,"rows_checked":0}`, which is what the old
 /// `unwrap_or((None, 0))` produced and would have masked a broken verifier.
 async fn audit_verify(State(state): State<Arc<AppState>>, req: Request) -> Response {
     if let Some(resp) = state.require_admin(req.headers()).await {
         return resp;
     }
-    let row: Result<(Option<i64>, i64), sqlx::Error> =
-        sqlx::query_as("SELECT first_bad, rows_checked FROM core.audit_verify()")
-            .fetch_one(state.pool.as_ref())
-            .await;
-    match row {
-        Ok((first_bad, rows)) => Json(json!({
-            "ok": first_bad.is_none(),
-            "first_bad": first_bad,
-            "rows_checked": rows,
-        }))
-        .into_response(),
+    match crate::audit::verify(state.pool.as_ref(), state.config.audit_key.as_ref()).await {
+        Ok(report) => Json(report).into_response(),
         Err(e) => internal_error("audit verification", &e),
     }
 }
@@ -1028,7 +1159,13 @@ async fn audit_refusal(
 ) {
     if let Err(e) = state
         .audit
-        .log(identity, action, "plugin", name, json!({ "refused": reason }))
+        .log(
+            identity,
+            action,
+            "plugin",
+            name,
+            json!({ "refused": reason }),
+        )
         .await
     {
         tracing::error!(action, plugin = name, error = %e, "refusal audit write failed");
@@ -1083,7 +1220,14 @@ async fn enable_plugin(
         }
         if let Some(reason) = enable_refusal(&name, &reg) {
             drop(reg);
-            audit_refusal(&state, identity.as_ref(), "plugin.enable.refused", &name, &reason).await;
+            audit_refusal(
+                &state,
+                identity.as_ref(),
+                "plugin.enable.refused",
+                &name,
+                &reason,
+            )
+            .await;
             return refusal(&name, &reason);
         }
     }
@@ -1096,8 +1240,18 @@ async fn enable_plugin(
         None => return error_response(StatusCode::NOT_FOUND, "unknown plugin"),
     };
     if !path.exists() {
-        let reason = format!("{name} cannot be enabled: its library {} is missing", path.display());
-        audit_refusal(&state, identity.as_ref(), "plugin.enable.refused", &name, &reason).await;
+        let reason = format!(
+            "{name} cannot be enabled: its library {} is missing",
+            path.display()
+        );
+        audit_refusal(
+            &state,
+            identity.as_ref(),
+            "plugin.enable.refused",
+            &name,
+            &reason,
+        )
+        .await;
         return refusal(&name, &reason);
     }
 
@@ -1126,6 +1280,7 @@ async fn enable_plugin(
         config: serde_json::Value::Object(Default::default()),
         identity: state.identity.clone(),
         http: state.http.clone(),
+        secrets: state.secrets.clone(),
     };
     let mut seen_routes = state.registry.read().await.live_route_keys();
     let loaded = match load_plugin(&path, &env, &mut seen_routes).await {
@@ -1135,7 +1290,14 @@ async fn enable_plugin(
             tracing::error!(plugin = %name, error = %e, "enable failed; plugin stays disabled");
             // The reason lands on the record, where the admin surface shows it.
             state.registry.write().await.record_error(&name, &reason);
-            audit_refusal(&state, identity.as_ref(), "plugin.enable.refused", &name, &reason).await;
+            audit_refusal(
+                &state,
+                identity.as_ref(),
+                "plugin.enable.refused",
+                &name,
+                &reason,
+            )
+            .await;
             return error_response(StatusCode::CONFLICT, reason);
         }
     };
@@ -1149,7 +1311,14 @@ async fn enable_plugin(
         );
         tracing::error!(plugin = %name, declared = %loaded.info.id, "enable refused: id mismatch");
         state.registry.write().await.record_error(&name, &reason);
-        audit_refusal(&state, identity.as_ref(), "plugin.enable.refused", &name, &reason).await;
+        audit_refusal(
+            &state,
+            identity.as_ref(),
+            "plugin.enable.refused",
+            &name,
+            &reason,
+        )
+        .await;
         return refusal(&name, &reason);
     }
 
@@ -1178,10 +1347,11 @@ async fn enable_plugin(
         }
     }
 
-    if let Err(e) = sqlx::query("UPDATE core.plugins SET enabled = true, updated_at = now() WHERE id = $1")
-        .bind(&name)
-        .execute(state.pool.as_ref())
-        .await
+    if let Err(e) =
+        sqlx::query("UPDATE core.plugins SET enabled = true, updated_at = now() WHERE id = $1")
+            .bind(&name)
+            .execute(state.pool.as_ref())
+            .await
     {
         // The flag is the durable truth (a restart reads it). If it cannot be
         // written, undo the load so no state contradicts the database.
@@ -1229,7 +1399,14 @@ async fn disable_plugin(
         }
         if let Some(reason) = disable_refusal(&name, &reg) {
             drop(reg);
-            audit_refusal(&state, identity.as_ref(), "plugin.disable.refused", &name, &reason).await;
+            audit_refusal(
+                &state,
+                identity.as_ref(),
+                "plugin.disable.refused",
+                &name,
+                &reason,
+            )
+            .await;
             return refusal(&name, &reason);
         }
     }
@@ -1245,7 +1422,14 @@ async fn disable_plugin(
         let reason =
             "refusing to remove the only identity provider while dev headers are off;              register/enable another identity provider, or set ADJUTANT_DEV_HEADERS=true              for a dev instance"
                 .to_string();
-        audit_refusal(&state, identity.as_ref(), "plugin.disable.refused", &name, &reason).await;
+        audit_refusal(
+            &state,
+            identity.as_ref(),
+            "plugin.disable.refused",
+            &name,
+            &reason,
+        )
+        .await;
         return refusal(&name, &reason);
     }
 
@@ -1264,10 +1448,11 @@ async fn disable_plugin(
     }
 
     // Flag first: past this point the teardown cannot fail.
-    if let Err(e) = sqlx::query("UPDATE core.plugins SET enabled = false, updated_at = now() WHERE id = $1")
-        .bind(&name)
-        .execute(state.pool.as_ref())
-        .await
+    if let Err(e) =
+        sqlx::query("UPDATE core.plugins SET enabled = false, updated_at = now() WHERE id = $1")
+            .bind(&name)
+            .execute(state.pool.as_ref())
+            .await
     {
         return internal_error("plugin lifecycle", &e);
     }
@@ -1414,6 +1599,7 @@ pub(crate) async fn load_fresh_generation(
         serde_json::Value::Object(Default::default()),
         state.identity.clone(),
         state.http.clone(),
+        state.secrets.clone(),
     )
     .await
     {
@@ -1427,19 +1613,31 @@ pub(crate) async fn load_fresh_generation(
         }
     };
 
+    // #152: a reload may have just applied the finance plugin's guard migration
+    // (enable/reinstall). Ownership has to be moved after that, exactly as at
+    // boot, or the writing role could disarm the guards it just installed.
+    if let Err(e) = crate::schema::protect_record_tables(state.pool.as_ref()).await {
+        tracing::error!(error = %e, "reload could not protect record ownership; old registry kept");
+        return Err(error_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "reload failed; old registry kept",
+        ));
+    }
+
     // `load_all` ran each plugin's `init`, which re-declares its scope edges;
     // refresh the resolution map before the new generation serves.
-    let fresh_hierarchy =
-        match crate::scope_hierarchy::ScopeHierarchy::load(state.pool.as_ref()).await {
-            Ok(h) => h,
-            Err(e) => {
-                tracing::error!(error = %e, "reload failed to load scope hierarchy; old registry kept");
-                return Err(error_response(
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    "reload failed; old registry kept",
-                ));
-            }
-        };
+    let fresh_hierarchy = match crate::scope_hierarchy::ScopeHierarchy::load(state.pool.as_ref())
+        .await
+    {
+        Ok(h) => h,
+        Err(e) => {
+            tracing::error!(error = %e, "reload failed to load scope hierarchy; old registry kept");
+            return Err(error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "reload failed; old registry kept",
+            ));
+        }
+    };
 
     Ok((fresh, fresh_hierarchy))
 }
@@ -1566,16 +1764,26 @@ mod tests {
     #[test]
     fn superuser_boot_is_refused_unless_explicitly_allowed() {
         assert!(superuser_refusal(false, false).is_ok());
-        assert!(superuser_refusal(true, true).is_ok(), "the opt-out permits it");
+        assert!(
+            superuser_refusal(true, true).is_ok(),
+            "the opt-out permits it"
+        );
         let err = superuser_refusal(true, false).expect_err("a superuser must be refused");
         assert!(err.contains("superuser"), "names the reason: {err}");
-        assert!(err.contains("ADJUTANT_ALLOW_SUPERUSER"), "names the opt-out: {err}");
+        assert!(
+            err.contains("ADJUTANT_ALLOW_SUPERUSER"),
+            "names the opt-out: {err}"
+        );
     }
 
     #[test]
     fn captures_are_percent_decoded_once() {
         assert_eq!(decode_path("%31"), "1");
-        assert_eq!(decode_path("a%2Fb"), "a/b", "an encoded slash decodes to a slash");
+        assert_eq!(
+            decode_path("a%2Fb"),
+            "a/b",
+            "an encoded slash decodes to a slash"
+        );
         assert_eq!(decode_path("a%20b"), "a b");
         // `+` is a literal plus in a path (unlike a query string).
         assert_eq!(decode_path("a+b"), "a+b");
@@ -1720,6 +1928,7 @@ mod tests {
             config: Arc::new(config),
             identity: IdentityHub::new(),
             http: crate::host::CoreHttp::new(),
+            secrets: Arc::new(std::sync::RwLock::new(crate::secrets::SecretSource::default())),
             hierarchy: RwLock::new(crate::scope_hierarchy::ScopeHierarchy::default()),
             scheduler: crate::scheduler::Scheduler::new(),
             outbox_mismatches: Mutex::new(0),
@@ -1780,7 +1989,10 @@ mod tests {
 
         let reg = state.registry.read().await;
         let info = reg.info("hello").expect("fixture plugin");
-        assert!(!info.enabled, "the flag must not be flipped on audit failure");
+        assert!(
+            !info.enabled,
+            "the flag must not be flipped on audit failure"
+        );
         assert!(!info.loaded, "nothing may be loaded on audit failure");
         drop(reg);
         assert!(
@@ -1818,12 +2030,10 @@ mod tests {
         assert_eq!(flights.count("store"), 0);
         // Another plugin's requests are not this plugin's business.
         let _other = flights.enter("hello");
-        assert!(
-            flights
-                .wait_idle("store", std::time::Duration::from_millis(50))
-                .await
-                .is_some()
-        );
+        assert!(flights
+            .wait_idle("store", std::time::Duration::from_millis(50))
+            .await
+            .is_some());
     }
 
     /// Issue #89 requirement #6: the non-disableable minimum is a *declarative*
@@ -1832,10 +2042,13 @@ mod tests {
     fn the_required_plugins_refuse_with_their_reason() {
         let reg = PluginRegistry::new(vec![slot("auth", true), slot("membership", true)]);
         for (id, why) in REQUIRED_PLUGINS {
-            let reason = disable_refusal(id, &reg)
-                .unwrap_or_else(|| panic!("{id} must not be disableable"));
+            let reason =
+                disable_refusal(id, &reg).unwrap_or_else(|| panic!("{id} must not be disableable"));
             assert!(reason.contains(why), "the reason is carried: {reason}");
-            assert!(reason.contains("required"), "and says it is required: {reason}");
+            assert!(
+                reason.contains("required"),
+                "and says it is required: {reason}"
+            );
         }
         // A plugin outside the set is not refused.
         assert!(disable_refusal("hello", &reg).is_none());
@@ -1887,5 +2100,8 @@ pub enum BuildError {
     Plugin(#[from] crate::plugin_runtime::PluginRuntimeError),
     #[error("{0}")]
     Superuser(String),
+    #[error("bootstrap: {0}")]
+    Bootstrap(String),
+    #[error("secrets: {0}")]
+    Secrets(String),
 }
-

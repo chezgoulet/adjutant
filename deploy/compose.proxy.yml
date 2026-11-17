@@ -17,7 +17,7 @@
 
 services:
   postgres:
-    image: postgres:18-alpine
+    image: postgres@sha256:3b0ef735388b2cb097fc29b8bb421d86d57d0ddbe7aa1fbd6493e06d65028503  # postgres:18-alpine (linux/amd64)
     environment:
       POSTGRES_USER: adjutant
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD}
@@ -33,6 +33,10 @@ services:
       interval: 5s
       timeout: 5s
       retries: 12
+    # initdb and the entrypoint's drop to the `postgres` user need the default
+    # capabilities, so this service keeps them. It never needs a new one.
+    security_opt:
+      - no-new-privileges:true
     networks: [internal]
     restart: unless-stopped
 
@@ -72,7 +76,15 @@ services:
       # container's filesystem: a bundle inside a container is lost the next
       # time the container is replaced, which is precisely when someone wants
       # it. `docs/backup-and-restore` is the host-side producer, if any.
+      # Keep identical to docker-compose.yml (verify.sh diffs the two).
+      ADJUTANT_SECRETS_FILE: /app/secrets/secrets.toml
       ADJUTANT_BACKUP_DIR: /app/backups
+      # The age public key every bundle is encrypted to. No default: with this
+      # unset the in-app backup fails closed rather than writing every plugin
+      # role's password in clear text. ADJUTANT_BACKUP_ALLOW_PLAINTEXT=true is
+      # the explicit, loud opt-out for a development box with no key.
+      ADJUTANT_BACKUP_AGE_RECIPIENT: ${ADJUTANT_BACKUP_AGE_RECIPIENT:-}
+      ADJUTANT_BACKUP_ALLOW_PLAINTEXT: ${ADJUTANT_BACKUP_ALLOW_PLAINTEXT:-false}
       # Leave ADJUTANT_DEV_HEADERS unset (off). Anyone who can reach the port can
       # claim any role when it is on.
     # NOTE: no `ports:` — the proxy is the only way in, and verify.sh checks it.
@@ -80,11 +92,34 @@ services:
     # host path is Docker's business.
     volumes:
       - backups:/app/backups
-    networks: [internal, edge]
+      # `../secrets`: volume paths resolve against the *first* compose file's
+      # directory, so `./secrets` here would be deploy/secrets — a different
+      # directory from the one `docker-compose.yml` mounts. Both must name the
+      # same host directory, and after resolution they do (verify.sh compares the
+      # two rendered services and would fail on a difference).
+      - ../secrets:/app/secrets
+    # Keep this block identical to docker-compose.yml: deploy/verify.sh compares
+    # the two rendered `adjutant` services and fails on drift. The image's USER
+    # is 10001:10001, the server needs no capability, and no setuid binary may
+    # raise one.
+    user: "10001:10001"
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    networks:
+      internal:
+      edge:
+        # Pinned BELOW the proxy's .2. Compose starts this service before Caddy
+        # (Caddy depends on it), and Docker's dynamic pool would otherwise hand
+        # it .2; Caddy's static .2 then fails with "Address already in use" and
+        # the whole proof never runs. The probe addresses start at .4, so .3 is
+        # the deterministic slot for the app.
+        ipv4_address: ${ADJUTANT_EDGE_PREFIX:-172.31.7}.3
     restart: unless-stopped
 
   caddy:
-    image: caddy:2-alpine
+    image: caddy@sha256:04913b1da43339a40ad1ea87827d70a576ac5aa6cf674c6e24fdca675887533a  # caddy:2-alpine (linux/amd64)
     depends_on: [adjutant]
     environment:
       DOMAIN: ${DOMAIN:?set DOMAIN to the certificate name}
@@ -118,7 +153,7 @@ services:
   # the failure this file is trying to avoid. A second stack on the same host sets
   # only that: `ADJUTANT_EDGE_PREFIX=172.31.8`.
   probe:
-    image: curlimages/curl:8.22.0
+    image: curlimages/curl@sha256:43366cd60f226c7655181a0f7e85c468a41d182fdd2dc2c1c3b872a2b9d05d7a  # curlimages/curl:8.22.0 (linux/amd64)
     profiles: ["probe"]
     entrypoint: ["sh", "-c"]
     networks:
@@ -129,7 +164,7 @@ services:
   # The second client. Same image, different pinned address — this is what makes
   # "a second client gets its own bucket" a real assertion rather than a hope.
   probe2:
-    image: curlimages/curl:8.22.0
+    image: curlimages/curl@sha256:43366cd60f226c7655181a0f7e85c468a41d182fdd2dc2c1c3b872a2b9d05d7a  # curlimages/curl:8.22.0 (linux/amd64)
     profiles: ["probe"]
     entrypoint: ["sh", "-c"]
     networks:

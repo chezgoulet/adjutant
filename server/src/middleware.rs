@@ -3,16 +3,21 @@
 //! tower layer, not a from_fn).
 
 use std::collections::HashMap;
+use std::future::Future;
 use std::net::SocketAddr;
+use std::pin::Pin;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
+use std::task::{Context, Poll};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use axum::extract::{ConnectInfo, Request};
+use axum::body::{Body, Bytes};
+use axum::extract::{ConnectInfo, Request, State};
+use axum::http::StatusCode;
 use axum::http::{HeaderName, HeaderValue};
 use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
-use axum::http::StatusCode;
+use http_body::Frame;
 
 use crate::config::RateConfig;
 
@@ -59,6 +64,129 @@ pub async fn request_log(request: Request, next: Next) -> Response {
         "request"
     );
     response
+}
+
+/// Router layer that puts one deadline on the whole body, not one per chunk.
+///
+/// `tower_http::timeout::RequestBodyTimeoutLayer` resets its timer whenever a
+/// frame arrives, so a client dribbling one byte per second never trips it. The
+/// review measured exactly that shape on a plugin route, so this wrapper starts
+/// its sleep once and never renews it.
+pub async fn body_deadline(
+    State(timeout): State<Duration>,
+    request: Request,
+    next: Next,
+) -> Response {
+    let (parts, body) = request.into_parts();
+    let body = Body::new(DeadlineBody::new(body, timeout));
+    next.run(Request::from_parts(parts, body)).await
+}
+
+/// Read a request body, mapping the body layer's failures to the status the
+/// client should see. Shared so no handler turns a timeout into an empty body.
+pub async fn read_body(body: Body, limit: usize) -> Result<Vec<u8>, Response> {
+    match axum::body::to_bytes(body, limit).await {
+        Ok(bytes) => Ok(bytes.to_vec()),
+        Err(e) => {
+            let inner = e.into_inner();
+            if error_chain_has::<BodyTimeoutError>(inner.as_ref()) {
+                Err(crate::server::error_response(
+                    StatusCode::REQUEST_TIMEOUT,
+                    "request body not received within the body deadline",
+                ))
+            } else if error_chain_has::<http_body_util::LengthLimitError>(inner.as_ref()) {
+                Err(crate::server::error_response(
+                    StatusCode::PAYLOAD_TOO_LARGE,
+                    "request body exceeds the configured limit",
+                ))
+            } else {
+                Err(crate::server::error_response(
+                    StatusCode::BAD_REQUEST,
+                    "request body could not be read",
+                ))
+            }
+        }
+    }
+}
+
+/// The body layers put their marker behind axum's own `Error` wrapper, so look
+/// down the source chain rather than only at the outermost type.
+fn error_chain_has<T: std::error::Error + 'static>(
+    mut error: &(dyn std::error::Error + 'static),
+) -> bool {
+    loop {
+        if error.is::<T>() {
+            return true;
+        }
+        match error.source() {
+            Some(source) => error = source,
+            None => return false,
+        }
+    }
+}
+
+/// Error marker for a body whose total deadline expired. The router's shared
+/// reader downcasts this to answer 408 rather than treating the body as empty.
+#[derive(Debug)]
+pub struct BodyTimeoutError;
+
+impl std::fmt::Display for BodyTimeoutError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "request body deadline exceeded")
+    }
+}
+
+impl std::error::Error for BodyTimeoutError {}
+
+struct DeadlineBody {
+    body: Body,
+    deadline: Pin<Box<tokio::time::Sleep>>,
+    timed_out: bool,
+}
+
+impl DeadlineBody {
+    fn new(body: Body, timeout: Duration) -> Self {
+        Self {
+            body,
+            deadline: Box::pin(tokio::time::sleep(timeout)),
+            timed_out: false,
+        }
+    }
+}
+
+impl http_body::Body for DeadlineBody {
+    type Data = Bytes;
+    type Error = Box<dyn std::error::Error + Send + Sync>;
+
+    fn poll_frame(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<Option<Result<Frame<Self::Data>, Self::Error>>> {
+        if self.timed_out {
+            return Poll::Ready(None);
+        }
+        // Data first: a frame that is already here is delivered even when the
+        // deadline is about to fire. Only a stalled body reaches the timer.
+        match Pin::new(&mut self.body).poll_frame(cx) {
+            Poll::Ready(Some(Ok(frame))) => return Poll::Ready(Some(Ok(frame))),
+            Poll::Ready(Some(Err(e))) => return Poll::Ready(Some(Err(e.into()))),
+            Poll::Ready(None) => return Poll::Ready(None),
+            Poll::Pending => {}
+        }
+        if self.deadline.as_mut().poll(cx).is_ready() {
+            self.timed_out = true;
+            return Poll::Ready(Some(Err(Box::new(BodyTimeoutError))));
+        }
+        Poll::Pending
+    }
+
+    fn is_end_stream(&self) -> bool {
+        self.body.is_end_stream()
+    }
+
+    fn size_hint(&self) -> http_body::SizeHint {
+        self.body.size_hint()
+    }
 }
 
 /// Fixed-window counter keyed by client IP. `max_requests == 0` disables.

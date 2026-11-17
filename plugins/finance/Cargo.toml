@@ -23,3 +23,6 @@ tokio.workspace = true
 # probes connect to a real PostgreSQL as this plugin's own role and drive the
 # real route handlers, so what they prove is what the *plugin's* statements do.
 sqlx.workspace = true
+# Reading the secrets file the tests need the plugin role's password from
+# (dev only: the plugin itself never touches the filesystem).
+toml.workspace = true

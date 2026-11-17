@@ -148,6 +148,30 @@ fn with_role(url: &str, role: &str, secret: &str) -> String {
     }
 }
 
+/// The plugin role's password: the deployment's **secrets file**, not the
+/// database. `bootstrap-isolation` writes it there (`0600`) and clears
+/// `core.plugins.db_secret`, so a dump no longer carries every role's password.
+fn role_password(plugin_id: &str) -> String {
+    // `cargo test -p X` runs the test binary with the *package* directory as its
+    // working directory, not the workspace root — so the default path is derived
+    // from the manifest rather than from wherever the runner happens to stand.
+    let path = std::env::var("ADJUTANT_SECRETS_FILE").unwrap_or_else(|_| {
+        format!("{}/../../secrets.toml", env!("CARGO_MANIFEST_DIR"))
+    });
+    let text = std::fs::read_to_string(&path).unwrap_or_else(|e| {
+        panic!("read {path}: {e} — run `adjutant bootstrap-isolation` first")
+    });
+    let parsed: toml::Value = toml::from_str(&text).expect("parse the secrets file");
+    parsed
+        .get(plugin_id)
+        .and_then(|section| section.get("db_password"))
+        .and_then(|value| value.as_str())
+        .map(str::to_string)
+        .unwrap_or_else(|| {
+            panic!("{path} has no [{plugin_id}] db_password — re-run `adjutant bootstrap-isolation`")
+        })
+}
+
 /// The admin pool the probes read rows back with — the operator's own
 /// connection, so nothing here depends on a grant the plugin does not hold.
 async fn admin_pool() -> PgPool {
@@ -160,23 +184,10 @@ async fn admin_pool() -> PgPool {
 ///
 /// No password is written: `bootstrap_role` keeps an existing secret, so a later
 /// boot of this database still authenticates.
-async fn plugin_pool(admin: &PgPool) -> PgPool {
+async fn plugin_pool(_admin: &PgPool) -> PgPool {
     let url = test_database_url();
     let plugin_id = "finance";
-    let secret: Option<String> =
-        sqlx::query_scalar("SELECT db_secret FROM core.plugins WHERE id = $1")
-            .bind(plugin_id)
-            .fetch_optional(admin)
-            .await
-            .expect("read the plugin's stored secret")
-            .flatten();
-    let Some(secret) = secret else {
-        panic!(
-            "this test database has no bootstrapped role for the `{plugin_id}` plugin (no \
-             core.plugins.db_secret row). Run the live ladder against it first: \
-             `ADJUTANT_PLUGIN_DIR=plugins-built ./target/debug/adjutant test-plugin`"
-        );
-    };
+    let secret = role_password(plugin_id);
     let role = format!("adjutant_plugin_{plugin_id}");
     PgPool::connect(&with_role(&url, &role, &secret))
         .await
@@ -267,13 +278,13 @@ async fn clear_probe_roles(admin: &PgPool) {
 /// Apply this plugin's migrations, as the plugin role, in its own schema — the
 /// same shape the runner uses (one transaction, `SET LOCAL search_path`).
 ///
-/// A database the ladder prepared has them already, and every statement is
-/// idempotent (the seed funds are `ON CONFLICT (code) DO NOTHING`, the receipt
-/// triggers are `DROP … IF EXISTS` then `CREATE`), so this is a no-op there.
+/// A database the ladder prepared has them already; applied versions are skipped
+/// exactly as the real runner skips them, which is also what lets a hardened
+/// database (#152) keep its record tables owned by the deployment role.
 ///
 /// `CREATE SCHEMA` is deliberately **not** done as the plugin role: a plugin
-/// role owns the database's schema but not the database, so the probe does what
-/// the operator does and then migrates as the plugin.
+/// role does not own the database, so the probe does what the operator does and
+/// then migrates as the plugin.
 async fn ensure_plugin_schema(admin: &PgPool, plugin: &PgPool) {
     sqlx::query(&format!(
         "CREATE SCHEMA IF NOT EXISTS finance AUTHORIZATION {PLUGIN_ROLE}"
@@ -281,12 +292,22 @@ async fn ensure_plugin_schema(admin: &PgPool, plugin: &PgPool) {
     .execute(admin)
     .await
     .expect("the finance schema, as `bootstrap-isolation` creates it");
-    sqlx::query(&format!("ALTER SCHEMA finance OWNER TO {PLUGIN_ROLE}"))
-        .execute(admin)
-        .await
-        .expect("the plugin role owns its own schema");
+    // #152: a hardened database has the record tables owned by the deployment
+    // role, so the plugin may no longer re-run DDL that touches them. Apply only
+    // the versions the real runner would apply: it skips a version it has
+    // already recorded, and this fixture now mirrors that instead of replaying
+    // every migration's SQL.
+    let applied: Vec<i64> = sqlx::query_scalar(
+        "SELECT version FROM core.schema_migrations WHERE schema = 'finance'",
+    )
+    .fetch_all(admin)
+    .await
+    .expect("read the applied finance migrations");
     let mut conn = plugin.acquire().await.expect("plugin connection");
     for migration in FinancePlugin::new().migrations() {
+        if applied.contains(&migration.version) {
+            continue;
+        }
         let script = format!(
             "BEGIN; SET LOCAL search_path TO \"finance\"; {}; COMMIT;",
             migration.sql
@@ -1095,8 +1116,14 @@ async fn a_receipt_cannot_be_updated_or_deleted() {
         .execute(&plugin)
         .await;
     let update_error = update.expect_err("the plugin's own role must not be able to edit a receipt");
+    // #152 made the refusal a privilege refusal first: the plugin role no longer
+    // owns the table, so it cannot reach the trigger at all. The trigger's own
+    // message is still the operator's refusal (below); either refusal is the
+    // record holding, and neither may ever become a success.
+    let update_message = update_error.to_string();
     assert!(
-        update_error.to_string().contains("cannot be modified"),
+        update_message.contains("cannot be modified")
+            || update_message.contains("permission denied"),
         "the refusal says why: {update_error}"
     );
     let delete = sqlx::query("DELETE FROM finance.receipts WHERE id = $1")
@@ -1104,25 +1131,33 @@ async fn a_receipt_cannot_be_updated_or_deleted() {
         .execute(&plugin)
         .await;
     let delete_error = delete.expect_err("the plugin's own role must not be able to delete a receipt");
+    let delete_message = delete_error.to_string();
     assert!(
-        delete_error.to_string().contains("cannot be deleted"),
+        delete_message.contains("cannot be deleted")
+            || delete_message.contains("permission denied"),
         "the refusal says why: {delete_error}"
     );
 
-    // The operator: this is not a privilege question, it is the record.
+    // The operator: this is not a privilege question, it is the record. The
+    // operator still holds the privilege, so the trigger itself must answer.
     let update = sqlx::query("UPDATE finance.receipts SET payer_name = 'Someone Else' WHERE id = $1")
         .bind(id)
         .execute(&admin)
         .await;
+    let update_error = update.expect_err("an operator may not edit a receipt either");
     assert!(
-        update.is_err(),
-        "an operator may not edit a receipt either — that is what immutability means"
+        update_error.to_string().contains("cannot be modified"),
+        "the operator's refusal is the record trigger: {update_error}"
     );
     let delete = sqlx::query("DELETE FROM finance.receipts WHERE id = $1")
         .bind(id)
         .execute(&admin)
         .await;
-    assert!(delete.is_err(), "an operator may not delete a receipt either");
+    let delete_error = delete.expect_err("an operator may not delete a receipt either");
+    assert!(
+        delete_error.to_string().contains("cannot be deleted"),
+        "the operator's refusal is the record trigger: {delete_error}"
+    );
 
     let after = receipts_written(&admin, mark).await;
     assert_eq!(after.len(), 1, "the receipt is still there: {after:?}");

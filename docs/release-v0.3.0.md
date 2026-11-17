@@ -15,11 +15,17 @@ Every artifact the release workflow produces, from this tree:
   guest, README and LICENSE, with a `.sha256`;
 - `adjutant-client-v0.3.0-web.tar.gz` — the client, built for the web;
 - `adjutant-client-v0.3.0-android.apk` — the client as an APK for a phone
-  (Obtainium is how the 161st receives it), **release mode, signed with Flutter's
-  throwaway debug key**, with a `.sha256`. Nothing we publish is signed until
-  beta, and the APK is the one artifact whose platform refuses an unsigned
-  install — so it is debug-signed so it installs at all, and a properly signed
-  build later may not upgrade over it cleanly.
+  (Obtainium is how the 161st receives it), **release mode, signed with the
+  troop's release key** (repository secrets, written to a never-committed
+  `key.properties`), with a `.sha256`. The release job verifies the built file
+  with `apksigner verify --print-certs` and fails if the signer DN contains
+  `CN=Android Debug` (#168). This page was written when nothing was signed until
+  beta; that is no longer the APK's state. **An APK from before this change was
+  signed with Flutter's public debug key, so it must be uninstalled once before a
+  release-signed build can be installed** — Android only upgrades an APK whose
+  signature matches, and the two keys are unrelated. While the debug key signed
+  it, anybody could produce an update Android accepted as ours; that path is
+  closed.
 
 ## What the tag does **not** claim
 
@@ -68,7 +74,9 @@ with the evidence in [`milestones/M5-mcp-and-flutter-mvp.md`](milestones/M5-mcp-
   matching runner does not fail — it **queues forever**. So the job ships behind
   the repository variable `ANDROID_DEVICE_GATE`, and switching it on is two
   clicks: add the repo to the runner group, set the variable to `true`.
-- **The APK is not attached to a *signed* release**, and will not be until beta.
+- **The APK is now release-signed, not debug-signed.** An install of the
+  debug-signed build must be uninstalled once; see the artifact note above. The
+  server tarball and web bundle remain unsigned until beta.
 - **Three findings from the device run** (#122 the wizard's *"Skip for now"*
   silently switching twelve plugins off at runtime; #123 an API 404 rendered as
   "Cannot reach the server"; #124 no screen re-reads after a queued write

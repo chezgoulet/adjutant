@@ -1091,15 +1091,15 @@ async fn book_draw(
         .map(|(_, id)| *id)
         .unwrap_or_default();
 
-    let mut body = json!({
-        "from_fund_id": from_id,
-        "to_fund_id": to_id,
-        "amount_cents": funded,
-        "description": description,
-    });
-    if allow_overdraft {
-        body["allow_overdraft"] = json!(true);
-    }
+    let order_id = order["id"].as_i64().unwrap_or_default();
+    let body = draw_transfer_body(
+        order_id,
+        from_id,
+        to_id,
+        funded,
+        description,
+        allow_overdraft,
+    );
     let mut outcome = call_as_caller(
         c,
         "POST",
@@ -1487,8 +1487,54 @@ fn sql_complete_order(c: &PluginContext, set: &str, guard: &str) -> String {
 fn draw_enqueue_expr(payload_param: &str) -> String {
     format!(
         "core.outbox_enqueue('{DRAW_PRINCIPAL}', 'POST', '{FINANCE_TRANSFER_PATH}', \
-         {payload_param}::jsonb, 'store-order-' || o.id || '-draw')"
+         {payload_param}::jsonb, '{DRAW_REFERENCE_PREFIX}' || o.id || '-draw')"
     )
+}
+
+/// The draw's **idempotency key** — one order, one draw — and, in the transfer
+/// itself, its `external_ref`. The two spellings are one string on purpose: the
+/// outbox key dedups the *enqueue*, and the ledger reference dedups the *money*.
+/// A delivery replay re-sends the payload with no headers (the relay strips
+/// them), so the key has to travel **in the body** to protect the transfer.
+fn draw_reference(order_id: i64) -> String {
+    format!("{DRAW_REFERENCE_PREFIX}{order_id}-draw")
+}
+
+/// The prefix both halves of the key share: the enqueue expression builds the
+/// outbox `idempotency_key` from the order row in SQL, and [`draw_reference`]
+/// builds the transfer's `external_ref` in Rust. Keeping one constant is what
+/// stops the two from drifting into two different keys for one draw.
+const DRAW_REFERENCE_PREFIX: &str = "store-order-";
+
+/// The body [`book_draw`] sends finance **as the caller**.
+///
+/// It carries the draw's reference for the same reason the intent does: an
+/// answer that is lost and a request that is replayed must find the transfer
+/// the first attempt made, not book a second one. Finance's
+/// `idx_transactions_external_ref` answers the replay with
+/// `200 {"duplicate": true, "transfer_group": …}`, which is a success here.
+///
+/// `allow_overdraft` is only present when a human authorised it; a machine
+/// principal may not, and the intent builds `false` explicitly.
+fn draw_transfer_body(
+    order_id: i64,
+    from_id: i64,
+    to_id: i64,
+    amount_cents: i64,
+    description: &str,
+    allow_overdraft: bool,
+) -> Value {
+    let mut body = json!({
+        "from_fund_id": from_id,
+        "to_fund_id": to_id,
+        "amount_cents": amount_cents,
+        "description": description,
+        "external_ref": draw_reference(order_id),
+    });
+    if allow_overdraft {
+        body["allow_overdraft"] = json!(true);
+    }
+    body
 }
 
 /// The draw's intent payload — **complete at enqueue time**, because the relay
@@ -1501,6 +1547,11 @@ fn draw_enqueue_expr(payload_param: &str) -> String {
 /// this plugin never has to read finance first. `fiscal_year` is deliberately
 /// omitted: finance derives it from `occurred_on` against its own fiscal calendar,
 /// which is finance's to know.
+///
+/// `external_ref` is the **same key as the intent's `idempotency_key`**: the
+/// relay redelivers a payload with no headers at all, so without it in the body
+/// a replayed intent is a second balanced transfer (two more legs) for one
+/// order's draw, which `ledger_verdict` cannot see (#150).
 fn draw_intent_payload(order_id: i64, funded_cents: i64, to_fund_code: &str) -> Value {
     json!({
         "from_fund_code": FUND_SCHOLARSHIP,
@@ -1509,6 +1560,7 @@ fn draw_intent_payload(order_id: i64, funded_cents: i64, to_fund_code: &str) -> 
         "description": format!("Store order {order_id} scholarship draw"),
         "occurred_on": Utc::now().date_naive().to_string(),
         "allow_overdraft": false,
+        "external_ref": draw_reference(order_id),
     })
 }
 
@@ -4845,7 +4897,53 @@ mod tests {
         );
         assert!(payload.contains("occurred_on"), "{payload}");
         assert!(payload.contains("allow_overdraft"), "{payload}");
+        assert!(
+            payload.contains("external_ref") && payload.contains("store-order-12-draw"),
+            "the transfer itself must carry the draw's key: the relay redelivers the \
+             payload with no headers, so the outbox key alone protects only the enqueue: {payload}"
+        );
         assert!(!payload.contains("fiscal_year"), "{payload}");
+    }
+
+    /// **A replayed draw names itself to finance.** The intent's
+    /// `idempotency_key` dedups the enqueue; a *delivery* replay is a second
+    /// `POST /api/finance/transfer`, and the relay strips every header. So the
+    /// draw's key has to be in the body, on both routes to finance — the relay's
+    /// payload and the caller's direct transfer — or the replay books a second
+    /// balanced pair of legs and silently moves the subsidy twice (#150).
+    ///
+    /// This half pins the payload the relay delivers: it is the path the issue's
+    /// end-to-end probe replayed.
+    #[test]
+    fn the_draw_intent_carries_its_reference() {
+        let payload = draw_intent_payload(12, 2_000, FUND_GENERAL);
+        assert_eq!(payload["external_ref"], json!("store-order-12-draw"));
+        assert_eq!(payload["allow_overdraft"], json!(false));
+    }
+
+    /// The other route to finance: a treasurer booking the draw with their own
+    /// credential. It carries the **same** key, so whichever route first reached
+    /// finance, the other is answered with the transfer already made.
+    #[test]
+    fn the_direct_draw_carries_its_reference() {
+        let body =
+            draw_transfer_body(12, 7, 3, 2_000, "Store order 12 scholarship draw", false);
+        assert_eq!(body["external_ref"], json!("store-order-12-draw"));
+        assert_eq!(body["from_fund_id"], json!(7));
+        assert_eq!(body["to_fund_id"], json!(3));
+        assert!(
+            body.get("allow_overdraft").is_none(),
+            "an unauthorised overdraft is absent, not false: finance's default is to refuse"
+        );
+
+        // A human who did authorise the overdraft still books under the same
+        // key: the draw is one money move, however it was authorised.
+        let authorised = draw_transfer_body(12, 7, 3, 2_000, "x", true);
+        assert_eq!(authorised["external_ref"], json!("store-order-12-draw"));
+        assert_eq!(authorised["allow_overdraft"], json!(true));
+
+        // The key is per order, not global: order 13 is a different draw.
+        assert_ne!(draw_reference(12), draw_reference(13));
     }
 
     /// **The in-flight case on the worklist.** An order whose draw is an outbox
@@ -5142,6 +5240,53 @@ mod tests {
         );
         assert!(host.events.published_types().contains(&EVENT_DRAW_BOOKED.to_string()));
         assert_audited(&host, "store.order.draw");
+    }
+
+    /// **A replay is the transfer finance already made, not a refusal.** When
+    /// the draw's reference is already in the ledger, finance answers
+    /// `200 {"duplicate": true, "transfer_group": …}`; the order records that
+    /// group rather than treating the answer as a failure. This is the shape a
+    /// lost answer produces on the next attempt.
+    #[tokio::test]
+    async fn a_duplicate_answer_from_finance_books_the_transfer_it_already_made() {
+        let (host, _plugin, routes) = store_plugin(configured_host()).await;
+        host.db.push_rows(vec![order_row(9, STATUS_COMPED, 2_000, 0, 2_000, DRAW_REFUSED)]);
+        host.db.push_rows(vec![order_row(9, STATUS_COMPED, 2_000, 0, 2_000, DRAW_ATTEMPTING)]);
+        host.http.push_json(
+            200,
+            &json!({ "funds": [
+                { "id": 2, "code": FUND_SCHOLARSHIP, "active": true },
+                { "id": 1, "code": FUND_GENERAL, "active": true }
+            ]}),
+        );
+        host.http.push_json(
+            200,
+            &json!({
+                "duplicate": true,
+                "transfer_group": "9c1e2f00-0000-0000-0000-00000000000a",
+                "amount_cents": 2_000,
+                "entries": 2,
+            }),
+        );
+        let mut booked = order_row(9, STATUS_COMPED, 2_000, 0, 2_000, DRAW_BOOKED);
+        booked["draw_ref"] = json!("9c1e2f00-0000-0000-0000-00000000000a");
+        host.db.push_rows(vec![booked]);
+
+        let (status, body) = call(
+            &route(&routes, "POST", "/api/store/order/{id}/draw").handler,
+            bearer(TestRequest::post("/api/store/order/9/draw"))
+                .param("id", "9")
+                .identity("treasurer", &["treasurer"])
+                .build(),
+        )
+        .await;
+        assert_eq!(status, 200, "{body}");
+        assert_eq!(body["draw"]["status"], DRAW_BOOKED);
+        assert_eq!(
+            body["draw"]["transfer_group"],
+            "9c1e2f00-0000-0000-0000-00000000000a"
+        );
+        assert!(host.events.published_types().contains(&EVENT_DRAW_BOOKED.to_string()));
     }
 
     #[tokio::test]

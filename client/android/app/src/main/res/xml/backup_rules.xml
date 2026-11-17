@@ -1,0 +1,12 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  Pre-Android-12 Auto Backup rules (`android:fullBackupContent`).
+
+  Same intent as `data_extraction_rules.xml`: keep the preferences file — the
+  read cache, the write queue and the server address — off a cloud backup and
+  off a device transfer. The session token is in `flutter_secure_storage`, not
+  here, and `allowBackup="false"` is the primary switch (#169).
+-->
+<full-backup-content>
+    <exclude domain="sharedpref" path="." />
+</full-backup-content>

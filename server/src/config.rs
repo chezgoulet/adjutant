@@ -9,6 +9,8 @@ use std::path::{Path, PathBuf};
 
 use serde::Deserialize;
 
+use adjutant_sdk::audit::ChainKey;
+
 /// Log output format.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LogFormat {
@@ -21,7 +23,9 @@ impl LogFormat {
         match s.to_ascii_lowercase().as_str() {
             "pretty" | "text" => Ok(LogFormat::Pretty),
             "json" => Ok(LogFormat::Json),
-            other => Err(format!("invalid log format {other:?}: expected pretty|json")),
+            other => Err(format!(
+                "invalid log format {other:?}: expected pretty|json"
+            )),
         }
     }
 }
@@ -35,7 +39,51 @@ pub struct RateConfig {
 
 impl Default for RateConfig {
     fn default() -> Self {
-        Self { window_secs: 60, max_requests: 120 }
+        Self {
+            window_secs: 60,
+            max_requests: 120,
+        }
+    }
+}
+
+/// HTTP connection and request deadlines (issue #172).
+///
+/// The header timeout is enforced by the server loop (hyper's HTTP/1 builder),
+/// because middleware only runs after a complete header block has arrived. The
+/// body and request deadlines are router layers, so a handler cannot forget
+/// them; the connection cap is a semaphore in the accept loop.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct HttpConfig {
+    /// First-byte deadline; the same budget then bounds the rest of the header
+    /// block. A client that sends nothing cannot occupy a socket at all.
+    pub header_timeout_secs: u64,
+    /// Maximum time from request start to the last body frame.
+    pub body_timeout_secs: u64,
+    /// Maximum time for the whole request, handler included.
+    pub request_timeout_secs: u64,
+    /// Concurrent accepted connections. Further TCP handshakes wait in the
+    /// kernel accept backlog until a slot is free.
+    pub max_connections: usize,
+}
+
+impl Default for HttpConfig {
+    fn default() -> Self {
+        Self {
+            // Every client this repo ships sends headers immediately; five
+            // seconds is generous for a lossy mobile link and still cuts the
+            // measured 25 s partial-header hold.
+            header_timeout_secs: 5,
+            // A total body deadline, not an inactivity timeout: one byte per
+            // second must not renew it. The Flutter client gives a whole JSON
+            // request 20 s, and no route in this tree accepts an upload.
+            body_timeout_secs: 10,
+            // The longest legitimate request is a backup bundle read/download;
+            // the client gives that one five minutes, so the server does too.
+            request_timeout_secs: 300,
+            // A held connection costs a slot for at most the header timeout;
+            // 128 leaves room for a troop while bounding the accept path.
+            max_connections: 128,
+        }
     }
 }
 
@@ -48,6 +96,8 @@ pub struct Config {
     pub log_filter: String,
     pub log_format: LogFormat,
     pub rate: RateConfig,
+    /// Request, body, header and connection limits (issue #172).
+    pub http: HttpConfig,
     /// Empty = no CORS layer (same-origin only). `["*"]` allows everyone.
     pub cors_origins: Vec<String>,
     /// Dev identity headers (`x-dev-user`/`x-dev-role`). Trivially spoofable —
@@ -63,6 +113,29 @@ pub struct Config {
     /// (design plugin-isolation §3.6), so the default is to refuse to boot; this
     /// exists only for a throwaway/dev database.
     pub allow_superuser: bool,
+    /// The first chief, created at boot from `ADJUTANT_BOOTSTRAP_USERNAME` and
+    /// `ADJUTANT_BOOTSTRAP_PASSWORD` when the database has no users (#173).
+    /// `None` leaves the first-user-becomes-chief path to HTTP registration.
+    pub bootstrap_chief: Option<BootstrapChief>,
+    /// Where the deployment keeps its secrets — the environment or this file,
+    /// never `core.plugins.config` (see [`crate::secrets`]).
+    /// `ADJUTANT_SECRETS_FILE`, `--secrets-file`, or `./secrets.toml` when that
+    /// file exists.
+    pub secrets_file: Option<PathBuf>,
+    /// The keyed audit layer's key (`ADJUTANT_AUDIT_KEY`, #160). `None` means
+    /// `core.audit_log.keyed_hash` stays NULL and `/api/audit/verify` reports
+    /// `keyed: false`: the unkeyed chain is the only protection, and the boot
+    /// log says so. Never logged; `ChainKey`'s `Debug` is redacted.
+    pub audit_key: Option<ChainKey>,
+}
+
+/// An operator-supplied first account. The password is held only in memory; it is
+/// never written to `core.*` in clear, and the created user's hash is argon2.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BootstrapChief {
+    pub username: String,
+    pub password: String,
+    pub email: Option<String>,
 }
 
 impl Default for Config {
@@ -75,10 +148,14 @@ impl Default for Config {
             log_filter: "info,adjutant_server=debug".into(),
             log_format: LogFormat::Pretty,
             rate: RateConfig::default(),
+            http: HttpConfig::default(),
             cors_origins: Vec::new(),
             allow_dev_headers: false,
             trusted_proxies: Vec::new(),
             allow_superuser: false,
+            secrets_file: None,
+            bootstrap_chief: None,
+            audit_key: None,
         }
     }
 }
@@ -94,16 +171,32 @@ struct FileConfig {
     log_filter: Option<String>,
     log_format: Option<String>,
     rates: Option<FileRates>,
+    http: Option<FileHttp>,
     cors: Option<FileCors>,
     auth: Option<FileAuth>,
     trusted_proxies: Option<Vec<String>>,
     allow_superuser: Option<bool>,
+    /// `[secrets] file = "..."` — where the deployment's secrets live.
+    secrets: Option<FileSecrets>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct FileSecrets {
+    file: Option<String>,
 }
 
 #[derive(Debug, Default, Deserialize)]
 struct FileRates {
     window_secs: Option<u64>,
     max_requests: Option<u32>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct FileHttp {
+    header_timeout_secs: Option<u64>,
+    body_timeout_secs: Option<u64>,
+    request_timeout_secs: Option<u64>,
+    max_connections: Option<usize>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -128,8 +221,14 @@ pub struct CliArgs {
     pub log_format: Option<String>,
     /// Explicit opt-in to the spoofable dev identity headers (dev only).
     pub allow_dev_headers: bool,
+    /// Explicit opt-out of the dev identity headers, so a config file that says
+    /// `allow_dev_headers = true` can be overridden off from the command line.
+    /// CLI is the highest layer; this wins over `--allow-dev-headers` too.
+    pub no_dev_headers: bool,
     /// Explicit opt-out of the superuser boot refusal (dev/throwaway only).
     pub allow_superuser: bool,
+    /// Where the deployment's secrets live (`--secrets-file`).
+    pub secrets_file: Option<String>,
     pub help: bool,
 }
 
@@ -146,10 +245,17 @@ USAGE:
                                    create/refresh per-plugin DB roles, schema
                                    ownership, grants and stored credentials
                                    (run once by the operator, against an admin URL)
-                                   --enable names which plugins this deployment
-                                   runs, comma or space separated; every other
-                                   plugin on disk is disabled. Omit it and the
-                                   existing flags are left alone.
+    adjutant verify-isolation [--app-role <NAME>] [OPTIONS]
+                                   assert the roles, ownership, allowlist grants
+                                   and session identities a restore must produce
+                                   (exits non-zero and names the missing role or
+                                   table; used by deploy/restore.sh)
+    adjutant grant-role <username> <role> [OPTIONS]
+                                   grant a role directly in the database — the
+                                   recovery path when the last admin is gone or
+                                   the API is unreachable
+    adjutant audit-verify [OPTIONS]  verify the audit chain (and the keyed layer
+                                   when ADJUTANT_AUDIT_KEY is set) without HTTP
     adjutant --help                print this help
 
 SERVE OPTIONS:
@@ -161,6 +267,9 @@ SERVE OPTIONS:
     --log-format <FMT>     pretty | json
     --allow-dev-headers    enable the spoofable x-dev-user/x-dev-role stub
                            (DEVELOPMENT ONLY; off by default)
+    --no-dev-headers       force the stub off, overriding a config file or
+                           environment that enabled it (wins over
+                           --allow-dev-headers)
     --allow-superuser      allow booting on a PostgreSQL superuser connection
                            (DEVELOPMENT/throwaway ONLY; off by default)
     -h, --help             print this help
@@ -173,14 +282,23 @@ BOOTSTRAP-ISOLATION OPTIONS:
                            no CREATEROLE) that owns the core schema and holds the
                            plugin roles; serve as it to avoid a superuser
     --app-password <PW>    set the application role's password (default: leave it)
+    --enable <IDS>         which plugins this deployment runs, comma or space
+                           separated; every other plugin on disk is disabled
 
 ENVIRONMENT (override file, overridden by flags):
     ADJUTANT_CONFIG, ADJUTANT_BIND, ADJUTANT_DATABASE_URL, ADJUTANT_PLUGIN_DIR,
     ADJUTANT_LOG, ADJUTANT_LOG_FORMAT, ADJUTANT_RATE_MAX, ADJUTANT_RATE_WINDOW,
     ADJUTANT_CORS (comma-separated origins), ADJUTANT_MAX_BODY,
+    ADJUTANT_HTTP_HEADER_TIMEOUT / ADJUTANT_HTTP_BODY_TIMEOUT /
+    ADJUTANT_HTTP_REQUEST_TIMEOUT (seconds) and ADJUTANT_HTTP_MAX_CONNECTIONS,
     ADJUTANT_DEV_HEADERS (true enables the dev stub; off by default),
     ADJUTANT_TRUSTED_PROXIES, ADJUTANT_ALLOW_SUPERUSER (true permits a superuser
-    connection; off by default)
+    connection; off by default),
+    ADJUTANT_AUDIT_KEY (64 hex characters or base64 of 32 bytes; unset leaves
+    the audit chain unkeyed and /api/audit/verify reports keyed:false),
+    ADJUTANT_BOOTSTRAP_USERNAME / ADJUTANT_BOOTSTRAP_PASSWORD (create the first
+    chief at boot when the database has no users; set both, or neither) and
+    ADJUTANT_BOOTSTRAP_EMAIL (optional)
 ";
 
 impl CliArgs {
@@ -214,7 +332,9 @@ impl CliArgs {
                 "--log" => out.log_filter = Some(take("--log")?),
                 "--log-format" => out.log_format = Some(take("--log-format")?),
                 "--allow-dev-headers" => out.allow_dev_headers = true,
+                "--no-dev-headers" => out.no_dev_headers = true,
                 "--allow-superuser" => out.allow_superuser = true,
+                "--secrets-file" => out.secrets_file = Some(take("--secrets-file")?),
                 other => return Err(format!("unknown argument {other:?} (try --help)")),
             }
         }
@@ -261,13 +381,35 @@ pub fn load(cli: &CliArgs) -> Result<Config, String> {
         cfg.rate.max_requests = v.parse().map_err(|e| format!("ADJUTANT_RATE_MAX: {e}"))?;
     }
     if let Ok(v) = std::env::var("ADJUTANT_RATE_WINDOW") {
-        cfg.rate.window_secs = v.parse().map_err(|e| format!("ADJUTANT_RATE_WINDOW: {e}"))?;
+        cfg.rate.window_secs = v
+            .parse()
+            .map_err(|e| format!("ADJUTANT_RATE_WINDOW: {e}"))?;
     }
     if let Ok(v) = std::env::var("ADJUTANT_CORS") {
         cfg.cors_origins = split_origins(&v);
     }
     if let Ok(v) = std::env::var("ADJUTANT_MAX_BODY") {
         cfg.max_body_bytes = v.parse().map_err(|e| format!("ADJUTANT_MAX_BODY: {e}"))?;
+    }
+    if let Ok(v) = std::env::var("ADJUTANT_HTTP_HEADER_TIMEOUT") {
+        cfg.http.header_timeout_secs = v
+            .parse()
+            .map_err(|e| format!("ADJUTANT_HTTP_HEADER_TIMEOUT: {e}"))?;
+    }
+    if let Ok(v) = std::env::var("ADJUTANT_HTTP_BODY_TIMEOUT") {
+        cfg.http.body_timeout_secs = v
+            .parse()
+            .map_err(|e| format!("ADJUTANT_HTTP_BODY_TIMEOUT: {e}"))?;
+    }
+    if let Ok(v) = std::env::var("ADJUTANT_HTTP_REQUEST_TIMEOUT") {
+        cfg.http.request_timeout_secs = v
+            .parse()
+            .map_err(|e| format!("ADJUTANT_HTTP_REQUEST_TIMEOUT: {e}"))?;
+    }
+    if let Ok(v) = std::env::var("ADJUTANT_HTTP_MAX_CONNECTIONS") {
+        cfg.http.max_connections = v
+            .parse()
+            .map_err(|e| format!("ADJUTANT_HTTP_MAX_CONNECTIONS: {e}"))?;
     }
     if let Ok(v) = std::env::var("ADJUTANT_DEV_HEADERS") {
         cfg.allow_dev_headers = matches!(v.as_str(), "1" | "true" | "yes");
@@ -277,6 +419,52 @@ pub fn load(cli: &CliArgs) -> Result<Config, String> {
     }
     if let Ok(v) = std::env::var("ADJUTANT_ALLOW_SUPERUSER") {
         cfg.allow_superuser = matches!(v.as_str(), "1" | "true" | "yes");
+    }
+    if let Ok(v) = std::env::var(crate::secrets::SECRETS_FILE_ENV) {
+        if !v.trim().is_empty() {
+            cfg.secrets_file = Some(PathBuf::from(v.trim()));
+        }
+    }
+    // #160: the keyed audit layer. Optional by design — local runs and the test
+    // suite must boot — but anything present must be a real 32-byte key. A
+    // malformed key is refused here, at boot, rather than silently degrading to
+    // an unkeyed chain (which would look protected and not be).
+    if let Ok(v) = std::env::var("ADJUTANT_AUDIT_KEY") {
+        cfg.audit_key = Some(
+            ChainKey::parse(&v).map_err(|e| format!("ADJUTANT_AUDIT_KEY: {e}"))?,
+        );
+    }
+    // The environment-supplied first chief (#173). Set together or not at all:
+    // half a credential pair is a misconfiguration that would otherwise boot a
+    // server nobody can log in to, or silently ignore the operator's intent.
+    let boot_user = std::env::var("ADJUTANT_BOOTSTRAP_USERNAME")
+        .ok()
+        .map(|v| v.trim().to_string())
+        .filter(|v| !v.is_empty());
+    let boot_pass = std::env::var("ADJUTANT_BOOTSTRAP_PASSWORD")
+        .ok()
+        .filter(|v| !v.is_empty());
+    match (boot_user, boot_pass) {
+        (None, None) => {}
+        (Some(username), Some(password)) => {
+            if password.len() < 8 {
+                return Err("ADJUTANT_BOOTSTRAP_PASSWORD: must be at least 8 characters".into());
+            }
+            cfg.bootstrap_chief = Some(BootstrapChief {
+                username,
+                password,
+                email: std::env::var("ADJUTANT_BOOTSTRAP_EMAIL")
+                    .ok()
+                    .map(|v| v.trim().to_string())
+                    .filter(|v| !v.is_empty()),
+            });
+        }
+        _ => {
+            return Err(
+                "ADJUTANT_BOOTSTRAP_USERNAME and ADJUTANT_BOOTSTRAP_PASSWORD must be set together"
+                    .into(),
+            )
+        }
     }
 
     // 3. CLI (highest precedence)
@@ -298,15 +486,60 @@ pub fn load(cli: &CliArgs) -> Result<Config, String> {
     if cli.allow_dev_headers {
         cfg.allow_dev_headers = true;
     }
+    // CLI is the highest layer, and the opt-out is applied after the opt-in so
+    // `--no-dev-headers` can force off a config file, the environment, or even
+    // a contradictory `--allow-dev-headers`.
+    if cli.no_dev_headers {
+        cfg.allow_dev_headers = false;
+    }
     if cli.allow_superuser {
         cfg.allow_superuser = true;
+    }
+    if let Some(v) = cli.secrets_file.as_deref() {
+        cfg.secrets_file = Some(PathBuf::from(v));
+    }
+
+    // A zero deadline or zero connection slots does not disable a limit: it
+    // makes the server refuse every connection or wait forever. Fail at boot
+    // with the setting named, rather than at the first request.
+    if cfg.http.header_timeout_secs == 0 {
+        return Err("HTTP header timeout must be at least 1 second".into());
+    }
+    if cfg.http.body_timeout_secs == 0 {
+        return Err("HTTP body timeout must be at least 1 second".into());
+    }
+    if cfg.http.request_timeout_secs == 0 {
+        return Err("HTTP request timeout must be at least 1 second".into());
+    }
+    if cfg.http.max_connections == 0 {
+        return Err("HTTP max connections must be at least 1".into());
+    }
+
+    // A wildcard origin is refused rather than accepted-with-a-warning.
+    //
+    // Sessions here are cookies (`adjutant_session`, HttpOnly, SameSite=Lax),
+    // so `*` is only harmless while nobody sets `allow_credentials` — one line
+    // in the CORS layer, added by whoever next needs a credentialed cross-origin
+    // call, and the wildcard becomes a site-wide credential leak. Refusing at
+    // boot means that edit cannot be enough on its own: the deployment has to
+    // name its origins.
+    if cfg.cors_origins.iter().any(|o| o.trim() == "*") {
+        return Err(
+            "cors origins: \"*\" is refused — sessions are cookie-authenticated, so list the \
+             exact origins (e.g. ADJUTANT_CORS_ORIGINS=https://app.example) instead"
+                .into(),
+        );
     }
 
     Ok(cfg)
 }
 
 fn split_origins(s: &str) -> Vec<String> {
-    s.split(',').map(str::trim).filter(|o| !o.is_empty()).map(String::from).collect()
+    s.split(',')
+        .map(str::trim)
+        .filter(|o| !o.is_empty())
+        .map(String::from)
+        .collect()
 }
 
 fn merge_file(cfg: &mut Config, path: &Path) -> Result<(), String> {
@@ -341,9 +574,28 @@ fn merge_file(cfg: &mut Config, path: &Path) -> Result<(), String> {
             cfg.rate.max_requests = v;
         }
     }
+    if let Some(h) = f.http {
+        if let Some(v) = h.header_timeout_secs {
+            cfg.http.header_timeout_secs = v;
+        }
+        if let Some(v) = h.body_timeout_secs {
+            cfg.http.body_timeout_secs = v;
+        }
+        if let Some(v) = h.request_timeout_secs {
+            cfg.http.request_timeout_secs = v;
+        }
+        if let Some(v) = h.max_connections {
+            cfg.http.max_connections = v;
+        }
+    }
     if let Some(c) = f.cors {
         if let Some(v) = c.origins {
             cfg.cors_origins = v;
+        }
+    }
+    if let Some(s) = f.secrets {
+        if let Some(v) = s.file {
+            cfg.secrets_file = Some(PathBuf::from(v));
         }
     }
     if let Some(a) = f.auth {
@@ -364,10 +616,121 @@ fn merge_file(cfg: &mut Config, path: &Path) -> Result<(), String> {
 mod tests {
     use super::*;
 
+    /// Serialises the tests in this module.
+    ///
+    /// `load()` reads process-global environment variables, and several tests
+    /// here set and clear them. Consolidating each test's cases into one
+    /// function stopped the racing *within* a test but not *between* tests: a
+    /// test that sets `ADJUTANT_BOOTSTRAP_USERNAME` while another test is inside
+    /// `load()` makes that other test observe a half-configured environment and
+    /// fail. It surfaced as
+    /// `dev_headers_default_off_and_require_explicit_opt_in` panicking with
+    /// "must be set together" only when the suite ran in parallel — it passed
+    /// alone and passed with `--test-threads=1`.
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// Take the module lock. A panic while holding it poisons the mutex; the
+    /// tests recover the guard rather than cascading one failure into the rest.
+    fn lock_env() -> std::sync::MutexGuard<'static, ()> {
+        ENV_LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    /// The environment bootstrap is all-or-nothing (#173). Runs every case in
+    /// one test so env-var mutation cannot race between parallel tests.
+    #[test]
+    fn bootstrap_chief_from_environment() {
+        let _env = lock_env();
+        let keys = [
+            "ADJUTANT_BOOTSTRAP_USERNAME",
+            "ADJUTANT_BOOTSTRAP_PASSWORD",
+            "ADJUTANT_BOOTSTRAP_EMAIL",
+        ];
+        let saved: Vec<(String, Option<String>)> = keys
+            .iter()
+            .map(|k| (k.to_string(), std::env::var(k).ok()))
+            .collect();
+        for k in keys {
+            std::env::remove_var(k);
+        }
+
+        // Neither variable: registration remains the bootstrap path.
+        assert!(load(&CliArgs::default()).unwrap().bootstrap_chief.is_none());
+
+        // Half a pair is a misconfiguration, not a partial bootstrap.
+        std::env::set_var("ADJUTANT_BOOTSTRAP_USERNAME", "chief");
+        assert!(load(&CliArgs::default())
+            .unwrap_err()
+            .contains("must be set together"));
+        std::env::remove_var("ADJUTANT_BOOTSTRAP_USERNAME");
+        std::env::set_var("ADJUTANT_BOOTSTRAP_PASSWORD", "password123");
+        assert!(load(&CliArgs::default())
+            .unwrap_err()
+            .contains("must be set together"));
+        std::env::remove_var("ADJUTANT_BOOTSTRAP_PASSWORD");
+
+        // The route's 8-character rule applies at boot too: a password the login
+        // route would refuse must not become the chief's password.
+        std::env::set_var("ADJUTANT_BOOTSTRAP_USERNAME", "chief");
+        std::env::set_var("ADJUTANT_BOOTSTRAP_PASSWORD", "short");
+        assert!(load(&CliArgs::default())
+            .unwrap_err()
+            .contains("at least 8 characters"));
+
+        // Both halves: carried, with the optional email.
+        std::env::set_var("ADJUTANT_BOOTSTRAP_PASSWORD", "password123");
+        std::env::set_var("ADJUTANT_BOOTSTRAP_EMAIL", "chief@example.org");
+        assert_eq!(
+            load(&CliArgs::default()).unwrap().bootstrap_chief,
+            Some(BootstrapChief {
+                username: "chief".into(),
+                password: "password123".into(),
+                email: Some("chief@example.org".into()),
+            })
+        );
+
+        // A whitespace-only email is absent, not an empty string.
+        std::env::set_var("ADJUTANT_BOOTSTRAP_EMAIL", "   ");
+        assert_eq!(
+            load(&CliArgs::default())
+                .unwrap()
+                .bootstrap_chief
+                .unwrap()
+                .email,
+            None
+        );
+
+        for (k, v) in saved {
+            match v {
+                Some(v) => std::env::set_var(k, v),
+                None => std::env::remove_var(k),
+            }
+        }
+    }
+
+    /// A wildcard origin is refused at boot, not accepted and warned about: the
+    /// session is a cookie, so `*` is only safe until the day someone adds
+    /// `allow_credentials` to the CORS layer.
+    #[test]
+    fn a_wildcard_cors_origin_is_refused_at_boot() {
+        let _env = lock_env();
+        let dir = std::env::temp_dir().join(format!("adjutant-cors-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("adjutant.toml");
+        std::fs::write(&file, "[cors]\norigins = [\"*\"]\n").unwrap();
+        let cli = CliArgs {
+            config: Some(file),
+            ..Default::default()
+        };
+        let err = load(&cli).expect_err("a wildcard origin must not boot");
+        assert!(err.contains("cors origins"), "{err}");
+        assert!(err.contains("refused"), "{err}");
+    }
+
     /// Precedence must hold: default < file < env < CLI. Runs all cases in one
     /// test so env-var mutation can't race between parallel tests.
     #[test]
     fn precedence_default_file_env_cli() {
+        let _env = lock_env();
         // default
         let d = Config::default();
         assert_eq!(d.bind.to_string(), "127.0.0.1:8787");
@@ -383,7 +746,10 @@ mod tests {
             "bind = \"0.0.0.0:9000\"\nlog_format = \"json\"\n[rates]\nmax_requests = 5\n[cors]\norigins = [\"https://x.test\"]\n",
         )
         .unwrap();
-        let cli = CliArgs { config: Some(file.clone()), ..Default::default() };
+        let cli = CliArgs {
+            config: Some(file.clone()),
+            ..Default::default()
+        };
         let c = load(&cli).unwrap();
         assert_eq!(c.bind.to_string(), "0.0.0.0:9000");
         assert_eq!(c.log_format, LogFormat::Json);
@@ -398,7 +764,10 @@ mod tests {
 
         // CLI beats env
         std::env::set_var("ADJUTANT_BIND", "1.2.3.4:1111");
-        let cli2 = CliArgs { bind: Some("5.6.7.8:2222".into()), ..cli.clone() };
+        let cli2 = CliArgs {
+            bind: Some("5.6.7.8:2222".into()),
+            ..cli.clone()
+        };
         let c = load(&cli2).unwrap();
         assert_eq!(c.bind.to_string(), "5.6.7.8:2222", "cli must beat env");
         std::env::remove_var("ADJUTANT_BIND");
@@ -408,6 +777,7 @@ mod tests {
 
     #[test]
     fn dev_headers_default_off_and_require_explicit_opt_in() {
+        let _env = lock_env();
         // The spoofable stub must not be silently available.
         assert!(!Config::default().allow_dev_headers);
 
@@ -417,7 +787,11 @@ mod tests {
         std::fs::write(&file, "[auth]\nallow_dev_headers = true\n").unwrap();
 
         // File opt-in.
-        let c = load(&CliArgs { config: Some(file.clone()), ..Default::default() }).unwrap();
+        let c = load(&CliArgs {
+            config: Some(file.clone()),
+            ..Default::default()
+        })
+        .unwrap();
         assert!(c.allow_dev_headers, "file must be able to opt in");
 
         // CLI flag is the highest layer: it beats an env that disables.
@@ -432,17 +806,59 @@ mod tests {
         std::env::remove_var("ADJUTANT_DEV_HEADERS");
 
         // And the flag parses.
-        assert!(CliArgs::parse(vec!["--allow-dev-headers".to_string()]).unwrap().allow_dev_headers);
+        assert!(
+            CliArgs::parse(vec!["--allow-dev-headers".to_string()])
+                .unwrap()
+                .allow_dev_headers
+        );
+
+        // The missing opt-out: a file that says `true` can be forced off from
+        // the command line, which is the whole point of --no-dev-headers.
+        let c = load(&CliArgs {
+            config: Some(file.clone()),
+            no_dev_headers: true,
+            ..Default::default()
+        })
+        .unwrap();
+        assert!(!c.allow_dev_headers, "--no-dev-headers must beat the file");
+
+        // CLI wins over the environment too, and the opt-out is the safe reading
+        // of a contradictory pair.
+        std::env::set_var("ADJUTANT_DEV_HEADERS", "true");
+        let c = load(&CliArgs {
+            no_dev_headers: true,
+            ..Default::default()
+        })
+        .unwrap();
+        assert!(!c.allow_dev_headers, "--no-dev-headers must beat the env");
+        std::env::remove_var("ADJUTANT_DEV_HEADERS");
+        let c = load(&CliArgs {
+            allow_dev_headers: true,
+            no_dev_headers: true,
+            ..Default::default()
+        })
+        .unwrap();
+        assert!(!c.allow_dev_headers, "the opt-out wins a contradictory CLI pair");
+        assert!(
+            CliArgs::parse(vec!["--no-dev-headers".to_string()])
+                .unwrap()
+                .no_dev_headers
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn serve_subcommand_is_optional_and_not_a_flag() {
+        let _env = lock_env();
         // `adjutant serve --bind 1.2.3.4:1` and `adjutant --bind 1.2.3.4:1` must
         // behave identically; the bare `serve` form used to exit 2.
-        let with = CliArgs::parse(vec!["serve".to_string(), "--bind".to_string(), "1.2.3.4:1".to_string()])
-            .expect("serve form parses");
+        let with = CliArgs::parse(vec![
+            "serve".to_string(),
+            "--bind".to_string(),
+            "1.2.3.4:1".to_string(),
+        ])
+        .expect("serve form parses");
         let without = CliArgs::parse(vec!["--bind".to_string(), "1.2.3.4:1".to_string()])
             .expect("flag form parses");
         assert_eq!(with.bind, without.bind);
@@ -453,6 +869,7 @@ mod tests {
 
     #[test]
     fn cli_parses_flags_and_equals_form() {
+        let _env = lock_env();
         let args = vec![
             "--bind".to_string(),
             "0.0.0.0:1".to_string(),
@@ -467,6 +884,7 @@ mod tests {
 
     #[test]
     fn log_format_rejects_garbage() {
+        let _env = lock_env();
         assert!(LogFormat::parse("json").is_ok());
         assert!(LogFormat::parse("yaml").is_err());
     }

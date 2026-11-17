@@ -199,14 +199,22 @@ subprocess.run(["psql", *PSQL, "-c",
 print("[e2e] data reset — starting from bootstrap state")
 
 # ---------------------------------------------------------------- 1. bootstrap
+# `register` is closed unless the server was started with a bootstrap secret; the
+# harness reads the same variable it expects in the server's environment.
+BOOTSTRAP_TOKEN = os.environ.get("ADJUTANT_BOOTSTRAP_TOKEN", "")
+if not BOOTSTRAP_TOKEN:
+    print("[E2E] ADJUTANT_BOOTSTRAP_TOKEN is unset: start the server with it and "
+          "export it here, or the bootstrap probe below answers 403")
 r = probe("1 register bootstrap chief", "POST", "/api/auth/register",
-          body={"username": "christopher", "password": "correct-horse-battery"},
+          body={"username": "christopher", "password": "correct-horse-battery",
+                "bootstrap_token": BOOTSTRAP_TOKEN},
           expect_status=201, expect_in='"bootstrap_role":"chief"')
 chief_token = r and r.get("token")
 assert chief_token, "bootstrap register failed — aborting"
 
 r2 = probe("2 register closed after first user", "POST", "/api/auth/register",
-           body={"username": "mallory", "password": "another-pass-9"}, expect_status=403)
+           body={"username": "mallory", "password": "another-pass-9",
+                 "bootstrap_token": BOOTSTRAP_TOKEN}, expect_status=403)
 
 # ---------------------------------------------------------------- 2. login / me / logout
 probe("3 wrong password rejected", "POST", "/api/auth/login",
@@ -230,6 +238,12 @@ probe("8 anonymous denied on same route", "GET", "/api/hello/greetings", expect_
 probe("9 chief creates scout", "POST", "/api/auth/users", token=chief_token,
       body={"username": "beatrice", "password": "shannons-scout-pass", "roles": ["scout"]},
       expect_status=201)
+# #147: the only admin cannot strip their own last grant. The scout exists but
+# holds no administrative role, so this write would leave nobody able to
+# administer the troop. The trigger behind it is what has to refuse, not just
+# this handler.
+probe("9a last admin cannot be stripped", "POST", "/api/auth/roles", token=chief_token,
+      body={"username": "christopher", "roles": []}, expect_status=409)
 sr = probe("10 scout logs in", "POST", "/api/auth/login",
            body={"username": "beatrice", "password": "shannons-scout-pass"},
            expect_status=200, expect_in="token")
@@ -312,10 +326,31 @@ probe_raw("28 re-import updates, no new rows", csv_reimport)
 
 # ---------------------------------------------------------------- 7. OIDC end-to-end
 # Set per-plugin config, then hot-reload (M2 feature) so auth re-inits with it.
+#
+# The client secret is NOT part of that config: secrets come from the deployment
+# (environment or the secrets file), never from `core.plugins.config`, which is
+# admin-editable and lands in every backup. So the harness writes the secret into
+# the secrets file the server was started with and puts only the non-secret half
+# in the row. Reload re-reads the file, which is also the rotation path.
+SECRETS_FILE = os.environ.get("ADJUTANT_SECRETS_FILE", "secrets.toml")
+existing = ""
+if os.path.exists(SECRETS_FILE):
+    existing = open(SECRETS_FILE).read()
+# `[auth]` almost certainly already exists — `bootstrap-isolation` writes the
+# auth plugin's `db_password` there — so the check is for the sub-table itself.
+if "[auth.oidc]" not in existing:
+    with open(SECRETS_FILE, "a") as fh:
+        fh.write(f"\n[auth.oidc]\nclient_secret = \"{SECRET}\"\n")
+    os.chmod(SECRETS_FILE, 0o600)
+print(f"[e2e] oidc client secret written to {SECRETS_FILE} (not the database)")
 subprocess.run(["psql", *PSQL, "-tAc",
                 f"UPDATE core.plugins SET config = "
+                # `id_token_alg` is pinned by the plugin config, not read from the
+                # token: this mock IdP signs with the shared secret, so the harness
+                # says so. Omit it and the deployment expects RS256.
                 f"'{{\"oidc\": {{\"issuer\": \"{ISSUER}\", \"client_id\": \"{CLIENT_ID}\", "
-                f"\"client_secret\": \"{SECRET}\", \"redirect_uri\": \"{BASE}/api/auth/oidc/callback\"}}}}' "
+                f"\"id_token_alg\": \"HS256\", "
+                f"\"redirect_uri\": \"{BASE}/api/auth/oidc/callback\"}}}}' "
                 f"WHERE id = 'auth';"], check=True, capture_output=True)
 probe("29 hot-reload picks up oidc config", "POST", "/api/plugins/reload",
       token=chief_token, expect_status=200, expect_in='"auth"')
@@ -455,6 +490,79 @@ def appointed_on_is_real():
     ok = status == 200 and bool(db) and f'"appointed_on":"{db}"' in raw.replace(" ", "")
     return ok, f"db={db!r} api={raw[:120]}"
 probe_raw("51 appointed_on decodes as a date, not null", appointed_on_is_real)
+
+# ------------------------------------------- 10. session revocation / password
+# #149 AUTH-3. A leaked token must stop working when its session is revoked, and
+# a password change must invalidate every sibling session but not the caller's.
+probe("52 chief creates a revocable user", "POST", "/api/auth/users", token=chief_token,
+      body={"username": "revocable", "password": "revocable-pass-1", "roles": ["scout"]},
+      expect_status=201)
+a = probe("53 first login", "POST", "/api/auth/login",
+          body={"username": "revocable", "password": "revocable-pass-1"},
+          expect_status=200, expect_in="token")
+token_a = a and a.get("token")
+assert token_a, "first login failed"
+b = probe("54 second concurrent login", "POST", "/api/auth/login",
+          body={"username": "revocable", "password": "revocable-pass-1"},
+          expect_status=200, expect_in="token")
+token_b = b and b.get("token")
+assert token_b, "second login failed"
+
+listed = probe("55 sessions list shows both, one current", "GET", "/api/auth/sessions",
+               token=token_a, expect_status=200, expect_in='"current":true')
+siblings = [s for s in (listed or {}).get("sessions", []) if not s.get("current")]
+assert len(siblings) == 1, f"expected exactly one sibling session, got {listed!r}"
+sibling_id = siblings[0]["id"]
+probe(f"56 revoke the sibling session", "DELETE", f"/api/auth/sessions/{sibling_id}",
+      token=token_a, expect_status=200, expect_in='"ok":true')
+probe("57 revoked token is 401", "GET", "/api/auth/me", token=token_b, expect_status=401)
+probe("58 the other session still works", "GET", "/api/auth/me", token=token_a,
+      expect_status=200, expect_in='"username":"revocable"')
+
+c = probe("59 third login before password change", "POST", "/api/auth/login",
+          body={"username": "revocable", "password": "revocable-pass-1"},
+          expect_status=200, expect_in="token")
+token_c = c and c.get("token")
+assert token_c, "third login failed"
+probe("60 password change succeeds", "POST", "/api/auth/password", token=token_a,
+      body={"current_password": "revocable-pass-1", "new_password": "revocable-pass-2"},
+      expect_status=200, expect_in="revoked_other_sessions")
+probe("61 caller survives their own password change", "GET", "/api/auth/me",
+      token=token_a, expect_status=200)
+probe("62 sibling session 401s after password change", "GET", "/api/auth/me",
+      token=token_c, expect_status=401)
+probe("63 old password no longer works", "POST", "/api/auth/login",
+      body={"username": "revocable", "password": "revocable-pass-1"},
+      expect_status=400, expect_in="invalid credentials")
+probe("64 new password works", "POST", "/api/auth/login",
+      body={"username": "revocable", "password": "revocable-pass-2"},
+      expect_status=200, expect_in="token")
+
+
+# ------------------------------------------------ 11. AUTH-4: Secure cookie
+def secure_cookie():
+    body = json.dumps({"username": "revocable", "password": "revocable-pass-2"}).encode()
+    req = urllib.request.Request(BASE + "/api/auth/login", method="POST")
+    req.add_header("content-type", "application/json")
+    status, _raw, hdrs = _open(req, data=body)
+    cookie = next((v for k, v in hdrs.items() if k.lower() == "set-cookie"), "")
+    ok = status == 200 and "Secure" in cookie and "HttpOnly" in cookie \
+        and "SameSite=Lax" in cookie
+    return ok, f"status={status} set-cookie={cookie[:160]}"
+probe_raw("65 login cookie carries Secure", secure_cookie)
+
+
+# ------------------------------------------------ 12. AUTH-5: auth audited
+def auth_audit_rows():
+    out = subprocess.run(["psql", *PSQL, "-tAc",
+                          "SELECT action FROM core.audit_log ORDER BY id;"],
+                         capture_output=True, text=True)
+    acts = out.stdout.split()
+    need = {"auth.register", "auth.login", "auth.login.failed", "auth.logout",
+            "auth.session.revoke", "auth.password.change"}
+    missing = need - set(acts)
+    return not missing, f"actions={acts} missing={sorted(missing)}"
+probe_raw("66 every auth event is audited", auth_audit_rows)
 
 srv.shutdown()
 print()

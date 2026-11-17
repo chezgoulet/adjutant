@@ -49,7 +49,7 @@ void main() {
     // The inbox as the device holds it: one unread notice, and the badge the
     // server last gave. This is what the screens open onto while offline.
     SharedPreferences.setMockInitialValues({
-      'cache.announcements': jsonEncode([
+      'cache.u1.announcements': jsonEncode([
         {
           'id': 7,
           'title': 'Meeting moved to Thursday',
@@ -59,8 +59,8 @@ void main() {
           'is_read': false,
         },
       ]),
-      'cache.announcements.at': DateTime(2026, 9, 27, 7, 30).toIso8601String(),
-      'cache.announcement.badge': jsonEncode({
+      'cache.u1.announcements.at': DateTime(2026, 9, 27, 7, 30).toIso8601String(),
+      'cache.u1.announcement.badge': jsonEncode({
         'member_id': 'u1',
         'visible': 1,
         'unread': 1,
@@ -68,7 +68,7 @@ void main() {
         'urgent_unread': 1,
         'has_urgent': true,
       }),
-      'cache.announcement.badge.at':
+      'cache.u1.announcement.badge.at':
           DateTime(2026, 9, 27, 7, 30).toIso8601String(),
     });
 
@@ -177,7 +177,7 @@ void main() {
     addTearDown(tester.view.reset);
 
     SharedPreferences.setMockInitialValues({
-      'cache.announcements': jsonEncode([
+      'cache.u1.announcements': jsonEncode([
         {
           'id': 7,
           'title': 'Meeting moved to Thursday',
@@ -187,8 +187,8 @@ void main() {
           'is_read': false,
         },
       ]),
-      'cache.announcements.at': DateTime(2026, 9, 27, 7, 30).toIso8601String(),
-      'cache.announcement.badge': jsonEncode({
+      'cache.u1.announcements.at': DateTime(2026, 9, 27, 7, 30).toIso8601String(),
+      'cache.u1.announcement.badge': jsonEncode({
         'member_id': 'u1',
         'visible': 1,
         'unread': 1,
@@ -196,7 +196,7 @@ void main() {
         'urgent_unread': 1,
         'has_urgent': true,
       }),
-      'cache.announcement.badge.at':
+      'cache.u1.announcement.badge.at':
           DateTime(2026, 9, 27, 7, 30).toIso8601String(),
     });
 

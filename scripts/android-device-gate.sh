@@ -176,12 +176,19 @@ step "booting the server on 0.0.0.0:$PORT (dev headers OFF)"
 # The stub is off so the session the device holds is one the server issued; the
 # bind is 0.0.0.0 because the device reaches the host through the emulator's NAT
 # (10.0.2.2), not through loopback.
+# The bootstrap secret the gate uses to claim its own identity. A fresh database
+# has no users, and `POST /api/auth/register` is closed unless the server was
+# started with a token — so the gate mints one, hands it to the server, and
+# presents the same value when it registers.
+BOOTSTRAP_TOKEN="$(openssl rand -hex 16)"
+export BOOTSTRAP_TOKEN
 ADJUTANT_DATABASE_URL="$DB_URL" \
 ADJUTANT_PLUGIN_DIR="$PLUGIN_DIR" \
 ADJUTANT_DEV_HEADERS=false \
 ADJUTANT_RATE_MAX=0 \
 ADJUTANT_ALLOW_SUPERUSER=true \
 ADJUTANT_LOG=warn \
+ADJUTANT_BOOTSTRAP_TOKEN="$BOOTSTRAP_TOKEN" \
 ADJUTANT_BIND="0.0.0.0:$PORT" \
   "$SERVER_BIN" >"$SERVER_LOG" 2>&1 &
 SERVER_PID=$!
@@ -207,7 +214,7 @@ echo "==> server is listening (pid $SERVER_PID); its log is $SERVER_LOG"
 step "creating the gate's identity"
 REGISTER=$(curl -s -o /tmp/adjutant-gate-identity.json -w '%{http_code}' \
   -X POST "http://127.0.0.1:$PORT/api/auth/register" -H 'content-type: application/json' \
-  -d "{\"username\":\"$USER_NAME\",\"password\":\"$PASSWORD\"}")
+  -d "{\"username\":\"$USER_NAME\",\"password\":\"$PASSWORD\",\"bootstrap_token\":\"$BOOTSTRAP_TOKEN\"}")
 case "$REGISTER" in
   201) echo "==> registered $USER_NAME as the bootstrap chief" ;;
   403)

@@ -219,7 +219,7 @@ async fn declared_manifest_satisfies_the_load_rules() {
         seen.push(key);
     }
     assert!(
-        routes.len() >= 14,
+        routes.len() >= 13,
         "the surface the client needs is bigger than this"
     );
 
@@ -909,10 +909,11 @@ async fn rsvp_refuses_an_unknown_answer_and_an_uncovered_lodge() {
 }
 
 #[tokio::test]
-async fn recording_another_members_rsvp_needs_manage() {
+async fn re_addressing_an_event_needs_manage_at_the_target_scope() {
     let (host, _plugin, routes) = plugin().await;
-    let delegated = route(&routes, "POST", "/api/calendar/event/{id}/rsvp/{member}");
+    let edit = route(&routes, "PATCH", "/api/calendar/event/{id}");
 
+    // The event is Lodge 3's, and the caller manages Lodge 3.
     host.db.push_rows(vec![event_row(
         7,
         SCOPE_LODGE,
@@ -921,14 +922,13 @@ async fn recording_another_members_rsvp_needs_manage() {
         "",
     )]);
     host.db.push_rows(vec![json!({ "n": 1 })]); // calendar:manage at Lodge 3
-    host.db.push_rows(vec![rsvp_row(12, "carl", "maybe")]);
-    host.db.push_rows(vec![counts(0)]);
+    // …and does NOT manage Lodge 9, which the patch tries to move it into.
+    host.db.push_rows(vec![json!({ "n": 0 })]);
 
     let (status, body) = call(
-        &delegated.handler,
-        TestRequest::post("/api/calendar/event/7/rsvp/carl")
+        &edit.handler,
+        TestRequest::patch("/api/calendar/event/7")
             .param("id", "7")
-            .param("member", "carl")
             .identity_grants(
                 "bea",
                 vec![RoleGrant {
@@ -936,18 +936,38 @@ async fn recording_another_members_rsvp_needs_manage() {
                     scope: Scope::lodge("3"),
                 }],
             )
-            .json(&json!({ "response": "maybe", "note": "phoned it in" }))
+            .json(&json!({ "scope_type": "lodge", "scope_id": "9" }))
             .build(),
     )
     .await;
-    assert_eq!(status, 200, "{body}");
-    let params = host.db.last_query_params("ON CONFLICT").unwrap();
-    let rendered: Vec<String> = params.iter().map(|p| format!("{p:?}")).collect();
+    assert_eq!(status, 403, "re-addressing is a write into the target: {body}");
     assert!(
-        rendered.iter().any(|p| p.contains("carl")),
-        "the answer is recorded for carl"
+        host.db
+            .executed_sql()
+            .iter()
+            .all(|s| !s.contains("SET") || !s.contains("scope_id")),
+        "the event must not be re-addressed: {:?}",
+        host.db.executed_sql()
     );
-    assert!(rendered.iter().any(|p| p.contains("maybe")));
+}
+
+#[tokio::test]
+async fn recording_another_members_rsvp_is_not_a_route() {
+    let (_host, _plugin, routes) = plugin().await;
+    // The owner's ruling: a manager records their own response like everyone
+    // else. Writing another member's RSVP was an IDOR behind a manage check, and
+    // the legitimate need behind it — "they phoned it in" — is a quorum problem,
+    // not an authorization one.
+    let found = routes.iter().any(|r| r.path == "/api/calendar/event/{id}/rsvp/{member}");
+    assert!(
+        !found,
+        "the delegated-RSVP route must not be declared: managers answer for themselves"
+    );
+    // The self-service route is still there and still derives the member from
+    // the session, not from the path.
+    let own = route(&routes, "POST", "/api/calendar/event/{id}/rsvp");
+    assert_eq!(own.required_permission.as_deref(), Some("calendar:rsvp"));
+
 }
 
 // ---------------------------------------------------------------------------
@@ -1098,6 +1118,66 @@ async fn listing_narrows_to_the_callers_scopes() {
     )
     .await;
     assert_eq!(status, 400);
+}
+
+/// A grant at a lodge the caller holds **no read permission for** must not widen
+/// the list. The route gate only proves `calendar:read` somewhere, so the lodge
+/// array has to come from `scopes_for`, not from every lodge grant the identity
+/// carries.
+#[tokio::test]
+async fn a_lodge_grant_without_read_does_not_widen_the_list() {
+    let (host, _plugin, routes) = plugin().await;
+    let list = route(&routes, "GET", "/api/calendar/events");
+    // Not troop-wide (the SDK answers a scoped identity without a query), and
+    // only Lodge 3 carries calendar:read.
+    host.db.push_rows(vec![json!({
+        "permission": "calendar:read",
+        "scope_type": "lodge",
+        "scope_id": "3"
+    })]);
+    host.db.push_rows(Vec::new()); // the page
+
+    let (status, body) = call(
+        &list.handler,
+        TestRequest::get("/api/calendar/events")
+            .identity_grants(
+                "bea",
+                vec![
+                    RoleGrant {
+                        role_id: "scout".into(),
+                        scope: Scope::lodge("3"),
+                    },
+                    // A second lodge where her role has no calendar:read.
+                    RoleGrant {
+                        role_id: "quartermaster".into(),
+                        scope: Scope::lodge("9"),
+                    },
+                ],
+            )
+            .build(),
+    )
+    .await;
+    assert_eq!(status, 200, "{body}");
+    let call = host
+        .db
+        .queried
+        .lock()
+        .unwrap()
+        .iter()
+        .find(|c| c.sql.contains("scope_id = ANY($2)"))
+        .cloned()
+        .expect("the events query ran");
+    match &call.params[1] {
+        SqlValue::TextArray(lodges) => assert_eq!(
+            lodges,
+            &vec!["3".to_string()],
+            "only the lodge where she holds calendar:read"
+        ),
+        other => panic!(
+            "expected the lodge ids, got {other:?}; queries: {:#?}",
+            host.db.queried_sql()
+        ),
+    }
 }
 
 #[tokio::test]

@@ -709,7 +709,12 @@ struct MentorProfileBody {
     #[serde(default)]
     affiliation: Option<String>,
     #[serde(default)]
-    expertise: Vec<String>,
+    expertise: Option<Vec<String>>,
+    /// The lodge this mentor is declared for. Required when somebody else is
+    /// declaring the profile, because the authority that allows it is authority
+    /// *covering that lodge*; a member declaring their own may omit it.
+    #[serde(default)]
+    lodge_id: Option<String>,
     #[serde(default)]
     capacity: Option<i64>,
     #[serde(default)]
@@ -891,6 +896,11 @@ impl AdjutantPlugin for MissionsPlugin {
                  created_at TIMESTAMPTZ NOT NULL DEFAULT now()\
              );\
              CREATE INDEX IF NOT EXISTS idx_stage_log_mission ON mission_stage_log(mission_id);",
+        ),
+        Migration::new(
+            2,
+            "mentor_profile_lodge",
+            "ALTER TABLE mentor_profiles ADD COLUMN IF NOT EXISTS lodge_id TEXT;",
         )]
     }
 
@@ -914,18 +924,24 @@ impl AdjutantPlugin for MissionsPlugin {
                         .has_in_scope(identity, "missions:read", &Scope::troop())
                         .await;
                     let caller = identity.map(|i| i.user_id.clone()).unwrap_or_default();
+                    // Only the lodges where the caller actually holds
+                    // `missions:read`. The gate proves the permission at *some*
+                    // scope, so scanning every lodge grant listed lodges where
+                    // this caller holds no read permission — and the query then
+                    // returned their missions. `scopes_for` is the
+                    // permission-aware answer, patrol grants included.
                     let lodge_ids: Vec<String> = if troop_wide {
                         Vec::new()
                     } else {
-                        identity
-                            .map(|i| {
-                                i.grants
-                                    .iter()
-                                    .filter(|g| g.scope.scope_type == ScopeType::Lodge)
-                                    .filter_map(|g| g.scope.scope_id.clone())
-                                    .collect()
-                            })
+                        c.permissions
+                            .scopes_for(identity, &["missions:read"])
+                            .await
                             .unwrap_or_default()
+                            .into_iter()
+                            .filter(|held| held.permission == "missions:read")
+                            .filter(|held| held.scope.scope_type == ScopeType::Lodge)
+                            .filter_map(|held| held.scope.scope_id.clone())
+                            .collect()
                     };
                     let rows = c
                         .db
@@ -1705,45 +1721,91 @@ impl AdjutantPlugin for MissionsPlugin {
                 let c = c.clone();
                 async move {
                     let body: MentorProfileBody = req.json()?;
-                    if body.member_id.trim().is_empty() {
+                    let member_id = body.member_id.trim().to_string();
+                    if member_id.is_empty() {
                         return PluginResponse::error(400, "member_id is required");
                     }
-                    let declared_by = req
-                        .identity
-                        .as_ref()
-                        .map(|i| i.user_id.clone())
-                        .unwrap_or_default();
+                    let Some(identity) = req.identity.clone() else {
+                        return PluginResponse::error(401, "authentication required");
+                    };
+
+                    // Writing somebody else's registry row is a curatorial act,
+                    // not a mentor's: it needs approve authority **covering that
+                    // member's lodge**, and the lodge therefore has to be named.
+                    // The route gate only says the caller holds `missions:mentor`
+                    // somewhere, which is why this check lives here.
+                    //
+                    // Before this, `member_id` came straight from the body and
+                    // nothing compared it to the caller — so any mentor could
+                    // overwrite or blank any member's row troop-wide, and the
+                    // `declared_by` on it became theirs.
+                    if member_id != identity.user_id {
+                        let lodge_id = body
+                            .lodge_id
+                            .as_deref()
+                            .map(str::trim)
+                            .filter(|v| !v.is_empty())
+                            .map(str::to_string);
+                        let Some(lodge_id) = lodge_id else {
+                            return PluginResponse::error(
+                                400,
+                                "declaring a profile for another member needs lodge_id: the                                  authority that allows it is approve authority covering that lodge",
+                            );
+                        };
+                        c.permissions
+                            .reach(
+                                Some(&identity),
+                                "missions:approve",
+                                &Scope::lodge(&lodge_id),
+                            )
+                            .await?;
+                    }
+
+                    let declared_by = identity.user_id.clone();
+                    // Omitted fields are bound as SQL NULL, and the UPDATE branch
+                    // COALESCEs them to the stored value. Before, they were bound
+                    // as '' and '{}', so a body of just `{"member_id": …}` blanked
+                    // the target's display_name and wiped their expertise — the
+                    // COALESCE on EXCLUDED guarded nothing.
                     let row = c
                         .db
                         .query_one(
                             format!(
-                                "INSERT INTO {} \
+                                "INSERT INTO {t} \
                                    (member_id, display_name, affiliation, expertise, capacity, \
-                                    is_active, declared_by, notes) \
-                                 VALUES ($1, COALESCE($2, ''), $3, $4, COALESCE($5, 1), \
-                                         COALESCE($6, true), $7, COALESCE($8, '')) \
+                                    is_active, declared_by, notes, lodge_id) \
+                                 VALUES ($1, COALESCE($2, ''), $3, COALESCE($4, '{{}}'), \
+                                         COALESCE($5, 1), COALESCE($6, true), $7, \
+                                         COALESCE($8, ''), $9) \
                                  ON CONFLICT (member_id) DO UPDATE SET \
-                                   display_name = COALESCE(EXCLUDED.display_name, {t}.display_name), \
-                                   affiliation = COALESCE(EXCLUDED.affiliation, {t}.affiliation), \
-                                   expertise = EXCLUDED.expertise, \
+                                   display_name = COALESCE($2, {t}.display_name), \
+                                   affiliation = COALESCE($3, {t}.affiliation), \
+                                   expertise = COALESCE($4, {t}.expertise), \
                                    capacity = COALESCE($5, {t}.capacity), \
                                    is_active = COALESCE($6, {t}.is_active), \
                                    notes = COALESCE($8, {t}.notes), \
+                                   lodge_id = COALESCE($9, {t}.lodge_id), \
                                    declared_by = EXCLUDED.declared_by, \
                                    updated_at = now() \
                                  RETURNING member_id, display_name, expertise, capacity, is_active",
-                                c.db.table("mentor_profiles"),
                                 t = c.db.table("mentor_profiles")
                             ),
                             vec![
-                                SqlValue::Text(body.member_id.trim().to_string()),
+                                SqlValue::Text(member_id),
                                 body.display_name.clone().into(),
                                 body.affiliation.clone().into(),
-                                SqlValue::TextArray(body.expertise.clone()),
+                                body.expertise
+                                    .clone()
+                                    .map(SqlValue::TextArray)
+                                    .unwrap_or(SqlValue::Null),
                                 body.capacity.map(SqlValue::Int).unwrap_or(SqlValue::NullInt),
                                 body.is_active.map(SqlValue::Bool).unwrap_or(SqlValue::NullBool),
                                 SqlValue::Text(declared_by),
                                 body.notes.clone().into(),
+                                body.lodge_id
+                                    .clone()
+                                    .map(|v| SqlValue::Text(v.trim().to_string()))
+                                    .unwrap_or(SqlValue::Null),
                             ],
                         )
                         .await?;

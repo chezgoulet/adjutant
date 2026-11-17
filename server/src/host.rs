@@ -7,7 +7,10 @@
 
 use std::sync::Arc;
 
-use adjutant_sdk::{Event, HostDb, HostEvents, HostHttp, HttpResponse, SdkError, SqlValue};
+use adjutant_sdk::{
+    canonical_created_at, canonical_payload, chain_key, AuditRow, Event, HostDb, HostEvents,
+    HostHttp, HttpResponse, SdkError, SqlValue, AUDIT_CHAIN_ADVISORY_LOCK, AUDIT_ZERO_HASH,
+};
 use async_trait::async_trait;
 use serde_json::Value;
 use sqlx::postgres::PgRow;
@@ -186,6 +189,116 @@ impl HostDb for CoreDb {
             out.push(Value::Object(obj));
         }
         Ok(out)
+    }
+
+    /// Appending an audit row is the one place the SDK needs several statements
+    /// to agree. Without a key it is the plain INSERT. With a key it is one
+    /// transaction:
+    ///
+    /// 1. take the same advisory lock the SQL trigger takes (`CHAIN_ADVISORY_LOCK`);
+    /// 2. read the previous `entry_hash`;
+    /// 3. allocate the id the row will carry;
+    /// 4. make PostgreSQL render `details` as `jsonb::text` (the exact bytes the
+    ///    trigger will hash) and pick a microsecond-precision timestamp;
+    /// 5. compute `HMAC(key, canonical_payload)` in Rust — the key is never sent
+    ///    to PostgreSQL, not even as a bind parameter;
+    /// 6. INSERT the row with `id`, `created_at` and `keyed_hash` already set.
+    ///
+    /// The trigger fills `prev_hash`/`entry_hash` from the same lock and sees
+    /// the same id and timestamp, so both hashes describe the same row. There is
+    /// no UPDATE: the append-only trigger would (correctly) refuse it.
+    async fn append_audit(&self, row: AuditRow) -> Result<(), SdkError> {
+        let Some(key) = chain_key() else {
+            let (sql, params) = row.unkeyed_insert();
+            return self.execute(sql, params).await.map(|_| ());
+        };
+
+        let mut tx = self
+            .pool
+            .begin()
+            .await
+            .map_err(|e| SdkError::Db(format!("audit transaction: {e}")))?;
+
+        sqlx::query("SELECT pg_advisory_xact_lock($1)")
+            .bind(AUDIT_CHAIN_ADVISORY_LOCK)
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| SdkError::Db(format!("audit chain lock: {e}")))?;
+
+        let prev: Option<String> = sqlx::query_scalar(
+            "SELECT entry_hash FROM core.audit_log ORDER BY id DESC LIMIT 1",
+        )
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(|e| SdkError::Db(format!("audit previous hash: {e}")))?
+        .flatten();
+        let prev = prev.unwrap_or_else(|| AUDIT_ZERO_HASH.to_string());
+
+        let id: i64 = sqlx::query_scalar(
+            "SELECT nextval(pg_get_serial_sequence('core.audit_log', 'id'))",
+        )
+        .fetch_one(&mut *tx)
+        .await
+        .map_err(|e| SdkError::Db(format!("audit id allocation: {e}")))?;
+
+        // jsonb normalises key order and whitespace. The trigger hashes
+        // `NEW.details::text` *after* the cast, so the HMAC must use that same
+        // rendering, not the caller's JSON string.
+        let details_text: String = sqlx::query_scalar("SELECT ($1::jsonb)::text")
+            .bind(&row.details)
+            .fetch_one(&mut *tx)
+            .await
+            .map_err(|e| SdkError::Db(format!("audit details canonicalisation: {e}")))?;
+
+        let created_at = canonical_created_at(chrono::Utc::now());
+        let user_text = match &row.user_id {
+            SqlValue::Uuid(u) => Some(
+                uuid::Uuid::parse_str(u)
+                    .map(|u| u.to_string())
+                    .unwrap_or_else(|_| u.clone()),
+            ),
+            _ => None,
+        };
+        let payload = canonical_payload(
+            &prev,
+            id,
+            &row.action,
+            &row.resource_type,
+            &row.resource_id,
+            &details_text,
+            &row.source,
+            user_text.as_deref(),
+            &created_at,
+        );
+        let keyed_hash = key.keyed_digest(&payload);
+
+        let insert = bind_params(
+            sqlx::query(
+                "INSERT INTO core.audit_log \
+                 (id, user_id, action, resource_type, resource_id, details, source, created_at, keyed_hash) \
+                 VALUES ($1, $2, $3, $4, $5, $6::jsonb, $7, $8::timestamptz, $9)",
+            ),
+            vec![
+                SqlValue::Int(id),
+                row.user_id.clone(),
+                SqlValue::Text(row.action.clone()),
+                SqlValue::Text(row.resource_type.clone()),
+                SqlValue::Text(row.resource_id.clone()),
+                SqlValue::Text(details_text.clone()),
+                SqlValue::Text(row.source.clone()),
+                SqlValue::Text(created_at.clone()),
+                SqlValue::Text(keyed_hash.clone()),
+            ],
+        )?;
+        insert
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| SdkError::Db(format!("audit insert: {e}")))?;
+
+        tx.commit()
+            .await
+            .map_err(|e| SdkError::Db(format!("audit commit: {e}")))?;
+        Ok(())
     }
 }
 

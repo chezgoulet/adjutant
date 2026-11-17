@@ -23,14 +23,18 @@ pub fn validate_plugin_name(name: &str) -> Result<(), String> {
     let ok = !name.is_empty()
         && name.len() <= 31
         && name.chars().next().is_some_and(|c| c.is_ascii_lowercase())
-        && name.chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_');
+        && name
+            .chars()
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_');
     if !ok {
         return Err(format!(
             "invalid plugin name {name:?}: expected [a-z][a-z0-9_]{{0,30}} (lowercase, underscore)"
         ));
     }
     if crate::plugin_runtime::RESERVED_IDS.contains(&name) {
-        return Err(format!("{name:?} is reserved by the core or an existing plugin"));
+        return Err(format!(
+            "{name:?} is reserved by the core or an existing plugin"
+        ));
     }
     Ok(())
 }
@@ -191,11 +195,11 @@ impl AdjutantPlugin for __STRUCT__ {
 export_plugin!(__STRUCT__);
 "#;
 
-/// The scaffolded plugin's first migration, kept beside the template that names it:
-/// a template pointing at a `.sql` file the scaffolder did not write would produce a
-/// crate that cannot compile (`include_str!` would fail to resolve), which is a worse
-/// first impression than the inline form it replaced.
-const INITIAL_SCHEMA_SQL: &str = r#"CREATE TABLE IF NOT EXISTS items (
+    /// The scaffolded plugin's first migration, kept beside the template that names it:
+    /// a template pointing at a `.sql` file the scaffolder did not write would produce a
+    /// crate that cannot compile (`include_str!` would fail to resolve), which is a worse
+    /// first impression than the inline form it replaced.
+    const INITIAL_SCHEMA_SQL: &str = r#"CREATE TABLE IF NOT EXISTS items (
     id BIGSERIAL PRIMARY KEY,
     name TEXT NOT NULL,
     created_at TIMESTAMPTZ NOT NULL DEFAULT now()
@@ -323,7 +327,10 @@ pub async fn reset_database(test_url: &str) -> Result<(), String> {
     let kill = format!(
         "SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE datname = '{dbname}' AND pid <> pg_backend_pid()"
     );
-    sqlx::query(&kill).execute(&pool).await.map_err(|e| e.to_string())?;
+    sqlx::query(&kill)
+        .execute(&pool)
+        .await
+        .map_err(|e| e.to_string())?;
     sqlx::query(&format!("DROP DATABASE IF EXISTS \"{dbname}\""))
         .execute(&pool)
         .await
@@ -376,31 +383,59 @@ pub async fn bootstrap_isolation(
         .await
         .map_err(|e| e.to_string())?;
 
+    // Where the generated role passwords go. Not the database: `db_secret` is
+    // cleartext, it lands in every `pg_dump`, and it is readable by anything that
+    // can read the row. The file is the deployment's, `0600`, and the runtime
+    // reads it at boot and on every reload.
+    // An operator running the bootstrap should not have to create the file
+    // first: absent a configured path, write the default one.
+    let secrets_path = crate::secrets::resolved_path(cfg.secrets_file.as_deref())
+        .unwrap_or_else(|| std::path::PathBuf::from(crate::secrets::DEFAULT_SECRETS_FILE));
+    let secrets_file = crate::secrets::SecretSource::load(Some(&secrets_path))?;
+
     let mut ids = Vec::new();
     for d in discovered {
-        let existing: Option<Option<String>> =
-            sqlx::query_scalar::<_, Option<String>>("SELECT db_secret FROM core.plugins WHERE id = $1")
-                .bind(&d.id)
-                .fetch_optional(pool.as_ref())
-                .await
-                .map_err(|e| format!("read {} credential: {e}", d.id))?;
-        let secret =
-            crate::schema::bootstrap_role(pool.as_ref(), &d.id, existing.flatten().as_deref(), rotate)
-                .await
-                .map_err(|e| format!("bootstrap {}: {e}", d.id))?;
+        // Reuse the password already in the file so a re-run does not rotate
+        // every role; the column is only read for an installation bootstrapped
+        // before the file existed.
+        let legacy: Option<Option<String>> = sqlx::query_scalar::<_, Option<String>>(
+            "SELECT db_secret FROM core.plugins WHERE id = $1",
+        )
+        .bind(&d.id)
+        .fetch_optional(pool.as_ref())
+        .await
+        .map_err(|e| format!("read {} credential: {e}", d.id))?;
+        let existing = secrets_file
+            .resolve(&d.id, "db_password")
+            .or_else(|| legacy.flatten());
+        let secret = crate::schema::bootstrap_role(
+            pool.as_ref(),
+            &d.id,
+            existing.as_deref(),
+            rotate,
+        )
+        .await
+        .map_err(|e| format!("bootstrap {}: {e}", d.id))?;
+        crate::secrets::write_plugin_password(&secrets_path, &d.id, &secret)?;
+        // The row records the plugin; the credential is cleared from it so a
+        // database dump no longer carries the password.
         sqlx::query(
-            "INSERT INTO core.plugins (id, version, db_secret) VALUES ($1, $2, $3) \
+            "INSERT INTO core.plugins (id, version, db_secret) VALUES ($1, $2, NULL) \
              ON CONFLICT (id) DO UPDATE SET version = EXCLUDED.version, \
-             db_secret = EXCLUDED.db_secret, updated_at = now()",
+             db_secret = NULL, updated_at = now()",
         )
         .bind(&d.id)
         .bind(&d.version)
-        .bind(&secret)
         .execute(pool.as_ref())
         .await
-        .map_err(|e| format!("store {} credential: {e}", d.id))?;
+        .map_err(|e| format!("store {} plugin row: {e}", d.id))?;
         ids.push(d.id);
     }
+    println!(
+        "[bootstrap] plugin role passwords written to {} (0600); the database \
+         row no longer holds them",
+        secrets_path.display()
+    );
 
     if let Some(app) = app_role {
         crate::schema::bootstrap_app_role(pool.as_ref(), app, app_password)
@@ -419,6 +454,15 @@ pub async fn bootstrap_isolation(
             .await
             .map_err(|e| format!("transfer core ownership to {app}: {e}"))?;
     }
+
+    // #152: a bundle recorded the finance guard migration, so move the record
+    // tables off the plugin role now — the restore gate must be able to see the
+    // hardened state before the server starts. When that migration is still
+    // pending (an older bundle, or a fresh install) the function is a no-op;
+    // the server hardens after it applies the migration.
+    crate::schema::protect_record_tables(pool.as_ref())
+        .await
+        .map_err(|e| format!("protect record tables: {e}"))?;
 
     // --- which plugins this deployment runs (issue #90) ----------------------
     //
@@ -450,6 +494,523 @@ pub async fn bootstrap_isolation(
     Ok(ids)
 }
 
+// ---------------------------------------------------------------------------
+// verify-isolation
+// ---------------------------------------------------------------------------
+
+/// Check that a database's provisioning is complete enough for the runtime.
+///
+/// This is the restore gate: `bootstrap-isolation` creates roles, ownership and
+/// grants, and this function asserts the result instead of trusting its exit
+/// code. It uses the **runtime's own** notion of the boundary —
+/// [`crate::schema::role_for`], [`crate::schema::core_grants`] and
+/// [`crate::host::plugin_pool`] — so passing here means more than "some grants
+/// exist":
+///
+/// * every installed plugin (`core.plugins.uninstalled = false`) has its
+///   `adjutant_plugin_<id>` role, and that role is neither `SUPERUSER` nor
+///   `CREATEROLE`;
+/// * the plugin's schema and every table/sequence/view in it are owned by that
+///   role;
+/// * the plugin holds the privileges in [`crate::schema::core_grants`], and
+///   holds no privilege on any `core.*` table outside that allowlist;
+/// * a connection made the way the runtime makes it (the stored `db_secret`,
+///   [`crate::host::plugin_pool`]) reports `session_user` as the plugin role;
+/// * with `app_role`, the application role exists, owns `core`, and is a member
+///   of every plugin role.
+///
+/// Every failure names the missing role or the wrong owner. A generic
+/// "restore failed" would send the operator back to the same dead end this
+/// function exists to end.
+pub async fn verify_isolation(
+    cfg: &Config,
+    app_role: Option<&str>,
+) -> Result<Vec<String>, String> {
+    let pool = crate::db::connect(cfg)
+        .await
+        .map_err(|e| format!("database: {e}"))?;
+
+    // Installed plugins are the expectation. A plugin that is in the dump but
+    // no longer on disk has a row here and no role after bootstrap — which is
+    // exactly the partial restore this check must catch.
+    let ids: Vec<String> =
+        sqlx::query_scalar("SELECT id FROM core.plugins WHERE NOT uninstalled ORDER BY id")
+            .fetch_all(pool.as_ref())
+            .await
+            .map_err(|e| format!("cannot read core.plugins: {e}"))?;
+
+    let mut checks = Vec::new();
+    let mut failures = Vec::new();
+
+    // #152: once the finance guard migration is recorded, the record objects
+    // are expected to have been moved off the plugin role. A bundle from before
+    // that migration is checked in its provisioned (plugin-owned) state; the
+    // server hardens it after applying the migration.
+    let finance_hardened: bool = sqlx::query_scalar(
+        "SELECT EXISTS (SELECT 1 FROM core.schema_migrations \
+                        WHERE schema = 'finance' AND version >= 4)",
+    )
+    .fetch_one(pool.as_ref())
+    .await
+    .map_err(|e| format!("read finance migration state: {e}"))?;
+
+    for id in &ids {
+        let role = crate::schema::role_for(id);
+
+        let attrs: Option<(bool, bool)> = sqlx::query_as(
+            "SELECT rolsuper, rolcreaterole FROM pg_roles WHERE rolname = $1",
+        )
+        .bind(&role)
+        .fetch_optional(pool.as_ref())
+        .await
+        .map_err(|e| format!("read role {role}: {e}"))?;
+        let Some((is_superuser, can_create_role)) = attrs else {
+            failures.push(format!("missing role {role} (plugin {id})"));
+            continue;
+        };
+        if is_superuser {
+            failures.push(format!("role {role} is SUPERUSER; a plugin role must not be"));
+        }
+        if can_create_role {
+            failures.push(format!("role {role} has CREATEROLE; a plugin role must not"));
+        }
+
+        let schema_owner: Option<String> = sqlx::query_scalar(
+            "SELECT pg_get_userbyid(nspowner) FROM pg_namespace WHERE nspname = $1",
+        )
+        .bind(id)
+        .fetch_optional(pool.as_ref())
+        .await
+        .map_err(|e| format!("read schema {id}: {e}"))?;
+        let hardened_records = id == "finance" && finance_hardened;
+        match schema_owner {
+            None => failures.push(format!("missing schema {id} (plugin {id})")),
+            Some(owner) if hardened_records => {
+                // The schema must not belong to the writing role: an owner can
+                // DROP the schema (and the records in it). The plugin keeps the
+                // USAGE/CREATE its migrations need.
+                if owner == role {
+                    failures.push(format!(
+                        "schema {id} is owned by the plugin role {role}; the record tables can be dropped"
+                    ));
+                }
+                for privilege in ["USAGE", "CREATE"] {
+                    let held: bool = sqlx::query_scalar(
+                        "SELECT has_schema_privilege($1::name, $2::name, $3::text)",
+                    )
+                    .bind(&role)
+                    .bind(id)
+                    .bind(privilege)
+                    .fetch_one(pool.as_ref())
+                    .await
+                    .map_err(|e| format!("check schema grant {id}: {e}"))?;
+                    if !held {
+                        failures.push(format!(
+                            "role {role} is missing {privilege} on schema {id}"
+                        ));
+                    }
+                }
+            }
+            Some(owner) if owner != role => failures.push(format!(
+                "schema {id} is owned by {owner}, expected {role}"
+            )),
+            Some(_) => {}
+        }
+
+        let wrong_owners: Vec<(String, String)> = sqlx::query_as(
+            "SELECT c.relname, pg_get_userbyid(c.relowner)
+               FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
+              WHERE n.nspname = $1
+                AND c.relkind IN ('r', 'p', 'v', 'm', 'S', 'f')
+                AND pg_get_userbyid(c.relowner) <> $2
+              ORDER BY c.relname",
+        )
+        .bind(id)
+        .bind(&role)
+        .fetch_all(pool.as_ref())
+        .await
+        .map_err(|e| format!("read objects in schema {id}: {e}"))?;
+        for (object, owner) in wrong_owners {
+            let protected = hardened_records
+                && (crate::schema::PROTECTED_RECORD_TABLES.contains(&object.as_str())
+                    || crate::schema::PROTECTED_RECORD_SEQUENCES.contains(&object.as_str()));
+            if protected {
+                // Checked explicitly below: it is *expected* not to be owned by
+                // the plugin role.
+                continue;
+            }
+            failures.push(format!(
+                "table {id}.{object} is owned by {owner}, expected {role}"
+            ));
+        }
+
+        if hardened_records {
+            check_protected_records(pool.as_ref(), &role, &mut failures).await?;
+        }
+
+        let allowlist = crate::schema::core_grants(id);
+        if let Some(grants) = allowlist {
+            for grant in grants {
+                for privilege in grant.privileges.split(',').map(str::trim) {
+                    match grant.columns {
+                        Some(columns) => {
+                            for column in columns {
+                                let held: bool = sqlx::query_scalar(
+                                    "SELECT has_column_privilege($1::name, $2::text, $3::text, $4::text)",
+                                )
+                                .bind(&role)
+                                .bind(format!("core.{}", grant.table))
+                                .bind(*column)
+                                .bind(privilege)
+                                .fetch_one(pool.as_ref())
+                                .await
+                                .map_err(|e| format!("check grant {id}: {e}"))?;
+                                if !held {
+                                    failures.push(format!(
+                                        "role {role} is missing {privilege} on \
+                                         core.{}.{column}",
+                                        grant.table
+                                    ));
+                                }
+                            }
+                        }
+                        None => {
+                            let held: bool = sqlx::query_scalar(
+                                "SELECT has_table_privilege($1::name, $2::text, $3::text)",
+                            )
+                            .bind(&role)
+                            .bind(format!("core.{}", grant.table))
+                            .bind(privilege)
+                            .fetch_one(pool.as_ref())
+                            .await
+                            .map_err(|e| format!("check grant {id}: {e}"))?;
+                            if !held {
+                                failures.push(format!(
+                                    "role {role} is missing {privilege} on core.{}",
+                                    grant.table
+                                ));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // The isolation probe that matters after a restore: `core.*` tables
+        // outside the allowlist must be unreachable. A restored grant that
+        // bootstrap failed to revoke is a confinement regression, not extra
+        // convenience.
+        let core_tables: Vec<String> =
+            sqlx::query_scalar("SELECT tablename FROM pg_tables WHERE schemaname = 'core' ORDER BY tablename")
+                .fetch_all(pool.as_ref())
+                .await
+                .map_err(|e| format!("list core tables: {e}"))?;
+        for table in core_tables {
+            let listed = allowlist
+                .map(|grants| grants.iter().any(|g| g.table == table))
+                .unwrap_or(false);
+            if listed {
+                continue;
+            }
+            // Table-level privileges include DELETE/TRUNCATE, which have no
+            // column-level form; column grants are a separate layer. Check
+            // both, or a legacy table grant would slip through.
+            let reachable: bool = sqlx::query_scalar(
+                "SELECT has_table_privilege($1::name, $2::text, 'SELECT')
+                     OR has_table_privilege($1::name, $2::text, 'INSERT')
+                     OR has_table_privilege($1::name, $2::text, 'UPDATE')
+                     OR has_table_privilege($1::name, $2::text, 'DELETE')
+                     OR has_table_privilege($1::name, $2::text, 'TRUNCATE')
+                     OR has_table_privilege($1::name, $2::text, 'REFERENCES')
+                     OR has_table_privilege($1::name, $2::text, 'TRIGGER')
+                     OR has_any_column_privilege($1::name, $2::text, 'SELECT')
+                     OR has_any_column_privilege($1::name, $2::text, 'INSERT')
+                     OR has_any_column_privilege($1::name, $2::text, 'UPDATE')
+                     OR has_any_column_privilege($1::name, $2::text, 'REFERENCES')",
+            )
+            .bind(&role)
+            .bind(format!("core.{table}"))
+            .fetch_one(pool.as_ref())
+            .await
+            .map_err(|e| format!("check isolation for {role}: {e}"))?;
+            if reachable {
+                failures.push(format!(
+                    "isolation probe failed: {role} holds a privilege on core.{table}, \
+                     which is not in its allowlist"
+                ));
+            }
+        }
+
+        let secret: Option<Option<String>> =
+            sqlx::query_scalar("SELECT db_secret FROM core.plugins WHERE id = $1")
+                .bind(id)
+                .fetch_optional(pool.as_ref())
+                .await
+                .map_err(|e| format!("read {id} legacy credential: {e}"))?;
+        let from_file = crate::secrets::SecretSource::load(cfg.secrets_file.as_deref())
+            .map(|source| source.resolve(id, "db_password"))
+            .unwrap_or(None);
+        match from_file.or_else(|| secret.flatten()) {
+            None => failures.push(format!(
+                "plugin {id} has no credential: expected `db_password` in the secrets file \
+                 ({:?}), or the legacy core.plugins.db_secret from before the move",
+                crate::secrets::resolved_path(cfg.secrets_file.as_deref())
+            )),
+            Some(secret) => {
+                match crate::host::plugin_pool(&cfg.database_url, id, &secret, 1).await {
+                    Ok(plugin_pool) => {
+                        let session: Result<String, sqlx::Error> =
+                            sqlx::query_scalar("SELECT session_user")
+                                .fetch_one(plugin_pool.as_ref())
+                                .await;
+                        plugin_pool.close().await;
+                        match session {
+                            Ok(user) if user == role => {}
+                            Ok(user) => failures.push(format!(
+                                "a connection for plugin {id} is {user}, expected {role}"
+                            )),
+                            Err(e) => failures.push(format!(
+                                "cannot query as {role} (plugin {id}): {e}"
+                            )),
+                        }
+                    }
+                    Err(e) => failures.push(format!(
+                        "cannot connect as {role} (plugin {id}) with its stored credential: {e}"
+                    )),
+                }
+            }
+        }
+
+        checks.push(format!(
+            "{id}: role {role}, schema/table ownership, allowlist grants and session identity"
+        ));
+    }
+
+    if let Some(app) = app_role {
+        let attrs: Option<(bool, bool)> = sqlx::query_as(
+            "SELECT rolsuper, rolcreaterole FROM pg_roles WHERE rolname = $1",
+        )
+        .bind(app)
+        .fetch_optional(pool.as_ref())
+        .await
+        .map_err(|e| format!("read role {app}: {e}"))?;
+        match attrs {
+            None => failures.push(format!("missing application role {app}")),
+            Some((true, _)) => failures.push(format!("application role {app} is SUPERUSER")),
+            Some((_, true)) => failures.push(format!("application role {app} has CREATEROLE")),
+            Some((false, false)) => {}
+        }
+
+        let core_owner: Option<String> = sqlx::query_scalar(
+            "SELECT pg_get_userbyid(nspowner) FROM pg_namespace WHERE nspname = 'core'",
+        )
+        .fetch_optional(pool.as_ref())
+        .await
+        .map_err(|e| format!("read core schema owner: {e}"))?;
+        match core_owner {
+            None => failures.push("missing core schema".to_string()),
+            Some(owner) if owner != app => failures.push(format!(
+                "core schema is owned by {owner}, expected {app}"
+            )),
+            Some(_) => {}
+        }
+
+        let core_wrong_owners: Vec<(String, String)> = sqlx::query_as(
+            "SELECT c.relname, pg_get_userbyid(c.relowner)
+               FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
+              WHERE n.nspname = 'core'
+                AND c.relkind IN ('r', 'p', 'v', 'm', 'S', 'f')
+                AND pg_get_userbyid(c.relowner) <> $1
+              ORDER BY c.relname",
+        )
+        .bind(app)
+        .fetch_all(pool.as_ref())
+        .await
+        .map_err(|e| format!("read core object owners: {e}"))?;
+        for (object, owner) in core_wrong_owners {
+            failures.push(format!(
+                "core.{object} is owned by {owner}, expected {app}"
+            ));
+        }
+
+        for id in &ids {
+            let role = crate::schema::role_for(id);
+            // A missing role is already named above; `pg_has_role` raises on a
+            // name that does not exist, and letting that abort would replace the
+            // specific failure with a generic one.
+            let exists: bool =
+                sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = $1)")
+                    .bind(&role)
+                    .fetch_one(pool.as_ref())
+                    .await
+                    .map_err(|e| format!("check role {role}: {e}"))?;
+            if !exists {
+                continue;
+            }
+            let member: bool = sqlx::query_scalar(
+                "SELECT pg_has_role($1::name, $2::name, 'MEMBER')",
+            )
+            .bind(app)
+            .bind(&role)
+            .fetch_one(pool.as_ref())
+            .await
+            .map_err(|e| format!("check membership in {role}: {e}"))?;
+            if !member {
+                failures.push(format!("{app} is not a member of {role}"));
+            }
+        }
+        checks.push(format!(
+            "{app}: non-superuser, owns core, member of every plugin role"
+        ));
+    }
+
+    if failures.is_empty() {
+        Ok(checks)
+    } else {
+        Err(failures.join("\n"))
+    }
+}
+
+/// #152: verify the hardened state of finance's record objects — they are not
+/// owned by the plugin role, the plugin can still write them (INSERT/SELECT) and
+/// cannot rewrite, delete or TRUNCATE them. Called only when the guard migration
+/// is recorded; an older bundle is checked in its provisioned state and the
+/// server hardens it after applying the migration.
+async fn check_protected_records(
+    pool: &sqlx::PgPool,
+    role: &str,
+    failures: &mut Vec<String>,
+) -> Result<(), String> {
+    for table in crate::schema::PROTECTED_RECORD_TABLES {
+        let qualified = format!("finance.{table}");
+        let exists: Option<String> = sqlx::query_scalar("SELECT to_regclass($1)::text")
+            .bind(&qualified)
+            .fetch_one(pool)
+            .await
+            .map_err(|e| format!("read record table {qualified}: {e}"))?;
+        if exists.is_none() {
+            failures.push(format!("missing record table {qualified}"));
+            continue;
+        }
+        let owner: Option<String> = sqlx::query_scalar(
+            "SELECT pg_get_userbyid(c.relowner)
+               FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
+              WHERE n.nspname = 'finance' AND c.relname = $1",
+        )
+        .bind(table)
+        .fetch_optional(pool)
+        .await
+        .map_err(|e| format!("read owner of {qualified}: {e}"))?;
+        if owner.as_deref() == Some(role) {
+            failures.push(format!(
+                "record table {qualified} is owned by the plugin role {role}; it can disable the immutability trigger"
+            ));
+        }
+        for privilege in ["SELECT", "INSERT"] {
+            let held: bool = sqlx::query_scalar(
+                "SELECT has_table_privilege($1::name, $2::text, $3::text)",
+            )
+            .bind(role)
+            .bind(&qualified)
+            .bind(privilege)
+            .fetch_one(pool)
+            .await
+            .map_err(|e| format!("check {privilege} on {qualified}: {e}"))?;
+            if !held {
+                failures.push(format!("role {role} is missing {privilege} on {qualified}"));
+            }
+        }
+        for privilege in ["UPDATE", "DELETE", "TRUNCATE"] {
+            let held: bool = sqlx::query_scalar(
+                "SELECT has_table_privilege($1::name, $2::text, $3::text)",
+            )
+            .bind(role)
+            .bind(&qualified)
+            .bind(privilege)
+            .fetch_one(pool)
+            .await
+            .map_err(|e| format!("check {privilege} on {qualified}: {e}"))?;
+            if held {
+                failures.push(format!(
+                    "role {role} still holds {privilege} on record table {qualified}; the plugin can rewrite records"
+                ));
+            }
+        }
+    }
+
+    for sequence in crate::schema::PROTECTED_RECORD_SEQUENCES {
+        let qualified = format!("finance.{sequence}");
+        let exists: Option<String> = sqlx::query_scalar("SELECT to_regclass($1)::text")
+            .bind(&qualified)
+            .fetch_one(pool)
+            .await
+            .map_err(|e| format!("read record sequence {qualified}: {e}"))?;
+        if exists.is_none() {
+            failures.push(format!("missing record sequence {qualified}"));
+            continue;
+        }
+        let owner: Option<String> = sqlx::query_scalar(
+            "SELECT pg_get_userbyid(c.relowner)
+               FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
+              WHERE n.nspname = 'finance' AND c.relname = $1",
+        )
+        .bind(sequence)
+        .fetch_optional(pool)
+        .await
+        .map_err(|e| format!("read owner of {qualified}: {e}"))?;
+        if owner.as_deref() == Some(role) {
+            failures.push(format!(
+                "record sequence {qualified} is owned by the plugin role {role}"
+            ));
+        }
+        let usage: bool = sqlx::query_scalar(
+            "SELECT has_sequence_privilege($1::name, $2::text, 'USAGE')",
+        )
+        .bind(role)
+        .bind(&qualified)
+        .fetch_one(pool)
+        .await
+        .map_err(|e| format!("check USAGE on {qualified}: {e}"))?;
+        if !usage {
+            failures.push(format!("role {role} is missing USAGE on {qualified}"));
+        }
+        let update: bool = sqlx::query_scalar(
+            "SELECT has_sequence_privilege($1::name, $2::text, 'UPDATE')",
+        )
+        .bind(role)
+        .bind(&qualified)
+        .fetch_one(pool)
+        .await
+        .map_err(|e| format!("check UPDATE on {qualified}: {e}"))?;
+        if update {
+            failures.push(format!(
+                "role {role} still holds UPDATE on record sequence {qualified}"
+            ));
+        }
+    }
+
+    for function in crate::schema::PROTECTED_RECORD_FUNCTIONS {
+        let owner: Option<String> = sqlx::query_scalar(
+            "SELECT pg_get_userbyid(p.proowner)
+               FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace
+              WHERE n.nspname = 'finance' AND p.proname = $1 AND p.pronargs = 0",
+        )
+        .bind(function)
+        .fetch_optional(pool)
+        .await
+        .map_err(|e| format!("read owner of finance.{function}(): {e}"))?;
+        match owner {
+            None => failures.push(format!("missing record guard function finance.{function}()")),
+            Some(owner) if owner == role => failures.push(format!(
+                "record guard function finance.{function}() is owned by the plugin role {role}; it can be replaced"
+            )),
+            Some(_) => {}
+        }
+    }
+
+    Ok(())
+}
+
 /// Boot the core against a pristine test database, then probe every registered
 /// plugin route with mock permissions (dev headers = the mock identity layer):
 ///
@@ -471,8 +1032,8 @@ pub async fn run_test_plugin(cfg: &Config) -> Result<Vec<Probe>, String> {
     cfg.bind = "127.0.0.1:0".parse().expect("ephemeral");
     cfg.rate.max_requests = 0; // probes would trip the limiter otherwise
     cfg.allow_dev_headers = true; // mock permissions
-    // The harness runs against a throwaway `_test` database, usually as a
-    // superuser; the refusal is about a real deployment connection.
+                                  // The harness runs against a throwaway `_test` database, usually as a
+                                  // superuser; the refusal is about a real deployment connection.
     cfg.allow_superuser = true;
     cfg.log_filter = "warn".into();
 
@@ -491,12 +1052,19 @@ pub async fn run_test_plugin(cfg: &Config) -> Result<Vec<Probe>, String> {
     let base = format!("http://{addr}");
 
     let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
+    let header_timeout = std::time::Duration::from_secs(cfg.http.header_timeout_secs);
+    let max_connections = cfg.http.max_connections;
     let server = tokio::spawn(async move {
-        axum::serve(listener, app)
-            .with_graceful_shutdown(async {
+        crate::serve::serve(
+            listener,
+            app,
+            async {
                 let _ = shutdown_rx.await;
-            })
-            .await
+            },
+            header_timeout,
+            max_connections,
+        )
+        .await
     });
 
     // Give the listener a beat, then read the live route table.
@@ -507,7 +1075,11 @@ pub async fn run_test_plugin(cfg: &Config) -> Result<Vec<Probe>, String> {
 
     let mut probes = Vec::new();
 
-    let health = client.get(format!("{base}/")).send().await.map_err(|e| e.to_string())?;
+    let health = client
+        .get(format!("{base}/"))
+        .send()
+        .await
+        .map_err(|e| e.to_string())?;
     probes.push(Probe {
         name: "core health".into(),
         status: health.status().as_u16(),
@@ -700,11 +1272,19 @@ pub struct ValidationCheck {
 }
 
 fn ok_check(name: &str, detail: &str) -> ValidationCheck {
-    ValidationCheck { name: name.into(), ok: true, detail: detail.into() }
+    ValidationCheck {
+        name: name.into(),
+        ok: true,
+        detail: detail.into(),
+    }
 }
 
 fn fail_check(name: &str, detail: &str) -> ValidationCheck {
-    ValidationCheck { name: name.into(), ok: false, detail: detail.into() }
+    ValidationCheck {
+        name: name.into(),
+        ok: false,
+        detail: detail.into(),
+    }
 }
 
 /// Validate a compiled plugin `.so` without a database or a server: verify the
@@ -735,15 +1315,13 @@ pub async fn validate_plugin(so_path: &Path) -> Result<Vec<ValidationCheck>, Str
 
     // 2. Construct the plugin (same symbol the core resolves).
     let mut plugin: Box<dyn adjutant_sdk::AdjutantPlugin> = {
-        let factory = unsafe {
-            lib.get::<adjutant_sdk::PluginFactory>(adjutant_sdk::ENTRY_SYMBOL)
-        }
-        .map_err(|e| {
-            format!(
-                "missing `{}` symbol: {e}",
-                String::from_utf8_lossy(adjutant_sdk::ENTRY_SYMBOL)
-            )
-        })?;
+        let factory = unsafe { lib.get::<adjutant_sdk::PluginFactory>(adjutant_sdk::ENTRY_SYMBOL) }
+            .map_err(|e| {
+                format!(
+                    "missing `{}` symbol: {e}",
+                    String::from_utf8_lossy(adjutant_sdk::ENTRY_SYMBOL)
+                )
+            })?;
         unsafe { Box::from_raw(factory()) }
     };
     let id = plugin.id().to_string();
@@ -763,11 +1341,17 @@ pub async fn validate_plugin(so_path: &Path) -> Result<Vec<ValidationCheck>, Str
     }
 
     let granted = plugin.permissions_granted();
-    checks.push(ok_check("permissions", &format!("{} declared", granted.len())));
+    checks.push(ok_check(
+        "permissions",
+        &format!("{} declared", granted.len()),
+    ));
 
     let migrations = plugin.migrations();
     match crate::plugin_runtime::validate_migrations(&id, &migrations) {
-        Ok(()) => checks.push(ok_check("migrations", &format!("{} declared", migrations.len()))),
+        Ok(()) => checks.push(ok_check(
+            "migrations",
+            &format!("{} declared", migrations.len()),
+        )),
         Err(e) => checks.push(fail_check("migrations", &e.to_string())),
     }
 
@@ -783,12 +1367,142 @@ pub async fn validate_plugin(so_path: &Path) -> Result<Vec<ValidationCheck>, Str
 }
 
 // ---------------------------------------------------------------------------
+// grant-role
+// ---------------------------------------------------------------------------
+
+/// `adjutant grant-role <username> <role>` — the operator's recovery hatch (#147).
+///
+/// It exists because the last-admin refusal and an unreachable API have the same
+/// consequence: nobody can grant a role through HTTP. This path talks to the
+/// database directly, so it works while the server is down, while the only admin
+/// is locked out, and while `POST /api/auth/register` is closed.
+///
+/// It refuses an unknown user or role by name rather than letting a foreign-key
+/// violation say it, and it says whether the grant was new — an operator who
+/// runs it twice should not have to guess.
+pub async fn grant_role(cfg: &Config, username: &str, role: &str) -> Result<String, String> {
+    let pool = crate::db::connect_and_migrate(cfg)
+        .await
+        .map_err(|e| format!("connect: {e}"))?;
+
+    let user_id: Option<uuid::Uuid> =
+        sqlx::query_scalar("SELECT id FROM core.users WHERE lower(username) = lower($1)")
+            .bind(username)
+            .fetch_optional(pool.as_ref())
+            .await
+            .map_err(|e| e.to_string())?;
+    let Some(user_id) = user_id else {
+        return Err(format!("no user named {username:?}"));
+    };
+
+    let known: Vec<String> = sqlx::query_scalar("SELECT id FROM core.roles ORDER BY id")
+        .fetch_all(pool.as_ref())
+        .await
+        .map_err(|e| e.to_string())?;
+    if !known.iter().any(|k| k == role) {
+        return Err(format!(
+            "no role named {role:?}; known roles: {}",
+            known.join(", ")
+        ));
+    }
+
+    let inserted = sqlx::query(
+        "INSERT INTO core.user_roles (user_id, role_id) VALUES ($1, $2) \
+         ON CONFLICT DO NOTHING",
+    )
+    .bind(user_id)
+    .bind(role)
+    .execute(pool.as_ref())
+    .await
+    .map_err(|e| e.to_string())?;
+
+    Ok(if inserted.rows_affected() > 0 {
+        format!("granted {role} to {username}")
+    } else {
+        format!("{username} already holds {role}")
+    })
+}
+
+// ---------------------------------------------------------------------------
+// audit-verify
+// ---------------------------------------------------------------------------
+
+/// Verify both audit layers without the HTTP surface. Returns `(good, report)`
+/// where `report` is the same JSON object `GET /api/audit/verify` returns,
+/// followed by one plain-text line when keyed rows without a `keyed_hash` exist.
+///
+/// `good` is the unkeyed chain **and** the keyed layer: when a key is
+/// configured, a bad `keyed_hash` fails the command even though the unkeyed
+/// chain (which the database can recompute) still verifies. Without a key the
+/// command succeeds on the unkeyed chain and prints `keyed: false`.
+///
+/// Unkeyed rows on a keyed deployment do not change `good`: they are legitimate
+/// pre-key history, but they can also come from a writer outside the keyed
+/// path, so the plain-text line makes them visible without failing the command.
+pub async fn audit_verify(cfg: &Config) -> Result<(bool, String), String> {
+    // Connect only: verification is read-only and must not require (or perform)
+    // migrations. A database that has not applied migration 17 has no
+    // core.audit_canonical()/keyed column, and the error says so.
+    let pool = crate::db::connect(cfg)
+        .await
+        .map_err(|e| format!("connect: {e}"))?;
+    let report = crate::audit::verify(pool.as_ref(), cfg.audit_key.as_ref())
+        .await
+        .map_err(|e| format!("verify: {e}"))?;
+    let good = report.ok && report.keyed_first_bad.is_none();
+    let mut json = serde_json::to_string_pretty(&report).map_err(|e| e.to_string())?;
+    if let Some(note) = unkeyed_rows_note(&report) {
+        json.push('\n');
+        json.push_str(&note);
+    }
+    Ok((good, json))
+}
+
+/// Finding 4: on a keyed deployment, NULL `keyed_hash` rows are either history
+/// written before the key existed or a writer that bypassed the keyed path.
+/// Say so on one line, but never fail the command for it.
+fn unkeyed_rows_note(report: &crate::audit::AuditReport) -> Option<String> {
+    if !report.keyed || report.keyed_rows_unkeyed == 0 {
+        return None;
+    }
+    Some(format!(
+        "warning: {} audit row(s) have no keyed_hash: either pre-key history or writes from a writer outside the keyed chain.",
+        report.keyed_rows_unkeyed
+    ))
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn audit_report(keyed: bool, keyed_rows_unkeyed: i64) -> crate::audit::AuditReport {
+        crate::audit::AuditReport {
+            ok: true,
+            first_bad: None,
+            rows_checked: 2,
+            keyed,
+            keyed_first_bad: None,
+            keyed_rows_checked: 0,
+            keyed_rows_unkeyed,
+        }
+    }
+
+    /// Finding 4: unkeyed rows on a keyed deployment produce one visible line,
+    /// and no line when there is no key or nothing is unkeyed.
+    #[test]
+    fn unkeyed_rows_on_a_keyed_deployment_get_one_warning_line() {
+        let note = unkeyed_rows_note(&audit_report(true, 3)).expect("a note");
+        assert!(note.contains('3'), "the count is stated: {note}");
+        assert!(note.contains("pre-key"), "names pre-key history: {note}");
+        assert!(!note.contains('\n'), "one line only: {note}");
+
+        assert!(unkeyed_rows_note(&audit_report(true, 0)).is_none());
+        assert!(unkeyed_rows_note(&audit_report(false, 3)).is_none());
+    }
 
     #[test]
     fn plugin_name_validation() {
@@ -798,7 +1512,10 @@ mod tests {
         assert!(validate_plugin_name("Camel").is_err());
         assert!(validate_plugin_name("9lives").is_err());
         assert!(validate_plugin_name("drop table").is_err());
-        assert!(validate_plugin_name("auth").is_err(), "reserved names rejected");
+        assert!(
+            validate_plugin_name("auth").is_err(),
+            "reserved names rejected"
+        );
         assert!(validate_plugin_name("plugins").is_err());
         assert!(validate_plugin_name(&"x".repeat(40)).is_err());
     }
@@ -812,7 +1529,8 @@ mod tests {
     }
 
     #[test]
-    fn struct_names_camel_case() {        assert_eq!(struct_name_for("gear_locker"), "GearLocker");
+    fn struct_names_camel_case() {
+        assert_eq!(struct_name_for("gear_locker"), "GearLocker");
         assert_eq!(struct_name_for("scouting"), "Scouting");
         assert_eq!(struct_name_for("a_b_c"), "ABC");
     }
@@ -852,7 +1570,11 @@ mod tests {
 
         let ws = std::fs::read_to_string(tmp.join("Cargo.toml")).unwrap();
         assert!(ws.contains("\"plugins/gear_locker\","));
-        assert_eq!(ws.matches("\"plugins/gear_locker\",").count(), 1, "idempotent");
+        assert_eq!(
+            ws.matches("\"plugins/gear_locker\",").count(),
+            1,
+            "idempotent"
+        );
 
         // duplicate refused; reserved refused
         assert!(scaffold_plugin(&tmp, "gear_locker").is_err());

@@ -80,10 +80,21 @@ export DOMAIN=adjutant.example.org      # the certificate is for this name
 export ACME_EMAIL=you@example.org
 export POSTGRES_PASSWORD="$(openssl rand -hex 24)"
 export ADJUTANT_APP_PASSWORD="$(openssl rand -hex 24)"
+# The age public key backup bundles are encrypted to. There is no default: a
+# backup without it fails closed rather than writing every plugin password in
+# clear text. Keep the private identity off this host (see docs/deployment.md
+# § Backup and restore).
+export ADJUTANT_BACKUP_AGE_RECIPIENT="age1..."
 # The edge network's third octet (default 172.31.7). The subnet, the proxy's
 # static address and the value the app trusts are all derived from it, so this is
 # the one thing a second stack on the same host changes.
 export ADJUTANT_EDGE_PREFIX=172.31.7
+
+# The plugin role passwords are written to ../secrets (the repo root's
+# `secrets/`, mounted into the container). The image runs as 10001:10001, so the
+# host directory must be writable by that uid — the same one-time chown any bind
+# mount needs for a non-root container user.
+mkdir -p secrets && chmod 700 secrets && sudo chown -R 10001:10001 secrets
 
 docker compose -f deploy/compose.proxy.yml up -d --build
 
@@ -110,6 +121,12 @@ for the **public** path — a certificate for a real name — but not for
 network and therefore needs neither a domain nor TLS. For a certificate without a
 domain, see `docs/deployment.md` § Putting it behind TLS — that question has three
 answers and this directory only assumes the first.
+
+CI runs the same script in the `deploy` job (`.github/workflows/ci.yml`): it
+builds the image, starts `compose.proxy.yml`, bootstraps the runtime role with the
+command above, waits for the image's own healthcheck to report `healthy`, runs the
+three proofs, and tears the stack down. The job is what keeps this file from being
+a proof only a person remembers to run.
 
 ## Status — read this before trusting it
 

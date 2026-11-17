@@ -2,7 +2,8 @@
 
 # --- build ------------------------------------------------------------------
 # Pinned to the MSRV so the container builds with a known-good toolchain.
-FROM rust:1.96-bookworm AS builder
+# rust:1.96-bookworm (linux/amd64)
+FROM rust@sha256:d99f7b31f49909348dc59b51f3c95d1efded1701ffb222f095aaab7de3c4abd8 AS builder
 WORKDIR /src
 COPY . .
 # Parallel rustc jobs during the image build. Defaulted low on purpose: a
@@ -16,7 +17,8 @@ RUN rustup target add wasm32-wasip1 \
     && cargo build --manifest-path wasm/Cargo.toml --release --target wasm32-wasip1
 
 # --- runtime ----------------------------------------------------------------
-FROM debian:bookworm-slim AS runtime
+# debian:bookworm-slim (linux/amd64)
+FROM debian@sha256:a3bba7dc7dbcc1f37c2856c51fc9a7fac96608f50cb87b1b4e4d8b8c85ae988e AS runtime
 # `pg_dump` for the in-app backup button, from PGDG rather than bookworm's own
 # repo. That is not a preference: bookworm ships postgresql-client 15, the deploy
 # stack runs postgres:18, and `pg_dump` refuses to dump a *newer* server. A
@@ -24,6 +26,13 @@ FROM debian:bookworm-slim AS runtime
 # would look like the button doing nothing at all — the least diagnosable shape a
 # failure can take. Match the client to the server, and if the deployment's
 # Postgres ever moves, this line moves with it.
+#
+# `age` for the in-app backup button's other half: a `pg_dump -Fc` contains every
+# plugin role's password in clear text, and compression is not encryption. The
+# server encrypts each bundle to ADJUTANT_BACKUP_AGE_RECIPIENT before it reaches
+# the backups volume. Only the public key is here — the private key must not live
+# on the server, which is the whole point. `age` is in bookworm, so this is a
+# package, not a vendored binary.
 RUN apt-get update \
     && apt-get install -y --no-install-recommends ca-certificates curl gnupg \
     && install -d /usr/share/postgresql-common/pgdg \
@@ -33,13 +42,26 @@ RUN apt-get update \
 https://apt.postgresql.org/pub/repos/apt bookworm-pgdg main" \
          > /etc/apt/sources.list.d/pgdg.list \
     && apt-get update \
-    && apt-get install -y --no-install-recommends postgresql-client-18 \
-    && apt-get purge -y --auto-remove curl gnupg \
+    && apt-get install -y --no-install-recommends postgresql-client-18 age \
+    && apt-get purge -y --auto-remove gnupg \
     && rm -rf /var/lib/apt/lists/*
+# `curl` is deliberately kept: the HEALTHCHECK below is an HTTP probe of the
+# server, and the image has no other HTTP client. It is still an unprivileged
+# user with no capabilities (see USER/cap_drop), so this is the one binary the
+# healthcheck needs rather than a build-time convenience left behind by accident.
 WORKDIR /app
 
 COPY --from=builder /src/target/release/adjutant /usr/local/bin/adjutant
-RUN mkdir -p /app/plugins /app/backups
+# The runtime identity is fixed and documented rather than allocated at build
+# time: a volume created by this image inherits these ids, and an operator
+# upgrading an existing backup volume can name the same pair when chowning it.
+# 10001 is above Debian's system range (100-999), so the base image will not
+# assign it to a package account on a later rebuild.
+RUN groupadd --gid 10001 adjutant \
+    && useradd --uid 10001 --gid adjutant --no-create-home --home-dir /app \
+         --shell /usr/sbin/nologin adjutant \
+    && mkdir -p /app/plugins /app/backups \
+    && chown -R adjutant:adjutant /app
 
 # Every plugin library the workspace built, by the same rule
 # `scripts/stage-plugins.py` uses: a plugin is a workspace crate that produces a
@@ -62,6 +84,38 @@ ENV ADJUTANT_PLUGIN_DIR=/app/plugins \
     ADJUTANT_BACKUP_DIR=/app/backups \
     ADJUTANT_LOG_FORMAT=json
 EXPOSE 8787
+
+# Everything above that writes happens as this user. The process never needs a
+# capability: it binds 8787 (>1024) and spawns `pg_dump`/`age` as children. The
+# compose files assert that too (`cap_drop: [ALL]`, `no-new-privileges`), so a
+# future image change that wants root has to say so rather than inherit it.
+USER adjutant:adjutant
+
+# Probe `/`, the core health route: it needs no plugin, no session and no
+# database read, so it answers exactly while the process is able to serve. It is
+# also one of the two open probes named in deploy/traefik/adjutant.yml.
+#
+# The interval is comfortably wider than the rate limiter's window in every
+# shipped configuration (deploy/verify.sh deliberately narrows it to 1 request
+# per 5s): a probe that exhausts its own budget would report 429 and teach
+# operators to ignore a red light.
+#
+# `start-period` is long on purpose. The listener is bound only after core and
+# plugin migrations finish, and migration 17 rewrites the whole audit chain, so
+# a large installation can legitimately serve nothing for minutes. Failures
+# inside this window do not count toward `retries`.
+#
+# `NotBootstrapped` is deliberately RED. The process refuses to boot before
+# `bootstrap-isolation` and exits 1, so the port is never bound and the probe
+# cannot succeed; the container's health state is `unhealthy` instead of the old
+# image's bare "Up" with no health state at all. (A crash-loop that exits in
+# under a second makes compose print `Restarting` rather than `Up (unhealthy)`,
+# but it is never healthy.) That is the defect this healthcheck exists to
+# expose, not a false alarm: pre-bootstrap is a required setup step that has not
+# been run, not a serving state. A green light there is precisely what hid the
+# crash-loop.
+HEALTHCHECK --interval=15s --timeout=5s --start-period=5m --retries=3 \
+  CMD curl -fsS --max-time 4 http://127.0.0.1:8787/ || exit 1
 
 ENTRYPOINT ["adjutant"]
 CMD ["serve"]

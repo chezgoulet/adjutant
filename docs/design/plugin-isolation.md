@@ -79,7 +79,11 @@ problem again, and it breaks the plugin API (arbitrary parameterised SQL is the 
 - One schema per plugin, **owned by that role**: `CREATE SCHEMA "<id>" AUTHORIZATION
   adjutant_plugin_<id>`.
 - No implicit `core.*` access. The explicit allowlist in `schema.rs` stays, but it now grants
-  to a role that cannot shed it.
+  to a role that cannot shed it. Where a table carries sensitive columns the allowlist names
+  columns rather than the whole table (`core.users` is column-granted: `membership` can read
+  roster identity but not `password_hash`). Bootstrap revokes the role's existing table- and
+  column-level privileges on `core.*` before re-granting, so a grant narrowed in a later
+  release also disappears on an existing installation.
 - The plugin role is a member of nothing, and nothing is a member of it except the role that
   needs to administer it at bootstrap.
 

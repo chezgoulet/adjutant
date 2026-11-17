@@ -126,6 +126,35 @@ static SETUP: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 /// (they assert on its global contents, so they must not interleave).
 static HIERARCHY: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
+/// Serializes the audit probes: they truncate `core.audit_log`, and the keyed
+/// one installs the process-global chain key.
+static AUDIT: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+/// Serializes the event-replay probes: they truncate `core.events` and assert on
+/// the ids a concurrent insert receives.
+static EVENTS: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+/// Empty `core.user_roles` without tripping the last-admin guard (#189).
+///
+/// `probe_scope_id_is_opaque_text_and_round_trips` must start from an empty
+/// table, and ends by storing a troop-scoped `chief` grant. The next run's
+/// `DELETE FROM core.user_roles` then fails: the final row it removes is the
+/// only admin, so `user_roles_keep_an_admin` refuses it — correctly, since that
+/// is the write the guard exists to stop. Every DELETE ordering leaves *some*
+/// admin row for last, so the fixture cannot delete its way back to empty.
+///
+/// TRUNCATE does not fire the row-level trigger. This is an admin-only fixture
+/// reset on a throwaway `_test` database, not a production write path; the
+/// guard still refuses every DELETE the suite (or an operator) would use
+/// against real data. Reset before and after the probe so a run that fails
+/// midway cannot poison the next one.
+async fn reset_user_roles(pool: &sqlx::PgPool) {
+    sqlx::query("TRUNCATE core.user_roles")
+        .execute(pool)
+        .await
+        .expect("reset core.user_roles");
+}
+
 /// Migrate `core` on the test database and bootstrap a plugin fixture role/schema
 /// for each id, returning `(admin_pool, plugin_pools)`. Mirrors a real
 /// deployment's first `bootstrap-isolation` run.
@@ -245,7 +274,10 @@ async fn probe_reset_role_is_inert_and_set_role_is_refused() {
         .await
         .expect("RESET ROLE is allowed but must be inert");
     let rows = plugin
-        .query("SELECT session_user AS u, current_user AS c".to_string(), vec![])
+        .query(
+            "SELECT session_user AS u, current_user AS c".to_string(),
+            vec![],
+        )
         .await
         .expect("session_user query");
     assert_eq!(rows[0]["u"], serde_json::json!(expected));
@@ -344,6 +376,330 @@ async fn probe_membership_role_cannot_write_user_roles() {
     );
 }
 
+/// #148: `membership` maps a session to a roster entry; the table-level SELECT
+/// it used to hold also exposed every argon2 password hash. Column-level grants
+/// make the hash unreachable while the roster columns keep working.
+#[tokio::test]
+#[ignore = "DB-gated: needs ADJUTANT_TEST_DATABASE_URL + CREATEROLE; run with `-- --ignored`"]
+async fn probe_membership_reads_roster_columns_but_not_password_hash() {
+    let (admin, pools) = setup(&["membership"]).await;
+    let role = schema::role_for("membership");
+    let membership = host::CoreDb::new(pools[0].clone());
+
+    // The grant is on columns, not the whole table.
+    let table_select: bool =
+        sqlx::query_scalar("SELECT has_table_privilege($1::name, 'core.users', 'SELECT')")
+            .bind(&role)
+            .fetch_one(admin.as_ref())
+            .await
+            .expect("has_table_privilege");
+    assert!(
+        !table_select,
+        "membership must not hold table-level SELECT on core.users (#148)"
+    );
+    let hash_readable: bool = sqlx::query_scalar(
+        "SELECT has_column_privilege($1::name, 'core.users', 'password_hash', 'SELECT')",
+    )
+    .bind(&role)
+    .fetch_one(admin.as_ref())
+    .await
+    .expect("has_column_privilege");
+    assert!(
+        !hash_readable,
+        "membership must not be able to read core.users.password_hash (#148)"
+    );
+
+    // The roster mapping still works: this is the query shape membership needs.
+    membership
+        .query(
+            "SELECT username, display_name FROM core.users".to_string(),
+            vec![],
+        )
+        .await
+        .expect("membership reads the roster identity columns");
+
+    // The negative probe. Assert *why* it fails: a privilege denial on the
+    // users table, after the catalog probes above showed the relation exists
+    // and only the column privilege is missing.
+    let err = membership
+        .query("SELECT password_hash FROM core.users".to_string(), vec![])
+        .await
+        .expect_err("membership must not read password hashes")
+        .to_string();
+    assert!(
+        err.contains("permission denied") && err.contains("users"),
+        "expected a column-privilege error on core.users, got: {err}"
+    );
+
+    // `SELECT *` is the shape a table-level grant used to permit. Under column
+    // grants it must fail even though the roster columns are readable: the role
+    // is not allowed to project the columns it was never granted.
+    let err = membership
+        .query("SELECT * FROM core.users".to_string(), vec![])
+        .await
+        .expect_err("membership must not be able to SELECT * from core.users")
+        .to_string();
+    assert!(
+        err.contains("permission denied") && err.contains("users"),
+        "expected a column-privilege error for SELECT * on core.users, got: {err}"
+    );
+}
+
+/// #148 upgrade path: an install provisioned by the old code holds table-level
+/// `SELECT` on `core.users`, and `GRANT SELECT (cols)` does not remove it. This
+/// reproduces the old grant, shows the hash is exposed under it, re-runs the
+/// fixed bootstrap on the same database, and shows the exposure is closed.
+#[tokio::test]
+#[ignore = "DB-gated: needs ADJUTANT_TEST_DATABASE_URL + CREATEROLE; run with `-- --ignored`"]
+async fn probe_rebootstrap_revokes_the_legacy_table_grant() {
+    let (admin, pools) = setup(&["membership"]).await;
+    let role = schema::role_for("membership");
+    let legacy = host::CoreDb::new(pools[0].clone());
+
+    // Reproduce what the pre-#148 bootstrap left behind.
+    sqlx::query(&format!(
+        "GRANT SELECT, INSERT, UPDATE ON core.users TO \"{role}\""
+    ))
+    .execute(admin.as_ref())
+    .await
+    .expect("install the legacy table-level grant");
+    let exposed: bool =
+        sqlx::query_scalar("SELECT has_table_privilege($1::name, 'core.users', 'SELECT')")
+            .bind(&role)
+            .fetch_one(admin.as_ref())
+            .await
+            .expect("has_table_privilege");
+    assert!(
+        exposed,
+        "the legacy grant must be reproduced for this test to prove anything"
+    );
+    println!("[#148] legacy grant: has_table_privilege(SELECT)={exposed}");
+    legacy
+        .query("SELECT password_hash FROM core.users".to_string(), vec![])
+        .await
+        .expect("the legacy table grant exposes password_hash — this is the defect");
+
+    // Re-run the fixed bootstrap against the same database (fresh pool: the
+    // run rotates the generated password).
+    let secret = schema::bootstrap_role(admin.as_ref(), "membership", None, false)
+        .await
+        .expect("re-bootstrap against the legacy database");
+    let membership = host::CoreDb::new(
+        host::plugin_pool(&base_url(), "membership", &secret, 2)
+            .await
+            .expect("plugin pool after re-bootstrap"),
+    );
+
+    let table_select: bool =
+        sqlx::query_scalar("SELECT has_table_privilege($1::name, 'core.users', 'SELECT')")
+            .bind(&role)
+            .fetch_one(admin.as_ref())
+            .await
+            .expect("has_table_privilege");
+    assert!(
+        !table_select,
+        "bootstrap must revoke the legacy table-level grant, not merely add columns"
+    );
+    let hash_readable: bool = sqlx::query_scalar(
+        "SELECT has_column_privilege($1::name, 'core.users', 'password_hash', 'SELECT')",
+    )
+    .bind(&role)
+    .fetch_one(admin.as_ref())
+    .await
+    .expect("has_column_privilege");
+    assert!(
+        !hash_readable,
+        "the hash column must be unreadable after the upgrade re-run"
+    );
+    let username_readable: bool = sqlx::query_scalar(
+        "SELECT has_column_privilege($1::name, 'core.users', 'username', 'SELECT')",
+    )
+    .bind(&role)
+    .fetch_one(admin.as_ref())
+    .await
+    .expect("has_column_privilege");
+    assert!(
+        username_readable,
+        "the allowlisted columns must be re-granted after the revoke"
+    );
+    println!(
+        "[#148] after re-bootstrap: has_table_privilege(SELECT)={table_select}, \
+         has_column_privilege(password_hash, SELECT)={hash_readable}, \
+         has_column_privilege(username, SELECT)={username_readable}"
+    );
+
+    let err = membership
+        .query("SELECT password_hash FROM core.users".to_string(), vec![])
+        .await
+        .expect_err("the fixed bootstrap must close the hash exposure")
+        .to_string();
+    assert!(
+        err.contains("permission denied") && err.contains("users"),
+        "expected a column-privilege error on core.users, got: {err}"
+    );
+    membership
+        .query(
+            "SELECT username, display_name FROM core.users".to_string(),
+            vec![],
+        )
+        .await
+        .expect("roster columns still readable after the upgrade");
+}
+
+/// #148 + #149: auth needs the hash to verify a login and INSERT to create
+/// users. The password-change route needs UPDATE, but only on `password_hash`;
+/// a table-level UPDATE would also permit rewriting identity and status columns.
+#[tokio::test]
+#[ignore = "DB-gated: needs ADJUTANT_TEST_DATABASE_URL + CREATEROLE; run with `-- --ignored`"]
+async fn probe_auth_hash_update_is_column_narrow() {
+    let (admin, pools) = setup(&["auth"]).await;
+    let role = schema::role_for("auth");
+    let auth = host::CoreDb::new(pools[0].clone());
+    let uid = "9f000000-0000-4000-8000-000000000149";
+
+    let table_update: bool =
+        sqlx::query_scalar("SELECT has_table_privilege($1::name, 'core.users', 'UPDATE')")
+            .bind(&role)
+            .fetch_one(admin.as_ref())
+            .await
+            .expect("has_table_privilege");
+    assert!(
+        !table_update,
+        "auth must not hold a table-level UPDATE on core.users (#148)"
+    );
+    for (column, expected, why) in [
+        (
+            "password_hash",
+            true,
+            "the password-change route writes the hash",
+        ),
+        (
+            "display_name",
+            false,
+            "no auth route writes the display name",
+        ),
+        (
+            "is_active",
+            false,
+            "no auth route activates or deactivates a user",
+        ),
+    ] {
+        let granted: bool = sqlx::query_scalar(
+            "SELECT has_column_privilege($1::name, 'core.users', $2::text, 'UPDATE')",
+        )
+        .bind(&role)
+        .bind(column)
+        .fetch_one(admin.as_ref())
+        .await
+        .expect("has_column_privilege");
+        assert_eq!(granted, expected, "UPDATE on users.{column}: {why}");
+    }
+    let hash_select: bool = sqlx::query_scalar(
+        "SELECT has_column_privilege($1::name, 'core.users', 'password_hash', 'SELECT')",
+    )
+    .bind(&role)
+    .fetch_one(admin.as_ref())
+    .await
+    .expect("has_column_privilege");
+    assert!(
+        hash_select,
+        "login verifies the hash, so auth keeps column SELECT"
+    );
+    let users_table_select: bool =
+        sqlx::query_scalar("SELECT has_table_privilege($1::name, 'core.users', 'SELECT')")
+            .bind(&role)
+            .fetch_one(admin.as_ref())
+            .await
+            .expect("has_table_privilege");
+    assert!(
+        !users_table_select,
+        "auth reads named columns, never the whole of core.users (#148)"
+    );
+    // Auth reads the hash and the login columns but not `SELECT *`: it holds no
+    // grant on `avatar_url`, `created_at` or `updated_at`, so the wildcard must
+    // be refused rather than silently widening what the role may project.
+    let err = auth
+        .query("SELECT * FROM core.users".to_string(), vec![])
+        .await
+        .expect_err("auth must not be able to SELECT * from core.users")
+        .to_string();
+    assert!(
+        err.contains("permission denied") && err.contains("users"),
+        "expected a column-privilege error for SELECT * on core.users, got: {err}"
+    );
+    let username_insert: bool = sqlx::query_scalar(
+        "SELECT has_column_privilege($1::name, 'core.users', 'username', 'INSERT')",
+    )
+    .bind(&role)
+    .fetch_one(admin.as_ref())
+    .await
+    .expect("has_column_privilege");
+    assert!(
+        username_insert,
+        "user creation inserts the columns named in the allowlist"
+    );
+
+    // The positive probe: the statement the route actually runs works.
+    sqlx::query(
+        "INSERT INTO core.users (id, display_name, username) VALUES ($1::uuid, 'Probe', 'auth_probe_149') \
+         ON CONFLICT (id) DO NOTHING",
+    )
+    .bind(uid)
+    .execute(admin.as_ref())
+    .await
+    .expect("fixture user");
+    auth.execute(
+        "UPDATE core.users SET password_hash = $1 WHERE id = $2::uuid".to_string(),
+        vec![
+            SqlValue::Text("$argon2id$v=19$m=19456,t=2,p=1$c2FsdA$cmVwbGFjZWQ".into()),
+            SqlValue::Uuid(uid.into()),
+        ],
+    )
+    .await
+    .expect("auth's role can update the hash column (AUTH-3)");
+
+    // The negative probe: the same table, a column auth was not granted. Assert
+    // *why* it fails — a column privilege denial, not a missing row or table.
+    let err = auth
+        .execute(
+            "UPDATE core.users SET display_name = 'Pwned' WHERE id = $1::uuid".to_string(),
+            vec![SqlValue::Uuid(uid.into())],
+        )
+        .await
+        .expect_err("a table-level UPDATE must remain impossible")
+        .to_string();
+    assert!(
+        err.contains("permission denied") && err.contains("display_name"),
+        "expected a column-privilege error on users.display_name, got: {err}"
+    );
+
+    // Sessions are revoked by writing `revoked_at`; auth's grant is whole-table
+    // because it already held whole-table SELECT/INSERT/DELETE there.
+    let sid = "9f000000-0000-4000-8000-00000000014a";
+    sqlx::query(
+        "INSERT INTO core.sessions (id, user_id, token_hash, expires_at) \
+         VALUES ($1::uuid, $2::uuid, 'probe-hash', now() + interval '1 hour') \
+         ON CONFLICT (id) DO NOTHING",
+    )
+    .bind(sid)
+    .bind(uid)
+    .execute(admin.as_ref())
+    .await
+    .expect("fixture session");
+    auth.execute(
+        "UPDATE core.sessions SET revoked_at = now() WHERE id = $1::uuid".to_string(),
+        vec![SqlValue::Uuid(sid.into())],
+    )
+    .await
+    .expect("auth's role can revoke a session");
+
+    sqlx::query("DELETE FROM core.users WHERE id = $1::uuid")
+        .bind(uid)
+        .execute(admin.as_ref())
+        .await
+        .expect("cleanup");
+}
+
 /// #33: `scope_id` is opaque TEXT owned by the plugin, `NULL` means troop-wide,
 /// and the invalid combinations are unstorable. A lodge-scoped grant with a
 /// bigint-looking id round-trips through storage and is honoured by
@@ -354,12 +710,14 @@ async fn probe_scope_id_is_opaque_text_and_round_trips() {
     let (admin, _pools) = setup(&[]).await;
     let uid = "11111111-1111-1111-1111-111111111111";
 
-    sqlx::query("DELETE FROM core.user_roles").execute(admin.as_ref()).await.expect("clear");
-    sqlx::query("INSERT INTO core.users (id, display_name) VALUES ($1::uuid, 'Bea') ON CONFLICT DO NOTHING")
-        .bind(uid)
-        .execute(admin.as_ref())
-        .await
-        .expect("user");
+    reset_user_roles(admin.as_ref()).await;
+    sqlx::query(
+        "INSERT INTO core.users (id, display_name) VALUES ($1::uuid, 'Bea') ON CONFLICT DO NOTHING",
+    )
+    .bind(uid)
+    .execute(admin.as_ref())
+    .await
+    .expect("user");
     // The role must hold a permission for `has_in_scope` to allow.
     sqlx::query(
         "INSERT INTO core.role_permissions (role_id, permission_id) VALUES ('scout', 'core:admin') \
@@ -388,24 +746,37 @@ async fn probe_scope_id_is_opaque_text_and_round_trips() {
     .expect("read the row back");
     assert_eq!(role_id, "scout");
     assert_eq!(scope_type, "lodge");
-    assert_eq!(scope_id.as_deref(), Some("1"), "the opaque id round-trips verbatim");
+    assert_eq!(
+        scope_id.as_deref(),
+        Some("1"),
+        "the opaque id round-trips verbatim"
+    );
 
     // Build the identity the way a session would and check coverage.
     let identity = Identity::from_grants(
         uid,
-        vec![RoleGrant { role_id, scope: Scope::lodge(scope_id.expect("id")) }],
+        vec![RoleGrant {
+            role_id,
+            scope: Scope::lodge(scope_id.expect("id")),
+        }],
     );
     let perms = PermissionService::new(host::CoreDb::new(admin.clone()));
     assert!(
-        perms.has_in_scope(Some(&identity), "core:admin", &Scope::lodge("1")).await,
+        perms
+            .has_in_scope(Some(&identity), "core:admin", &Scope::lodge("1"))
+            .await,
         "a lodge-scoped grant covers its own lodge"
     );
     assert!(
-        !perms.has_in_scope(Some(&identity), "core:admin", &Scope::lodge("2")).await,
+        !perms
+            .has_in_scope(Some(&identity), "core:admin", &Scope::lodge("2"))
+            .await,
         "and not another lodge"
     );
     assert!(
-        !perms.has_in_scope(Some(&identity), "core:admin", &Scope::troop()).await,
+        !perms
+            .has_in_scope(Some(&identity), "core:admin", &Scope::troop())
+            .await,
         "a lodge grant does not cover troop"
     );
 
@@ -416,7 +787,10 @@ async fn probe_scope_id_is_opaque_text_and_round_trips() {
     .bind(uid)
     .execute(admin.as_ref())
     .await;
-    assert!(lodge_without_id.is_err(), "a non-troop scope needs a scope_id");
+    assert!(
+        lodge_without_id.is_err(),
+        "a non-troop scope needs a scope_id"
+    );
 
     let troop_with_id = sqlx::query(
         "INSERT INTO core.user_roles (user_id, role_id, scope_type, scope_id) \
@@ -425,7 +799,10 @@ async fn probe_scope_id_is_opaque_text_and_round_trips() {
     .bind(uid)
     .execute(admin.as_ref())
     .await;
-    assert!(troop_with_id.is_err(), "a troop scope must have a NULL scope_id");
+    assert!(
+        troop_with_id.is_err(),
+        "a troop scope must have a NULL scope_id"
+    );
 
     let troop_with_null = sqlx::query(
         "INSERT INTO core.user_roles (user_id, role_id, scope_type, scope_id) \
@@ -435,6 +812,84 @@ async fn probe_scope_id_is_opaque_text_and_round_trips() {
     .execute(admin.as_ref())
     .await;
     assert!(troop_with_null.is_ok(), "troop-wide is scope_id NULL");
+
+    // Leave the shared test database as we found it (#189). Removing the
+    // fixture user after the role reset keeps a rerun's `ON CONFLICT` insert
+    // honest rather than silently reusing last run's row.
+    reset_user_roles(admin.as_ref()).await;
+    sqlx::query("DELETE FROM core.users WHERE id = $1::uuid")
+        .bind(uid)
+        .execute(admin.as_ref())
+        .await
+        .expect("remove the fixture user");
+}
+
+/// #158: migration 5 aborted on a live database carrying a plausible legacy
+/// grant. Migration 1 declared `scope_id UUID NOT NULL DEFAULT zero-UUID` for
+/// every scope type, so `(scope_type='lodge', scope_id=zero-UUID)` is a row a
+/// deployed database can hold. Migration 5 nulled it and then added a CHECK
+/// requiring a non-troop row to have a non-NULL scope_id, so the transaction
+/// aborted and every boot retried and failed.
+///
+/// The row is seeded on the current (already-text) shape, then migration 5's
+/// SQL is re-run exactly as the migration runner would: the upgrade path, not a
+/// fresh install.
+#[tokio::test]
+#[ignore = "DB-gated: needs ADJUTANT_TEST_DATABASE_URL; run with `-- --ignored`"]
+async fn migration_5_keeps_a_non_troop_zero_uuid_grant() {
+    let (admin, _pools) = setup(&[]).await;
+    let uid = "33333333-3333-3333-3333-333333333333";
+    const ZERO_UUID: &str = "00000000-0000-0000-0000-000000000000";
+
+    reset_user_roles(admin.as_ref()).await;
+    sqlx::query(
+        "INSERT INTO core.users (id, display_name) VALUES ($1::uuid, 'Legacy Grant') \
+         ON CONFLICT DO NOTHING",
+    )
+    .bind(uid)
+    .execute(admin.as_ref())
+    .await
+    .expect("fixture user");
+    sqlx::query(
+        "INSERT INTO core.user_roles (user_id, role_id, scope_type, scope_id) \
+         VALUES ($1::uuid, 'scout', 'lodge', $2)",
+    )
+    .bind(uid)
+    .bind(ZERO_UUID)
+    .execute(admin.as_ref())
+    .await
+    .expect("the legacy non-troop zero-UUID grant is storable");
+
+    let sql = db::CORE_MIGRATIONS
+        .iter()
+        .find(|(version, _, _)| *version == 5)
+        .map(|(_, _, sql)| *sql)
+        .expect("migration 5 is present");
+    sqlx::raw_sql(&format!("BEGIN; {sql}; COMMIT;"))
+        .execute(admin.as_ref())
+        .await
+        .expect("migration 5 applies over a non-troop zero-UUID row");
+
+    let (scope_type, scope_id): (String, Option<String>) = sqlx::query_as(
+        "SELECT scope_type, scope_id FROM core.user_roles WHERE user_id = $1::uuid",
+    )
+    .bind(uid)
+    .fetch_one(admin.as_ref())
+    .await
+    .expect("the grant survived the migration");
+    assert_eq!(scope_type, "lodge");
+    assert_eq!(
+        scope_id.as_deref(),
+        Some(ZERO_UUID),
+        "a non-troop zero UUID is a valid opaque id and must not be nulled"
+    );
+
+    reset_user_roles(admin.as_ref()).await;
+    sqlx::query("DELETE FROM core.users WHERE id = $1::uuid")
+        .bind(uid)
+        .execute(admin.as_ref())
+        .await
+        .expect("remove the fixture user");
 }
 
 /// Hierarchical coverage: with a declared lodge→patrol edge, a lodge-scoped
@@ -446,7 +901,10 @@ async fn probe_scope_id_is_opaque_text_and_round_trips() {
 async fn probe_scope_hierarchy_lodge_covers_its_patrols() {
     let _h = HIERARCHY.lock().await;
     let (admin, _pools) = setup(&[]).await;
-    sqlx::query("DELETE FROM core.scope_hierarchy").execute(admin.as_ref()).await.expect("clear");
+    sqlx::query("DELETE FROM core.scope_hierarchy")
+        .execute(admin.as_ref())
+        .await
+        .expect("clear");
     sqlx::query(
         "INSERT INTO core.scope_hierarchy (parent_type, parent_id, child_type, child_id) \
          VALUES ('lodge', '3', 'patrol', '7')",
@@ -462,7 +920,10 @@ async fn probe_scope_hierarchy_lodge_covers_its_patrols() {
     )
     .execute(admin.as_ref())
     .await;
-    assert!(self_edge.is_err(), "a self-edge must be rejected by the CHECK");
+    assert!(
+        self_edge.is_err(),
+        "a self-edge must be rejected by the CHECK"
+    );
 
     sqlx::query(
         "INSERT INTO core.role_permissions (role_id, permission_id) \
@@ -472,30 +933,44 @@ async fn probe_scope_hierarchy_lodge_covers_its_patrols() {
     .await
     .expect("permissions");
 
-    let hierarchy = ScopeHierarchy::load(admin.as_ref()).await.expect("load the hierarchy");
+    let hierarchy = ScopeHierarchy::load(admin.as_ref())
+        .await
+        .expect("load the hierarchy");
     let perms = PermissionService::new(host::CoreDb::new(admin.clone()));
 
     let lodge_grant = Identity::from_grants(
         "u",
-        vec![RoleGrant { role_id: "chief".into(), scope: Scope::lodge("3") }],
+        vec![RoleGrant {
+            role_id: "chief".into(),
+            scope: Scope::lodge("3"),
+        }],
     );
     let expanded = hierarchy.expand(&lodge_grant);
     assert!(
-        perms.has_in_scope(Some(&expanded), "core:admin", &Scope::patrol("7")).await,
+        perms
+            .has_in_scope(Some(&expanded), "core:admin", &Scope::patrol("7"))
+            .await,
         "a lodge grant covers the patrol declared inside it"
     );
     assert!(
-        !perms.has_in_scope(Some(&expanded), "core:admin", &Scope::patrol("8")).await,
+        !perms
+            .has_in_scope(Some(&expanded), "core:admin", &Scope::patrol("8"))
+            .await,
         "and not a patrol that is not declared inside it"
     );
 
     let patrol_grant = Identity::from_grants(
         "u",
-        vec![RoleGrant { role_id: "scout".into(), scope: Scope::patrol("7") }],
+        vec![RoleGrant {
+            role_id: "scout".into(),
+            scope: Scope::patrol("7"),
+        }],
     );
     let patrol_expanded = hierarchy.expand(&patrol_grant);
     assert!(
-        !perms.has_in_scope(Some(&patrol_expanded), "core:admin", &Scope::lodge("3")).await,
+        !perms
+            .has_in_scope(Some(&patrol_expanded), "core:admin", &Scope::lodge("3"))
+            .await,
         "covering is downward only: a patrol grant does not cover its lodge"
     );
 }
@@ -529,7 +1004,10 @@ async fn probe_scope_edge_ownership_is_enforced() {
             vec![],
         )
         .await;
-    assert!(map_write.is_err(), "a plugin has no grant on core.scope_owners");
+    assert!(
+        map_write.is_err(),
+        "a plugin has no grant on core.scope_owners"
+    );
 
     // Simulate a future plugin granted the edge table but owning no scope type.
     sqlx::query("GRANT SELECT, INSERT, DELETE ON core.scope_hierarchy TO adjutant_plugin_hello")
@@ -548,7 +1026,10 @@ async fn probe_scope_edge_ownership_is_enforced() {
         .await
         .expect_err("hello does not own lodge/patrol")
         .to_string();
-    assert!(raw_err.contains("may not declare"), "clear trigger error: {raw_err}");
+    assert!(
+        raw_err.contains("may not declare"),
+        "clear trigger error: {raw_err}"
+    );
     println!("[edge-ownership] trigger refusal: {raw_err}");
 
     // The declare API refuses it too, with its own clear message.
@@ -560,7 +1041,10 @@ async fn probe_scope_edge_ownership_is_enforced() {
         .await
         .expect_err("the declare API refuses a type the plugin does not own")
         .to_string();
-    assert!(api_err.contains("may not declare"), "clear API error: {api_err}");
+    assert!(
+        api_err.contains("may not declare"),
+        "clear API error: {api_err}"
+    );
     println!("[edge-ownership] declare-API refusal: {api_err}");
 
     // Query the table, not only the errors: the refused edge must be absent.
@@ -617,7 +1101,9 @@ async fn probe_scheduler_runs_records_and_stops() {
     let fail_sched = Schedule::new(
         "boom",
         std::time::Duration::from_millis(100),
-        schedule_handler(|| async { Err::<(), _>(adjutant_sdk::SdkError::Internal("boom".into())) }),
+        schedule_handler(|| async {
+            Err::<(), _>(adjutant_sdk::SdkError::Internal("boom".into()))
+        }),
     );
 
     let (tx, mut rx) = tokio::sync::mpsc::channel::<String>(16);
@@ -629,7 +1115,9 @@ async fn probe_scheduler_runs_records_and_stops() {
             let db = db.clone();
             let tx = tx.clone();
             async move {
-                let rows = db.query("SELECT session_user AS u".to_string(), vec![]).await?;
+                let rows = db
+                    .query("SELECT session_user AS u".to_string(), vec![])
+                    .await?;
                 let who = rows[0]["u"].as_str().unwrap_or_default().to_string();
                 let _ = tx.send(who).await;
                 Ok(())
@@ -662,12 +1150,18 @@ async fn probe_scheduler_runs_records_and_stops() {
         }
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
     }
-    assert!(ok_runs >= 2, "at least two successful runs recorded, got {ok_runs}");
+    assert!(
+        ok_runs >= 2,
+        "at least two successful runs recorded, got {ok_runs}"
+    );
 
     // The admin view (what PluginInfo reports) has last_run and next_run.
     let infos = scheduler.infos("sched_probe");
     assert_eq!(infos.len(), 2, "both schedules listed");
-    let tick_info = infos.iter().find(|s| s.name == "tick").expect("tick listed");
+    let tick_info = infos
+        .iter()
+        .find(|s| s.name == "tick")
+        .expect("tick listed");
     assert!(tick_info.last_run.is_some(), "last_run is reported");
     assert!(tick_info.next_run.is_some(), "next_run is reported");
 
@@ -696,7 +1190,11 @@ async fn probe_scheduler_runs_records_and_stops() {
         bad_after <= bad_runs + 8,
         "a failing schedule must not spin: {bad_runs} -> {bad_after} in ~0.45s"
     );
-    let boom = scheduler.infos("sched_probe").into_iter().find(|s| s.name == "boom").unwrap();
+    let boom = scheduler
+        .infos("sched_probe")
+        .into_iter()
+        .find(|s| s.name == "boom")
+        .unwrap();
     assert!(boom.last_error.is_some(), "last_error is reported");
 
     // Stop: the shutdown aborts the plugin's tasks, and what it *promises* is
@@ -708,7 +1206,10 @@ async fn probe_scheduler_runs_records_and_stops() {
     // *started* before it.
     scheduler.stop("sched_probe");
     assert!(
-        scheduler.infos("sched_probe").iter().all(|s| s.next_run.is_none()),
+        scheduler
+            .infos("sched_probe")
+            .iter()
+            .all(|s| s.next_run.is_none()),
         "a stopped plugin's schedules report no next run"
     );
     // `JoinHandle::abort` cancels the task at its next await point rather than
@@ -733,4 +1234,584 @@ async fn probe_scheduler_runs_records_and_stops() {
         after_stop, 0,
         "a stopped plugin's schedules must not start new runs after the stop"
     );
+}
+
+// ---------------------------------------------------------------------------
+// Audit chain v2 + the keyed layer (#159, #160)
+//
+// These are the issue reproductions as tests. They are #[ignore]d with the rest
+// of this file, so a bare workspace run reports them as ignored, never passed.
+// ---------------------------------------------------------------------------
+
+/// Empty the chain without tripping the append-only/TRUNCATE guards. The guards
+/// are the mechanism under test in other probes; here we are the owner preparing
+/// a fixture, which is exactly the adversary #160 describes.
+async fn reset_audit_log(pool: &sqlx::PgPool) {
+    sqlx::raw_sql(
+        "ALTER TABLE core.audit_log DISABLE TRIGGER audit_append_only;\
+         ALTER TABLE core.audit_log DISABLE TRIGGER audit_no_truncate;\
+         TRUNCATE core.audit_log RESTART IDENTITY;\
+         ALTER TABLE core.audit_log ENABLE TRIGGER audit_append_only;\
+         ALTER TABLE core.audit_log ENABLE TRIGGER audit_no_truncate;",
+    )
+    .execute(pool)
+    .await
+    .expect("reset core.audit_log");
+}
+
+async fn unkeyed_verify(pool: &sqlx::PgPool) -> (Option<i64>, i64) {
+    sqlx::query_as("SELECT first_bad, rows_checked FROM core.audit_verify()")
+        .fetch_one(pool)
+        .await
+        .expect("core.audit_verify()")
+}
+
+/// #159's reproduction: change only the actor and the timestamp, and the v1
+/// chain kept saying ok. v2 must name the row.
+#[tokio::test]
+#[ignore = "DB-gated: needs ADJUTANT_TEST_DATABASE_URL; run with `-- --ignored`"]
+async fn changing_user_id_and_created_at_breaks_the_chain() {
+    let _guard = AUDIT.lock().await;
+    let (pool, _) = setup(&[]).await;
+    reset_audit_log(pool.as_ref()).await;
+
+    let alice = "aaaaaaaa-1111-1111-1111-111111111111";
+    let bob = "bbbbbbbb-2222-2222-2222-222222222222";
+    for (id, name) in [(alice, "Alice"), (bob, "Bob")] {
+        sqlx::query(
+            "INSERT INTO core.users (id, display_name) VALUES ($1::uuid, $2) \
+             ON CONFLICT (id) DO NOTHING",
+        )
+        .bind(id)
+        .bind(name)
+        .execute(pool.as_ref())
+        .await
+        .expect("fixture user");
+    }
+
+    for (action, user) in [("first", alice), ("second", bob)] {
+        sqlx::query(
+            "INSERT INTO core.audit_log (user_id, action, resource_type, resource_id, details, source) \
+             VALUES ($1::uuid, $2, 'thing', '1', '{}', 'core')",
+        )
+        .bind(user)
+        .bind(action)
+        .execute(pool.as_ref())
+        .await
+        .expect("append audit row");
+    }
+
+    let (first_bad, rows) = unkeyed_verify(pool.as_ref()).await;
+    assert_eq!(first_bad, None, "the untouched chain verifies");
+    assert_eq!(rows, 2);
+
+    // The CLI reports the same two layers and does not claim keyed protection
+    // when configured without a key.
+    let cfg = adjutant_server::config::Config {
+        database_url: base_url(),
+        audit_key: None,
+        ..Default::default()
+    };
+    let (good, report) = adjutant_server::cli::audit_verify(&cfg)
+        .await
+        .expect("audit-verify CLI");
+    assert!(good, "the unkeyed chain is good");
+    assert!(
+        report.contains("\"keyed\": false"),
+        "no key reports keyed:false, got: {report}"
+    );
+
+    // The owner disables the append-only guard, changes only who and when, and
+    // re-arms it. Nothing hashed by v1 changed.
+    sqlx::query("ALTER TABLE core.audit_log DISABLE TRIGGER audit_append_only")
+        .execute(pool.as_ref())
+        .await
+        .expect("disable guard");
+    sqlx::query(
+        "UPDATE core.audit_log \
+         SET user_id = $1::uuid, created_at = created_at - interval '30 days' \
+         WHERE id = 1",
+    )
+    .bind(bob)
+    .execute(pool.as_ref())
+    .await
+    .expect("rewrite actor and timestamp");
+    sqlx::query("ALTER TABLE core.audit_log ENABLE TRIGGER audit_append_only")
+        .execute(pool.as_ref())
+        .await
+        .expect("re-arm guard");
+
+    let (first_bad, rows) = unkeyed_verify(pool.as_ref()).await;
+    assert_eq!(
+        first_bad,
+        Some(1),
+        "v2 hashes user_id and created_at, so the re-attributed row is named"
+    );
+    assert_eq!(rows, 2);
+}
+
+const TEST_KEY_HEX: &str =
+    "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f";
+
+/// #160's reproduction: the owner rewrites an action and recomputes the unkeyed
+/// chain. SQL says ok — and the keyed verifier names the row. Without the key,
+/// there is nothing to name.
+#[tokio::test]
+#[ignore = "DB-gated: needs ADJUTANT_TEST_DATABASE_URL; run with `-- --ignored`"]
+async fn keyed_layer_detects_an_owner_rewrite_the_unkeyed_chain_accepts() {
+    use adjutant_sdk::{audit::ChainKey, AuditService};
+
+    let _guard = AUDIT.lock().await;
+    let (pool, _) = setup(&[]).await;
+    reset_audit_log(pool.as_ref()).await;
+
+    let key = ChainKey::parse(TEST_KEY_HEX).expect("fixed test key");
+    assert!(
+        adjutant_sdk::audit::set_chain_key(key.clone()) || adjutant_sdk::audit::chain_key().is_some(),
+        "the process-global key is installed once"
+    );
+
+    let audit = AuditService::new(host::CoreDb::new(pool.clone()), "core".into());
+    audit
+        .log(None, "first", "thing", "1", serde_json::json!({"n": 1}))
+        .await
+        .expect("keyed append 1");
+    audit
+        .log(None, "second", "thing", "2", serde_json::json!({"n": 2}))
+        .await
+        .expect("keyed append 2");
+
+    let keyed: Vec<Option<String>> =
+        sqlx::query_scalar("SELECT keyed_hash FROM core.audit_log ORDER BY id")
+            .fetch_all(pool.as_ref())
+            .await
+            .expect("read keyed hashes");
+    assert_eq!(keyed.len(), 2);
+    assert!(
+        keyed.iter().all(Option::is_some),
+        "the writer computes keyed_hash before the INSERT; the row lands with both hashes"
+    );
+
+    let report = adjutant_server::audit::verify(pool.as_ref(), Some(&key))
+        .await
+        .expect("keyed verify");
+    assert!(report.ok, "the chain verifies");
+    assert!(report.keyed);
+    assert_eq!(report.keyed_rows_checked, 2);
+    assert_eq!(report.keyed_rows_unkeyed, 0);
+    assert_eq!(report.keyed_first_bad, None);
+
+    // Without a key the verifier says so and checks nothing — it does not
+    // report a green keyed result.
+    let no_key = adjutant_server::audit::verify(pool.as_ref(), None)
+        .await
+        .expect("unkeyed verify");
+    assert!(!no_key.keyed);
+    assert_eq!(no_key.keyed_rows_checked, 0);
+    assert_eq!(no_key.keyed_first_bad, None);
+
+    // As the owning role: disable the guard, rewrite the action, recompute the
+    // unkeyed chain exactly as core.audit_chain_fill would, re-arm. The owner
+    // also *guesses* the keyed layer by writing the unkeyed digest into
+    // `keyed_hash` — the best a writer without the key can do. The real HMAC
+    // still disagrees, which is the whole point of the key.
+    sqlx::query("ALTER TABLE core.audit_log DISABLE TRIGGER audit_append_only")
+        .execute(pool.as_ref())
+        .await
+        .expect("disable guard");
+    sqlx::query("UPDATE core.audit_log SET action = 'owner-rewrote' WHERE id = 1")
+        .execute(pool.as_ref())
+        .await
+        .expect("rewrite action");
+    sqlx::raw_sql(
+        r#"
+        DO $fn$
+        DECLARE r RECORD; prev TEXT := repeat('0', 64); h TEXT;
+        BEGIN
+          FOR r IN SELECT id, user_id, action, resource_type, resource_id, details, source, created_at
+                   FROM core.audit_log ORDER BY id LOOP
+            h := encode(public.digest(core.audit_canonical(prev, r.id, r.action, r.resource_type,
+                 r.resource_id, r.details, r.source, r.user_id, r.created_at), 'sha256'), 'hex');
+            UPDATE core.audit_log
+               SET prev_hash = prev, entry_hash = h, keyed_hash = h
+             WHERE id = r.id;
+            prev := h;
+          END LOOP;
+        END $fn$;
+        "#,
+    )
+    .execute(pool.as_ref())
+    .await
+    .expect("recompute the unkeyed chain as the owner");
+    sqlx::query("ALTER TABLE core.audit_log ENABLE TRIGGER audit_append_only")
+        .execute(pool.as_ref())
+        .await
+        .expect("re-arm guard");
+
+    let (first_bad, rows) = unkeyed_verify(pool.as_ref()).await;
+    assert_eq!(
+        first_bad, None,
+        "the unkeyed chain is internally consistent again — this is the point of #160"
+    );
+    assert_eq!(rows, 2);
+
+    let report = adjutant_server::audit::verify(pool.as_ref(), Some(&key))
+        .await
+        .expect("keyed verify after rewrite");
+    assert!(report.ok, "the unkeyed layer still says ok");
+    assert_eq!(
+        report.keyed_first_bad,
+        Some(1),
+        "the keyed layer names the rewritten row"
+    );
+    assert_eq!(report.keyed_rows_checked, 2);
+
+    // The operator's CLI path reaches the same two layers: the unkeyed chain is
+    // good, the keyed layer is not, and the command must exit non-zero.
+    let cfg = adjutant_server::config::Config {
+        database_url: base_url(),
+        audit_key: Some(key.clone()),
+        ..Default::default()
+    };
+    let (good, cli_report) = adjutant_server::cli::audit_verify(&cfg)
+        .await
+        .expect("audit-verify CLI with a key");
+    assert!(!good, "the keyed rewrite must fail the CLI");
+    assert!(
+        cli_report.contains("\"keyed_first_bad\": 1"),
+        "the CLI names the row, got: {cli_report}"
+    );
+
+    // And the row the owner erased is genuinely gone from the unkeyed view.
+    let action: String = sqlx::query_scalar("SELECT action FROM core.audit_log WHERE id = 1")
+        .fetch_one(pool.as_ref())
+        .await
+        .expect("read row 1");
+    assert_eq!(action, "owner-rewrote");
+}
+
+/// Finding 4: a keyed deployment with pre-key (NULL `keyed_hash`) rows reports
+/// them in one plain-text line but still succeeds — the rows are not proof of a
+/// bypass, and they must not be counted as keyed protection either.
+#[tokio::test]
+#[ignore = "DB-gated: needs ADJUTANT_TEST_DATABASE_URL; run with `-- --ignored`"]
+async fn keyed_deployment_names_unkeyed_rows_without_failing() {
+    use adjutant_sdk::{audit::ChainKey, AuditService};
+
+    let _guard = AUDIT.lock().await;
+    let (pool, _) = setup(&[]).await;
+    reset_audit_log(pool.as_ref()).await;
+
+    let key = ChainKey::parse(TEST_KEY_HEX).expect("fixed test key");
+    assert!(
+        adjutant_sdk::audit::set_chain_key(key.clone())
+            || adjutant_sdk::audit::chain_key().is_some(),
+        "the process-global key is installed once"
+    );
+
+    let audit = AuditService::new(host::CoreDb::new(pool.clone()), "core".into());
+    audit
+        .log(None, "keyed", "thing", "1", serde_json::json!({}))
+        .await
+        .expect("keyed append");
+
+    // A writer outside the keyed path: the trigger fills the unkeyed chain, but
+    // keyed_hash stays NULL, exactly like history written before the key.
+    sqlx::query(
+        "INSERT INTO core.audit_log (action, resource_type, resource_id, details, source) \
+         VALUES ('pre-key', 'thing', '2', '{}', 'core')",
+    )
+    .execute(pool.as_ref())
+    .await
+    .expect("unkeyed append");
+
+    let report = adjutant_server::audit::verify(pool.as_ref(), Some(&key))
+        .await
+        .expect("keyed verify");
+    assert!(report.ok, "the unkeyed chain verifies");
+    assert!(report.keyed, "the keyed layer was checked");
+    assert_eq!(report.keyed_rows_checked, 1);
+    assert_eq!(report.keyed_rows_unkeyed, 1);
+    assert_eq!(report.keyed_first_bad, None);
+
+    let cfg = adjutant_server::config::Config {
+        database_url: base_url(),
+        audit_key: Some(key),
+        ..Default::default()
+    };
+    let (good, cli_report) = adjutant_server::cli::audit_verify(&cfg)
+        .await
+        .expect("audit-verify CLI with a key");
+    assert!(good, "unkeyed rows are a warning, not a failure");
+    assert!(
+        cli_report.contains("1 audit row(s) have no keyed_hash"),
+        "the count is stated, got: {cli_report}"
+    );
+    assert!(
+        cli_report.contains("outside the keyed chain"),
+        "the bypass possibility is stated, got: {cli_report}"
+    );
+}
+
+/// The fixed vector, computed by PostgreSQL itself. The Rust half lives in
+/// `plugins/sdk` (`audit_vector_is_pinned_for_sql_and_rust`); both must agree or
+/// the trigger and the app verifier disagree about every row.
+#[tokio::test]
+#[ignore = "DB-gated: needs ADJUTANT_TEST_DATABASE_URL; run with `-- --ignored`"]
+async fn sql_and_rust_agree_on_the_pinned_audit_vector() {
+    use adjutant_sdk::audit::ChainKey;
+
+    let (pool, _) = setup(&[]).await;
+
+    // Finding 1: the wrapper calls to_char, whose timestamp forms are STABLE.
+    // An IMMUTABLE marker would be a false promise to the planner.
+    let volatility: String = sqlx::query_scalar(
+        "SELECT provolatile::text FROM pg_proc \
+         WHERE proname = 'audit_canonical' AND pronamespace = 'core'::regnamespace",
+    )
+    .fetch_one(pool.as_ref())
+    .await
+    .expect("core.audit_canonical exists");
+    assert_eq!(
+        volatility, "s",
+        "core.audit_canonical must be STABLE, not IMMUTABLE"
+    );
+    let payload: String = sqlx::query_scalar(
+        "SELECT core.audit_canonical( \
+             $1::text, 42::bigint, $2::text, $3::text, $4::text, $5::jsonb, $6::text, \
+             $7::uuid, $8::timestamptz)",
+    )
+    .bind(adjutant_sdk::AUDIT_ZERO_HASH)
+    .bind("member.update")
+    .bind("member")
+    .bind("11111111-1111-1111-1111-111111111111")
+    .bind("{\"b\":\"x\",\"a\":1}")
+    .bind("core")
+    .bind("22222222-2222-2222-2222-222222222222")
+    .bind("2026-01-02T03:04:05.123456Z")
+    .fetch_one(pool.as_ref())
+    .await
+    .expect("SQL canonical payload");
+
+    let (sha, hmac): (String, String) = sqlx::query_as(
+        "SELECT encode(public.digest($1, 'sha256'), 'hex'), \
+                encode(public.hmac(convert_to($1, 'UTF8'), decode($2, 'hex'), 'sha256'), 'hex')",
+    )
+    .bind(&payload)
+    .bind(TEST_KEY_HEX)
+    .fetch_one(pool.as_ref())
+    .await
+    .expect("SQL digests");
+
+    let rust_payload = adjutant_sdk::canonical_payload(
+        adjutant_sdk::AUDIT_ZERO_HASH,
+        42,
+        "member.update",
+        "member",
+        "11111111-1111-1111-1111-111111111111",
+        "{\"a\": 1, \"b\": \"x\"}",
+        "core",
+        Some("22222222-2222-2222-2222-222222222222"),
+        "2026-01-02T03:04:05.123456+00:00",
+    );
+    assert_eq!(
+        payload, rust_payload,
+        "SQL and Rust must pin the same canonical form"
+    );
+    assert_eq!(
+        sha,
+        adjutant_sdk::unkeyed_digest(&rust_payload),
+        "the unkeyed entry_hash agrees"
+    );
+    let key = ChainKey::parse(TEST_KEY_HEX).expect("fixed key");
+    assert_eq!(
+        hmac,
+        key.keyed_digest(&rust_payload),
+        "the keyed HMAC agrees"
+    );
+}
+
+/// The one path a fresh install never takes: upgrading a database whose rows
+/// already carry v1 hashes. Re-running migration 17's SQL must repair them
+/// (the DO block) and leave the append-only guard armed.
+#[tokio::test]
+#[ignore = "DB-gated: needs ADJUTANT_TEST_DATABASE_URL; run with `-- --ignored`"]
+async fn migration_17_recomputes_a_v1_chain_on_upgrade() {
+    let _guard = AUDIT.lock().await;
+    let (pool, _) = setup(&[]).await;
+    reset_audit_log(pool.as_ref()).await;
+
+    for action in ["first", "second"] {
+        sqlx::query(
+            "INSERT INTO core.audit_log (action, resource_type, resource_id, details, source) \
+             VALUES ($1, 'thing', '1', '{}', 'core')",
+        )
+        .bind(action)
+        .execute(pool.as_ref())
+        .await
+        .expect("append phase-2 row");
+    }
+
+    // Rewrite the hashes with the v1 formula, as a database that applied
+    // migration 2 and not 17 would have them.
+    sqlx::query("ALTER TABLE core.audit_log DISABLE TRIGGER audit_append_only")
+        .execute(pool.as_ref())
+        .await
+        .expect("disable guard");
+    sqlx::raw_sql(
+        r#"
+        DO $fn$
+        DECLARE r RECORD; prev TEXT := repeat('0', 64); h TEXT;
+        BEGIN
+          FOR r IN SELECT id, action, resource_type, resource_id, details, source
+                   FROM core.audit_log ORDER BY id LOOP
+            h := encode(public.digest(prev || '|' || r.id::text || '|' || r.action || '|' ||
+                 r.resource_type || '|' || r.resource_id || '|' || r.details::text || '|' ||
+                 r.source, 'sha256'), 'hex');
+            UPDATE core.audit_log SET prev_hash = prev, entry_hash = h WHERE id = r.id;
+            prev := h;
+          END LOOP;
+        END $fn$;
+        "#,
+    )
+    .execute(pool.as_ref())
+    .await
+    .expect("write v1 hashes");
+    sqlx::query("ALTER TABLE core.audit_log ENABLE TRIGGER audit_append_only")
+        .execute(pool.as_ref())
+        .await
+        .expect("re-arm guard");
+
+    let (first_bad, _) = unkeyed_verify(pool.as_ref()).await;
+    assert_eq!(
+        first_bad,
+        Some(1),
+        "v1 hashes do not satisfy the v2 verifier"
+    );
+
+    let sql = db::CORE_MIGRATIONS
+        .iter()
+        .find(|(version, _, _)| *version == 17)
+        .map(|(_, _, sql)| *sql)
+        .expect("migration 17 is present");
+    sqlx::raw_sql(&format!("BEGIN; {sql}; COMMIT;"))
+        .execute(pool.as_ref())
+        .await
+        .expect("run migration 17 over existing rows");
+
+    let (first_bad, rows) = unkeyed_verify(pool.as_ref()).await;
+    assert_eq!(
+        first_bad, None,
+        "the upgrade recomputed the chain instead of leaving every row bad"
+    );
+    assert_eq!(rows, 2);
+
+    let armed: bool = sqlx::query_scalar(
+        "SELECT tgenabled <> 'D' FROM pg_trigger WHERE tgname = 'audit_append_only'",
+    )
+    .fetch_one(pool.as_ref())
+    .await
+    .expect("trigger state");
+    assert!(armed, "the append-only guard is re-armed after the recompute");
+
+    // Prove it: an UPDATE is refused again.
+    let err = sqlx::query("UPDATE core.audit_log SET action = 'nope' WHERE id = 1")
+        .execute(pool.as_ref())
+        .await
+        .expect_err("the append-only guard is back");
+    assert!(
+        err.to_string().contains("append-only"),
+        "expected the append-only error, got: {err}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Cursor replay is gap-free (#162)
+// ---------------------------------------------------------------------------
+
+/// #162's reproduction, as two SQL sessions.
+///
+/// T1 allocates a low id and stays open. T2 commits a higher id, a reader sees
+/// it and advances its cursor past T1's id; when T1 finally commits, the event
+/// is durable but unreachable by `id > cursor`.
+///
+/// Migration 18 makes id allocation and commit order the same: the INSERT
+/// trigger holds a transaction-scoped advisory lock from before `nextval` until
+/// commit, so T2 cannot receive a higher id while T1 is unresolved. This test
+/// asserts the reader's own discipline — after its first poll and the commit of
+/// T1, replaying from the cursor it returned must not lose either event.
+#[tokio::test]
+#[ignore = "DB-gated: needs ADJUTANT_TEST_DATABASE_URL; run with `-- --ignored`"]
+async fn replay_from_the_returned_cursor_does_not_skip_a_late_commit() {
+    let _guard = EVENTS.lock().await;
+    let (pool, _) = setup(&[]).await;
+    sqlx::query("TRUNCATE core.events RESTART IDENTITY")
+        .execute(pool.as_ref())
+        .await
+        .expect("reset core.events");
+
+    // T1: allocate a low id, keep the transaction open.
+    let mut tx1 = pool.begin().await.expect("T1 transaction");
+    sqlx::query(
+        "INSERT INTO core.events (event_type, payload, source_plugin) \
+         VALUES ('a-lost', '{}', 'probe')",
+    )
+    .execute(&mut *tx1)
+    .await
+    .expect("T1 insert");
+
+    // T2: a concurrent insert. Before migration 18 it commits immediately with
+    // a higher id; after it, the trigger makes it wait for T1 to resolve.
+    let pool2 = pool.clone();
+    let t2 = tokio::spawn(async move {
+        sqlx::query_scalar::<_, i64>(
+            "INSERT INTO core.events (event_type, payload, source_plugin) \
+             VALUES ('b-late', '{}', 'probe') RETURNING id",
+        )
+        .fetch_one(pool2.as_ref())
+        .await
+    });
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+
+    // Poll #1: the reader sees what is visible and uses the last id as its
+    // cursor, exactly as `/api/events/recent` does.
+    let first: Vec<(i64, String)> = sqlx::query_as(
+        "SELECT id, event_type FROM core.events WHERE id > 0 ORDER BY id ASC LIMIT 100",
+    )
+    .fetch_all(pool.as_ref())
+    .await
+    .expect("poll #1");
+    let cursor = first.last().map(|row| row.0).unwrap_or(0);
+
+    tx1.commit().await.expect("T1 commit");
+    let second_id = t2
+        .await
+        .expect("T2 task")
+        .expect("T2 insert commits after T1");
+
+    // Poll #2 from the cursor poll #1 returned. The late event must be here.
+    let second: Vec<(i64, String)> = sqlx::query_as(
+        "SELECT id, event_type FROM core.events WHERE id > $1 ORDER BY id ASC LIMIT 100",
+    )
+    .bind(cursor)
+    .fetch_all(pool.as_ref())
+    .await
+    .expect("poll #2");
+
+    let mut seen: Vec<&str> = first
+        .iter()
+        .chain(second.iter())
+        .map(|(_, event_type)| event_type.as_str())
+        .collect();
+    seen.sort_unstable();
+    assert_eq!(
+        seen,
+        vec!["a-lost", "b-late"],
+        "cursor {cursor} (T2 id {second_id}) skipped an event: poll #1 = {first:?}, poll #2 = {second:?}"
+    );
+
+    sqlx::query("TRUNCATE core.events RESTART IDENTITY")
+        .execute(pool.as_ref())
+        .await
+        .expect("cleanup core.events");
 }

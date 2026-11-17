@@ -915,16 +915,35 @@ Map<String, dynamic> _asMap(dynamic value) {
   return const {};
 }
 
-/// The API returns bare arrays for collections, but has been observed to wrap
-/// them (`{"items": [...]}`, `{"members": [...]}`) on some routes. Accept both
-/// rather than trusting one shape — and never crash on the other.
+/// The API returns bare arrays for collections, but wraps them
+/// (`{"items": [...]}`, `{"members": [...]}`) on most routes. Accept both rather
+/// than trusting one shape — and never crash on the other.
 ///
-/// `lodges` is in this list because it had to be: `GET /api/membership/lodges`
-/// answers `{"lodges": [{"name": …, "patrols": […]}, …]}`, which this function
-/// silently turned into an empty list — a decode path no mock-client test
-/// covered, and the live harness (`live/live_client_test.dart`) is what found
-/// it. The wrapper the server uses is listed here rather than the route being
-/// special-cased.
+/// This used to be a hard-coded whitelist, and that was the defect: a wrapper it
+/// did not name (`{"occurrences": [...]}` from `GET /api/calendar/upcoming`,
+/// `{"stewards": [...]}`) silently became `const []`, an answer indistinguishable
+/// from "there are none" — and the screens cached it. `lodges` was the reported
+/// instance; the list had already been repaired once for that one key instead of
+/// for the class.
+///
+/// So there are three paths now, in order:
+///
+/// 1. a bare array;
+/// 2. an object naming a wrapper the server actually uses, listed below — kept
+///    explicit because a named key says what the route means, and because
+///    several of these payloads carry more than one array-shaped field
+///    (`upcoming` has `occurrences` *and* `seasonal`), where the structural
+///    rule below would refuse to guess;
+/// 3. an object with **exactly one** array-valued field, whatever it is called.
+///    That is the server's collection convention (`{"<collection>": [...]}`)
+///    applied structurally, so a new route's wrapper does not need this function
+///    edited before it can be read.
+///
+/// A payload with two arrays and no recognised name returns empty rather than
+/// picking one: guessing which array is the collection is how a caller is handed
+/// the wrong one. Every route that returns a list has a decode test in
+/// `test/api_client_decode_test.dart`, with the payload copied from the server's
+/// own `json!` construction.
 List<Map<String, dynamic>> _asList(dynamic value) {
   if (value is List) {
     return value.whereType<Map>().map((e) => Map<String, dynamic>.from(e)).toList();
@@ -935,17 +954,33 @@ List<Map<String, dynamic>> _asList(dynamic value) {
       'data',
       'members',
       'lodges',
+      'stewards',
       'missions',
       'events',
+      'occurrences',
       'motions',
       'announcements',
       'orders',
       'comps',
+      'checkouts',
+      'plugins',
+      'receipts',
+      'categories',
+      'runs',
+      'presets',
+      'sessions',
     ]) {
       final inner = value[key];
       if (inner is List) {
         return inner.whereType<Map>().map((e) => Map<String, dynamic>.from(e)).toList();
       }
+    }
+    final arrays = value.values.whereType<List>().toList();
+    if (arrays.length == 1) {
+      return arrays.single
+          .whereType<Map>()
+          .map((e) => Map<String, dynamic>.from(e))
+          .toList();
     }
   }
   return const [];

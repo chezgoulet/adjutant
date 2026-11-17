@@ -450,10 +450,10 @@ async fn declared_manifest_satisfies_the_load_rules() {
     assert!(versions.iter().all(|v| *v >= 1), "versions start at 1");
     assert_eq!(
         versions,
-        vec![1, 2],
+        vec![1, 2, 3],
         "the outbox intent's status had to be a NEW version: an applied migration is skipped \
          without its SQL being compared, so amending version 1 would be invisible on every \
-         database that already ran it"
+         database that already ran it. Version 3 is the dues mirror, for the same reason."
     );
 
     let ddl = &migrations[0].sql;
@@ -500,13 +500,25 @@ async fn declared_manifest_satisfies_the_load_rules() {
     // by which the ledger learns (the intent is). It still does not subscribe to
     // anything it publishes itself (plugin-to-plugin.md §3.4).
     let subscriptions = plugin.subscriptions();
-    assert_eq!(subscriptions.len(), 1);
-    assert_eq!(subscriptions[0].filter, adjutant_stripe::OUTBOX_EVENT_PREFIX);
-    assert_eq!(subscriptions[0].filter, "core.outbox.");
+    assert_eq!(subscriptions.len(), 2, "the outbox outcomes, and dues standings");
+    let outbox = subscriptions
+        .iter()
+        .find(|s| s.filter == adjutant_stripe::OUTBOX_EVENT_PREFIX)
+        .expect("the outbox subscription");
+    assert_eq!(outbox.filter, "core.outbox.");
     assert!(
-        subscriptions[0].matches("core.outbox.delivered")
-            && subscriptions[0].matches("core.outbox.exhausted"),
+        outbox.matches("core.outbox.delivered") && outbox.matches("core.outbox.exhausted"),
         "it must take the relay's terminal outcomes"
+    );
+    // The shop mirrors finance's dues standing so a dues checkout can be priced
+    // without the payer holding a finance permission.
+    let dues = subscriptions
+        .iter()
+        .find(|s| s.filter == "finance.dues")
+        .expect("the dues mirror subscription");
+    assert!(
+        dues.matches("finance.dues.assessed") && dues.matches("finance.dues.payment"),
+        "the assessment and the payment both change the figure"
     );
     let schedules = plugin.schedules();
     assert_eq!(schedules.len(), 1);
@@ -1299,6 +1311,178 @@ async fn an_unknown_event_type_is_accepted_and_recorded_without_a_payment() {
 }
 
 // ---------------------------------------------------------------------------
+// Checkout — dues priced from the mirror
+// ---------------------------------------------------------------------------
+
+fn mirror_row(member: &str, year: i64, assessed: i64, funded: i64, paid: i64) -> serde_json::Value {
+    serde_json::json!({
+        "member_id": member,
+        "fiscal_year": year,
+        "assessed_cents": assessed,
+        "funded_cents": funded,
+        "paid_cents": paid,
+        "outstanding_cents": (assessed - funded - paid).max(0),
+        "settled": paid >= assessed - funded,
+        "status": "assessed",
+    })
+}
+
+/// A dues session with no amount charges what the member owes, and the row
+/// records what they were assessed against — the assessed figure is what makes an
+/// under-payment legible later.
+#[tokio::test]
+async fn a_dues_checkout_defaults_to_what_is_owed_and_records_the_assessment() {
+    let h = Harness::new(config());
+    let routes = h.routes().await;
+    let checkout = route(&routes, "POST", "/api/stripe/checkout");
+    h.db.push_rows(vec![mirror_row("42", 2026, 12000, 2000, 4000)]);
+    h.db.push_rows(vec![session_row()]);
+    h.http.push_json(
+        200,
+        &serde_json::json!({ "id": "cs_test_2", "url": "https://checkout.stripe.test/cs_test_2" }),
+    );
+    let mut settled = session_row();
+    settled["status"] = serde_json::json!("created");
+    h.db.push_rows(vec![settled]);
+
+    let (status, body) = call(
+        &checkout.handler,
+        TestRequest::post("/api/stripe/checkout")
+            .json(&serde_json::json!({ "purpose": "dues", "dues_year": 2026 }))
+            .identity("42", &["scout"])
+            .build(),
+    )
+    .await;
+    assert_eq!(status, 201, "{body}");
+
+    // 12000 assessed - 2000 funded - 4000 paid = 6000 owed, and that is what
+    // Stripe is asked to charge.
+    let insert = h
+        .db
+        .last_query_params("INSERT INTO \"stripe\".\"checkout_sessions\"")
+        .expect("the pending row");
+    assert!(has_int(&insert, 6000), "the amount charged: {:?}", canonical(&insert));
+    assert!(
+        has_int(&insert, 12000),
+        "the assessed figure is recorded beside it: {:?}",
+        canonical(&insert)
+    );
+    let outbound = h.http.outbound_text();
+    assert!(outbound.contains("6000"), "Stripe is asked for 6000: {outbound}");
+}
+
+/// Paying less is allowed and deliberate — the owner's ruling. Paying more is a
+/// donation, which is a different purpose.
+#[tokio::test]
+async fn a_dues_checkout_may_pay_less_but_not_more() {
+    let h = Harness::new(config());
+    let routes = h.routes().await;
+    let checkout = route(&routes, "POST", "/api/stripe/checkout");
+
+    h.db.push_rows(vec![mirror_row("42", 2026, 12000, 0, 0)]);
+    h.db.push_rows(vec![session_row()]);
+    h.http.push_json(
+        200,
+        &serde_json::json!({ "id": "cs_test_3", "url": "https://checkout.stripe.test/cs_test_3" }),
+    );
+    let mut settled = session_row();
+    settled["status"] = serde_json::json!("created");
+    h.db.push_rows(vec![settled]);
+
+    let (status, body) = call(
+        &checkout.handler,
+        TestRequest::post("/api/stripe/checkout")
+            .json(&serde_json::json!({
+                "purpose": "dues", "dues_year": 2026, "amount_cents": 1000
+            }))
+            .identity("42", &["scout"])
+            .build(),
+    )
+    .await;
+    assert_eq!(status, 201, "paying less is allowed: {body}");
+    let insert = h
+        .db
+        .last_query_params("INSERT INTO \"stripe\".\"checkout_sessions\"")
+        .expect("the pending row");
+    assert!(has_int(&insert, 1000), "the chosen amount");
+    assert!(has_int(&insert, 12000), "against the full assessment");
+
+    // Over the outstanding amount is refused, and says where it belongs.
+    h.db.push_rows(vec![mirror_row("42", 2026, 12000, 0, 0)]);
+    let (status, body) = call(
+        &checkout.handler,
+        TestRequest::post("/api/stripe/checkout")
+            .json(&serde_json::json!({
+                "purpose": "dues", "dues_year": 2026, "amount_cents": 20000
+            }))
+            .identity("42", &["scout"])
+            .build(),
+    )
+    .await;
+    assert_eq!(status, 400, "{body}");
+    assert!(
+        body["error"].as_str().unwrap().contains("donation"),
+        "the refusal points at the purpose that fits: {body}"
+    );
+}
+
+/// Zero — and anything under Stripe's minimum — is a waiver in finance, not a
+/// session. Stripe cannot charge zero, so the shop says so rather than opening a
+/// request that cannot succeed.
+#[tokio::test]
+async fn paying_nothing_is_a_waiver_not_a_session() {
+    let h = Harness::new(config());
+    let routes = h.routes().await;
+    let checkout = route(&routes, "POST", "/api/stripe/checkout");
+    h.db.push_rows(vec![mirror_row("42", 2026, 12000, 0, 0)]);
+
+    let (status, body) = call(
+        &checkout.handler,
+        TestRequest::post("/api/stripe/checkout")
+            .json(&serde_json::json!({
+                "purpose": "dues", "dues_year": 2026, "amount_cents": 10
+            }))
+            .identity("42", &["scout"])
+            .build(),
+    )
+    .await;
+    assert_eq!(status, 409, "{body}");
+    assert!(
+        body["error"].as_str().unwrap().contains("waiver"),
+        "the refusal names the mechanism: {body}"
+    );
+    assert!(
+        h.http.calls().is_empty(),
+        "nothing is sent to Stripe for an amount it cannot charge"
+    );
+}
+
+/// No mirror row: the shop refuses to price from nothing rather than let the
+/// payer set their own dues.
+#[tokio::test]
+async fn a_dues_checkout_without_an_assessment_is_refused() {
+    let h = Harness::new(config());
+    let routes = h.routes().await;
+    let checkout = route(&routes, "POST", "/api/stripe/checkout");
+    h.db.push_rows(Vec::new()); // no mirror row for this member
+
+    let (status, body) = call(
+        &checkout.handler,
+        TestRequest::post("/api/stripe/checkout")
+            .json(&serde_json::json!({ "purpose": "dues", "dues_year": 2026 }))
+            .identity("42", &["scout"])
+            .build(),
+    )
+    .await;
+    assert_eq!(status, 409, "{body}");
+    assert!(
+        body["error"].as_str().unwrap().contains("finance"),
+        "the refusal says where the number comes from: {body}"
+    );
+    assert!(h.http.calls().is_empty(), "nothing reaches Stripe");
+}
+
+// ---------------------------------------------------------------------------
 // Checkout
 // ---------------------------------------------------------------------------
 
@@ -1322,7 +1506,7 @@ async fn a_checkout_records_the_attempt_then_settles_it_from_stripe() {
         &checkout.handler,
         TestRequest::post("/api/stripe/checkout")
             .json(&serde_json::json!({
-                "purpose": "dues",
+                "purpose": "donation",
                 "amount_cents": 2500,
                 "member_id": "42",
                 "dues_year": 2026,
@@ -1401,7 +1585,7 @@ async fn a_refused_checkout_is_recorded_as_a_failed_attempt_not_erased() {
     let (status, body) = call(
         &checkout.handler,
         TestRequest::post("/api/stripe/checkout")
-            .json(&serde_json::json!({ "purpose": "dues", "amount_cents": 2500 }))
+            .json(&serde_json::json!({ "purpose": "donation", "amount_cents": 2500 }))
             .identity("bea", &["chief"])
             .build(),
     )
@@ -1461,7 +1645,7 @@ async fn a_checkout_for_somebody_else_needs_stripe_manage() {
         &checkout.handler,
         TestRequest::post("/api/stripe/checkout")
             .json(&serde_json::json!({
-                "purpose": "dues", "amount_cents": 2500, "member_id": "99"
+                "purpose": "donation", "amount_cents": 2500, "member_id": "99"
             }))
             .identity("bea", &["scout"])
             .build(),
@@ -1488,7 +1672,7 @@ async fn a_checkout_with_neither_url_configured_nor_supplied_is_refused() {
     let (status, body) = call(
         &checkout.handler,
         TestRequest::post("/api/stripe/checkout")
-            .json(&serde_json::json!({ "purpose": "dues", "amount_cents": 2500 }))
+            .json(&serde_json::json!({ "purpose": "donation", "amount_cents": 2500 }))
             .identity("bea", &["chief"])
             .build(),
     )
@@ -1968,7 +2152,7 @@ async fn no_secret_ever_reaches_a_response_an_event_or_an_audit_entry() {
     let (_status, checkout_body) = call(
         &checkout.handler,
         TestRequest::post("/api/stripe/checkout")
-            .json(&serde_json::json!({ "purpose": "dues", "amount_cents": 2500 }))
+            .json(&serde_json::json!({ "purpose": "donation", "amount_cents": 2500 }))
             .identity("bea", &["chief"])
             .build(),
     )

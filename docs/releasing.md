@@ -18,9 +18,12 @@ in particular the interim `v0.3.0` recommendation and the v1.0 gate.
     which is how a troop opens Adjutant from anywhere;
   - `adjutant-client-vX.Y.Z-android.apk`, the same client as an APK — the
     Obtainium path, and the file a phone installs. It is built in **release**
-    mode, signed with Flutter's throwaway debug key (the one platform that
-    refuses an unsigned install outright), and the workflow fails rather than
-    attach an APK that is missing or a stub.
+    mode and signed with the troop's **release key**, configured from the
+    `ANDROID_KEYSTORE_BASE64`, `ANDROID_KEYSTORE_PASSWORD`, `ANDROID_KEY_ALIAS`
+    and `ANDROID_KEY_PASSWORD` repository secrets. A missing secret fails the
+    job instead of falling back to the public debug key, and the built file is
+    checked with `apksigner verify --print-certs` (#168). The workflow fails
+    rather than attach an APK that is missing, a stub, or debug-signed.
 - **Every artifact carries a `.sha256` beside it**, and a manual
   `workflow_dispatch` run builds all three without creating a release — so a
   packaging fault can surface before a tag rather than at one.
@@ -40,11 +43,29 @@ in particular the interim `v0.3.0` recommendation and the v1.0 gate.
 
 ## Version bump
 
+`Cargo.toml` `[workspace.package].version` is the source of truth. The core and
+SDK inherit it, and the release tag is cut from it.
+
 1. Update `version` in [`Cargo.toml`](../Cargo.toml) `[workspace.package]`
-   (the core and SDK share a version; plugins version independently).
-2. If the SDK contract changed in a breaking way, bump `SDK_ABI_VERSION` in
+   (the core and SDK share a version; plugins version independently). Keep the
+   `[workspace.dependencies]` entry for `adjutant-sdk` at the same version.
+2. Update `version` in [`client/pubspec.yaml`](../client/pubspec.yaml) to the
+   same `X.Y.Z`. Keep or increment the `+N` build number; Android's
+   `versionName` comes from this field, not from `Cargo.toml` (#177).
+3. If the SDK contract changed in a breaking way, bump `SDK_ABI_VERSION` in
    `plugins/sdk/src/lib.rs` and note it in [`CHANGELOG.md`](../CHANGELOG.md).
-3. Move the `[Unreleased]` changelog section to the new version.
+4. Move the `[Unreleased]` changelog section to the new version.
+5. Run the gate before tagging:
+
+   ```bash
+   python3 scripts/check-versions.py --tag vX.Y.Z
+   ```
+
+   It compares the proposed tag, `Cargo.toml`, the `adjutant-sdk` dependency,
+   `client/pubspec.yaml`, the newest released `CHANGELOG.md` heading and the MCP
+   bridge's `SERVER_VERSION`. The same script runs on every push and tag in CI,
+   and is the first step of the release job, so mismatched files cannot publish
+   a release even if the local run is skipped.
 
 ## Verify before publishing
 

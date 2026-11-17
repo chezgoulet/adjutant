@@ -12,13 +12,19 @@
 //!    lesson). id_tokens verified with `jsonwebtoken` (HS256 client-secret or
 //!    RS256 via JWKS).
 //!
-//! Bootstrap: while `core.users` is empty, `POST /api/auth/register` is open
-//! and the first user becomes `chief`. Afterwards registration is closed —
-//! only `auth:manage_users` may create users.
+//! Bootstrap: while `core.users` is empty, `POST /api/auth/register` creates the
+//! first `chief` — but only for a caller presenting `ADJUTANT_BOOTSTRAP_TOKEN`,
+//! and only with that variable set. Unset means closed: the route that mints an
+//! admin out of nothing must not be answered by whoever reaches the port first.
+//! Afterwards registration is closed — only `auth:manage_users` may create users.
+//!
+//! Login counts failures per username: ten inside fifteen minutes cools the name
+//! off with `429` for the rest of the window. The core's per-IP limiter is the
+//! other half; this is the half that an attacker rotating addresses cannot dodge.
 //!
 //! Config (per-plugin row `core.plugins.config`, admin-set, reload to apply):
-//! `{"oidc": {"issuer", "client_id", "client_secret", "redirect_uri"},
-//!   "session_ttl_hours": 720}`
+//! `{"oidc": {"issuer", "client_id", "client_secret", "redirect_uri",
+//!   "id_token_alg": "RS256"}, "session_ttl_hours": 720}`
 
 use std::collections::HashMap;
 use std::sync::OnceLock;
@@ -28,6 +34,110 @@ use serde::{Deserialize, Serialize};
 
 const SESSION_COOKIE: &str = "adjutant_session";
 const DEFAULT_TTL_HOURS: i64 = 720; // 30 days
+
+/// The `id_token` algorithm assumed when the deployment does not name one.
+const DEFAULT_ID_TOKEN_ALG: &str = "RS256";
+
+/// How old an OIDC `state` may be when it is redeemed. Enforced where the state
+/// is consumed, and swept here as housekeeping — not the other way round.
+const OIDC_STATE_TTL_MINUTES: i64 = 15;
+
+/// The environment variable carrying the one-time secret that claims a fresh
+/// installation.
+///
+/// `/api/auth/register` is the only route that mints a `chief` from nothing, so
+/// it must not be open to whoever reaches the port first. With this unset,
+/// registration is CLOSED — a fresh deployment is claimed by setting it, or by
+/// the CLI. Off-by-default is the whole point: the earlier design left a race
+/// between the operator and the internet.
+const BOOTSTRAP_TOKEN_ENV: &str = "ADJUTANT_BOOTSTRAP_TOKEN";
+
+/// Failed logins for one username before that username is cooled off, and for
+/// how long. Keyed on the submitted name (existing or not), so a refusal says
+/// nothing about whether the account exists.
+const LOGIN_FAILURE_LIMIT: u32 = 10;
+const LOGIN_COOLOFF_SECS: u64 = 900;
+
+/// Per-username failure window for `/api/auth/login`.
+///
+/// The core's rate limiter is per client IP; this is the other half — an
+/// attacker who rotates addresses still has to spend guesses against one name.
+/// In-process on purpose: a restart forgives, and the IP limiter is the outer
+/// bound, so this is defence in depth rather than the only wall.
+///
+/// **The trade is a lockout an attacker can trigger.** Ten bad guesses against
+/// `chris` refuse `chris` for fifteen minutes, including from the person who
+/// owns it — that is the price of counting per name rather than per guess. For a
+/// troop this size it is the right side of the trade (the window expires by
+/// itself and a restart clears it), and the alternative — no per-name limit —
+/// leaves one name open to an unbounded distributed guess.
+
+#[derive(Default)]
+struct LoginThrottle {
+    hits: std::sync::Mutex<std::collections::HashMap<String, (std::time::Instant, u32)>>,
+}
+
+impl LoginThrottle {
+    /// How long this username is still refused for, `None` when it may try.
+    fn cooling(&self, key: &str, now: std::time::Instant) -> Option<u64> {
+        let mut map = self.hits.lock().unwrap_or_else(|e| e.into_inner());
+        let (started, count) = map.get(key).copied()?;
+        if count < LOGIN_FAILURE_LIMIT {
+            return None;
+        }
+        let window = std::time::Duration::from_secs(LOGIN_COOLOFF_SECS);
+        let elapsed = now.duration_since(started);
+        if elapsed >= window {
+            map.remove(key);
+            return None;
+        }
+        Some((window - elapsed).as_secs().max(1))
+    }
+
+    fn failure(&self, key: &str, now: std::time::Instant) {
+        let mut map = self.hits.lock().unwrap_or_else(|e| e.into_inner());
+        if map.len() > 10_000 {
+            let window = std::time::Duration::from_secs(LOGIN_COOLOFF_SECS);
+            map.retain(|_, (started, _)| now.duration_since(*started) < window);
+        }
+        let entry = map.entry(key.to_string()).or_insert((now, 0));
+        // A window that has run out starts again rather than resuming a spent one.
+        if now.duration_since(entry.0) >= std::time::Duration::from_secs(LOGIN_COOLOFF_SECS) {
+            *entry = (now, 0);
+        }
+        entry.1 += 1;
+    }
+
+    fn success(&self, key: &str) {
+        self.hits
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(key);
+    }
+}
+
+/// The configured bootstrap secret, if the deployment set one.
+fn bootstrap_token() -> Option<String> {
+    std::env::var(BOOTSTRAP_TOKEN_ENV)
+        .ok()
+        .map(|v| v.trim().to_string())
+        .filter(|v| !v.is_empty())
+}
+
+/// Compare two secrets without returning early on the first differing byte.
+///
+/// Both sides are hashed first so the comparison is over a fixed-length value
+/// and the loop cost does not depend on where the strings diverge.
+fn secret_matches(presented: &str, expected: &str) -> bool {
+    use sha2::{Digest, Sha256};
+    let a = Sha256::digest(presented.as_bytes());
+    let b = Sha256::digest(expected.as_bytes());
+    let mut diff = 0u8;
+    for (x, y) in a.iter().zip(b.iter()) {
+        diff |= x ^ y;
+    }
+    diff == 0
+}
 
 // ---------------------------------------------------------------------------
 // Config
@@ -39,6 +149,13 @@ struct OidcCfg {
     client_id: String,
     client_secret: String,
     redirect_uri: String,
+    /// The `id_token` algorithm this deployment will accept. Pinned from config
+    /// rather than read out of the token: a verifier that believes the token's
+    /// own header is one misconfiguration away from being told what to trust.
+    /// Defaults to RS256 (the normal OIDC case); set `"HS256"` for a shared-secret
+    /// IdP.
+    #[serde(default)]
+    id_token_alg: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -65,7 +182,11 @@ fn verify_password(password: &str, stored: &str) -> bool {
     use argon2::password_hash::{PasswordHash, PasswordVerifier};
     use argon2::Argon2;
     PasswordHash::new(stored)
-        .map(|parsed| Argon2::default().verify_password(password.as_bytes(), &parsed).is_ok())
+        .map(|parsed| {
+            Argon2::default()
+                .verify_password(password.as_bytes(), &parsed)
+                .is_ok()
+        })
         .unwrap_or(false)
 }
 
@@ -81,6 +202,19 @@ fn token_hash(token: &str) -> String {
     hex::encode(Sha256::digest(token.as_bytes()))
 }
 
+/// Shape check before binding a path capture as `::uuid`. A malformed id is a
+/// missing id to the caller (404), not a database error they can distinguish.
+fn is_uuid(value: &str) -> bool {
+    value.len() == 36
+        && value.chars().enumerate().all(|(i, ch)| {
+            if matches!(i, 8 | 13 | 18 | 23) {
+                ch == '-'
+            } else {
+                ch.is_ascii_hexdigit()
+            }
+        })
+}
+
 // ---------------------------------------------------------------------------
 // Session handling (shared by routes + identity provider)
 // ---------------------------------------------------------------------------
@@ -88,6 +222,9 @@ fn token_hash(token: &str) -> String {
 #[derive(Debug, Serialize)]
 struct SessionUser {
     id: String,
+    /// The `core.sessions.id` the presented token belongs to. Used to tell the
+    /// caller which listed session is the current one.
+    session_id: String,
     username: String,
     email: Option<String>,
     display_name: String,
@@ -107,7 +244,10 @@ fn extract_token(headers: &HashMap<String, String>) -> Option<String> {
             .map(|(_, v)| v.as_str())
     };
     if let Some(auth) = get("authorization") {
-        if let Some(tok) = auth.strip_prefix("Bearer ").or_else(|| auth.strip_prefix("bearer ")) {
+        if let Some(tok) = auth
+            .strip_prefix("Bearer ")
+            .or_else(|| auth.strip_prefix("bearer "))
+        {
             if !tok.is_empty() {
                 return Some(tok.trim().to_string());
             }
@@ -129,7 +269,8 @@ fn extract_token(headers: &HashMap<String, String>) -> Option<String> {
 async fn session_identity(db: &DbHandle, token: &str) -> Result<Option<SessionUser>, SdkError> {
     let rows = db
         .query(
-            "SELECT u.id::text AS id, u.username, u.email, u.display_name, u.is_active, \
+            "SELECT u.id::text AS id, s.id::text AS session_id, \
+                    u.username, u.email, u.display_name, u.is_active, \
                     COALESCE(ARRAY(\
                         SELECT role_id FROM core.user_roles WHERE user_id = u.id\
                     ), '{}') AS roles, \
@@ -142,7 +283,8 @@ async fn session_identity(db: &DbHandle, token: &str) -> Result<Option<SessionUs
                     ), '[]'::jsonb) AS grant_list \
              FROM core.sessions s \
              JOIN core.users u ON u.id = s.user_id \
-             WHERE s.token_hash = $1 AND s.expires_at > now()",
+             WHERE s.token_hash = $1 AND s.expires_at > now() \
+               AND s.revoked_at IS NULL",
             vec![SqlValue::Text(token_hash(token))],
         )
         .await?;
@@ -156,20 +298,47 @@ async fn session_identity(db: &DbHandle, token: &str) -> Result<Option<SessionUs
     let username = row["username"].as_str().unwrap_or_default().to_string();
     let roles: Vec<String> = row["roles"]
         .as_array()
-        .map(|a| a.iter().filter_map(|v| v.as_str().map(String::from)).collect())
+        .map(|a| {
+            a.iter()
+                .filter_map(|v| v.as_str().map(String::from))
+                .collect()
+        })
         .unwrap_or_default();
     let grants: Vec<RoleGrant> = row["grant_list"]
         .as_array()
-        .map(|a| a.iter().filter_map(|g| grant_from_row(&username, g)).collect())
+        .map(|a| {
+            a.iter()
+                .filter_map(|g| grant_from_row(&username, g))
+                .collect()
+        })
         .unwrap_or_default();
     Ok(Some(SessionUser {
         id: row["id"].as_str().unwrap_or_default().to_string(),
+        session_id: row["session_id"].as_str().unwrap_or_default().to_string(),
         username,
         email: row["email"].as_str().map(String::from),
         display_name: row["display_name"].as_str().unwrap_or_default().to_string(),
         roles,
         grants,
     }))
+}
+
+/// The authenticated caller, or the 401 response to return.
+///
+/// Shared by every route that acts on the caller's own account, so the
+/// revocation check (`session_identity`) cannot be bypassed by a new handler.
+async fn session_or_401(
+    ctx: &PluginContext,
+    req: &PluginRequest,
+) -> Result<SessionUser, PluginResponse> {
+    let token = extract_token(&req.headers)
+        .ok_or_else(|| PluginResponse::error(401, "authentication required").unwrap())?;
+    session_identity(&ctx.db, &token)
+        .await
+        .map_err(|e| PluginResponse::error(500, e.to_string()).unwrap())
+        .and_then(|u| {
+            u.ok_or_else(|| PluginResponse::error(401, "session expired or invalid").unwrap())
+        })
 }
 
 /// One `core.user_roles` row (as JSON) → [`RoleGrant`], **fail closed**.
@@ -211,13 +380,52 @@ fn grant_from_row(user: &str, g: &serde_json::Value) -> Option<RoleGrant> {
         );
         return None;
     }
-    Some(RoleGrant { role_id, scope: Scope { scope_type, scope_id } })
+    Some(RoleGrant {
+        role_id,
+        scope: Scope {
+            scope_type,
+            scope_id,
+        },
+    })
 }
 
 /// PostgreSQL unique-violation detection. sqlx surfaces the driver message
 /// (SQLSTATE 23505) as text across the host boundary, so match both forms.
 fn is_duplicate_key(err: &str) -> bool {
     err.contains("duplicate key") || err.contains("23505")
+}
+
+/// Record a refused login: the attempted username and a reason category, never
+/// the submitted secret. The actor is unknown (there is no session), so the
+/// entry falls back to `details.user_id`-style attribution in `details`.
+async fn audit_login_failure(
+    audit: &AuditService,
+    username: &str,
+    reason: &str,
+) -> Result<(), SdkError> {
+    audit
+        .log(
+            None,
+            "auth.login.failed",
+            "user",
+            username,
+            serde_json::json!({"username": username, "reason": reason}),
+        )
+        .await
+}
+
+/// Give the bootstrap slot back when registration failed before a user existed,
+/// so a mistyped or already-taken username does not spend the installation's only
+/// self-service way in (#173). Best-effort by design: this runs inside an error
+/// path, and the operator's `ADJUTANT_BOOTSTRAP_*` path is the deterministic
+/// recovery.
+async fn release_bootstrap_claim(db: &DbHandle, claim: &str) {
+    let _ = db
+        .execute(
+            "DELETE FROM core.bootstrap_claim WHERE claim_token = $1",
+            vec![SqlValue::Text(claim.to_string())],
+        )
+        .await;
 }
 
 /// Local username for an IdP-created user: lowercase, `[a-z0-9._-]`, capped at
@@ -264,14 +472,43 @@ async fn create_session(
     Ok((token, chrono::Utc::now().to_rfc3339()))
 }
 
-fn session_cookie(token: &str, ttl_hours: i64) -> (String, String) {
+/// Whether the deployment explicitly opted out of the `Secure` cookie attribute.
+///
+/// Development-only escape hatch: the server binds plain HTTP locally, where a
+/// browser would refuse to send a `Secure` cookie. It is **never** inferred from
+/// the bind address or from a forwarded header — a deployment that terminates
+/// TLS at a proxy must leave this unset.
+fn insecure_cookies_enabled() -> bool {
+    std::env::var("ADJUTANT_INSECURE_COOKIES")
+        .map(|v| v == "true")
+        .unwrap_or(false)
+}
+
+fn session_cookie_with(token: &str, ttl_hours: i64, secure: bool) -> (String, String) {
+    let secure = if secure { "; Secure" } else { "" };
     (
         "set-cookie".into(),
         format!(
-            "{SESSION_COOKIE}={token}; HttpOnly; SameSite=Lax; Path=/; Max-Age={}",
+            "{SESSION_COOKIE}={token}; HttpOnly; SameSite=Lax; Path=/; Max-Age={}{secure}",
             ttl_hours * 3600
         ),
     )
+}
+
+fn session_cookie(token: &str, ttl_hours: i64) -> (String, String) {
+    session_cookie_with(token, ttl_hours, !insecure_cookies_enabled())
+}
+
+fn cleared_session_cookie_with(secure: bool) -> (String, String) {
+    let secure = if secure { "; Secure" } else { "" };
+    (
+        "set-cookie".into(),
+        format!("{SESSION_COOKIE}=; HttpOnly; SameSite=Lax; Path=/; Max-Age=0{secure}"),
+    )
+}
+
+fn cleared_session_cookie() -> (String, String) {
+    cleared_session_cookie_with(!insecure_cookies_enabled())
 }
 
 // ---------------------------------------------------------------------------
@@ -284,7 +521,10 @@ struct SessionIdentityProvider {
 
 #[async_trait]
 impl IdentityProvider for SessionIdentityProvider {
-    async fn identify(&self, headers: &HashMap<String, String>) -> Result<Option<Identity>, SdkError> {
+    async fn identify(
+        &self,
+        headers: &HashMap<String, String>,
+    ) -> Result<Option<Identity>, SdkError> {
         let Some(token) = extract_token(headers) else {
             return Ok(None); // no credentials → core may fall back to dev headers
         };
@@ -302,25 +542,28 @@ impl IdentityProvider for SessionIdentityProvider {
 pub struct AuthPlugin {
     ctx: OnceLock<PluginContext>,
     cfg: AuthConfig,
+    /// Per-username failed-login window (see [`LoginThrottle`]). Shared with the
+    /// login route's closure, so the count survives the per-request clone.
+    throttle: std::sync::Arc<LoginThrottle>,
 }
 
 impl AuthPlugin {
     pub fn new() -> Self {
-        Self { ctx: OnceLock::new(), cfg: AuthConfig::default() }
+        Self {
+            ctx: OnceLock::new(),
+            cfg: AuthConfig::default(),
+            throttle: std::sync::Arc::new(LoginThrottle::default()),
+        }
     }
 
     fn ctx(&self) -> &PluginContext {
-        self.ctx.get().expect("core must call init() before routes()")
+        self.ctx
+            .get()
+            .expect("core must call init() before routes()")
     }
 
     async fn require_session(&self, req: &PluginRequest) -> Result<SessionUser, PluginResponse> {
-        let token = extract_token(&req.headers).ok_or_else(|| {
-            PluginResponse::error(401, "authentication required").unwrap()
-        })?;
-        session_identity(&self.ctx().db, &token)
-            .await
-            .map_err(|e| PluginResponse::error(500, e.to_string()).unwrap())
-            .and_then(|u| u.ok_or_else(|| PluginResponse::error(401, "session expired or invalid").unwrap()))
+        session_or_401(self.ctx(), req).await
     }
 
     fn ttl(&self) -> i64 {
@@ -359,6 +602,13 @@ impl AdjutantPlugin for AuthPlugin {
         Ok(())
     }
 
+    /// The OIDC client secret is a deployment secret, not plugin config: it is
+    /// resolved from `ADJUTANT_SECRET_AUTH_OIDC_CLIENT_SECRET` or the secrets
+    /// file and injected into `ctx.config` before `init`.
+    fn secret_config_keys(&self) -> Vec<&'static str> {
+        vec!["oidc.client_secret"]
+    }
+
     fn permissions_granted(&self) -> Vec<Permission> {
         vec![Permission::new(
             "auth:manage_users",
@@ -387,10 +637,12 @@ impl AdjutantPlugin for AuthPlugin {
         // --- login ----------------------------------------------------------
         let c = ctx.clone();
         let ttl = self.ttl();
+        let throttle = self.throttle.clone();
         let login = RouteDefinition::post(
             "/api/auth/login",
             route_handler(move |req| {
                 let c = c.clone();
+                let throttle = throttle.clone();
                 async move {
                     #[derive(Deserialize)]
                     struct Body {
@@ -398,27 +650,59 @@ impl AdjutantPlugin for AuthPlugin {
                         password: String,
                     }
                     let body: Body = req.json()?;
-                    let rows = c
-                        .db
-                        .query(
+                    // The per-username window, checked before the database: a
+                    // cooled-off name is refused without spending a hash, and
+                    // the answer is the same whether or not the account exists
+                    // (the key is the submitted name, not a lookup result).
+                    let key = body.username.trim().to_ascii_lowercase();
+                    if let Some(secs) = throttle.cooling(&key, std::time::Instant::now()) {
+                        return PluginResponse::error(
+                            429,
+                            format!(
+                                "too many failed attempts for this username; \
+                                 try again in {secs}s"
+                            ),
+                        );
+                    }
+                    let rows =
+                        c.db.query(
                             "SELECT id::text AS id, username, password_hash, is_active \
                              FROM core.users WHERE lower(username) = lower($1)",
                             vec![SqlValue::Text(body.username.clone())],
                         )
                         .await?;
-                    let row = rows.into_iter().next().ok_or_else(|| {
-                        SdkError::BadRequest("invalid credentials".into())
-                    })?;
+                    let Some(row) = rows.into_iter().next() else {
+                        throttle.failure(&key, std::time::Instant::now());
+                        audit_login_failure(&c.audit, &body.username, "unknown_user").await?;
+                        return Err(SdkError::BadRequest("invalid credentials".into()));
+                    };
                     let stored = row["password_hash"].as_str().unwrap_or("");
-                    if stored.is_empty()
-                        || !verify_password(&body.password, stored)
-                        || row["is_active"] != serde_json::json!(true)
-                    {
-                        // Same message for unknown user and bad password — no user enumeration.
+                    if stored.is_empty() || !verify_password(&body.password, stored) {
+                        throttle.failure(&key, std::time::Instant::now());
+                        // The reason is recorded for auditors; the response is the
+                        // same for an unknown user and a bad password (no enumeration).
+                        audit_login_failure(&c.audit, &body.username, "bad_password").await?;
+                        return Err(SdkError::BadRequest("invalid credentials".into()));
+                    }
+                    if row["is_active"] != serde_json::json!(true) {
+                        throttle.failure(&key, std::time::Instant::now());
+                        audit_login_failure(&c.audit, &body.username, "inactive").await?;
                         return Err(SdkError::BadRequest("invalid credentials".into()));
                     }
                     let uid = row["id"].as_str().unwrap_or_default().to_string();
+                    throttle.success(&key);
                     let (token, expires) = create_session(&c.db, &uid, ttl).await?;
+                    // Success is attributed to the user; the token itself is never
+                    // part of the audit record.
+                    c.audit
+                        .log(
+                            Some(&Identity::from_grants(uid.clone(), vec![])),
+                            "auth.login",
+                            "user",
+                            &uid,
+                            serde_json::json!({"username": body.username}),
+                        )
+                        .await?;
                     let mut resp = PluginResponse::json(
                         200,
                         &serde_json::json!({
@@ -442,27 +726,219 @@ impl AdjutantPlugin for AuthPlugin {
                 async move {
                     let token = extract_token(&req.headers).unwrap_or_default();
                     if !token.is_empty() {
-                        c.db
-                            .execute(
-                                "DELETE FROM core.sessions WHERE token_hash = $1",
+                        let removed =
+                            c.db.query(
+                                "DELETE FROM core.sessions WHERE token_hash = $1 \
+                                 RETURNING id::text AS id, user_id::text AS user_id",
                                 vec![SqlValue::Text(token_hash(&token))],
                             )
                             .await?;
+                        if let Some(row) = removed.first() {
+                            let uid = row["user_id"].as_str().unwrap_or_default().to_string();
+                            let sid = row["id"].as_str().unwrap_or_default().to_string();
+                            c.audit
+                                .log(
+                                    Some(&Identity::from_grants(uid, vec![])),
+                                    "auth.logout",
+                                    "session",
+                                    &sid,
+                                    serde_json::json!({}),
+                                )
+                                .await?;
+                        }
                     }
                     let mut resp = PluginResponse::json(200, &serde_json::json!({"ok": true}))?;
-                    resp.headers
-                        .push(("set-cookie".into(), format!("{SESSION_COOKIE}=; Path=/; Max-Age=0")));
+                    resp.headers.push(cleared_session_cookie());
                     Ok(resp)
                 }
             }),
         );
 
+        // --- own sessions: list ---------------------------------------------
+        let c = ctx.clone();
+        let list_sessions = RouteDefinition::get(
+            "/api/auth/sessions",
+            route_handler(move |req| {
+                let c = c.clone();
+                async move {
+                    let user = match session_or_401(&c, &req).await {
+                        Err(resp) => return Ok(resp),
+                        Ok(user) => user,
+                    };
+                    // `revoked_at` is filtered here as well as in the identity
+                    // lookup: a revoked session is no longer a thing the caller
+                    // is holding.
+                    let rows =
+                        c.db.query(
+                            "SELECT id::text AS id, created_at, expires_at, device_info \
+                             FROM core.sessions \
+                             WHERE user_id = $1::uuid AND revoked_at IS NULL \
+                               AND expires_at > now() \
+                             ORDER BY created_at DESC",
+                            vec![SqlValue::Text(user.id.clone())],
+                        )
+                        .await?;
+                    let sessions: Vec<serde_json::Value> = rows
+                        .iter()
+                        .map(|r| {
+                            let id = r["id"].as_str().unwrap_or_default();
+                            serde_json::json!({
+                                "id": id,
+                                "created_at": r["created_at"],
+                                "expires_at": r["expires_at"],
+                                "device_info": r["device_info"],
+                                "current": id == user.session_id.as_str(),
+                            })
+                        })
+                        .collect();
+                    PluginResponse::json(200, &serde_json::json!({"sessions": sessions}))
+                }
+            }),
+        );
+
+        // --- own sessions: revoke one ---------------------------------------
+        let c = ctx.clone();
+        let revoke_session = RouteDefinition::delete(
+            "/api/auth/sessions/{id}",
+            route_handler(move |req| {
+                let c = c.clone();
+                async move {
+                    let user = match session_or_401(&c, &req).await {
+                        Err(resp) => return Ok(resp),
+                        Ok(user) => user,
+                    };
+                    let id = req.params.get("id").cloned().unwrap_or_default();
+                    // Another user's session and a missing one take the same path:
+                    // both update no row and both answer 404 (never 403), so the
+                    // response cannot be used to test whether an id exists.
+                    if !is_uuid(&id) {
+                        return PluginResponse::error(404, "session not found");
+                    }
+                    let rows =
+                        c.db.query(
+                            "UPDATE core.sessions SET revoked_at = now() \
+                             WHERE id = $1::uuid AND user_id = $2::uuid \
+                               AND revoked_at IS NULL \
+                             RETURNING id::text AS id",
+                            vec![SqlValue::Text(id.clone()), SqlValue::Text(user.id.clone())],
+                        )
+                        .await?;
+                    if rows.is_empty() {
+                        return PluginResponse::error(404, "session not found");
+                    }
+                    c.audit
+                        .log(
+                            Some(&Identity::from_grants(user.id.clone(), vec![])),
+                            "auth.session.revoke",
+                            "session",
+                            &id,
+                            serde_json::json!({}),
+                        )
+                        .await?;
+                    PluginResponse::json(200, &serde_json::json!({"ok": true, "id": id}))
+                }
+            }),
+        );
+
+        // --- change password (revokes every other session) -------------------
+        let c = ctx.clone();
+        let change_password = RouteDefinition::post(
+            "/api/auth/password",
+            route_handler(move |req| {
+                let c = c.clone();
+                async move {
+                    #[derive(Deserialize)]
+                    struct Body {
+                        current_password: String,
+                        new_password: String,
+                    }
+                    let user = match session_or_401(&c, &req).await {
+                        Err(resp) => return Ok(resp),
+                        Ok(user) => user,
+                    };
+                    let body: Body = req.json()?;
+                    if body.new_password.len() < 8 {
+                        return PluginResponse::error(
+                            400,
+                            "new password must be at least 8 characters",
+                        );
+                    }
+                    let rows =
+                        c.db.query(
+                            "SELECT password_hash FROM core.users WHERE id = $1::uuid",
+                            vec![SqlValue::Text(user.id.clone())],
+                        )
+                        .await?;
+                    let stored = rows
+                        .first()
+                        .and_then(|r| r["password_hash"].as_str())
+                        .unwrap_or("");
+                    if stored.is_empty() || !verify_password(&body.current_password, stored) {
+                        c.audit
+                            .log(
+                                Some(&Identity::from_grants(user.id.clone(), vec![])),
+                                "auth.password.change.failed",
+                                "user",
+                                &user.id,
+                                serde_json::json!({"reason": "bad_current_password"}),
+                            )
+                            .await?;
+                        return PluginResponse::error(400, "current password is incorrect");
+                    }
+                    let hash = hash_password(&body.new_password)?;
+                    let updated =
+                        c.db.execute(
+                            "UPDATE core.users SET password_hash = $1 WHERE id = $2::uuid",
+                            vec![SqlValue::Text(hash), SqlValue::Text(user.id.clone())],
+                        )
+                        .await?;
+                    if updated == 0 {
+                        return PluginResponse::error(401, "session expired or invalid");
+                    }
+                    // Every sibling goes; the presented session is excluded by id,
+                    // so the caller is not logged out by their own password change.
+                    let revoked =
+                        c.db.execute(
+                            "UPDATE core.sessions SET revoked_at = now() \
+                             WHERE user_id = $1::uuid AND id <> $2::uuid \
+                               AND revoked_at IS NULL",
+                            vec![
+                                SqlValue::Text(user.id.clone()),
+                                SqlValue::Text(user.session_id.clone()),
+                            ],
+                        )
+                        .await?;
+                    c.audit
+                        .log(
+                            Some(&Identity::from_grants(user.id.clone(), vec![])),
+                            "auth.password.change",
+                            "user",
+                            &user.id,
+                            serde_json::json!({"revoked_other_sessions": revoked}),
+                        )
+                        .await?;
+                    PluginResponse::json(
+                        200,
+                        &serde_json::json!({"ok": true, "revoked_other_sessions": revoked}),
+                    )
+                }
+            }),
+        );
+
         // --- me -------------------------------------------------------------
-        let me_self = AuthPlugin { ctx: self.ctx.clone(), cfg: self.cfg.clone() };
+        let me_self = AuthPlugin {
+            ctx: self.ctx.clone(),
+            cfg: self.cfg.clone(),
+            throttle: self.throttle.clone(),
+        };
         let me = RouteDefinition::get(
             "/api/auth/me",
             route_handler(move |req| {
-                let me = AuthPlugin { ctx: me_self.ctx.clone(), cfg: me_self.cfg.clone() };
+                let me = AuthPlugin {
+                    ctx: me_self.ctx.clone(),
+                    cfg: me_self.cfg.clone(),
+                    throttle: me_self.throttle.clone(),
+                };
                 async move {
                     match me.require_session(&req).await {
                         Err(resp) => Ok(resp),
@@ -495,14 +971,21 @@ impl AdjutantPlugin for AuthPlugin {
                         #[serde(default)]
                         email: Option<String>,
                         password: String,
+                        /// The deployment's one-time claim secret
+                        /// (`ADJUTANT_BOOTSTRAP_TOKEN`). Absent on every
+                        /// registration after the first, which is closed.
+                        #[serde(default)]
+                        bootstrap_token: Option<String>,
                     }
-                    let n: i64 = c
-                        .db
-                        .query("SELECT COUNT(*) AS n FROM core.users", vec![])
-                        .await?
-                        .first()
-                        .and_then(|r| r["n"].as_i64())
-                        .unwrap_or(0);
+                    // Column-level grants: `COUNT(*)` needs table-level SELECT,
+                    // which auth no longer holds on `core.users`. `COUNT(id)`
+                    // names a granted column and answers the same question.
+                    let n: i64 =
+                        c.db.query("SELECT COUNT(id) AS n FROM core.users", vec![])
+                            .await?
+                            .first()
+                            .and_then(|r| r["n"].as_i64())
+                            .unwrap_or(0);
                     if n > 0 {
                         return PluginResponse::error(
                             403,
@@ -510,10 +993,58 @@ impl AdjutantPlugin for AuthPlugin {
                         );
                     }
                     let body: Body = req.json()?;
+                    // The bootstrap gate. `register` is the only route that mints
+                    // a `chief` from nothing, so it must not be answered by
+                    // whoever reaches the port first: the deployment sets
+                    // ADJUTANT_BOOTSTRAP_TOKEN, and the first registration must
+                    // present it. Unset means closed — a fresh install is claimable
+                    // only by someone who can read the server's configuration.
+                    // No log line on refusal on purpose: this route is open to
+                    // the network, and an audit row per guess is a free way to
+                    // grow the table. The response says what is missing.
+                    let Some(expected) = bootstrap_token() else {
+                        return PluginResponse::error(
+                            403,
+                            format!(
+                                "registration is closed: set {BOOTSTRAP_TOKEN_ENV} on the server \
+                                 and send it as `bootstrap_token` to claim a fresh installation"
+                            ),
+                        );
+                    };
+                    let presented = body.bootstrap_token.clone().unwrap_or_default();
+                    if !secret_matches(&presented, &expected) {
+                        return PluginResponse::error(
+                            403,
+                            "registration is closed: bootstrap token missing or wrong",
+                        );
+                    }
                     if body.password.len() < 8 {
-                        return PluginResponse::error(400, "password must be at least 8 characters");
+                        return PluginResponse::error(
+                            400,
+                            "password must be at least 8 characters",
+                        );
                     }
                     let pw = hash_password(&body.password)?;
+                    // Claim the one bootstrap slot **before** creating the user (#173).
+                    // The primary key is the mutex: with two concurrent first
+                    // registrations exactly one INSERT returns a row, so the
+                    // empty-table check above can only be raced by a caller that has
+                    // already lost. The slot is spent for the life of the database.
+                    let claim = new_token();
+                    let claimed =
+                        c.db.query(
+                            "INSERT INTO core.bootstrap_claim (id, claim_token) VALUES (1, $1) \
+                             ON CONFLICT (id) DO NOTHING \
+                             RETURNING claim_token::text AS token",
+                            vec![SqlValue::Text(claim.clone())],
+                        )
+                        .await?;
+                    if claimed.is_empty() {
+                        return PluginResponse::error(
+                            403,
+                            "registration is closed — ask an admin to create the user",
+                        );
+                    }
                     let rows = match c
                         .db
                         .query(
@@ -533,12 +1064,20 @@ impl AdjutantPlugin for AuthPlugin {
                         // A unique violation is the caller's problem, not a server
                         // error: report it as such (the earlier 500 was a defect).
                         Err(SdkError::Db(e)) if is_duplicate_key(&e) => {
+                            release_bootstrap_claim(&c.db, &claim).await;
                             return PluginResponse::error(
                                 409,
                                 "already registered — log in instead",
                             )
                         }
-                        Err(e) => return Err(e),
+                        Err(e) => {
+                            // The slot was claimed before the insert. Any failure
+                            // before a user exists must give it back, or a typo in
+                            // the username would spend the installation's only
+                            // bootstrap path (#173).
+                            release_bootstrap_claim(&c.db, &claim).await;
+                            return Err(e);
+                        }
                     };
                     let uid = rows
                         .first()
@@ -546,14 +1085,22 @@ impl AdjutantPlugin for AuthPlugin {
                         .unwrap_or_default()
                         .to_string();
                     // First user of a fresh troop = chief (SPEC §9 bootstrap).
-                    c.db
-                        .execute(
-                            "INSERT INTO core.user_roles (user_id, role_id) \
+                    c.db.execute(
+                        "INSERT INTO core.user_roles (user_id, role_id) \
                              VALUES ($1::uuid, 'chief') ON CONFLICT DO NOTHING",
-                            vec![SqlValue::Text(uid.clone())],
+                        vec![SqlValue::Text(uid.clone())],
+                    )
+                    .await?;
+                    let (token, expires) = create_session(&c.db, &uid, ttl).await?;
+                    c.audit
+                        .log(
+                            Some(&Identity::from_grants(uid.clone(), vec![])),
+                            "auth.register",
+                            "user",
+                            &uid,
+                            serde_json::json!({"username": body.username}),
                         )
                         .await?;
-                    let (token, expires) = create_session(&c.db, &uid, ttl).await?;
                     let mut resp = PluginResponse::json(
                         201,
                         &serde_json::json!({
@@ -587,7 +1134,10 @@ impl AdjutantPlugin for AuthPlugin {
                     }
                     let body: Body = req.json()?;
                     if body.password.len() < 8 {
-                        return PluginResponse::error(400, "password must be at least 8 characters");
+                        return PluginResponse::error(
+                            400,
+                            "password must be at least 8 characters",
+                        );
                     }
                     let pw = hash_password(&body.password)?;
                     let rows = match c
@@ -620,13 +1170,12 @@ impl AdjutantPlugin for AuthPlugin {
                         .unwrap_or_default()
                         .to_string();
                     for role in &body.roles {
-                        c.db
-                            .execute(
-                                "INSERT INTO core.user_roles (user_id, role_id) \
+                        c.db.execute(
+                            "INSERT INTO core.user_roles (user_id, role_id) \
                                  VALUES ($1::uuid, $2) ON CONFLICT DO NOTHING",
-                                vec![SqlValue::Text(uid.clone()), SqlValue::Text(role.clone())],
-                            )
-                            .await?;
+                            vec![SqlValue::Text(uid.clone()), SqlValue::Text(role.clone())],
+                        )
+                        .await?;
                     }
                     c.audit
                         .log(
@@ -671,21 +1220,51 @@ impl AdjutantPlugin for AuthPlugin {
                         .and_then(|r| r["id"].as_str())
                         .ok_or_else(|| SdkError::BadRequest("unknown user".into()))?
                         .to_string();
-                    // Replace the full role set (explicit PUT-like semantics).
-                    c.db
-                        .execute(
-                            "DELETE FROM core.user_roles WHERE user_id = $1::uuid",
+                    // Replace the full role set (explicit PUT-like semantics), but
+                    // grant before revoking: `core.user_roles` refuses a delete that
+                    // would leave the troop with no admin (#147), and a replace that
+                    // deleted first would trip that guard even when the same request
+                    // re-grants the role a moment later.
+                    let current =
+                        c.db.query(
+                            "SELECT role_id FROM core.user_roles WHERE user_id = $1::uuid",
                             vec![SqlValue::Text(uid.clone())],
                         )
                         .await?;
+                    let current: Vec<String> = current
+                        .iter()
+                        .filter_map(|r| r["role_id"].as_str().map(str::to_string))
+                        .collect();
+
                     for role in &body.roles {
-                        c.db
-                            .execute(
-                                "INSERT INTO core.user_roles (user_id, role_id) \
+                        c.db.execute(
+                            "INSERT INTO core.user_roles (user_id, role_id) \
                                  VALUES ($1::uuid, $2) ON CONFLICT DO NOTHING",
+                            vec![SqlValue::Text(uid.clone()), SqlValue::Text(role.clone())],
+                        )
+                        .await?;
+                    }
+                    for role in current.iter().filter(|r| !body.roles.contains(r)) {
+                        let deleted =
+                            c.db.execute(
+                                "DELETE FROM core.user_roles \
+                                 WHERE user_id = $1::uuid AND role_id = $2",
                                 vec![SqlValue::Text(uid.clone()), SqlValue::Text(role.clone())],
                             )
-                            .await?;
+                            .await;
+                        if let Err(e) = deleted {
+                            // The schema's keep-an-admin trigger (#147). Report it
+                            // as a refusal the caller can act on, not a 500: the
+                            // request is valid, the world is not ready for it.
+                            if e.to_string().contains("last_admin") {
+                                return PluginResponse::error(
+                                    409,
+                                    "refusing to remove the last admin — grant another user \
+                                     `chief` first (or run `adjutant grant-role`)",
+                                );
+                            }
+                            return Err(e);
+                        }
                     }
                     c.audit
                         .log(
@@ -712,9 +1291,8 @@ impl AdjutantPlugin for AuthPlugin {
             route_handler(move |_req| {
                 let c = c.clone();
                 async move {
-                    let rows = c
-                        .db
-                        .query(
+                    let rows =
+                        c.db.query(
                             "SELECT u.id::text AS id, u.username, u.email, u.display_name, \
                                     u.is_active, \
                                     COALESCE(ARRAY(\
@@ -729,10 +1307,21 @@ impl AdjutantPlugin for AuthPlugin {
             }),
         );
 
-        vec![login, logout, me, register, create_user, assign_roles, list_users]
-            .into_iter()
-            .chain(self.oidc_routes(ctx.clone()))
-            .collect()
+        vec![
+            login,
+            logout,
+            me,
+            register,
+            list_sessions,
+            revoke_session,
+            change_password,
+            create_user,
+            assign_roles,
+            list_users,
+        ]
+        .into_iter()
+        .chain(self.oidc_routes(ctx.clone()))
+        .collect()
     }
 }
 
@@ -764,30 +1353,24 @@ impl AuthPlugin {
                     };
                     // One-time state, stored server-side (SPEC: no client trust).
                     let state = new_token();
-                    c.db
-                        .execute(
-                            "INSERT INTO oidc_states (state) VALUES ($1) \
+                    c.db.execute(
+                        "INSERT INTO oidc_states (state) VALUES ($1) \
                              ON CONFLICT (state) DO NOTHING",
-                            vec![SqlValue::Text(state.clone())],
-                        )
-                        .await?;
+                        vec![SqlValue::Text(state.clone())],
+                    )
+                    .await?;
                     // Separate execute: sqlx prepared statements accept one
                     // command only ("cannot insert multiple commands").
-                    c.db
-                        .execute(
-                            "DELETE FROM oidc_states \
-                             WHERE created_at < now() - interval '15 minutes'",
-                            vec![],
-                        )
-                        .await?;
-                    let redirect = req
-                        .query_param("redirect")
-                        .unwrap_or("1")
-                        .to_string();
+                    c.db.execute(
+                        "DELETE FROM oidc_states \
+                             WHERE created_at < now() - make_interval(mins => $1::int)",
+                        vec![SqlValue::Int(OIDC_STATE_TTL_MINUTES)],
+                    )
+                    .await?;
+                    let redirect = req.query_param("redirect").unwrap_or("1").to_string();
                     // Per OIDC, the authorize endpoint comes from discovery —
                     // never guess it (the sep() helper builds DISCOVERY urls).
-                    let auth_ep =
-                        discover(&c.http, &oidc.issuer, "authorization_endpoint").await?;
+                    let auth_ep = discover(&c.http, &oidc.issuer, "authorization_endpoint").await?;
                     let sep_char = if auth_ep.contains('?') { "&" } else { "?" };
                     let url = format!(
                         "{auth_ep}{sep_char}response_type=code&client_id={}&redirect_uri={}&state={}&scope=openid+email+profile",
@@ -802,9 +1385,12 @@ impl AuthPlugin {
                             .push(("cache-control".into(), "no-store".into()));
                         return Ok(resp);
                     }
-                    PluginResponse::json(200, &serde_json::json!({
-                        "authorize_url": url, "state": state,
-                    }))
+                    PluginResponse::json(
+                        200,
+                        &serde_json::json!({
+                            "authorize_url": url, "state": state,
+                        }),
+                    )
                 }
             }),
         );
@@ -828,12 +1414,19 @@ impl AuthPlugin {
                     if code.is_empty() || state.is_empty() {
                         return PluginResponse::error(400, "missing code or state");
                     }
-                    // Consume state (single-use, 15 min TTL enforced on insert).
-                    let consumed = c
-                        .db
-                        .query(
-                            "DELETE FROM oidc_states WHERE state = $1 RETURNING state",
-                            vec![SqlValue::Text(state)],
+                    // Consume state: single use, and only while it is fresh.
+                    //
+                    // The TTL is enforced HERE, not only by the sweep in
+                    // `oidc/login` — a state row must not become redeemable
+                    // forever just because nobody started another login to
+                    // prune it. A stale state and an unknown one take the same
+                    // path, so the answer says nothing about which it was.
+                    let consumed =
+                        c.db.query(
+                            "DELETE FROM oidc_states WHERE state = $1 \
+                               AND created_at > now() - make_interval(mins => $2::int) \
+                             RETURNING state",
+                            vec![SqlValue::Text(state), SqlValue::Int(OIDC_STATE_TTL_MINUTES)],
                         )
                         .await?;
                     if consumed.is_empty() {
@@ -854,8 +1447,14 @@ impl AuthPlugin {
                         .request(
                             "POST".into(),
                             token_url,
-                            vec![("content-type".into(), "application/x-www-form-urlencoded".into())],
-                            Some(("application/x-www-form-urlencoded".into(), form.into_bytes())),
+                            vec![(
+                                "content-type".into(),
+                                "application/x-www-form-urlencoded".into(),
+                            )],
+                            Some((
+                                "application/x-www-form-urlencoded".into(),
+                                form.into_bytes(),
+                            )),
                         )
                         .await?;
                     if resp.status >= 400 {
@@ -876,9 +1475,8 @@ impl AuthPlugin {
                     let email = claims.email.clone();
 
                     // Find-or-create the user keyed on the IdP subject.
-                    let rows = c
-                        .db
-                        .query(
+                    let rows =
+                        c.db.query(
                             "SELECT id::text AS id FROM core.users WHERE external_id = $1",
                             vec![SqlValue::Text(subject.clone())],
                         )
@@ -1000,9 +1598,14 @@ async fn discover(
     field: &str,
 ) -> Result<String, SdkError> {
     let url = discovery_url(issuer);
-    let resp = http.request("GET".into(), url.clone(), vec![], None).await?;
+    let resp = http
+        .request("GET".into(), url.clone(), vec![], None)
+        .await?;
     if resp.status >= 400 {
-        return Err(SdkError::Internal(format!("discovery failed: HTTP {}", resp.status)));
+        return Err(SdkError::Internal(format!(
+            "discovery failed: HTTP {}",
+            resp.status
+        )));
     }
     let doc: serde_json::Value = resp.json()?;
     doc[field]
@@ -1044,10 +1647,39 @@ async fn verify_id_token(
     use jsonwebtoken::jwk::JwkSet;
     use jsonwebtoken::{decode, decode_header, Algorithm, DecodingKey, Validation};
 
-    let header = decode_header(token)
-        .map_err(|e| SdkError::BadRequest(format!("id_token header: {e}")))?;
+    let header =
+        decode_header(token).map_err(|e| SdkError::BadRequest(format!("id_token header: {e}")))?;
 
-    let key = match header.alg {
+    // The algorithm is a property of the deployment, not of the token: read it
+    // from config, then refuse a token that claims another one. `Validation`
+    // would reject the mismatch later anyway; checking here makes the refusal
+    // say why, and keeps the key choice tied to the configured algorithm.
+    let configured = oidc
+        .id_token_alg
+        .as_deref()
+        .map(str::trim)
+        .filter(|v| !v.is_empty())
+        .unwrap_or(DEFAULT_ID_TOKEN_ALG)
+        .to_ascii_uppercase();
+    let algorithm = match configured.as_str() {
+        "HS256" => Algorithm::HS256,
+        "HS384" => Algorithm::HS384,
+        "HS512" => Algorithm::HS512,
+        "RS256" => Algorithm::RS256,
+        other => {
+            return Err(SdkError::Internal(format!(
+                "auth plugin: id_token_alg {other:?} is not supported (HS256|HS384|HS512|RS256)"
+            )))
+        }
+    };
+    if header.alg != algorithm {
+        return Err(SdkError::BadRequest(format!(
+            "id_token alg {:?} does not match the configured {algorithm:?}",
+            header.alg
+        )));
+    }
+
+    let key = match algorithm {
         Algorithm::HS256 | Algorithm::HS384 | Algorithm::HS512 => {
             DecodingKey::from_secret(oidc.client_secret.as_bytes())
         }
@@ -1073,7 +1705,7 @@ async fn verify_id_token(
         }
     };
 
-    let mut validation = Validation::new(header.alg);
+    let mut validation = Validation::new(algorithm);
     validation.set_issuer(&[oidc.issuer.trim_end_matches('/')]);
     validation.set_audience(std::slice::from_ref(&oidc.client_id));
     let data = decode::<IdClaims>(token, &key, &validation)
@@ -1089,7 +1721,10 @@ mod oidc_tests {
     #[test]
     fn urlencode_escapes_query_unsafe_bytes() {
         assert_eq!(urlencode("ab_c-1.2~"), "ab_c-1.2~");
-        assert_eq!(urlencode("https://a b/c?d=e&f"), "https%3A%2F%2Fa%20b%2Fc%3Fd%3De%26f");
+        assert_eq!(
+            urlencode("https://a b/c?d=e&f"),
+            "https%3A%2F%2Fa%20b%2Fc%3Fd%3De%26f"
+        );
     }
 
     #[test]
@@ -1136,12 +1771,8 @@ mod oidc_tests {
         let mut v = Validation::new(Algorithm::HS256);
         v.set_issuer(&["https://idp.example"]);
         v.set_audience(&["adjutant"]);
-        let out = decode::<C>(
-            &tok,
-            &DecodingKey::from_secret(b"shared-secret"),
-            &v,
-        )
-        .expect("valid token verifies");
+        let out = decode::<C>(&tok, &DecodingKey::from_secret(b"shared-secret"), &v)
+            .expect("valid token verifies");
         assert_eq!(out.claims.sub, "idp-user-1");
         assert_eq!(out.claims.email, "u@example.org");
 
@@ -1172,7 +1803,10 @@ mod tests {
         let h = hash_password("correct horse battery staple").unwrap();
         assert!(verify_password("correct horse battery staple", &h));
         assert!(!verify_password("wrong password", &h));
-        assert!(!verify_password("correct horse battery staple", "not-a-hash"));
+        assert!(!verify_password(
+            "correct horse battery staple",
+            "not-a-hash"
+        ));
     }
 
     #[test]
@@ -1188,7 +1822,10 @@ mod tests {
     #[test]
     fn extract_token_from_cookie_and_bearer() {
         let mut h = HashMap::new();
-        h.insert("cookie".into(), format!("{SESSION_COOKIE}=abc123; theme=dark"));
+        h.insert(
+            "cookie".into(),
+            format!("{SESSION_COOKIE}=abc123; theme=dark"),
+        );
         assert_eq!(extract_token(&h).as_deref(), Some("abc123"));
 
         let mut h = HashMap::new();
@@ -1202,11 +1839,37 @@ mod tests {
     }
 
     #[test]
-    fn cookie_format_is_http_only() {
-        let (_, v) = session_cookie("tok", 24);
-        assert!(v.contains("HttpOnly"));
-        assert!(v.contains("SameSite=Lax"));
-        assert!(v.contains("Max-Age=86400"));
+    fn cookie_is_secure_by_default_and_pins_every_attribute() {
+        // The old test asserted only that the attributes it expected were
+        // present, so a missing `Secure` was invisible. Pin the whole set.
+        let (_, secure) = session_cookie_with("tok", 24, true);
+        for attr in [
+            "HttpOnly",
+            "SameSite=Lax",
+            "Path=/",
+            "Max-Age=86400",
+            "Secure",
+        ] {
+            assert!(secure.contains(attr), "missing {attr}: {secure}");
+        }
+
+        // The development-only opt-out removes exactly `Secure`, nothing else.
+        let (_, insecure) = session_cookie_with("tok", 24, false);
+        assert!(!insecure.contains("Secure"), "{insecure}");
+        assert!(insecure.contains("HttpOnly") && insecure.contains("SameSite=Lax"));
+
+        // Clearing the cookie carries the same attributes, including `Secure`.
+        let (_, cleared) = cleared_session_cookie_with(true);
+        assert!(cleared.contains("Max-Age=0"));
+        assert!(cleared.contains("HttpOnly") && cleared.contains("SameSite=Lax"));
+        assert!(cleared.contains("Secure"), "{cleared}");
+
+        // The default (no ADJUTANT_INSECURE_COOKIES opt-in) must be Secure.
+        let (_, default) = session_cookie("tok", 24);
+        assert!(
+            default.contains("Secure"),
+            "default cookie is not Secure: {default}"
+        );
     }
 
     #[test]
@@ -1231,6 +1894,7 @@ mod tests {
         let host = TestHost::new();
         host.db.push_rows(vec![serde_json::json!({
             "id": "11111111-1111-1111-1111-111111111111",
+            "session_id": "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa",
             "username": "bea",
             "email": "bea@example.org",
             "display_name": "Bea",
@@ -1260,6 +1924,10 @@ mod tests {
         // The query went through the host and bound the token hash.
         let calls = host.db.queried.lock().unwrap();
         assert!(calls[0].sql_contains(&["core.sessions", "token_hash"]));
+        assert!(
+            calls[0].sql_contains(&["revoked_at IS NULL"]),
+            "identity lookup must reject a revoked session, not only the login path"
+        );
     }
 
     /// Scopes fail closed: an unrecognised/missing/empty `scope_type`, or a
@@ -1312,6 +1980,419 @@ mod tests {
             );
         }
     }
+
+    // --- new session/password handlers -------------------------------------
+
+    use adjutant_sdk::testing::{response_json, TestHost, TestRequest};
+
+    const CALLER: &str = "11111111-1111-1111-1111-111111111111";
+    const CALLER_SESSION: &str = "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa";
+    const OTHER_SESSION: &str = "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb";
+
+    fn session_row(user_id: &str, session_id: &str) -> serde_json::Value {
+        serde_json::json!({
+            "id": user_id,
+            "session_id": session_id,
+            "username": "bea",
+            "email": "bea@example.org",
+            "display_name": "Bea",
+            "is_active": true,
+            "roles": ["chief"],
+            "grant_list": [
+                {"role_id": "chief", "scope_type": "troop",
+                 "scope_id": "00000000-0000-0000-0000-000000000000"}
+            ]
+        })
+    }
+
+    fn with_cookie(req: TestRequest) -> TestRequest {
+        req.header("cookie", "adjutant_session=raw-token")
+    }
+
+    /// The bootstrap secret is process-wide state. Tests that touch it hold this
+    /// lock and put the environment back, so a parallel test never sees another's
+    /// token. A `tokio` lock rather than a std one: these tests await while they
+    /// hold it, and a `std::sync` guard must not cross an await point.
+    const CONST_TEST_TOKEN: &str = "test-bootstrap-token";
+
+    async fn bootstrap_env() -> tokio::sync::MutexGuard<'static, ()> {
+        static LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+        LOCK.lock().await
+    }
+
+    fn set_bootstrap_token(token: Option<&str>) {
+        match token {
+            Some(token) => std::env::set_var(BOOTSTRAP_TOKEN_ENV, token),
+            None => std::env::remove_var(BOOTSTRAP_TOKEN_ENV),
+        }
+    }
+
+    async fn call(
+        host: &TestHost,
+        method: &str,
+        path: &str,
+        req: PluginRequest,
+    ) -> (u16, serde_json::Value) {
+        let mut plugin = AuthPlugin::new();
+        plugin.init(host.context("auth")).await.unwrap();
+        let routes = plugin.routes();
+        let route = routes
+            .iter()
+            .find(|r| r.method.as_str() == method && r.path == path)
+            .unwrap_or_else(|| panic!("route {method} {path}"));
+        match (route.handler)(req).await {
+            Ok(resp) => (resp.status, response_json(&resp)),
+            Err(e) => (e.status(), serde_json::json!({"error": e.to_string()})),
+        }
+    }
+
+    fn audit_params(host: &TestHost) -> Vec<String> {
+        host.db
+            .last_execute_params("core.audit_log")
+            .expect("an audit INSERT")
+            .iter()
+            .map(|v| format!("{v:?}"))
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn list_sessions_requires_a_session() {
+        let host = TestHost::new();
+        let (status, _) = call(
+            &host,
+            "GET",
+            "/api/auth/sessions",
+            TestRequest::get("/api/auth/sessions").build(),
+        )
+        .await;
+        assert_eq!(status, 401);
+        assert_eq!(host.db.query_count(), 0, "no token, no lookup");
+    }
+
+    #[tokio::test]
+    async fn list_sessions_marks_the_presented_session() {
+        let host = TestHost::new();
+        host.db.push_rows(vec![session_row(CALLER, CALLER_SESSION)]);
+        host.db.push_rows(vec![
+            serde_json::json!({
+                "id": CALLER_SESSION, "created_at": "2026-10-01T00:00:00Z",
+                "expires_at": "2026-11-01T00:00:00Z", "device_info": {"os": "phone"}
+            }),
+            serde_json::json!({
+                "id": OTHER_SESSION, "created_at": "2026-10-02T00:00:00Z",
+                "expires_at": "2026-11-02T00:00:00Z", "device_info": {}
+            }),
+        ]);
+        let req = with_cookie(TestRequest::get("/api/auth/sessions")).build();
+        let (status, body) = call(&host, "GET", "/api/auth/sessions", req).await;
+        assert_eq!(status, 200, "{body}");
+        let sessions = body["sessions"].as_array().expect("sessions");
+        assert_eq!(sessions.len(), 2);
+        assert_eq!(sessions[0]["current"], serde_json::json!(true));
+        assert_eq!(sessions[1]["current"], serde_json::json!(false));
+        assert_eq!(sessions[0]["device_info"]["os"], serde_json::json!("phone"));
+
+        let queried = host.db.queried_sql();
+        assert!(queried[1].contains("user_id = $1::uuid"));
+        assert!(queried[1].contains("revoked_at IS NULL"));
+        let params = host
+            .db
+            .last_query_params("FROM core.sessions")
+            .expect("list params");
+        assert!(matches!(&params[0], SqlValue::Text(v) if v == CALLER));
+    }
+
+    #[tokio::test]
+    async fn revoke_requires_a_session_and_a_well_formed_id() {
+        let host = TestHost::new();
+        let (status, _) = call(
+            &host,
+            "DELETE",
+            "/api/auth/sessions/{id}",
+            TestRequest::delete("/api/auth/sessions/not-a-uuid")
+                .param("id", "not-a-uuid")
+                .build(),
+        )
+        .await;
+        assert_eq!(status, 401);
+        assert_eq!(host.db.query_count(), 0);
+
+        host.db.push_rows(vec![session_row(CALLER, CALLER_SESSION)]);
+        let req = with_cookie(TestRequest::delete("/api/auth/sessions/not-a-uuid"))
+            .param("id", "not-a-uuid")
+            .build();
+        let (status, body) = call(&host, "DELETE", "/api/auth/sessions/{id}", req).await;
+        assert_eq!(status, 404, "{body}");
+        assert_eq!(host.db.query_count(), 1, "only the session lookup ran");
+    }
+
+    #[tokio::test]
+    async fn revoking_another_users_session_is_404() {
+        let host = TestHost::new();
+        host.db.push_rows(vec![session_row(CALLER, CALLER_SESSION)]);
+        // The guarded UPDATE matches no row: not the caller's, or already gone.
+        host.db.push_rows(vec![]);
+        let req = with_cookie(TestRequest::delete(&format!(
+            "/api/auth/sessions/{OTHER_SESSION}"
+        )))
+        .param("id", OTHER_SESSION)
+        .build();
+        let (status, body) = call(&host, "DELETE", "/api/auth/sessions/{id}", req).await;
+        assert_eq!(status, 404, "{body}");
+        assert_eq!(body["error"], serde_json::json!("session not found"));
+        let sql = host.db.queried_sql();
+        assert!(
+            sql[1].contains("user_id = $2::uuid"),
+            "ownership is in the SQL"
+        );
+        let params = host.db.last_query_params("UPDATE core.sessions").unwrap();
+        assert!(matches!(&params[1], SqlValue::Text(v) if v == CALLER));
+    }
+
+    #[tokio::test]
+    async fn revoking_own_session_succeeds_and_is_audited() {
+        let host = TestHost::new();
+        host.db.push_rows(vec![session_row(CALLER, CALLER_SESSION)]);
+        host.db
+            .push_rows(vec![serde_json::json!({"id": OTHER_SESSION})]);
+        host.db.push_rows(vec![serde_json::json!({"id": CALLER})]); // audit actor exists
+        let req = with_cookie(TestRequest::delete(&format!(
+            "/api/auth/sessions/{OTHER_SESSION}"
+        )))
+        .param("id", OTHER_SESSION)
+        .build();
+        let (status, body) = call(&host, "DELETE", "/api/auth/sessions/{id}", req).await;
+        assert_eq!(status, 200, "{body}");
+        let params = host.db.last_query_params("UPDATE core.sessions").unwrap();
+        assert!(matches!(&params[0], SqlValue::Text(v) if v == OTHER_SESSION));
+        let audit = audit_params(&host).join(" ");
+        assert!(audit.contains("auth.session.revoke"), "{audit}");
+        assert!(!audit.contains("raw-token"));
+    }
+
+    #[tokio::test]
+    async fn password_change_refuses_a_bad_current_password() {
+        let host = TestHost::new();
+        let hash = hash_password("the-real-password").unwrap();
+        host.db.push_rows(vec![session_row(CALLER, CALLER_SESSION)]);
+        host.db
+            .push_rows(vec![serde_json::json!({"password_hash": hash})]);
+        host.db.push_rows(vec![serde_json::json!({"id": CALLER})]); // audit actor exists
+        let req = with_cookie(TestRequest::post("/api/auth/password"))
+            .json(&serde_json::json!({
+                "current_password": "the-wrong-password",
+                "new_password": "a-new-long-password",
+            }))
+            .build();
+        let (status, body) = call(&host, "POST", "/api/auth/password", req).await;
+        assert_eq!(status, 400, "{body}");
+        let executed = host.db.executed_sql().join(" ");
+        assert!(
+            !executed.contains("SET password_hash"),
+            "hash must not change"
+        );
+        assert!(!executed.contains("core.sessions SET revoked_at"));
+        let audit = audit_params(&host).join(" ");
+        assert!(audit.contains("auth.password.change.failed"), "{audit}");
+        assert!(!audit.contains("the-wrong-password"));
+        assert!(!audit.contains("a-new-long-password"));
+    }
+
+    #[tokio::test]
+    async fn password_change_rejects_a_short_new_password_before_reading_the_hash() {
+        let host = TestHost::new();
+        host.db.push_rows(vec![session_row(CALLER, CALLER_SESSION)]);
+        let req = with_cookie(TestRequest::post("/api/auth/password"))
+            .json(&serde_json::json!({
+                "current_password": "the-real-password",
+                "new_password": "short",
+            }))
+            .build();
+        let (status, _) = call(&host, "POST", "/api/auth/password", req).await;
+        assert_eq!(status, 400);
+        assert_eq!(host.db.query_count(), 1, "only the session lookup ran");
+        assert!(!host
+            .db
+            .executed_sql()
+            .iter()
+            .any(|s| s.contains("password_hash")));
+    }
+
+    #[tokio::test]
+    async fn password_change_revokes_siblings_but_not_the_caller() {
+        let host = TestHost::new();
+        let hash = hash_password("the-real-password").unwrap();
+        host.db.push_rows(vec![session_row(CALLER, CALLER_SESSION)]);
+        host.db
+            .push_rows(vec![serde_json::json!({"password_hash": hash})]);
+        host.db.push_execute(Ok(1)); // password_hash UPDATE
+        host.db.push_execute(Ok(2)); // sibling revocation
+        host.db.push_rows(vec![serde_json::json!({"id": CALLER})]); // audit actor exists
+        let req = with_cookie(TestRequest::post("/api/auth/password"))
+            .json(&serde_json::json!({
+                "current_password": "the-real-password",
+                "new_password": "a-new-long-password",
+            }))
+            .build();
+        let (status, body) = call(&host, "POST", "/api/auth/password", req).await;
+        assert_eq!(status, 200, "{body}");
+        assert_eq!(body["revoked_other_sessions"], serde_json::json!(2));
+
+        let executed = host.db.executed_sql();
+        assert!(executed[0].contains("UPDATE core.users SET password_hash"));
+        assert!(
+            executed[1].contains("UPDATE core.sessions SET revoked_at"),
+            "{executed:?}"
+        );
+        assert!(
+            executed[1].contains("id <> $2::uuid"),
+            "the caller is excluded"
+        );
+        let params = host.db.last_execute_params("UPDATE core.sessions").unwrap();
+        assert!(matches!(&params[0], SqlValue::Text(v) if v == CALLER));
+        assert!(matches!(&params[1], SqlValue::Text(v) if v == CALLER_SESSION));
+        let audit = audit_params(&host).join(" ");
+        assert!(audit.contains("auth.password.change"), "{audit}");
+        assert!(!audit.contains("a-new-long-password"));
+    }
+
+    #[tokio::test]
+    async fn failed_login_is_audited_without_the_submitted_secret() {
+        let host = TestHost::new();
+        host.db.push_rows(vec![]); // no such user
+        let req = TestRequest::post("/api/auth/login")
+            .json(&serde_json::json!({
+                "username": "mallory",
+                "password": "attempted-secret",
+            }))
+            .build();
+        let (status, body) = call(&host, "POST", "/api/auth/login", req).await;
+        assert_eq!(status, 400, "{body}");
+        let audit = audit_params(&host).join(" ");
+        assert!(audit.contains("auth.login.failed"), "{audit}");
+        assert!(audit.contains("mallory"), "{audit}");
+        assert!(audit.contains("unknown_user"), "{audit}");
+        assert!(!audit.contains("attempted-secret"), "{audit}");
+    }
+
+    #[tokio::test]
+    async fn login_success_and_logout_are_audited() {
+        let host = TestHost::new();
+        let hash = hash_password("the-real-password").unwrap();
+        host.db.push_rows(vec![serde_json::json!({
+            "id": CALLER, "username": "bea", "password_hash": hash, "is_active": true
+        })]);
+        host.db.push_rows(vec![serde_json::json!({"id": CALLER})]); // audit actor exists
+        let req = TestRequest::post("/api/auth/login")
+            .json(&serde_json::json!({
+                "username": "bea",
+                "password": "the-real-password",
+            }))
+            .build();
+        let (status, body) = call(&host, "POST", "/api/auth/login", req).await;
+        assert_eq!(status, 200, "{body}");
+        let token = body["token"].as_str().expect("token");
+        let audit = audit_params(&host).join(" ");
+        assert!(audit.contains("auth.login"), "{audit}");
+        assert!(
+            !audit.contains(token),
+            "the session token must never be audited"
+        );
+
+        // Logout deletes the presented row and records the actor from RETURNING.
+        host.db.push_rows(vec![
+            serde_json::json!({"id": OTHER_SESSION, "user_id": CALLER}),
+        ]);
+        host.db.push_rows(vec![serde_json::json!({"id": CALLER})]);
+        let req = with_cookie(TestRequest::post("/api/auth/logout")).build();
+        let (status, _) = call(&host, "POST", "/api/auth/logout", req).await;
+        assert_eq!(status, 200);
+        let audit = audit_params(&host).join(" ");
+        assert!(audit.contains("auth.logout"), "{audit}");
+        assert!(!audit.contains("raw-token"));
+    }
+
+    #[tokio::test]
+    async fn registration_is_audited() {
+        let _env = bootstrap_env().await;
+        set_bootstrap_token(Some(CONST_TEST_TOKEN));
+        let host = TestHost::new();
+        host.db.push_rows(vec![serde_json::json!({"n": 0})]); // no users yet
+        host.db
+            .push_rows(vec![serde_json::json!({"token": "claim"})]); // bootstrap claim
+        host.db.push_rows(vec![serde_json::json!({"id": CALLER})]); // user INSERT
+        host.db.push_rows(vec![serde_json::json!({"id": CALLER})]); // audit actor exists
+        let req = TestRequest::post("/api/auth/register")
+            .json(&serde_json::json!({
+                "username": "christopher",
+                "password": "correct-horse-battery",
+                "bootstrap_token": CONST_TEST_TOKEN,
+            }))
+            .build();
+        let (status, body) = call(&host, "POST", "/api/auth/register", req).await;
+        assert_eq!(status, 201, "{body}");
+        let audit = audit_params(&host).join(" ");
+        assert!(audit.contains("auth.register"), "{audit}");
+        assert!(audit.contains("christopher"), "{audit}");
+        assert!(!audit.contains("correct-horse-battery"));
+        set_bootstrap_token(None);
+    }
+
+    /// A fresh installation must not be claimable by whoever reaches the port:
+    /// no configured secret means registration is closed, whatever the caller
+    /// sends.
+    #[tokio::test]
+    async fn registration_is_closed_when_no_bootstrap_secret_is_configured() {
+        let _env = bootstrap_env().await;
+        set_bootstrap_token(None);
+        let host = TestHost::new();
+        host.db.push_rows(vec![serde_json::json!({"n": 0})]); // no users yet
+        let req = TestRequest::post("/api/auth/register")
+            .json(&serde_json::json!({
+                "username": "squatter",
+                "password": "correct-horse-battery",
+                "bootstrap_token": "guess",
+            }))
+            .build();
+        let (status, body) = call(&host, "POST", "/api/auth/register", req).await;
+        assert_eq!(status, 403, "{body}");
+        assert!(
+            body["error"]
+                .as_str()
+                .unwrap()
+                .contains(BOOTSTRAP_TOKEN_ENV),
+            "the refusal has to name the switch: {body}"
+        );
+        // Nothing was written: no claim, no user.
+        assert_eq!(host.db.query_count(), 1, "only the user count ran");
+        assert!(host.db.executed_sql().is_empty(), "no INSERT may run");
+    }
+
+    /// The secret is required, and a wrong one is refused the same way a missing
+    /// one is — no answer tells an attacker which of the two they got wrong.
+    #[tokio::test]
+    async fn registration_refuses_a_missing_or_wrong_bootstrap_secret() {
+        let _env = bootstrap_env().await;
+        set_bootstrap_token(Some(CONST_TEST_TOKEN));
+        for presented in [serde_json::Value::Null, serde_json::json!("not-the-token")] {
+            let host = TestHost::new();
+            host.db.push_rows(vec![serde_json::json!({"n": 0})]);
+            let mut payload = serde_json::json!({
+                "username": "squatter",
+                "password": "correct-horse-battery",
+            });
+            if !presented.is_null() {
+                payload["bootstrap_token"] = presented;
+            }
+            let req = TestRequest::post("/api/auth/register")
+                .json(&payload)
+                .build();
+            let (status, body) = call(&host, "POST", "/api/auth/register", req).await;
+            assert_eq!(status, 403, "{body}");
+            assert!(host.db.executed_sql().is_empty(), "no INSERT may run");
+        }
+        set_bootstrap_token(None);
+    }
 }
 
 #[cfg(test)]
@@ -1354,22 +2435,78 @@ mod id_token_tests {
             } else {
                 return Err(SdkError::Internal(format!("unexpected url {url}")));
             };
-            Ok(HttpResponse { status: 200, headers: HashMap::new(), body })
+            Ok(HttpResponse {
+                status: 200,
+                headers: HashMap::new(),
+                body,
+            })
         }
     }
 
     const ISSUER: &str = "https://idp.example";
     const SECRET: &str = "shared-secret";
     const CLIENT: &str = "adjutant-test";
-    const RSA_PEM: &str = include_str!("../tests/fixtures/rs256-test-key.pem");
-    const JWKS: &str = include_str!("../tests/fixtures/rs256-jwks.json");
+    /// An RSA key for the test run, with the JWKS that publishes its public half.
+    ///
+    /// Generated rather than committed. A PEM in a repository is a private key in
+    /// a repository whatever the comment above it says, and neither a reviewer
+    /// nor a scanner can tell a throwaway from a live one — so the test makes its
+    /// own, and there is nothing to leak, rotate or waive.
+    struct TestKey {
+        pem: String,
+        kid: String,
+        jwks: String,
+    }
 
+    fn rsa_test_key(kid: &str) -> TestKey {
+        use rsa::pkcs8::{EncodePrivateKey, LineEnding};
+        use rsa::traits::PublicKeyParts;
+
+        let mut rng = rand::thread_rng();
+        let key = rsa::RsaPrivateKey::new(&mut rng, 2048).expect("generate an RSA key");
+        let pem = key
+            .to_pkcs8_pem(LineEnding::LF)
+            .expect("export PKCS#8 PEM")
+            .to_string();
+        let jwks = serde_json::json!({
+            "keys": [{
+                "kty": "RSA",
+                "use": "sig",
+                "alg": "RS256",
+                "kid": kid,
+                "n": b64url(&key.n().to_bytes_be()),
+                "e": b64url(&key.e().to_bytes_be()),
+            }]
+        })
+        .to_string();
+        TestKey {
+            pem,
+            kid: kid.to_string(),
+            jwks,
+        }
+    }
+
+    fn b64url(bytes: &[u8]) -> String {
+        use base64::Engine;
+        base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes)
+    }
+
+    /// The default deployment shape: RS256 against a JWKS.
     fn oidc() -> OidcCfg {
         OidcCfg {
             issuer: ISSUER.into(),
             client_id: CLIENT.into(),
             client_secret: SECRET.into(),
             redirect_uri: "https://app.example/cb".into(),
+            id_token_alg: None,
+        }
+    }
+
+    /// The same IdP, pinned to a shared-secret signature instead.
+    fn oidc_hs256() -> OidcCfg {
+        OidcCfg {
+            id_token_alg: Some("HS256".into()),
+            ..oidc()
         }
     }
 
@@ -1398,9 +2535,24 @@ mod id_token_tests {
     async fn hs256_valid_token_is_accepted() {
         let http: Arc<dyn HostHttp> = Arc::new(StubHttp { jwks: None });
         let tok = hs256(&claims(ISSUER, CLIENT, 3600), SECRET.as_bytes());
-        let got = verify_id_token(&http, &oidc(), &tok).await.expect("valid token");
+        let got = verify_id_token(&http, &oidc_hs256(), &tok)
+            .await
+            .expect("valid token");
         assert_eq!(got.sub, "idp-user-1");
         assert_eq!(got.email.as_deref(), Some("u@example.org"));
+    }
+
+    #[tokio::test]
+    async fn a_token_signed_with_another_algorithm_is_refused() {
+        let http: Arc<dyn HostHttp> = Arc::new(StubHttp { jwks: None });
+        let tok = hs256(&claims(ISSUER, CLIENT, 3600), SECRET.as_bytes());
+        // The deployment is pinned to RS256 (the default). An HS256 token is a
+        // header claim, not a decision the verifier gets to take: accepting it
+        // is the algorithm-confusion shape.
+        let err = verify_id_token(&http, &oidc(), &tok)
+            .await
+            .expect_err("an HS256 token must not pass an RS256 deployment");
+        assert!(err.to_string().contains("does not match"), "{err}");
     }
 
     #[tokio::test]
@@ -1409,19 +2561,25 @@ mod id_token_tests {
         // An hour past expiry: comfortably outside jsonwebtoken's default 60s
         // clock-skew leeway (which is why -60 would still be accepted).
         let tok = hs256(&claims(ISSUER, CLIENT, -3600), SECRET.as_bytes());
-        assert!(verify_id_token(&http, &oidc(), &tok).await.is_err(), "expired token must fail");
+        assert!(
+            verify_id_token(&http, &oidc_hs256(), &tok).await.is_err(),
+            "expired token must fail"
+        );
     }
 
     #[tokio::test]
     async fn wrong_issuer_audience_and_secret_are_rejected() {
         let http: Arc<dyn HostHttp> = Arc::new(StubHttp { jwks: None });
         for tok in [
-            hs256(&claims("https://evil.example", CLIENT, 3600), SECRET.as_bytes()),
+            hs256(
+                &claims("https://evil.example", CLIENT, 3600),
+                SECRET.as_bytes(),
+            ),
             hs256(&claims(ISSUER, "someone-else", 3600), SECRET.as_bytes()),
             hs256(&claims(ISSUER, CLIENT, 3600), b"wrong-secret"),
         ] {
             assert!(
-                verify_id_token(&http, &oidc(), &tok).await.is_err(),
+                verify_id_token(&http, &oidc_hs256(), &tok).await.is_err(),
                 "iss/aud/secret mismatch must fail"
             );
         }
@@ -1429,25 +2587,33 @@ mod id_token_tests {
 
     #[tokio::test]
     async fn rs256_token_is_verified_against_jwks() {
-        let http: Arc<dyn HostHttp> = Arc::new(StubHttp { jwks: Some(JWKS.into()) });
+        let key = rsa_test_key("generated-key-1");
+        let http: Arc<dyn HostHttp> = Arc::new(StubHttp {
+            jwks: Some(key.jwks.clone()),
+        });
         let header = jsonwebtoken::Header {
             alg: jsonwebtoken::Algorithm::RS256,
-            kid: Some("test-key-1".into()),
+            kid: Some(key.kid.clone()),
             ..Default::default()
         };
         let tok = jsonwebtoken::encode(
             &header,
             &claims(ISSUER, CLIENT, 3600),
-            &jsonwebtoken::EncodingKey::from_rsa_pem(RSA_PEM.as_bytes()).unwrap(),
+            &jsonwebtoken::EncodingKey::from_rsa_pem(key.pem.as_bytes()).unwrap(),
         )
         .unwrap();
-        let got = verify_id_token(&http, &oidc(), &tok).await.expect("RS256 token via JWKS");
+        let got = verify_id_token(&http, &oidc(), &tok)
+            .await
+            .expect("RS256 token via JWKS");
         assert_eq!(got.sub, "idp-user-1");
     }
 
     #[tokio::test]
     async fn rs256_token_with_unknown_kid_is_rejected() {
-        let http: Arc<dyn HostHttp> = Arc::new(StubHttp { jwks: Some(JWKS.into()) });
+        let key = rsa_test_key("generated-key-1");
+        let http: Arc<dyn HostHttp> = Arc::new(StubHttp {
+            jwks: Some(key.jwks.clone()),
+        });
         let header = jsonwebtoken::Header {
             alg: jsonwebtoken::Algorithm::RS256,
             kid: Some("no-such-key".into()),
@@ -1456,7 +2622,7 @@ mod id_token_tests {
         let tok = jsonwebtoken::encode(
             &header,
             &claims(ISSUER, CLIENT, 3600),
-            &jsonwebtoken::EncodingKey::from_rsa_pem(RSA_PEM.as_bytes()).unwrap(),
+            &jsonwebtoken::EncodingKey::from_rsa_pem(key.pem.as_bytes()).unwrap(),
         )
         .unwrap();
         assert!(verify_id_token(&http, &oidc(), &tok).await.is_err());
