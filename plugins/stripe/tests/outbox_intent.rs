@@ -848,8 +848,14 @@ async fn the_worklist_lists_an_in_flight_intent_and_drops_it_once_the_intent_is_
     let mut plugin = StripePlugin::new();
     plugin.init(ctx.clone()).await.expect("init");
     let subscriptions = plugin.subscriptions();
-    assert_eq!(subscriptions.len(), 1);
-    (subscriptions[0].handler)(Event {
+    // Two: the dues standing mirror, and the core's outbox outcomes. This probe
+    // wants the second, named by filter rather than by index so adding a
+    // subscription is not a test edit.
+    let outbox = subscriptions
+        .iter()
+        .find(|s| s.filter == adjutant_stripe::OUTBOX_EVENT_PREFIX)
+        .expect("the outbox subscription");
+    (outbox.handler)(Event {
         id: 0,
         event_type: "core.outbox.delivered".to_string(),
         payload: json!({
