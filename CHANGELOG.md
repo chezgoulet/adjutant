@@ -11,6 +11,24 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+Nothing yet.
+
+---
+
+## [0.4.0] — 2026-11-17 — Security, secrets, and a shop that prices dues
+
+Pre-deploy security review (J.A.S.O.N.), then the two items it deferred: plugin
+secrets moved out of the database, and MCP writes gated behind an intent. A
+`_any_scope` authorization audit across all 83 plugin routes, and the dues
+checkout priced from finance rather than from the payer.
+
+**Breaking for a deployment:** secrets come from `ADJUTANT_SECRET_*` or the
+secrets file now, a secret left in `core.plugins.config` stops the boot, the MCP
+write surface needs an intent, a wildcard CORS origin is refused, and
+`POST /api/calendar/event/{id}/rsvp/{member}` is gone. `SDK_ABI_VERSION` is 6:
+`AdjutantPlugin::secret_config_keys` changed the trait surface, so a plugin built
+against 5 refuses to load.
+
 ### Added
 
 - **A dues checkout is priced by finance, not by the payer.** `purpose: "dues"`

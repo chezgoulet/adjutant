@@ -82,7 +82,7 @@ import urllib.request
 
 PROTOCOL_VERSION = "2025-06-18"
 SERVER_NAME = "adjutant"
-SERVER_VERSION = "0.3.0"
+SERVER_VERSION = "0.4.0"
 
 
 def _log(message: str) -> None:
