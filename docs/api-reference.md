@@ -266,7 +266,7 @@ to the Troop Council, which decides it once one other Council member seconds it.
 | POST | `/api/missions/mission/{id}/debrief` | `missions:update` | `{notes, goals_met?, lessons?, service_hours?, participant_count?}` → `execution → debrief` |
 | POST | `/api/missions/mission/{id}/report` | `missions:update` | `{summary, impact_metrics?, service_hours?, participant_count?}` → `debrief → report` |
 | POST | `/api/missions/mission/{id}/complete` | `missions:approve` | `report → completed`; publishes `mission.completed` |
-| POST | `/api/missions/mentor/profile` | `missions:mentor` | `{member_id, display_name?, affiliation?, expertise?, capacity?, is_active?, notes?}` |
+| POST | `/api/missions/mentor/profile` | `missions:mentor` | `{member_id, display_name?, affiliation?, expertise?, capacity?, is_active?, notes?, lodge_id?}`. A member may declare their **own** row. Declaring for somebody else needs `missions:approve` covering that member's Lodge, so `lodge_id` is required then. An omitted field is left as stored; it does not blank the row |
 | GET | `/api/missions/mission/{id}/mentor/suggestions` | `missions:approve` | Ranked mentors: expertise overlap, then spare capacity |
 | POST | `/api/missions/mission/{id}/mentor` | `missions:approve` | `{mentor_member, mentee_member?, role?, notes?}` |
 | POST | `/api/missions/mentorship/{id}/close` | `missions:update` | `{status?: completed\|ended, notes?}` |
@@ -619,7 +619,6 @@ clock too, beside the base occurrence's absolute `starts_at`.
 | GET | `/api/calendar/event/{id}/occurrences?from=&limit=` | `calendar:read` | The expanded series, `EXDATE`s removed |
 | GET | `/api/calendar/event/{id}/quorum?occurrence=` | `calendar:read` | The quorum projection for one occurrence |
 | POST | `/api/calendar/event/{id}/rsvp` | `calendar:rsvp` at the event's scope | `{response: going\|not_going\|maybe\|pending, occurrence?, note?}` — omitted `occurrence` answers for the whole series; a re-answer updates |
-| POST | `/api/calendar/event/{id}/rsvp/{member}` | `calendar:manage` | The same body, recorded for another member (the phoned-in RSVP) |
 | GET | `/api/calendar/event/{id}/rsvps` | `calendar:read` | Every answer, plus the counts for the next occurrence |
 | PATCH | `/api/calendar/event/{id}` | `calendar:manage` at the event's scope | Any subset of the create body; validated against the whole event |
 | POST | `/api/calendar/event/{id}/cancel` | `calendar:manage` at the event's scope | Cancels the series, keeping its RSVPs and the record |

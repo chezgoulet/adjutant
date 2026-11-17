@@ -125,6 +125,36 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Security
 
+- **A mentor can no longer write another member's registry row.** `POST
+  /api/missions/mentor/profile` took `member_id` from the body and compared it to
+  nothing: any `missions:mentor` holder, at any scope, could overwrite or blank
+  any member's profile troop-wide, and the row's `declared_by` became theirs. It
+  was also the blanking bug's home — omitted fields were bound as `''` and `'{}'`,
+  so a body naming only the member erased their name and expertise, and the
+  COALESCE on `EXCLUDED` guarded nothing. Declaring your **own** profile needs no
+  authority beyond the permission; declaring another's needs `missions:approve`
+  covering that member's Lodge, which is why `lodge_id` is now part of the body
+  and of the row. Omitted fields are bound as NULL and the UPDATE coalesces them
+  against the stored value.
+- **The calendar and missions lists only see Lodges where the caller holds the
+  read permission.** Both built their lodge array from every lodge *grant* the
+  identity carried, without asking whether that role has the permission — the
+  route gate only proves it somewhere. A member holding `calendar:read` at one
+  Lodge and an unrelated role at another saw the second Lodge's events (and
+  missions), while `GET /event/{id}` on the same row answered 403. Both now use
+  `scopes_for`, the permission-aware primitive announcements already used.
+- **`PATCH /api/calendar/event/{id}` authorizes the scope it moves the event
+  into.** It checked `calendar:manage` on the row as stored and then wrote a new
+  `scope_type`/`scope_id` from the body, so a Lodge manager could plant an event
+  in another Lodge's calendar or make it troop-wide — which `create` would have
+  refused. The target scope is checked when it differs, as announcements' re-
+  address already did.
+- **Recording an RSVP for another member is no longer a route.** By the owner's
+  ruling a manager answers for themselves; `POST
+  /api/calendar/event/{id}/rsvp/{member}` is removed rather than guarded, because
+  the member id came from the path with no roster check at all. Reading another
+  member's RSVP — notes included — stays open to anyone who can read the event,
+  which the owner confirmed is intended.
 - **Plugin secrets come from the deployment, not the database.** `stripe`'s
   `secret_key` and `webhook_secret`, `auth`'s `oidc.client_secret` and every
   plugin's database password were read from `core.plugins.config` /
