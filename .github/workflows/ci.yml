@@ -6,6 +6,16 @@ on:
     branches: [testing, main, "feature/*", "fix/*"]
   pull_request:
 
+# Cargo fetches every crate over HTTP/2 with multiplexed connections, and this
+# runner's network drops them mid-stream often enough to matter: three runs today
+# died on `curl [56] Failure when receiving data from the peer (OpenSSL
+# SSL_read: unexpected eof)` — once in the image build, once fetching a single
+# dependency, once on the apt key. Multiplexing off and a bigger retry budget is
+# the documented workaround, and it costs a few seconds on a cold cache.
+env:
+  CARGO_HTTP_MULTIPLEXING: "false"
+  CARGO_NET_RETRY: "10"
+
 jobs:
   # #181: a supply-chain rule written only in prose drifts back to tags. This job
   # is the rule: `scripts/check-pins.py` fails when a workflow `uses:` has no
