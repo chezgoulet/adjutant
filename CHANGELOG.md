@@ -13,6 +13,18 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Added
 
+- **A dues checkout is priced by finance, not by the payer.** `purpose: "dues"`
+  now charges what the member still owes, from the shop's mirror of
+  `finance.dues.assessed` (`stripe.dues_mirror`, migration 3, filled by a
+  subscription and re-published by finance's five-minute sweep). A payer may
+  deliberately pay **less** — the owner's ruling — and the session records
+  `assessed_cents` beside `amount_cents`, so a shortfall reads as a choice rather
+  than as a payment that went missing. More than is owed is a `400` (an extra
+  amount is a donation); no mirrored assessment is a `409` naming finance; and an
+  amount under Stripe's 50-cent minimum, including zero, is a `409` explaining
+  that paying nothing is a **waiver in finance**, not a session, because Stripe
+  cannot charge zero. Before this the amount was whatever the caller sent, so dues
+  standing could be satisfied for a penny.
 - **Finance re-announces dues standing, so the shop can price a dues checkout.**
   `finance.dues.assessed` and `finance.dues.payment` already carry a member's
   assessment and their paid/outstanding figures; a five-minute `dues_standing`
