@@ -151,7 +151,24 @@
 //! `ledger_intent_id`, the intent its booking rides on when it has one.
 //! `stripe.dues_mirror` — each member's dues standing as finance last announced
 //! it, so a dues checkout can be priced without the payer holding a finance
-//! permission.
+//! permission. `stripe.subscriptions` — the **automatic** dues arrangements: what
+//! each member agreed to, at what amount and interval, and whether it is live.
+//!
+//! ## Automatic dues
+//!
+//! `POST /api/stripe/subscribe` opens a Stripe Checkout session in subscription
+//! mode, priced per charge from the mirrored assessment: the amount defaults to
+//! what is owed, and may be **less** — a member paying a third of their dues
+//! monthly is the case this exists for. Each charge arrives as `invoice.paid`,
+//! carrying the metadata Stripe copied from the subscription (`member_id`,
+//! `dues_year`, `fund_code`, `category`), and books a dues payment through the
+//! same path a manual one takes — so standing, receipts and the ledger cannot tell
+//! the two kinds apart, because they are the same kind.
+//!
+//! `customer.subscription.*` mirrors the arrangement itself. The event is the
+//! authority on whether it ended: Stripe's snapshot can still read `active` on a
+//! `deleted` event, and a mirror that trusted the snapshot would keep a cancelled
+//! member in the charging list.
 //!
 //! ## Dues are priced by finance
 //!
@@ -466,6 +483,13 @@ pub struct StripeConfig {
 }
 
 /// A trimmed, non-blank setting, or `None`.
+/// A metadata value Stripe copied as an empty string is absent, not a value:
+/// `fund_code: ""` must fall back to the configured default, not clear it.
+fn empty_to_none(value: String) -> Option<String> {
+    let trimmed = value.trim();
+    (!trimmed.is_empty()).then(|| trimmed.to_string())
+}
+
 fn setting(value: &Option<String>) -> Option<String> {
     value
         .as_deref()
@@ -800,6 +824,26 @@ pub enum WebhookOutcome {
     /// A payment-shaped delivery this plugin could not read. Recorded and
     /// audited, never guessed at.
     Unusable(String),
+    /// A subscription's arrangement changed: opened, updated, or ended.
+    Subscription(Box<SubscriptionFact>),
+}
+
+/// One subscription as Stripe states it.
+///
+/// Only what the shop acts on: which arrangement it is, whose it is, what it
+/// charges, and whether it is live. Everything else — items, discounts, tax — is
+/// Stripe's record and is read there.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SubscriptionFact {
+    pub stripe_subscription_id: String,
+    pub stripe_customer_id: String,
+    pub member_id: String,
+    pub fiscal_year: Option<i32>,
+    pub status: String,
+    pub amount_cents: i64,
+    pub currency: String,
+    pub interval: String,
+    pub current_period_end: Option<String>,
 }
 
 /// Read the envelope. An event with no `id` is an error: without it the
@@ -907,6 +951,161 @@ pub fn classify_webhook(payload: &Value, event_type: &str) -> WebhookOutcome {
                 description: meta(object, "description").unwrap_or_default(),
                 dues_year: meta(object, "dues_year").and_then(|y| y.parse::<i32>().ok()),
                 related_event_id: meta(object, "related_event_id").unwrap_or_default(),
+            }))
+        }
+        // A subscription's own lifecycle. The arrangement is the shop's record of
+        // "this member pays this much on this schedule", so every change to it is
+        // mirrored; the money is `invoice.paid`, which is a payment like any other.
+        "customer.subscription.created"
+        | "customer.subscription.updated"
+        | "customer.subscription.deleted" => {
+            let Some(object) = object else {
+                return WebhookOutcome::Unusable("the event has no data.object".to_string());
+            };
+            let Some(id) = object.get("id").and_then(Value::as_str) else {
+                return WebhookOutcome::Unusable("the subscription has no id".to_string());
+            };
+            let metadata = object.get("metadata");
+            let meta_of = |key: &str| -> String {
+                metadata
+                    .and_then(|m| m.get(key))
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_string()
+            };
+            let member_id = meta_of("member_id");
+            if member_id.is_empty() {
+                // A subscription the shop cannot attribute is not one it can
+                // keep; Stripe would not have it unless it came from somewhere
+                // else (a dashboard-created subscription), and the operator
+                // should learn that rather than have it silently ignored.
+                return WebhookOutcome::Unusable(format!(
+                    "subscription {id} carries no member_id: it was not opened by the shop"
+                ));
+            }
+            let amount_cents = object
+                .get("items")
+                .and_then(|i| i.get("data"))
+                .and_then(Value::as_array)
+                .and_then(|items| items.first())
+                .and_then(|item| item.get("price"))
+                .and_then(|price| price.get("unit_amount"))
+                .and_then(Value::as_i64)
+                .unwrap_or(0);
+            let interval = object
+                .get("items")
+                .and_then(|i| i.get("data"))
+                .and_then(Value::as_array)
+                .and_then(|items| items.first())
+                .and_then(|item| item.get("price"))
+                .and_then(|price| price.get("recurring"))
+                .and_then(|r| r.get("interval"))
+                .and_then(Value::as_str)
+                .unwrap_or("year")
+                .to_string();
+            // The event that says "deleted" is the authority: the snapshot in
+            // `data.object` can still read `active` while the arrangement has
+            // ended, and a mirror that trusted the snapshot would keep charging
+            // a member who cancelled. Everything else is Stripe's own status,
+            // normalised to the shop's spelling.
+            let status = if event_type == "customer.subscription.deleted" {
+                "cancelled"
+            } else {
+                match object.get("status").and_then(Value::as_str) {
+                    Some("active") => "active",
+                    Some("past_due") => "past_due",
+                    Some("canceled") => "cancelled",
+                    _ => "incomplete",
+                }
+            }
+            .to_string();
+            WebhookOutcome::Subscription(Box::new(SubscriptionFact {
+                stripe_subscription_id: id.to_string(),
+                stripe_customer_id: object
+                    .get("customer")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_string(),
+                member_id,
+                fiscal_year: meta_of("dues_year").parse::<i32>().ok(),
+                status,
+                amount_cents,
+                currency: object
+                    .get("currency")
+                    .and_then(Value::as_str)
+                    .unwrap_or(DEFAULT_CURRENCY)
+                    .to_ascii_lowercase(),
+                interval,
+                current_period_end: object
+                    .get("current_period_end")
+                    .and_then(Value::as_i64)
+                    .map(|ts| ts.to_string()),
+            }))
+        }
+        // A subscription charged. The invoice's payment intent is the money; the
+        // metadata Stripe copied from the subscription says whose dues it is.
+        "invoice.paid" | "invoice.payment_succeeded" => {
+            let Some(object) = object else {
+                return WebhookOutcome::Unusable("the event has no data.object".to_string());
+            };
+            let invoice_id = object.get("id").and_then(Value::as_str).unwrap_or_default();
+            let amount_cents = object
+                .get("amount_paid")
+                .and_then(Value::as_i64)
+                .unwrap_or(0);
+            if amount_cents <= 0 {
+                // A zero-amount invoice is a proration or a trial, not a payment.
+                return WebhookOutcome::Nothing;
+            }
+            let subscription_meta = object
+                .get("subscription_details")
+                .and_then(|d| d.get("metadata"))
+                .or_else(|| {
+                    object
+                        .get("lines")
+                        .and_then(|l| l.get("data"))
+                        .and_then(Value::as_array)
+                        .and_then(|lines| lines.first())
+                        .and_then(|line| line.get("metadata"))
+                });
+            let sub_meta = |key: &str| -> String {
+                subscription_meta
+                    .and_then(|m| m.get(key))
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_string()
+            };
+            let payment_id = object
+                .get("payment_intent")
+                .and_then(Value::as_str)
+                .map(str::to_string)
+                .filter(|id| !id.is_empty())
+                // A charge raised by an invoice can arrive without a payment
+                // intent (a bank debit, say). The invoice is then the thing that
+                // is unique per charge, so it is what makes the delivery
+                // idempotent.
+                .unwrap_or_else(|| format!("in_{invoice_id}"));
+            WebhookOutcome::Payment(Box::new(PaymentFact {
+                payment_id,
+                amount_cents,
+                currency: object
+                    .get("currency")
+                    .and_then(Value::as_str)
+                    .unwrap_or(DEFAULT_CURRENCY)
+                    .to_ascii_lowercase(),
+                session_id: String::new(),
+                session_ref: None,
+                purpose: normalize_purpose(&sub_meta("purpose")),
+                member_id: sub_meta("member_id"),
+                fund_code: empty_to_none(sub_meta("fund_code")),
+                category: empty_to_none(sub_meta("category")),
+                description: if sub_meta("description").is_empty() {
+                    "Automatic dues".to_string()
+                } else {
+                    sub_meta("description")
+                },
+                dues_year: sub_meta("dues_year").parse::<i32>().ok(),
+                related_event_id: sub_meta("related_event_id"),
             }))
         }
         "checkout.session.completed" => {
@@ -1099,6 +1298,60 @@ pub fn checkout_form(request: &CheckoutRequest) -> Vec<(String, String)> {
     form
 }
 
+/// The form for a **subscription** Checkout: one line item, a recurring price
+/// built inline, and the metadata Stripe copies onto every invoice the
+/// subscription raises.
+///
+/// The metadata is what makes an automatic payment bookable: `invoice.paid`
+/// carries no shop identity of its own, so the subscription's metadata is where
+/// "whose dues, which year, which fund" travels to the webhook.
+pub fn subscription_form(request: &SubscriptionRequest) -> Vec<(String, String)> {
+    let mut form: Vec<(String, String)> = vec![
+        ("mode".to_string(), "subscription".to_string()),
+        ("success_url".to_string(), request.success_url.clone()),
+        ("cancel_url".to_string(), request.cancel_url.clone()),
+        ("line_items[0][quantity]".to_string(), "1".to_string()),
+        (
+            "line_items[0][price_data][currency]".to_string(),
+            request.currency.clone(),
+        ),
+        (
+            "line_items[0][price_data][unit_amount]".to_string(),
+            request.amount_cents.to_string(),
+        ),
+        (
+            "line_items[0][price_data][recurring][interval]".to_string(),
+            request.interval.clone(),
+        ),
+        (
+            "line_items[0][price_data][product_data][name]".to_string(),
+            request.label.clone(),
+        ),
+        // The payer may change the card later without a new enrolment, and the
+        // mandate text names the troop rather than the individual line item.
+        (
+            "subscription_data[description]".to_string(),
+            request.label.clone(),
+        ),
+    ];
+    for (key, value) in request.metadata.clone() {
+        form.push((format!("subscription_data[metadata][{key}]"), value));
+    }
+    form
+}
+
+/// One enrolment request, as the form builder and the route share it.
+#[derive(Debug, Clone)]
+pub struct SubscriptionRequest {
+    pub amount_cents: i64,
+    pub currency: String,
+    pub interval: String,
+    pub label: String,
+    pub success_url: String,
+    pub cancel_url: String,
+    pub metadata: Vec<(String, String)>,
+}
+
 /// The label a payer sees: what they are paying for, and for whom.
 pub fn checkout_label(purpose: &str, dues_year: Option<i32>, member_id: &str) -> String {
     let what = match purpose {
@@ -1175,6 +1428,35 @@ pub fn parse_amount_to_cents(raw: &str) -> Result<i64, String> {
 // ---------------------------------------------------------------------------
 // Request bodies
 // ---------------------------------------------------------------------------
+
+#[derive(Debug, Deserialize)]
+struct SubscribeBody {
+    #[serde(default)]
+    member_id: Option<String>,
+    #[serde(default)]
+    dues_year: Option<i32>,
+    #[serde(default)]
+    amount_cents: Option<i64>,
+    #[serde(default)]
+    amount: Option<String>,
+    /// `year` (the default a dues model implies) or `month`.
+    #[serde(default = "default_interval")]
+    interval: String,
+    #[serde(default)]
+    currency: Option<String>,
+    #[serde(default)]
+    fund_code: Option<String>,
+    #[serde(default)]
+    category: Option<String>,
+    #[serde(default)]
+    success_url: Option<String>,
+    #[serde(default)]
+    cancel_url: Option<String>,
+}
+
+fn default_interval() -> String {
+    "year".to_string()
+}
 
 #[derive(Debug, Deserialize)]
 struct CheckoutBody {
@@ -1898,6 +2180,51 @@ fn mirror_lookup_params(member: &str, fiscal_year: Option<i32>) -> Vec<SqlValue>
     ]
 }
 
+/// Mirror one subscription's arrangement.
+///
+/// Upsert by Stripe's id: the same arrangement arrives several times over its
+/// life (`created`, then `updated` on every renewal and amount change, then
+/// `deleted`), and each one is the current truth rather than a new row. Returns
+/// how many rows the statement touched, so a delivery for an arrangement the
+/// shop never opened (created in Stripe's dashboard) is visible in the audit as
+/// `0` rather than looking mirrored.
+async fn mirror_subscription(
+    c: &PluginContext,
+    sub: &SubscriptionFact,
+) -> Result<u64, SdkError> {
+    c.db
+        .execute(
+            format!(
+                "INSERT INTO {t} \
+                   (member_id, fiscal_year, stripe_subscription_id, stripe_customer_id, \
+                    status, amount_cents, currency, interval, cancelled_at, updated_at) \
+                 VALUES ($1, COALESCE($2, EXTRACT(YEAR FROM now())::int), $3, $4, $5, $6, \
+                         $7, $8, CASE WHEN $5 = 'cancelled' THEN now() ELSE NULL END, now()) \
+                 ON CONFLICT (stripe_subscription_id) DO UPDATE SET \
+                   status = EXCLUDED.status, \
+                   amount_cents = EXCLUDED.amount_cents, \
+                   currency = EXCLUDED.currency, \
+                   interval = EXCLUDED.interval, \
+                   stripe_customer_id = EXCLUDED.stripe_customer_id, \
+                   cancelled_at = CASE WHEN EXCLUDED.status = 'cancelled' THEN now() \
+                                       ELSE {t}.cancelled_at END, \
+                   updated_at = now()",
+                t = c.db.table("subscriptions")
+            ),
+            vec![
+                SqlValue::Text(sub.member_id.clone()),
+                sub.fiscal_year.map(|y| SqlValue::Int(i64::from(y))).unwrap_or(SqlValue::NullInt),
+                SqlValue::Text(sub.stripe_subscription_id.clone()),
+                SqlValue::Text(sub.stripe_customer_id.clone()),
+                SqlValue::Text(sub.status.clone()),
+                SqlValue::Int(sub.amount_cents),
+                SqlValue::Text(sub.currency.clone()),
+                SqlValue::Text(sub.interval.clone()),
+            ],
+        )
+        .await
+}
+
 /// Mirror one of finance's standing announcements.
 ///
 /// `finance.dues.assessed` (an assessment) carries no paid/outstanding figure
@@ -2130,6 +2457,7 @@ pub mod migrations {
         1 => "stripe_schema" => "../migrations/001_stripe_schema.sql";
         2 => "payment_ledger_intent" => "../migrations/002_payment_ledger_intent.sql";
         3 => "dues_mirror" => "../migrations/003_dues_mirror.sql";
+        4 => "dues_subscriptions" => "../migrations/004_dues_subscriptions.sql";
     }
 }
 
@@ -2300,10 +2628,336 @@ impl AdjutantPlugin for StripePlugin {
 export_plugin!(StripePlugin);
 
 /// Every route this plugin serves, in the order the API reference lists them.
+/// `POST /api/stripe/subscribe` — open an **automatic** dues arrangement.
+///
+/// The member chooses an amount (what they owe, or less — the same ruling the
+/// one-off checkout follows) and an interval; Stripe Checkout collects the card
+/// in subscription mode, and every charge lands as `invoice.paid`, which books a
+/// dues payment exactly as a manual one does.
+///
+/// Automatic does not mean "the full assessed amount": it means "this amount, on
+/// this schedule, without a page to open". A member paying a third of their dues
+/// monthly is the case this exists for.
+fn route_subscribe(ctx: &PluginContext, cfg: &StripeConfig) -> RouteDefinition {
+    let c = ctx.clone();
+    let cfg = cfg.clone();
+    RouteDefinition::post_protected_any_scope(
+        "/api/stripe/subscribe",
+        PERM_CHECKOUT,
+        route_handler(move |req| {
+            let c = c.clone();
+            let cfg = cfg.clone();
+            async move {
+                let Some(secret) = cfg.secret_key() else {
+                    return PluginResponse::error(
+                        503,
+                        "no Stripe secret_key is configured for this plugin, so no subscription can \
+                         be opened; set it in the deployment's secrets and reload",
+                    );
+                };
+                let body: SubscribeBody = req.json()?;
+                let caller = caller_of(&req);
+                let member_id = trimmed(&body.member_id)
+                    .or_else(|| caller.clone())
+                    .unwrap_or_default();
+                if member_id.is_empty() {
+                    return PluginResponse::error(
+                        400,
+                        "an automatic dues arrangement needs a member: subscribe yourself, or name \
+                         the member as the treasurer",
+                    );
+                }
+                // Enrolling somebody else is the treasurer's act.
+                if Some(member_id.as_str()) != caller.as_deref() {
+                    if let Err(e) = c
+                        .permissions
+                        .reach(req.identity.as_ref(), PERM_MANAGE, &Scope::troop())
+                        .await
+                    {
+                        return PluginResponse::error(e.status(), e.to_string());
+                    }
+                }
+                let interval = match body.interval.trim().to_ascii_lowercase().as_str() {
+                    "year" | "yearly" | "annual" => "year".to_string(),
+                    "month" | "monthly" => "month".to_string(),
+                    other => {
+                        return PluginResponse::error(
+                            400,
+                            format!("interval {other:?} must be \"year\" or \"month\""),
+                        )
+                    }
+                };
+                let Some(standing) = c
+                    .db
+                    .query_one(mirror_lookup_sql(&c), mirror_lookup_params(&member_id, body.dues_year))
+                    .await?
+                else {
+                    return PluginResponse::error(
+                        409,
+                        format!(
+                            "no dues assessment for {member_id} has reached the shop yet — finance \
+                             announces it and this shop mirrors it; try again in a minute, or ask \
+                             the treasurer to assess it"
+                        ),
+                    );
+                };
+                let owed = standing["outstanding_cents"].as_i64().unwrap_or(0);
+                if owed <= 0 {
+                    return PluginResponse::error(
+                        409,
+                        format!("{member_id} has nothing outstanding — the dues are settled"),
+                    );
+                }
+                let per_charge = match resolve_amount(body.amount_cents, &body.amount) {
+                    // No amount: the whole outstanding figure, on the chosen interval.
+                    Err(_) if body.amount_cents.is_none() && trimmed(&body.amount).is_none() => owed,
+                    Ok(amount) => amount,
+                    Err(reason) => return PluginResponse::error(400, reason),
+                };
+                if per_charge > owed {
+                    return PluginResponse::error(
+                        400,
+                        format!(
+                            "each charge may not exceed what is outstanding ({owed} cents); an \
+                             extra amount is a donation — open one with purpose \"donation\""
+                        ),
+                    );
+                }
+                if per_charge < STRIPE_MINIMUM_CHARGE_CENTS {
+                    return PluginResponse::error(
+                        409,
+                        format!(
+                            "Stripe cannot charge less than {STRIPE_MINIMUM_CHARGE_CENTS} cents \
+                             per charge, so an arrangement for less than that is not possible; \
+                             paying nothing is a waiver in finance"
+                        ),
+                    );
+                }
+                let fiscal_year = standing["fiscal_year"].as_i64().unwrap_or(0) as i32;
+                let currency = trimmed(&body.currency).unwrap_or_else(|| cfg.currency());
+                let success_url = match trimmed(&body.success_url).or_else(|| cfg.success_url()) {
+                    Some(url) => url,
+                    None => {
+                        return PluginResponse::error(400, "success_url is required (or set a default with the plugin's success_url config)")
+                    }
+                };
+                let cancel_url = match trimmed(&body.cancel_url).or_else(|| cfg.cancel_url()) {
+                    Some(url) => url,
+                    None => {
+                        return PluginResponse::error(400, "cancel_url is required (or set a default with the plugin's cancel_url config)")
+                    }
+                };
+                let fund_code = trimmed(&body.fund_code)
+                    .unwrap_or_else(|| cfg.fund_code_for(PURPOSE_DUES));
+                let category = trimmed(&body.category)
+                    .unwrap_or_else(|| category_for(PURPOSE_DUES).to_string());
+                let label = format!(
+                    "Troop dues {fiscal_year} — automatic (per {interval})"
+                );
+
+                // The row exists before Stripe is called, so an enrolment that
+                // never completed is visible as `pending` rather than invisible.
+                let created = c
+                    .db
+                    .query_one(
+                        format!(
+                            "INSERT INTO {t} \
+                               (member_id, fiscal_year, status, amount_cents, currency, interval, \
+                                fund_code, category, created_by) \
+                             VALUES ($1, $2, 'pending', $3, $4, $5, $6, $7, $8) \
+                             RETURNING id, member_id, fiscal_year, status, amount_cents, currency, \
+                                       interval, created_at::text AS created_at",
+                            t = c.db.table("subscriptions")
+                        ),
+                        vec![
+                            SqlValue::Text(member_id.clone()),
+                            SqlValue::Int(i64::from(fiscal_year)),
+                            SqlValue::Int(per_charge),
+                            SqlValue::Text(currency.clone()),
+                            SqlValue::Text(interval.clone()),
+                            SqlValue::Text(fund_code.clone()),
+                            SqlValue::Text(category.clone()),
+                            SqlValue::Text(caller.clone().unwrap_or_default()),
+                        ],
+                    )
+                    .await?;
+                let Some(row) = created else {
+                    return PluginResponse::error(500, "the subscription row was not written");
+                };
+
+                let metadata = vec![
+                    ("purpose".to_string(), PURPOSE_DUES.to_string()),
+                    ("member_id".to_string(), member_id.clone()),
+                    ("dues_year".to_string(), fiscal_year.to_string()),
+                    ("fund_code".to_string(), fund_code.clone()),
+                    ("category".to_string(), category.clone()),
+                    ("description".to_string(), label.clone()),
+                    (
+                        "subscription_row".to_string(),
+                        row["id"].as_i64().unwrap_or_default().to_string(),
+                    ),
+                ];
+                let form = form_encode(&subscription_form(&SubscriptionRequest {
+                    amount_cents: per_charge,
+                    currency: currency.clone(),
+                    interval: interval.clone(),
+                    label: label.clone(),
+                    success_url,
+                    cancel_url,
+                    metadata,
+                }));
+                let response = c
+                    .http
+                    .request(
+                        "POST".to_string(),
+                        format!("{}/v1/checkout/sessions", cfg.api_base()),
+                        vec![
+                            ("authorization".to_string(), format!("Bearer {secret}")),
+                            (
+                                "content-type".to_string(),
+                                "application/x-www-form-urlencoded".to_string(),
+                            ),
+                        ],
+                        Some((
+                            "application/x-www-form-urlencoded".to_string(),
+                            form.into_bytes(),
+                        )),
+                    )
+                    .await;
+                match response {
+                    Ok(response) if (200..300).contains(&response.status) => {
+                        let parsed =
+                            serde_json::from_slice::<Value>(&response.body).unwrap_or(Value::Null);
+                        let checkout_url = parsed
+                            .get("url")
+                            .and_then(Value::as_str)
+                            .unwrap_or_default()
+                            .to_string();
+                        if checkout_url.is_empty() {
+                            return PluginResponse::error(
+                                502,
+                                "Stripe opened the session but returned no checkout url",
+                            );
+                        }
+                        c.audit
+                            .log(
+                                req.identity.as_ref(),
+                                "stripe.subscribe.opened",
+                                "stripe_subscription",
+                                &row["id"].as_i64().unwrap_or_default().to_string(),
+                                json!({
+                                    "member_id": member_id,
+                                    "fiscal_year": fiscal_year,
+                                    "amount_cents": per_charge,
+                                    "interval": interval,
+                                }),
+                            )
+                            .await?;
+                        PluginResponse::json(
+                            201,
+                            &json!({
+                                "subscription": row,
+                                "checkout_url": checkout_url,
+                                "note": "the arrangement is live once Stripe reports \
+                                         customer.subscription.created; each charge books a dues \
+                                         payment when its invoice is paid",
+                            }),
+                        )
+                    }
+                    Ok(response) => {
+                        let detail = String::from_utf8_lossy(&response.body).to_string();
+                        let _ = c
+                            .db
+                            .execute(
+                                format!(
+                                    "UPDATE {t} SET status = 'incomplete', updated_at = now() \
+                                     WHERE id = $1",
+                                    t = c.db.table("subscriptions")
+                                ),
+                                vec![SqlValue::Int(row["id"].as_i64().unwrap_or_default())],
+                            )
+                            .await;
+                        PluginResponse::error(
+                            response.status,
+                            format!("Stripe refused the session: {detail}"),
+                        )
+                    }
+                    Err(e) => {
+                        let _ = c
+                            .db
+                            .execute(
+                                format!(
+                                    "UPDATE {t} SET status = 'incomplete', updated_at = now() \
+                                     WHERE id = $1",
+                                    t = c.db.table("subscriptions")
+                                ),
+                                vec![SqlValue::Int(row["id"].as_i64().unwrap_or_default())],
+                            )
+                            .await;
+                        PluginResponse::error(502, format!("the shop could not reach Stripe: {e}"))
+                    }
+                }
+            }
+        }),
+    )
+}
+
+/// `GET /api/stripe/subscriptions` — the arrangements the shop knows about.
+///
+/// A member sees their own; `stripe:read_all` sees the troop's. Same narrowing as
+/// the sessions list, for the same reason: an arrangement names a person.
+fn route_list_subscriptions(ctx: &PluginContext) -> RouteDefinition {
+    let c = ctx.clone();
+    RouteDefinition::get_protected_any_scope(
+        "/api/stripe/subscriptions",
+        PERM_READ,
+        route_handler(move |req| {
+            let c = c.clone();
+            async move {
+                let everything = c
+                    .permissions
+                    .has_in_scope(req.identity.as_ref(), PERM_READ_ALL, &Scope::troop())
+                    .await;
+                let fiscal_year = req.query_int("fiscal_year");
+                let rows = c
+                    .db
+                    .query(
+                        format!(
+                            "SELECT id, member_id, fiscal_year, stripe_subscription_id, status, \
+                                    amount_cents, currency, interval, current_period_end::text \
+                                      AS current_period_end, cancelled_at::text AS cancelled_at, \
+                                    created_at::text AS created_at \
+                             FROM {t} \
+                             WHERE ($1::bool OR member_id = $2) \
+                               AND ($3::bigint IS NULL OR fiscal_year = $3) \
+                             ORDER BY created_at DESC, id DESC LIMIT 200",
+                            t = c.db.table("subscriptions")
+                        ),
+                        vec![
+                            SqlValue::Bool(everything),
+                            SqlValue::Text(caller_of(&req).unwrap_or_default()),
+                            fiscal_year.map(SqlValue::Int).unwrap_or(SqlValue::NullInt),
+                        ],
+                    )
+                    .await?;
+                PluginResponse::json(
+                    200,
+                    &json!({
+                        "subscriptions": rows,
+                        "scope": if everything { "troop" } else { "own" },
+                    }),
+                )
+            }
+        }),
+    )
+}
+
 fn stripe_routes(ctx: &PluginContext, cfg: &StripeConfig) -> Vec<RouteDefinition> {
     vec![
         route_health(cfg),
         route_checkout(ctx, cfg),
+        route_subscribe(ctx, cfg),
+        route_list_subscriptions(ctx),
         route_list_sessions(ctx),
         route_get_session(ctx),
         route_webhook(ctx, cfg),
@@ -3082,6 +3736,44 @@ pub async fn handle_webhook(
     let outcome = classify_webhook(&payload, &envelope.event_type);
     let fact = match outcome {
         WebhookOutcome::Payment(fact) => *fact,
+        // A subscription's arrangement, mirrored rather than booked: no money
+        // moves on this event, and the money that does move arrives as
+        // `invoice.paid` and takes the payment path above.
+        WebhookOutcome::Subscription(sub) => {
+            let mirrored = mirror_subscription(c, sub.as_ref()).await?;
+            c.audit
+                .log(
+                    None,
+                    "stripe.subscription.changed",
+                    "stripe_subscription",
+                    &sub.stripe_subscription_id,
+                    json!({
+                        "event_type": envelope.event_type,
+                        "member_id": sub.member_id,
+                        "status": sub.status,
+                        "amount_cents": sub.amount_cents,
+                        "interval": sub.interval,
+                        "mirrored": mirrored,
+                    }),
+                )
+                .await?;
+            return PluginResponse::json(
+                200,
+                &json!({
+                    "received": true,
+                    "duplicate": false,
+                    "event_id": envelope.event_id,
+                    "event_type": envelope.event_type,
+                    "payment": Value::Null,
+                    "subscription": {
+                        "id": sub.stripe_subscription_id,
+                        "member_id": sub.member_id,
+                        "status": sub.status,
+                        "mirrored": mirrored,
+                    },
+                }),
+            );
+        }
         WebhookOutcome::Nothing => {
             c.audit
                 .log(
