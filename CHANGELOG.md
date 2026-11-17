@@ -11,7 +11,21 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
-Nothing yet.
+### Added
+
+- **Automatic dues.** `POST /api/stripe/subscribe` opens a Stripe Checkout session
+  in **subscription** mode, priced per charge from the mirrored assessment: the
+  amount defaults to what the member owes, may be deliberately **less** (a member
+  paying a third monthly is the case this exists for), and the interval is
+  `year` or `month`. Each charge arrives as `invoice.paid`, carrying the metadata
+  Stripe copied from the subscription, and books a dues payment through the same
+  path a manual one takes — so standing, receipts and the ledger treat the two
+  identically. `customer.subscription.*` mirrors the arrangement itself
+  (`stripe.subscriptions`, migration 4), with the event as the authority on
+  whether it ended: Stripe's snapshot can still read `active` on a `deleted`
+  event, and a mirror that trusted it would keep a cancelled member in the
+  charging list. `GET /api/stripe/subscriptions` lists the arrangements a caller
+  may see.
 
 ---
 
