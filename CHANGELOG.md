@@ -13,6 +13,16 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Added
 
+- **Finance re-announces dues standing, so the shop can price a dues checkout.**
+  `finance.dues.assessed` and `finance.dues.payment` already carry a member's
+  assessment and their paid/outstanding figures; a five-minute `dues_standing`
+  schedule now re-publishes every member's current standing in the same shape
+  (`assessed_cents`, `funded_cents`, `paid_cents`, `outstanding_cents`,
+  `settled`), so a consumer — the shop, next — converges from a cold start or
+  after a path that did not publish, without a watermark to keep. The event
+  vocabulary gains the constant (`event_type::DUES_ASSESSED`) rather than a
+  string repeated at each publisher.
+
 - **The audit chain has an off-database anchor** (#160). Setting
   `ADJUTANT_AUDIT_KEY` (64 hex characters or base64 of 32 bytes) makes every
   audit insert carry `keyed_hash = HMAC-SHA256(key, canonical payload)`,

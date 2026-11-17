@@ -1055,6 +1055,13 @@ pub mod event_type {
     pub const CONFLICT_ESCALATED: &str = "conflict.escalated";
     /// `payment.received` — Stripe payment confirmed (stripe).
     pub const PAYMENT_RECEIVED: &str = "payment.received";
+    /// `finance.dues.assessed` — a member's dues standing, as finance has it:
+    /// `{member_id, fiscal_year, assessed_cents, funded_cents, outstanding_cents,
+    /// status}`. Published when an assessment or a payment changes the row, and
+    /// re-published by a sweep so a consumer that started late still converges.
+    /// The shop prices a dues checkout from its mirror of this, which is why the
+    /// figure has to reach it without the payer holding a finance permission.
+    pub const DUES_ASSESSED: &str = "finance.dues.assessed";
     /// `member.joined` — new member registered (membership).
     pub const MEMBER_JOINED: &str = "member.joined";
     /// `member.left` — member departed (membership).

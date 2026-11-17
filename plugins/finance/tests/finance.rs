@@ -3759,11 +3759,22 @@ async fn the_ledger_audit_publishes_only_when_the_books_do_not_add_up() {
     plugin.init(host.context("finance")).await.unwrap();
 
     let schedules = plugin.schedules();
-    assert_eq!(schedules.len(), 1);
-    assert_eq!(schedules[0].name, "ledger_audit");
+    // Two: the daily book audit, and the dues-standing sweep the shop converges
+    // from. Named rather than indexed, so adding a schedule is not a test edit.
+    assert_eq!(schedules.len(), 2, "the two declared schedules");
+    let audit = schedules
+        .iter()
+        .find(|s| s.name == "ledger_audit")
+        .expect("the ledger audit");
+    assert_eq!(audit.every, std::time::Duration::from_secs(24 * 60 * 60));
+    let standing = schedules
+        .iter()
+        .find(|s| s.name == "dues_standing")
+        .expect("the dues standing sweep");
     assert_eq!(
-        schedules[0].every,
-        std::time::Duration::from_secs(24 * 60 * 60)
+        standing.every,
+        std::time::Duration::from_secs(5 * 60),
+        "a backstop cadence, not the main path"
     );
 
     // A healthy ledger: the schedule stays silent (a silent watch is a happy one).
@@ -3773,7 +3784,7 @@ async fn the_ledger_audit_publishes_only_when_the_books_do_not_add_up() {
     host.db
         .push_rows(vec![json!({ "fund_total_cents": 70_000 })]);
     host.db.push_rows(vec![group_row("a", 2, 0)]);
-    (schedules[0].handler)().await.unwrap();
+    (audit.handler)().await.unwrap();
     host.events.assert_none();
 
     // A broken one: it says so, with the evidence.
@@ -3783,7 +3794,7 @@ async fn the_ledger_audit_publishes_only_when_the_books_do_not_add_up() {
     host.db
         .push_rows(vec![json!({ "fund_total_cents": 69_000 })]);
     host.db.push_rows(vec![group_row("a", 2, 0)]);
-    (schedules[0].handler)().await.unwrap();
+    (audit.handler)().await.unwrap();
     host.events.assert_published("finance.ledger.imbalanced");
     let payload = host
         .events

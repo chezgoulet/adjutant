@@ -443,7 +443,12 @@ a replayed event is a no-op rather than a second deposit. `external_ref` is also
 how the ledger route and the dues-payment route detect a replay.
 
 **Schedules:** `ledger_audit`, daily — re-derives the totals and the transfer
-groups and stays silent unless something is wrong.
+groups and stays silent unless something is wrong. `dues_standing`, every five
+minutes — re-publishes every member's current dues figures on
+`finance.dues.assessed` (with `paid_cents`, `outstanding_cents` and `settled`), so
+a consumer that mirrors them converges without a watermark to lose. The main path
+is the events an assessment and a payment already publish; the sweep is the
+backstop.
 
 **The six funds.** Migration 1 seeds General, Scholarship, Equipment,
 Expedition, Impact and Commencement; `kind` is one of those six and `code` is
