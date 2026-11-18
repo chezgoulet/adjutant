@@ -6,7 +6,7 @@ publish_to: 'none'
 # scripts/check-versions.py (#177): Android's versionName is read from here via
 # build.gradle.kts, so a stale value ships an APK that reports the wrong release.
 # The `+N` build number is independent of the release version.
-version: 0.4.0+2
+version: 0.5.0+3
 
 # The exact Flutter SDK this app is built and gated with (issue #76). CI reads
 # THIS file — `flutter-version-file` in .github/workflows/ci.yml — rather than

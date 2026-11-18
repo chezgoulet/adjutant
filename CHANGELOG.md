@@ -15,6 +15,37 @@ Nothing yet.
 
 ---
 
+## [0.5.0] — 2026-11-17 — Automatic dues
+
+The recurring half of the dues ruling: a member enrols once, Stripe charges them
+on the interval and amount they chose, and every charge books a dues payment
+through the same path a manual one takes.
+
+Also in this release: `RUSTSEC-2026-0543` (chrono unmaintained) is ignored for a
+bounded window with the migration filed as #219, because the advisory arrived
+from the database rather than from any change here and it was failing every
+branch.
+
+`SDK_ABI_VERSION` stays 6 — nothing in the plugin surface changed.
+
+### Added
+
+- **Automatic dues.** `POST /api/stripe/subscribe` opens a Stripe Checkout session
+  in **subscription** mode, priced per charge from the mirrored assessment: the
+  amount defaults to what the member owes, may be deliberately **less** (a member
+  paying a third monthly is the case this exists for), and the interval is
+  `year` or `month`. Each charge arrives as `invoice.paid`, carrying the metadata
+  Stripe copied from the subscription, and books a dues payment through the same
+  path a manual one takes — so standing, receipts and the ledger treat the two
+  identically. `customer.subscription.*` mirrors the arrangement itself
+  (`stripe.subscriptions`, migration 4), with the event as the authority on
+  whether it ended: Stripe's snapshot can still read `active` on a `deleted`
+  event, and a mirror that trusted it would keep a cancelled member in the
+  charging list. `GET /api/stripe/subscriptions` lists the arrangements a caller
+  may see.
+
+---
+
 ## [0.4.0] — 2026-11-17 — Security, secrets, and a shop that prices dues
 
 Pre-deploy security review (J.A.S.O.N.), then the two items it deferred: plugin

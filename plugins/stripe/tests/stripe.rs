@@ -434,7 +434,7 @@ async fn declared_manifest_satisfies_the_load_rules() {
             }
         }
     }
-    assert_eq!(routes.len(), 9, "nine routes, as documented");
+    assert_eq!(routes.len(), 11, "eleven routes, as documented");
     assert_eq!(
         routes.iter().filter(|r| r.required_permission.is_none()).count(),
         1,
@@ -450,7 +450,7 @@ async fn declared_manifest_satisfies_the_load_rules() {
     assert!(versions.iter().all(|v| *v >= 1), "versions start at 1");
     assert_eq!(
         versions,
-        vec![1, 2, 3],
+        vec![1, 2, 3, 4],
         "the outbox intent's status had to be a NEW version: an applied migration is skipped \
          without its SQL being compared, so amending version 1 would be invisible on every \
          database that already ran it. Version 3 is the dues mirror, for the same reason."
@@ -2347,4 +2347,213 @@ async fn the_session_list_accepts_only_a_status_it_knows() {
         2,
         "the permission check and the page — one query each"
     );
+}
+
+// ---------------------------------------------------------------------------
+// Automatic dues: the subscription events
+// ---------------------------------------------------------------------------
+
+fn subscription_event(event_type: &str, object: serde_json::Value) -> serde_json::Value {
+    serde_json::json!({
+        "id": format!("evt_{event_type}"),
+        "type": event_type,
+        "livemode": false,
+        "data": { "object": object },
+    })
+}
+
+/// A subscription the shop opened is mirrored with the parameters the shop acts
+/// on; the status vocabulary is normalised, because Stripe's `canceled` and the
+/// shop's `cancelled` would otherwise be two spellings of one state.
+#[test]
+fn a_subscription_event_is_read_into_the_facts_the_shop_keeps() {
+    use adjutant_stripe::classify_webhook;
+    let object = serde_json::json!({
+        "id": "sub_1",
+        "customer": "cus_1",
+        "status": "active",
+        "currency": "cad",
+        "current_period_end": 1790000000,
+        "metadata": { "member_id": "bea", "dues_year": "2027" },
+        "items": { "data": [ { "price": {
+            "unit_amount": 3000,
+            "recurring": { "interval": "month" }
+        } } ] },
+    });
+    let outcome = classify_webhook(&subscription_event("customer.subscription.created", object.clone()), "customer.subscription.created");
+    let adjutant_stripe::WebhookOutcome::Subscription(fact) = outcome else {
+        panic!("expected a subscription fact, got {outcome:?}");
+    };
+    assert_eq!(fact.member_id, "bea");
+    assert_eq!(fact.fiscal_year, Some(2027));
+    assert_eq!(fact.status, "active");
+    assert_eq!(fact.amount_cents, 3000);
+    assert_eq!(fact.interval, "month");
+    assert_eq!(fact.stripe_customer_id, "cus_1");
+
+    // `deleted` is an end, whatever the object still says.
+    let ended = classify_webhook(
+        &subscription_event("customer.subscription.deleted", object),
+        "customer.subscription.deleted",
+    );
+    let adjutant_stripe::WebhookOutcome::Subscription(fact) = ended else {
+        panic!("expected a subscription fact");
+    };
+    assert_eq!(fact.status, "cancelled");
+}
+
+/// A subscription the shop did not open cannot be attributed, and saying so is
+/// better than mirroring a row nobody asked for.
+#[test]
+fn a_subscription_without_a_member_is_reported_not_mirrored() {
+    use adjutant_stripe::classify_webhook;
+    let object = serde_json::json!({ "id": "sub_2", "status": "active", "metadata": {} });
+    let outcome = classify_webhook(
+        &subscription_event("customer.subscription.created", object),
+        "customer.subscription.created",
+    );
+    let adjutant_stripe::WebhookOutcome::Unusable(reason) = outcome else {
+        panic!("expected Unusable, got {outcome:?}");
+    };
+    assert!(reason.contains("member_id"), "{reason}");
+}
+
+/// A subscription's charge books a dues payment: amount from the invoice, and
+/// whose dues from the metadata Stripe copied off the subscription.
+#[test]
+fn a_paid_subscription_invoice_is_a_dues_payment() {
+    use adjutant_stripe::classify_webhook;
+    let object = serde_json::json!({
+        "id": "in_1",
+        "amount_paid": 2500,
+        "currency": "cad",
+        "payment_intent": "pi_1",
+        "subscription_details": { "metadata": {
+            "purpose": "dues",
+            "member_id": "bea",
+            "dues_year": "2027",
+            "fund_code": "general",
+            "category": "dues"
+        } },
+    });
+    let outcome = classify_webhook(&subscription_event("invoice.paid", object), "invoice.paid");
+    let adjutant_stripe::WebhookOutcome::Payment(fact) = outcome else {
+        panic!("expected a payment, got {outcome:?}");
+    };
+    assert_eq!(fact.payment_id, "pi_1");
+    assert_eq!(fact.amount_cents, 2500);
+    assert_eq!(fact.member_id, "bea");
+    assert_eq!(fact.purpose, "dues");
+    assert_eq!(fact.dues_year, Some(2027));
+    assert_eq!(fact.fund_code.as_deref(), Some("general"));
+
+    // A zero-amount invoice is a proration or a trial, not a payment.
+    let zero = serde_json::json!({ "id": "in_2", "amount_paid": 0, "currency": "cad" });
+    assert!(matches!(
+        classify_webhook(&subscription_event("invoice.paid", zero), "invoice.paid"),
+        adjutant_stripe::WebhookOutcome::Nothing
+    ));
+
+    // No payment intent (a bank debit): the invoice id keeps the delivery
+    // idempotent.
+    let bank = serde_json::json!({
+        "id": "in_3", "amount_paid": 1500, "currency": "cad",
+        "subscription_details": { "metadata": { "member_id": "bea", "purpose": "dues" } },
+    });
+    let adjutant_stripe::WebhookOutcome::Payment(fact) =
+        classify_webhook(&subscription_event("invoice.paid", bank), "invoice.paid")
+    else {
+        panic!("expected a payment");
+    };
+    assert_eq!(fact.payment_id, "in_in_3");
+}
+
+/// Enrolling for automatic dues prices the arrangement per charge from the same
+/// mirrored assessment the one-off checkout uses, and sends Stripe a
+/// **subscription** session: the recurring fields are what make it automatic.
+#[tokio::test]
+async fn subscribing_sends_stripe_a_recurring_session() {
+    let h = Harness::new(config());
+    let routes = h.routes().await;
+    let subscribe = route(&routes, "POST", "/api/stripe/subscribe");
+    h.db.push_rows(vec![mirror_row("42", 2026, 12000, 2000, 4000)]); // owed 6000
+    h.db.push_rows(vec![serde_json::json!({
+        "id": 9, "member_id": "42", "fiscal_year": 2026, "status": "pending",
+        "amount_cents": 2000, "currency": "cad", "interval": "month",
+        "created_at": "2026-11-17T00:00:00Z"
+    })]);
+    h.http.push_json(
+        200,
+        &serde_json::json!({ "id": "cs_sub_1", "url": "https://checkout.stripe.test/cs_sub_1" }),
+    );
+
+    let (status, body) = call(
+        &subscribe.handler,
+        TestRequest::post("/api/stripe/subscribe")
+            .json(&serde_json::json!({ "interval": "month", "amount_cents": 2000 }))
+            .identity("42", &["scout"])
+            .build(),
+    )
+    .await;
+    assert_eq!(status, 201, "{body}");
+    assert_eq!(body["checkout_url"], "https://checkout.stripe.test/cs_sub_1");
+    assert_eq!(body["subscription"]["interval"], "month");
+
+    // The row records what the member agreed to, before Stripe says whether the
+    // card worked.
+    let insert = h
+        .db
+        .last_query_params("INSERT INTO \"stripe\".\"subscriptions\"")
+        .expect("the pending arrangement");
+    assert!(has_int(&insert, 2000), "{:?}", canonical(&insert));
+    assert!(has_text(&insert, "month"), "{:?}", canonical(&insert));
+
+    let outbound = h.http.outbound_text();
+    assert!(outbound.contains("mode=subscription"), "{outbound}");
+    assert!(
+        outbound.contains("price_data][recurring][interval]=month"),
+        "the price is recurring: {outbound}"
+    );
+    assert!(
+        outbound.contains("subscription_data[metadata][member_id]=42"),
+        "whose dues travels on the subscription: {outbound}"
+    );
+    assert!(
+        outbound.contains("subscription_data[metadata][dues_year]=2026"),
+        "the invoice's metadata carries the year the charge belongs to: {outbound}"
+    );
+}
+
+/// An arrangement is priced against an assessment, like every other dues path;
+/// and paying nothing per charge is a waiver, not a subscription.
+#[tokio::test]
+async fn subscribing_refuses_a_missing_assessment_and_a_sub_minimum_charge() {
+    let h = Harness::new(config());
+    let routes = h.routes().await;
+    let subscribe = route(&routes, "POST", "/api/stripe/subscribe");
+
+    h.db.push_rows(Vec::new()); // no mirror row
+    let (status, body) = call(
+        &subscribe.handler,
+        TestRequest::post("/api/stripe/subscribe")
+            .json(&serde_json::json!({ "interval": "year" }))
+            .identity("42", &["scout"])
+            .build(),
+    )
+    .await;
+    assert_eq!(status, 409, "{body}");
+    assert!(body["error"].as_str().unwrap().contains("finance"), "{body}");
+
+    h.db.push_rows(vec![mirror_row("42", 2026, 12000, 0, 0)]);
+    let (status, body) = call(
+        &subscribe.handler,
+        TestRequest::post("/api/stripe/subscribe")
+            .json(&serde_json::json!({ "interval": "month", "amount_cents": 10 }))
+            .identity("42", &["scout"])
+            .build(),
+    )
+    .await;
+    assert_eq!(status, 409, "{body}");
+    assert!(body["error"].as_str().unwrap().contains("waiver"), "{body}");
+    assert!(h.http.calls().is_empty(), "nothing reaches Stripe");
 }
