@@ -27,7 +27,7 @@ members = [
 ]
 
 [workspace.package]
-version = "0.4.0"
+version = "0.5.0"
 edition = "2021"
 # Minimum supported Rust version. wasmtime 49 (the WASM host) requires 1.96;
 # that is the binding constraint. Bump only when a dependency (or we) require it.
@@ -36,7 +36,7 @@ license = "MIT"
 repository = "https://github.com/chezgoulet/adjutant"
 
 [workspace.dependencies]
-adjutant-sdk = { path = "plugins/sdk", version = "0.4.0" }
+adjutant-sdk = { path = "plugins/sdk", version = "0.5.0" }
 axum = "0.8"
 # The server loop needs hyper's HTTP/1 header-read deadline, which `axum::serve`
 # does not expose (issue #172). These are already axum's own dependencies.

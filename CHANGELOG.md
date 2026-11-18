@@ -11,6 +11,23 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+Nothing yet.
+
+---
+
+## [0.5.0] — 2026-11-17 — Automatic dues
+
+The recurring half of the dues ruling: a member enrols once, Stripe charges them
+on the interval and amount they chose, and every charge books a dues payment
+through the same path a manual one takes.
+
+Also in this release: `RUSTSEC-2026-0543` (chrono unmaintained) is ignored for a
+bounded window with the migration filed as #219, because the advisory arrived
+from the database rather than from any change here and it was failing every
+branch.
+
+`SDK_ABI_VERSION` stays 6 — nothing in the plugin surface changed.
+
 ### Added
 
 - **Automatic dues.** `POST /api/stripe/subscribe` opens a Stripe Checkout session
