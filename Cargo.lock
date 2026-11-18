@@ -13,7 +13,7 @@ dependencies = [
 
 [[package]]
 name = "adjutant-announcements"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "adjutant-sdk",
  "chrono",
@@ -24,7 +24,7 @@ dependencies = [
 
 [[package]]
 name = "adjutant-archive"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "adjutant-sdk",
  "chrono",
@@ -35,7 +35,7 @@ dependencies = [
 
 [[package]]
 name = "adjutant-auth"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "adjutant-sdk",
  "argon2",
@@ -54,7 +54,7 @@ dependencies = [
 
 [[package]]
 name = "adjutant-calendar"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "adjutant-sdk",
  "chrono",
@@ -65,7 +65,7 @@ dependencies = [
 
 [[package]]
 name = "adjutant-conflicts"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "adjutant-sdk",
  "chrono",
@@ -76,7 +76,7 @@ dependencies = [
 
 [[package]]
 name = "adjutant-equipment"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "adjutant-sdk",
  "chrono",
@@ -87,7 +87,7 @@ dependencies = [
 
 [[package]]
 name = "adjutant-finance"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "adjutant-sdk",
  "chrono",
@@ -100,7 +100,7 @@ dependencies = [
 
 [[package]]
 name = "adjutant-governance"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "adjutant-sdk",
  "chrono",
@@ -111,7 +111,7 @@ dependencies = [
 
 [[package]]
 name = "adjutant-hello"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "adjutant-sdk",
  "serde",
@@ -120,7 +120,7 @@ dependencies = [
 
 [[package]]
 name = "adjutant-mcp"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "adjutant-sdk",
  "hex",
@@ -133,7 +133,7 @@ dependencies = [
 
 [[package]]
 name = "adjutant-membership"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "adjutant-sdk",
  "serde",
@@ -143,7 +143,7 @@ dependencies = [
 
 [[package]]
 name = "adjutant-missions"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "adjutant-sdk",
  "chrono",
@@ -154,7 +154,7 @@ dependencies = [
 
 [[package]]
 name = "adjutant-sdk"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "async-trait",
  "base64",
@@ -170,7 +170,7 @@ dependencies = [
 
 [[package]]
 name = "adjutant-server"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "adjutant-sdk",
  "argon2",
@@ -202,7 +202,7 @@ dependencies = [
 
 [[package]]
 name = "adjutant-store"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "adjutant-sdk",
  "chrono",
@@ -215,7 +215,7 @@ dependencies = [
 
 [[package]]
 name = "adjutant-stripe"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "adjutant-sdk",
  "chrono",
@@ -408,7 +408,7 @@ dependencies = [
 
 [[package]]
 name = "broken-init-fixture"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "adjutant-sdk",
 ]
